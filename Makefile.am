@@ -35,7 +35,7 @@ UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
-  tests/integration/audit
+  tests/integration/audit tests/integration/transfer_audit
 FUZZY_TESTS = tests/fuzzy/cluster
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
@@ -83,6 +83,10 @@ tests_integration_audit_SOURCES = tests/integration/audit.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_integration_audit_LDADD = src/libvsr.a
+tests_integration_transfer_audit_SOURCES = tests/integration/transfer_audit.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_transfer_audit_LDADD = src/libvsr.a
 tests_fuzzy_cluster_SOURCES = tests/fuzzy/cluster.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h \
