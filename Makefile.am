@@ -41,8 +41,15 @@ INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
   tests/integration/audit tests/integration/transfer_audit
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
-  tests/regression/witness_prefix tests/regression/boundary_from_view_change
+  tests/regression/witness_prefix tests/regression/boundary_from_view_change \
+  tests/regression/review_epoch_recovery_vote
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
+# Reproductions of open safety bugs found in review; they turn into XPASS
+# once the core is fixed and should then move to the ordinary regressions.
+# review_epoch_recovery_vote: a member that lost its store rejoins as a voter
+# through a NEW_EPOCH redirect and a single-donor epoch transfer without the
+# recovery quorum, so a later view change replaces acknowledged commands.
+XFAIL_TESTS = tests/regression/review_epoch_recovery_vote
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
 tests_unit_checked_LDADD = src/libvsr.a
@@ -109,6 +116,11 @@ tests_regression_witness_prefix_SOURCES = tests/regression/witness_prefix.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_witness_prefix_LDADD = src/libvsr.a
+tests_regression_review_epoch_recovery_vote_SOURCES = \
+  tests/regression/review_epoch_recovery_vote.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_review_epoch_recovery_vote_LDADD = src/libvsr.a
 tests_regression_boundary_from_view_change_SOURCES = \
   tests/regression/boundary_from_view_change.c \
   tests/lib/memory.c tests/lib/memory.h \
