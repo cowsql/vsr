@@ -29,6 +29,7 @@ struct vsr_epochs {
     struct vsr_member *pending_members;
     struct vsr_member *pending_previous_members;
     uint64_t pending_peer;
+    uint64_t learner;
     uint64_t sequence;
     uint64_t peer;
     uint64_t retry_at;
@@ -89,6 +90,26 @@ static uint32_t member_role(const struct vsr_membership *membership,
                                    : membership->members[index].role;
 }
 
+/* A JOIN replica that belongs to neither group of the current handoff. It
+ * warms without a vote or a retention obligation and is never a donor. */
+static bool learner(const struct vsr *v)
+{
+    const struct vsr_protocol *p = vsr_protocol_const(v);
+    return p->self == VSR_INDEX_NONE &&
+           member_role(p->epoch.previous, v->options.replica) ==
+               VSR_MEMBER_NONE;
+}
+
+/* The local replica has sent EPOCH_STARTED for the current epoch, so its
+ * promised coverage is already recoverable and retained. */
+static bool promised(const struct vsr *v)
+{
+    const struct vsr_protocol *p = vsr_protocol_const(v);
+    const struct vsr_epochs *e = epochs_const(v);
+    return e->installed && p->self != VSR_INDEX_NONE &&
+           e->epoch == p->current.epoch;
+}
+
 static void protect(struct vsr *v)
 {
     struct vsr_epochs *e = epochs(v);
@@ -131,7 +152,8 @@ static bool locally_installed(const struct vsr *v)
     uint32_t previous = member_role(p->epoch.previous, v->options.replica);
     if (role == VSR_MEMBER_FULL && v->status.role != VSR_MEMBER_FULL)
         return false;
-    if (role == VSR_MEMBER_FULL || previous == VSR_MEMBER_FULL)
+    if (role == VSR_MEMBER_FULL || previous == VSR_MEMBER_FULL ||
+        (learner(v) && v->status.role == VSR_MEMBER_FULL))
         return v->status.applied >= p->epoch.boundary &&
                p->clients_stored >= p->epoch.boundary && !p->results_pending;
     return true;
@@ -164,6 +186,7 @@ static void arm(struct vsr *v)
     e->transferring = false;
     e->announce = true;
     e->promise = false;
+    e->learner = 0;
     e->cursor = 0;
     e->peer = donor(v);
     e->stage = EPOCH_FENCE;
@@ -322,9 +345,16 @@ int vsr_epochs_event(struct vsr *v, const struct vsr_event *event,
             epoch->boundary != p->epoch.boundary)
             return VSR_OK;
         if (member_role(&p->current, message->from) == VSR_MEMBER_NONE &&
-            member_role(p->epoch.previous, message->from) == VSR_MEMBER_NONE)
+            member_role(p->epoch.previous, message->from) == VSR_MEMBER_NONE) {
+            /* An authenticated learner outside both groups collects the
+             * same promises as a member. Answering it only retransmits a
+             * promise this replica already made to both groups; it creates
+             * no vote and no further retention obligation. */
+            if (promised(v))
+                e->learner = message->from;
             return VSR_OK;
-        if (e->installed && p->self != VSR_INDEX_NONE)
+        }
+        if (promised(v))
             e->promise = true;
         return VSR_OK;
     }
@@ -333,7 +363,8 @@ int vsr_epochs_event(struct vsr *v, const struct vsr_event *event,
      * descriptors have been compacted. This grants metadata knowledge only;
      * the receiver remains TRANSFERRING until the complete prefix is checked. */
     if (epoch->previous == NULL ||
-        member_role(&p->current, message->from) == VSR_MEMBER_NONE ||
+        (member_role(&p->current, message->from) == VSR_MEMBER_NONE &&
+         member_role(v->options.seed, message->from) == VSR_MEMBER_NONE) ||
         (epoch->current->epoch == p->current.epoch + 1 &&
          !vsr_membership_equal(epoch->previous, &p->current)))
         return VSR_OK;
@@ -382,8 +413,10 @@ static bool persist_phase(struct vsr *v, bool steady)
         hard.state = VSR_HARD_NORMAL;
         hard.last_normal_view = hard.view;
     }
+    /* Only a removed donor retires. A learner records the nonvoting warm-up
+     * state so a restart resumes discovery instead of a removal tombstone. */
     if (steady && p->self == VSR_INDEX_NONE)
-        hard.state = VSR_HARD_RETIRED;
+        hard.state = learner(v) ? VSR_HARD_RECOVERING : VSR_HARD_RETIRED;
     uint32_t role = member_role(&p->current, v->options.replica);
     if (steady && role != VSR_MEMBER_NONE)
         hard.role = role;
@@ -396,11 +429,41 @@ static bool persist_phase(struct vsr *v, bool steady)
     return true;
 }
 
+static bool send_epoch(struct vsr *v, uint64_t peer, uint32_t type)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_epochs *e = epochs(v);
+    bool announce = type == VSR_MSG_START_EPOCH;
+    struct vsr_message message = {v->options.cluster,
+                                  p->current.epoch,
+                                  v->status.view,
+                                  v->options.replica,
+                                  type,
+                                  0,
+                                  p->epoch.boundary,
+                                  announce ? &p->epoch : NULL};
+    if (!vsr_protocol_emit(v, VSR_OP_SEND, peer, EPOCH_SEND, &message, NULL, 0,
+                           0))
+        return false;
+    e->sends++;
+    return true;
+}
+
 static bool send_announcements(struct vsr *v)
 {
     struct vsr_protocol *p = vsr_protocol(v);
     struct vsr_epochs *e = epochs(v);
-    if (!stable_configuration(v) || (!e->announce && !e->promise))
+    if (!stable_configuration(v))
+        return false;
+    if (e->learner != 0) {
+        /* One slot suffices: a learner retransmits START_EPOCH until STEADY,
+         * so a reply lost to a concurrent learner is requested again. */
+        if (promised(v) && !send_epoch(v, e->learner, VSR_MSG_EPOCH_STARTED))
+            return false;
+        e->learner = 0;
+        return true;
+    }
+    if (!e->announce && !e->promise)
         return false;
     uint64_t total = (uint64_t)p->current.count + p->previous.count;
     while (e->cursor < total) {
@@ -412,21 +475,11 @@ static bool send_announcements(struct vsr *v)
             e->cursor++;
             continue;
         }
-        uint32_t type =
-            e->announce ? VSR_MSG_START_EPOCH : VSR_MSG_EPOCH_STARTED;
-        struct vsr_message message = {v->options.cluster,
-                                      p->current.epoch,
-                                      v->status.view,
-                                      v->options.replica,
-                                      type,
-                                      0,
-                                      p->epoch.boundary,
-                                      e->announce ? &p->epoch : NULL};
-        if (!vsr_protocol_emit(v, VSR_OP_SEND, peer, EPOCH_SEND, &message, NULL,
-                               0, 0))
+        if (!send_epoch(v, peer,
+                        e->announce ? VSR_MSG_START_EPOCH
+                                    : VSR_MSG_EPOCH_STARTED))
             return false;
         e->cursor++;
-        e->sends++;
         return true;
     }
     e->cursor = 0;
@@ -499,7 +552,8 @@ bool vsr_epochs_poll(struct vsr *v)
         p->epoch.phase = VSR_EPOCH_STEADY;
         uint32_t role = member_role(&p->current, v->options.replica);
         if (role == VSR_MEMBER_NONE)
-            v->status.state = VSR_STATE_RETIRED;
+            v->status.state =
+                learner(v) ? VSR_STATE_WARMING : VSR_STATE_RETIRED;
         else {
             v->status.role = role;
             if (role == VSR_MEMBER_WITNESS)
@@ -546,4 +600,5 @@ void vsr_epochs_stop(struct vsr *v)
     e->stage = EPOCH_IDLE;
     e->retry_at = VSR_NO_DEADLINE;
     e->pending = NULL;
+    e->learner = 0;
 }

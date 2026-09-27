@@ -290,7 +290,8 @@ enum vsr_message_type {
     VSR_MSG_LOG,       /* number: last op; body: vsr_state_chunk */
     VSR_MSG_STATE_UNAVAILABLE, /* number: last op; body: vsr_state_chunk */
     VSR_MSG_START_EPOCH,       /* number: boundary; body: vsr_epoch */
-    VSR_MSG_EPOCH_STARTED, /* number: boundary; body: NULL; retention promise */
+    VSR_MSG_EPOCH_STARTED, /* number: boundary; body: NULL; retention promise,
+                              also unicast to an authenticated learner */
     VSR_MSG_NEW_EPOCH,     /* number: boundary; body: vsr_epoch */
     VSR_MSG_CHECKPOINT,    /* number: retained op; body: vsr_checkpoint */
     VSR_MSG_READ_PROBE,    /* number: commit floor; body: vsr_nonce */

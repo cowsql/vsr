@@ -157,19 +157,26 @@ through the boundary; a witness retains the protocol history and required remote
 checkpoint coverage. EPOCH_STARTED promises that this coverage is recoverable
 under the cluster's durability policy and will be retained until safe successor
 coverage exists. It is sent to both groups and retransmitted in response to
-START_EPOCH. It is never sent merely because a replica knows the membership.
+START_EPOCH. A current member that has already promised also answers
+START_EPOCH from an authenticated learner outside both groups with the same
+promise, unicast to that sender; this retransmission adds no vote and no
+retention obligation beyond what the member owes the two groups. It is never
+sent merely because a replica knows the membership.
 
-Each replica establishes STEADY after collecting the required distinct
-EPOCH_STARTED promises or learning a later committed epoch that necessarily
-follows that handoff. A local durable STEADY record survives restart. A peer's
-phase alone does not establish the receiver's installation or retirement.
-Readiness collection is independent of current view so view changes cannot
-erase the obligation. Until STEADY, the next RECONFIGURE is rejected with BUSY.
+Each replica, including a learner, establishes STEADY after collecting the
+required distinct EPOCH_STARTED promises or learning a later committed epoch
+that necessarily follows that handoff. A local durable STEADY record survives
+restart. A peer's phase alone does not establish the receiver's installation or
+retirement. Readiness collection is independent of current view so view changes
+cannot erase the obligation. Until STEADY, the next RECONFIGURE is rejected
+with BUSY.
 CHECK_EPOCH may commit but cannot execute successfully before its target is
 ready; this also prevents a cached duplicate from bypassing the retention fence.
 
 Removed members serve as donors while TRANSITIONING, then persist retirement
-and become RETIRED. A full member demoted to witness retains its full donor
+and become RETIRED. A learner that installs through the boundary is never
+retired: at STEADY it resumes nonvoting warm-up in the learned epoch and awaits
+logged admission. A full member demoted to witness retains its full donor
 state through handoff; its materialized `status.role` can therefore remain FULL
 while the new membership permits only witness voting. It cannot lead or serve
 application reads in that epoch. A promoted witness cannot vote as a new full

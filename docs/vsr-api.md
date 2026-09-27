@@ -371,12 +371,19 @@ Epoch descriptors retain the current and immediate previous membership plus the
 committed transition boundary. Their phase is the owner's local progress, not
 evidence that the receiver has caught up. EPOCH_STARTED is sent to both old and
 new groups only after the sender has recoverable state through the boundary;
-full members have also rebuilt application/client state. Handoff completion
-combines distinct current-member acknowledgments under DESIGN.md's quorum and
-full-member retention rule. The epoch metadata remains after handoff so a
-restart can recover the configuration and removal boundary. A demoted full
-member keeps its donor image and materialized FULL role until handoff permits
-release, even though voting and primary eligibility use the new membership.
+full members have also rebuilt application/client state. A member that has
+promised retransmits it unicast to an authenticated learner's START_EPOCH.
+Handoff completion, for members and learners alike, combines distinct
+current-member acknowledgments under DESIGN.md's quorum and full-member
+retention rule; a learner's STEADY grants it no vote and obliges no one further.
+A JOIN replica whose seed is stale learns the committed epoch from a seed
+member's NEW_EPOCH, installs through the boundary, collects the same promises,
+and returns to WARMING rather than RETIRED; it is admitted by a later
+RECONFIGURE like a learner that joined at epoch 0. The epoch metadata remains
+after handoff so a restart can recover the configuration and removal boundary.
+A demoted full member keeps its donor image and materialized FULL role until
+handoff permits release, even though voting and primary eligibility use the new
+membership.
 
 In durable mode the order is SNAPSHOT_SYNC, STORE publication/restoration, SYNC
 of that store revision, then dependent trimming or participation. PUBLISH does
