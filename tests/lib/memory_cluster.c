@@ -1128,6 +1128,8 @@ int mem_node_restart(struct mem_node *node, struct vsr_id incarnation)
           !same_id(node->options.incarnation, incarnation));
     node->options.incarnation = incarnation;
     node->options.start_mode = VSR_START_RECOVER;
+    /* A restart uses RECOVER even during warm-up; join_role is JOIN-only. */
+    node->options.join_role = VSR_MEMBER_NONE;
     return node_init(node);
 }
 
