@@ -81,6 +81,7 @@ struct vsr_transaction {
     uint64_t committed;
     uint64_t clients_through;
     uint64_t begin; /* retained log begin after TRIM/RESTORE; zero otherwise */
+    bool restores;  /* replaces the indexed client base (RESTORE) */
     bool completed;
 };
 

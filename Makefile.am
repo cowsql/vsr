@@ -41,7 +41,8 @@ INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
   tests/integration/audit tests/integration/transfer_audit
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
-  tests/regression/witness_prefix tests/regression/pressure_reload
+  tests/regression/witness_prefix tests/regression/pressure_reload \
+  tests/regression/anchor_behind_applied tests/regression/reply_restore
 FUZZY_TESTS = tests/fuzzy/cluster
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
@@ -113,6 +114,15 @@ tests_regression_pressure_reload_SOURCES = tests/regression/pressure_reload.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_pressure_reload_LDADD = src/libvsr.a
+tests_regression_anchor_behind_applied_SOURCES = \
+  tests/regression/anchor_behind_applied.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_anchor_behind_applied_LDADD = src/libvsr.a
+tests_regression_reply_restore_SOURCES = tests/regression/reply_restore.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_reply_restore_LDADD = src/libvsr.a
 tests_fuzzy_cluster_SOURCES = tests/fuzzy/cluster.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h \

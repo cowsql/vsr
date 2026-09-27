@@ -87,7 +87,14 @@ loaded for application while a transition forbids it; a primary announces
 commits to peers whose next entry lies below its trimmed log; a witness
 needs coverage only for retained entries it actually discards; and a refused
 input releases a readable cache pin only once the protocol poll is idle, so a
-pin the next poll consumes is never evicted and reloaded around the retry. Increasing test
+pin the next poll consumes is never evicted and reloaded around the retry.
+Two further schedule-dependent defects surfaced once that cycle was gone: a
+full member adopted a selected offer's checkpoint below its own applied
+position and installed it behind entries it had applied (it now keeps its
+state and fetches only the log past its position), and an executed reply
+decided before a RESTORE replaced the indexed client base was emitted against
+the restored revision (it is now decided again, and held while a restoration
+is outstanding). Increasing test
 defaults is not a substitute for checking the accepted minimum. Large
 command/small manifest and small command/large manifest configurations need
 separate fault campaigns.
