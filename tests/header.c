@@ -18,6 +18,8 @@ CHECK_LAYOUT(sizeof(struct vsr_message) == 64, message_is_64_bytes);
 CHECK_LAYOUT(sizeof(struct vsr_entry) == 64, entry_is_64_bytes);
 CHECK_LAYOUT(sizeof(struct vsr_member) == 16, member_is_16_bytes);
 CHECK_LAYOUT(sizeof(struct vsr_client_record) == 64, client_record_is_64_bytes);
+CHECK_LAYOUT(sizeof(struct vsr_read_barrier) == 24, read_barrier_is_24_bytes);
+CHECK_LAYOUT(sizeof(struct vsr_failure) == 24, failure_is_24_bytes);
 CHECK_LAYOUT(offsetof(struct vsr_event, data) == 16, event_body_offset);
 CHECK_LAYOUT(offsetof(struct vsr_op, data) == 16, operation_body_offset);
 CHECK_LAYOUT(offsetof(struct vsr_message, body) == 56, message_body_offset);
@@ -55,4 +57,55 @@ void vsr_header_lifecycle_signatures(void)
     (void)layout_fn;
     (void)init_fn;
     (void)deinit_fn;
+}
+
+/* Exercise cold-path payloads as a C and C++ adapter would construct them. */
+int vsr_header_payload_check(struct vsr *v,
+                             const struct vsr_membership *membership,
+                             uint64_t operation_id, uint64_t lease)
+{
+    const struct vsr_epoch epoch = {
+        membership, NULL, 0, VSR_EPOCH_STEADY, 0
+    };
+    const struct vsr_store_identity identity = {
+        { UINT64_C(1), UINT64_C(2) }, UINT64_C(7), VSR_DURABLE, 0
+    };
+    const struct vsr_hard_state hard = {
+        0, 0, 0, &epoch, VSR_HARD_NORMAL, VSR_MEMBER_FULL
+    };
+    const struct vsr_recovered recovered = {
+        identity, UINT64_C(1), UINT64_C(1), UINT64_C(1), hard, NULL
+    };
+    const struct vsr_loaded loaded = { &recovered, UINT64_C(1), 0, 1, 0 };
+    const struct vsr_event completion = {
+        VSR_EVENT_COMPLETE, VSR_IO_OK, operation_id, &loaded, lease
+    };
+    const struct vsr_read_barrier read = {
+        0, VSR_NO_DEADLINE, VSR_READ_LINEARIZABLE, 0
+    };
+    const struct vsr_change changes[] = {
+        { VSR_STORE_IDENTITY, 1, 0, &identity },
+        { VSR_STORE_HARD_STATE, 1, 0, &hard }
+    };
+    const struct vsr_store transaction = { UINT64_C(1), changes, 2, 0 };
+    const struct vsr_log_state offer = {
+        { { UINT64_C(3), UINT64_C(4) }, UINT64_C(1) },
+        0, 0, 0, UINT64_C(1), UINT64_C(1), &epoch, { NULL, 0, 0 }, NULL
+    };
+    const struct vsr_state_chunk chunk = {
+        { { UINT64_C(5), UINT64_C(6) }, UINT64_C(1) }, offer, 0, 0
+    };
+    const struct vsr_message message = {
+        { UINT64_C(1), UINT64_C(2) }, 0, 0, UINT64_C(7),
+        VSR_MSG_NEW_STATE, 0, 0, &chunk
+    };
+    struct vsr_status status;
+    (void)completion;
+    (void)read;
+    (void)transaction;
+    (void)message;
+    /* These stack payloads are compile-only; submitting them would require
+     * keeping them alive until their leases are explicitly released. */
+    vsr_get_status(v, &status);
+    return status.failure.code == VSR_FAILURE_NONE;
 }

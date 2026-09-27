@@ -1,284 +1,365 @@
-# VSR API sketch
+# Adapter reference
 
-Project-wide architectural principles are defined in [DESIGN.md](../DESIGN.md).
+[include/vsr.h](../include/vsr.h) defines the public types and entry points.
+[DESIGN.md](../DESIGN.md) defines the protocol invariants. This reference specifies
+how an adapter drives an instance and implements its external operations.
 
-The public surface is in [include/vsr.h](../include/vsr.h). It describes a
-replica engine and its contracts, not an implementation or a verified protocol.
-The protocol reference is Liskov and Cowling's
-[Viewstamped Replication Revisited](https://pages.cs.wisc.edu/~remzi/Classes/739/Papers/vr-revisited.pdf).
-The logical storage interface, memory ownership, batching, and quorum read
-barrier below are design choices for this library.
+## Initialization
 
-## Coverage
+Zero reserved fields and initialize every option explicitly; there are no
+implicit capacity or timeout defaults. `cache_line_bytes = 0` selects 64-byte
+alignment. Other values must be powers of two; the returned arena alignment also
+satisfies the alignment of every internal type. `vsr_layout` validates options,
+checks size arithmetic, and includes progress reserves in its result. `vsr_init`
+requires at least that size and alignment and copies all option/seed metadata.
 
-| Concern | Interface |
+Cluster, replica, and process-incarnation IDs must be nonzero. Incarnations must
+be unique across all starts in the cluster, including starts after storage loss.
+Only one live instance may use a replica ID or its logical store. Replica IDs
+are stable across membership changes and independent of transport addresses.
+
+| Start mode | Seed and store | Startup behavior |
+| --- | --- | --- |
+| `NEW` | Common epoch-0 membership containing this replica; empty store | Establish the agreed genesis state and initialize storage |
+| `RECOVER` | A discovery seed; matching local store if available | Restore local state and perform quorum recovery when required |
+| `JOIN` | Known membership excluding this replica; empty store | Warm as `join_role` without voting; await logged admission |
+
+The first step starts asynchronous `LOAD_RECOVERY`. `NOT_FOUND` means no
+initialized store. `NEW` and `JOIN` fail on an existing store. `RECOVER` fails on
+identity/policy mismatch or corruption; an absent store requires quorum recovery,
+never automatic bootstrap. Stale but internally valid state in replicated mode
+is only a recovery hint. A restart uses `RECOVER`, including during warm-up.
+The persisted hard-state role records whether application state is being
+maintained; it does not grant a vote to a replica absent from the membership.
+
+Transaction 1 of a previously empty store contains `STORE_IDENTITY` and initial
+hard state. Identity is immutable, independent of process incarnation, and
+preserved through checkpoint restoration. Restoring a peer's checkpoint must
+not replace the destination's local replica identity or transaction sequence.
+A full replica receives `SNAPSHOT_INSTALL` before any `APPLY`; a NULL checkpoint
+means reset to the cluster's agreed genesis application state.
+
+All limits are positive. `message_bytes` must fit the checked sum of one maximum
+command and one maximum checkpoint manifest; `batch_entries` must fit the log cache.
+The planner rejects capacities that cannot support minimum protocol progress.
+Admission additionally reserves space for each operation's maximum completion.
+Limit exhaustion must defer new work before consuming those reserves.
+Configuration, entry-count, span-count, command, result, manifest, and message
+limits are deployment compatibility requirements; there is no peer negotiation.
+
+## Driving the core
+
+`vsr_step(v, NULL, &update)` and `vsr_step_many(v, NULL, 0, &update)` drain ready
+work. Before every call, provide `update.ops` and a positive `update.capacity`.
+The other update fields are outputs. Input and output arrays must not overlap
+each other, the arena, or pinned objects. Serialize all calls on an instance.
+
+Each return, including an event error, reports:
+
+| Output | Meaning |
 | --- | --- |
-| Normal replication, heartbeats, retransmission | `PREPARE`, `PREPARE_OK`, `COMMIT`, `TIME`, batched log entries |
-| View change | `START_VIEW_CHANGE`, `DO_VIEW_CHANGE`, `START_VIEW`; explicit last normal view and missing-log fetch |
-| Crash recovery | Async recovery metadata/log loads, fresh recovery nonces, recovery responses, application replay |
-| State transfer | Bounded log chunks, exact source revisions, checkpoint offers, out-of-core snapshot fetch/install |
-| Reconfiguration | Logged reconfiguration and check-epoch requests; current/previous memberships, transition boundary, epoch messages, retirement |
-| Joining and witnesses | Nonvoting warm-up; explicit full/witness roles; promotion requires application catch-up |
-| Client semantics | Stable request identity, pending-request suppression, indexed completed-client table and cached replies, client recovery query |
-| Application execution | Ordered committed batches, deterministic results, separate committed/applied/durable progress |
-| Reads | Ordinary logged commands, fresh-quorum read fences, or explicitly weaker causal backup reads |
-| Persistence | Incremental atomic logical transactions, suffix replacement, pipelined writes, group durability barriers |
-| Checkpoints and compaction | Capture, persist, publish, fetch, install, trim, revision reclamation, snapshot deletion |
-| Resource management | Fixed arena, bounded caches, input pins, bounded output arrays, partial batch consumption, stop/drain |
+| `consumed` | Exact accepted prefix; resubmit only the suffix |
+| `count` | Valid operations in the caller's output array |
+| `deadline_ns` | Absolute replacement timer deadline; `VSR_NO_DEADLINE` cancels it |
+| `MORE` | Runnable work remains; drain without new input |
+| `OUTPUT_FULL` | Additional output needs slots; implies `MORE` |
+| `INPUT_BLOCKED` | The next event needs resources released by other work |
+| `STATE_CHANGED` | State, role, epoch, transition phase, view, or latched failure changed |
 
-There is no client-side proxy, address discovery service, codec, storage engine,
-application, or I/O executor in this header. These belong outside the replica
-engine. Client and replica traffic can use different transports. Reads that
-update access timestamps or otherwise change state must be logged commands.
-There is no implicit time-based read lease or unsynchronized primary-local read.
+`VSR_OK` means all input was consumed and no immediately runnable work remains;
+external operations may still be outstanding. `VSR_AGAIN` indicates a work budget
+or capacity boundary, even if all input was accepted. `VSR_EINVAL` identifies an
+invalid event or argument; `VSR_ELIMIT` identifies a permanent size or capacity
+violation. An event error leaves that event unconsumed and preserves earlier
+accepted events and output. Neither a negative result nor `AGAIN` rolls back work.
 
-## The driver boundary
+Dispatch all returned operations before reusing the array. Queue immediate
+completions and feed them back after dispatch; do not call into the core
+reentrantly. On `MORE`, drain before adding requests. If blocked without `MORE`,
+service completions and time rather than repeatedly offering the same request.
+Reorder an adapter queue when a blocked proposal precedes a needed completion.
+Completions, STOP, and lease release retain progress capacity under saturation.
 
-`vsr_step(v, event, update)` remains the single-event entry point;
-`vsr_step_many` amortizes dispatch and lets the engine form protocol and storage
-batches. Supply a `TIME` event with the current monotonic time each loop turn,
-including during sustained traffic. Other events use the last accepted time.
-No protocol timeout runs until the first `TIME` establishes the clock origin.
-Use the latest returned deadline to arm or replace one outer timer.
+Supply `TIME` regularly, including under sustained traffic. Its ID is monotonic
+nanoseconds in one local clock domain; values may repeat but never decrease.
+Other events use the last accepted time. The first TIME establishes the origin;
+protocol timers and read deadlines do not fire beforehand. A returned deadline
+at or before the current time requires another current TIME event. Early timer
+wakeups are harmless. `batch_delay_ns = 0` disables intentional delay; positive
+values bound it from the first queued entry. Heartbeats and retries cannot wait
+for application batching. Counter or time arithmetic must fail before wrapping.
 
-The driver owns the output array. Dispatch every returned operation before
-reusing those slots; operation bodies remain valid until their completions are
-accepted. Queue immediate completions while iterating the output, then feed
-them back afterwards. `RELEASE` is a notification, not work needing completion.
+Deterministic replay records options, event values and order, call boundaries,
+and output capacity. Replace process-local pointers with stable recorder handles.
+Operation IDs are unique within an instance, not across starts; the adapter must
+drain old work before reusing storage or associate completions with an instance
+generation.
 
-Reply routes are process-local, generation-qualified adapter handles, not
-replicated client identities. A stale/closed route fails delivery instead of
-being reassigned to another client. An inherited log request with no local route
-caches its result for the client's retry. `CLIENT_QUERY` replies use the largest
-locally known request number; `VSR_REPLY_EXECUTED` distinguishes an available
-cached result from a merely pending request. READ cookies also act as reply
-routes for rejection, so they must be nonzero and follow the same rule.
+## Ownership and resource accounting
 
-Every return reports how many input events were accepted. Retain and retry only
-the unconsumed suffix. Results already produced remain valid if a later event
-is invalid. With valid output storage, invalid call arguments clear output
-counts; null/invalid instance or output pointers are programming errors.
+An accepted event with non-NULL data transfers an immutable lease over every
+reachable record, array, span descriptor, and payload byte. The event descriptor
+itself is borrowed only for the call. The adapter keeps the graph alive until
+`RELEASE(lease)`, even if a request has already completed or one send has finished.
+Unconsumed events transfer nothing. Shared allocations use distinct lease IDs
+and adapter-side reference counts. IDs may be reused only after release is
+processed. Input graphs may not point into the core arena.
 
-`MORE` or `OUTPUT_FULL` means call again without new input to drain work.
-`INPUT_BLOCKED` without `MORE` means progress needs a completion, release of
-resources, or a timer event; do not busy-spin on the same proposal. Prioritize
-completions over blocked requests. Slow peers cannot cause unbounded buffering:
-the engine must coalesce retry intent, bound outstanding sends, and load older
-entries from storage when needed.
+An emitted operation pins its entire data graph until its matching COMPLETE is
+accepted. Overwriting the caller's output array does not invalidate that graph.
+Finish every access relying on the pin, including deferred zero-copy send
+notifications, before completing. Storage may acquire its own references to
+adapter-owned payload buffers; it must consume or copy core-owned descriptors
+before completion. A completion carrying data is itself a new leased input;
+its metadata must not retain pointers into the operation's core-owned records.
+For example, a CAPTURE result copies the template's epoch/member descriptors
+into adapter-owned storage instead of returning their arena pointers.
 
-The arena planner must reserve enough space to consume each already-issued
-operation's bounded completion, return every accepted input lease, and finish
-shutdown even when new request admission is saturated. Work can be continued
-over several drain calls, but accepted work must not be dropped. Incoming
-messages may be deferred or retransmitted under pressure; progress capacity
-must be reserved independently of new application requests. Invalid or
-oversized input is distinguished from temporary pressure.
+Every operation except RELEASE receives exactly one completion, including failed
+submission and cancellation. Unknown or duplicate operation IDs are API errors.
+Cancellation means accesses have ended; it cannot undo an operation already
+performed or certify successful persistence. A rejected completion still owns
+its operation pin and transfers no new lease. Correct it or replace it with a
+failure completion after external accesses end.
 
-## Memory and cache layout
+Limits count logical blob bytes, not encoded framing or host structure padding.
+`command_bytes`, `result_bytes`, and `manifest_bytes` bound individual objects;
+`message_bytes` bounds their aggregate in a message or log load. Typed array
+counts separately bound metadata. `pinned_payload_bytes` counts payload bytes
+once per occurrence in each admitted graph, including duplicate references;
+sharing across leases counts again. Core-generated references to an existing
+lease add no charge. Reserved completion capacity is unavailable to new input.
+Adapters separately account for backing allocation sizes and external queues.
 
-On the tested 64-bit ABI, events, operations, and updates are 32 bytes; message
-envelopes and log-entry headers are 64 bytes; member records are 16 bytes.
-The layout checks live in [tests/header.c](../tests/header.c). These sizes are
-not a wire ABI, an architecture-independent cache-line claim, or a measured
-performance result.
+## Requests, replies, and reads
 
-Use contiguous arrays and slab indices internally. Place frequently accessed
-replica state separately from membership, recovery, transfer, and checkpoint
-state. Align the arena and hot array bases using the requested cache-line size;
-avoid padding every small descriptor to a full line. Separate per-instance
-arenas when different threads own different replicas. There is no shared queue
-or atomic reference counting requirement inside the single-owner core.
+A request uses a nonzero client incarnation and nonzero increasing number. At
+most one request per incarnation is outstanding. Retry the same identity, type,
+and body after an uncertain outcome; only its routing epoch may follow redirects.
+Known duplicate results are resolved before rejecting a stale routing epoch.
+Do not change a command merely because its first attempt timed out.
 
-`vsr_layout`/`vsr_init` replace heap allocation. Limits bound metadata and active
-working sets, not the total indexed log or client table. Large command, reply,
-and snapshot bytes remain in adapter-managed pools. The core may copy small
-headers into its arena; it does not secretly flatten or copy payload buffers.
-Scatter/gather spans can reference receive buffers, mmap regions, or registered
-I/O memory. The same immutable payload can back several peer sends and a store
-transaction. A backend may still need a copy for its chosen codec or lifetime;
-the interface does not force that copy.
+Reply routes and read cookies are nonzero, generation-qualified local handles.
+Closed routes fail delivery and must not be reassigned to another request while
+referenced. They are never stored in the replicated log. An inherited request
+without a local route retains its result for a client retry. Duplicate attempts
+may share one pending route; admission is not a promise that every retransmission
+will receive a separate reply.
 
-An accepted event with a body transfers a lease over the entire reachable
-object graph. Returning from `step`, accepting a proposal, or completing one
-send does not release that input. Only the matching `RELEASE` does. Shared
-allocations use separate leases and adapter-side reference counts. Avoid a
-stack-allocated body unless its lifetime really extends to release. Large
-receive buffers can remain pinned by a small surviving slice; choose pool and
-lease granularity accordingly. The payload-byte limit counts logical referenced
-bytes; the adapter must also account for actual backing allocation sizes.
+| Reply | Contract |
+| --- | --- |
+| `OK` | Request committed and completed; `EXECUTED` set; result and op valid |
+| `NOT_PRIMARY` | Retry using the advertised primary, if known |
+| `NEW_EPOCH` | Routing epoch differs; use returned membership and retry |
+| `BUSY` | Admission or transition temporarily prevents handling |
+| `INVALID` / `LIMIT` | Well-formed request violates a protocol rule or admission limit |
+| `STALE_REQUEST` | A newer request is known; this request will not execute again |
+| `CLIENT_STATE` | Latest locally known request, with result only if `EXECUTED` |
+| `CLIENT_UNKNOWN` | No local completed or retained request; queried client, number/op zero |
+| `TIMEOUT` | Read deadline expired before a read fence was emitted |
 
-Operation body pins and input leases have different lifetimes. The core can
-release an operation after its completion while still retaining an input lease
-for another send, a cached reply, or an unpersisted log entry. Conversely, it
-can evict persisted payloads and later request them with `LOAD`, returning input
-leases without keeping an entire history in RAM.
+Ordinary replies echo the submitted request ID. Client queries instead report
+the latest locally known ID for the queried client. Read rejections use an
+all-zero request ID and the cookie as the reply route. Absent results are empty
+blobs with code zero; control requests also have empty successful results.
+An unknown primary is `VSR_NO_REPLICA`. Structural errors and oversized input
+graphs can be rejected before admission with an API error instead of a reply.
 
-The adapter may acquire independent references to its own payload buffers
-before completing a store operation, allowing zero-copy retention in an
-in-memory store or cache. Completing the operation ends reliance on the core's
-pin; it need not destroy an independently owned backing allocation. Core-arena
-descriptors cannot be retained this way and must be consumed or copied first.
+`CLIENT_QUERY` is local observation and may reveal an uncommitted request that
+later disappears. `CLIENT_UNKNOWN` does not prove global absence. A client that
+keeps an incarnation must durably preserve its issued sequence and unresolved
+command; a query alone cannot reconstruct a safe next number. A fresh incarnation
+avoids number reuse but does not resolve an old command's uncertain outcome.
+No client-record deletion API is provided: eviction removes a memory cache entry,
+not persistent duplicate suppression.
 
-## Storage and application progress
+`READ` carries an applied minimum and an absolute deadline, or
+`VSR_NO_DEADLINE`. A zero deadline is already expired once time is established.
+Linearizable reads require a normal, established primary and a fresh quorum
+round begun after admission. Reads admitted after a probe starts cannot share
+that probe. Causal reads require a normal full replica and only the applied
+minimum. Waiting reads occupy `pending_reads`; view/epoch changes reject or
+restart unfinished rounds without reusing old acknowledgments.
 
-The adapter supplies an indexed logical store: recovery metadata, log ranges,
-and completed client records. It can implement that store using a WAL, immutable
-segments, a page tree, an in-memory map, or another design. The core chooses
-logical changes and their ordering; the adapter chooses their representation.
-`VSR_REPLICATED` still needs this readable store, which may be entirely volatile.
+A successful barrier emits `READ_READY`, freezing application mutation at
+`fence.applied >= min_op`. Capture a snapshot or finish the read, then complete
+the operation. Evaluation and delivery may continue independently on that
+snapshot. No APPLY, INSTALL, or CAPTURE overlaps the fence. Once READ_READY is
+emitted, its deadline no longer cancels the pin; the adapter must complete it.
+Failed read delivery abandons the local route. The core produces no read value.
 
-For example, the engine may emit `STORE(41)`, `STORE(42)`, and `SYNC(42)`.
-The adapter can serialize both transactions into one write and flush, or use
-parallel writes. It reports each operation separately. A `STORE` completion
-means the transaction is readable and no longer depends on its operation pin;
-a `SYNC` completion certifies the whole durable prefix, not just the last write.
-The engine tracks readable and durable prefixes despite out-of-order completions.
-It may submit `SYNC` before earlier store completions, so the adapter implements
-the barrier dependency. Durable protocol messages wait in the core until all
-necessary durability and completion conditions hold.
+## Indexed storage
 
-Transactions atomically combine logical suffix truncation/replacement, view and
-epoch fences, client results, and checkpoint references as needed. Their sequence
-numbers are unrelated to consensus operation numbers. Recovery exposes a valid
-complete transaction prefix. Torn transactions and later dependent records are
-discarded by the adapter; acknowledged durable state must never be discarded.
-Compaction cannot erase the fencing metadata needed to recover safely.
+The store provides immutable logical revisions, not full physical copies of
+each revision. Sequence 0 denotes the empty store. Transactions begin at 1 and
+continue from the recovered sequence without gaps. Apply changes in array order
+and transactions in sequence order, regardless of physical write scheduling.
 
-`LOAD_RECOVERY` ignores its input sequence and returns the recovered sequence;
-other loads read the requested revision. `LOAD_LOG` returns consecutive entries
-starting at `first`, within both limits, and advances `next`; it must not return
-an empty nonterminal success. An empty range is valid. `LOAD_CLIENT` returns
-zero or one completed record. Older log ranges already compacted can return
-`NOT_FOUND`, allowing checkpoint transfer instead of treating that as an empty
-log. Unexpected holes or corrupt safety state must not become successful reads.
+| Change | Required fields and behavior |
+| --- | --- |
+| `IDENTITY` | `first=0, count=1`; immutable identity, only in transaction 1 |
+| `APPEND` | `first>=1, count>0`; consecutive entries at the current log end |
+| `TRUNCATE` | `first>committed, count=0, data=NULL`; remove suffix starting there |
+| `CLIENTS` | `first=0, count>0`; update latest completed client records |
+| `HARD_STATE` | `first=0, count=1`; replace protocol metadata without weakening fences |
+| `PUBLISH_CHECKPOINT` | `first=0, count=1`; replace recovery anchor without resetting live state |
+| `RESTORE_CHECKPOINT` | `first=0, count=1`; reset log/client base to the selected checkpoint |
+| `TRIM` | `first>=1, count=0, data=NULL`; remove covered log entries below first |
 
-Store revisions are immutable logical views, not mandatory physical copies.
-`RECLAIM(min_sequence)` permits collecting older versions after external readers
-drain, without deleting data still reachable from a retained version. The core
-must retain revisions needed by outstanding loads and checkpoint capture. Exported
-log offers have bounded retention; an expired offer receives `STATE_UNAVAILABLE`
-with its echoed nonce and a current offer. The receiver revalidates the new offer
-under its recovery/view-change rules instead of substituting a different log.
+APPEND and CLIENTS arrays each contain at most `batch_entries` items. Every
+transaction has at most `VSR_MAX_STORE_CHANGES` changes. TRUNCATE followed by
+APPEND replaces an uncommitted suffix. RESTORE includes the appropriate hard
+state and any retained suffix in the same atomic transaction; it neither
+installs the application nor resets local identity or storage sequence.
 
-`APPLY` executes an ordered committed batch. Application result codes are data;
-execution failure is an unsuccessful completion and halts the replica. Control
-entries occupy log positions but are application no-ops; the core handles their
-protocol effects and replies. Only full replicas execute commands. No reply is
-released before its operation has committed and its result is available.
+Maintain an index from client ID to its latest retained log entry. APPEND,
+TRUNCATE, RESTORE, and TRIM update that index atomically with the log. Completed
+client records form a separate index. Replaying old results must not overwrite
+a record for a later request. The core merges both indexes with in-flight state
+to deduplicate without scanning an unbounded log on each cache miss. Witnesses
+do not generate application-result records; client queries receive NOT_PRIMARY.
 
-Application progress in RAM is not durable application progress. On restart,
-install the checkpoint and execute every committed suffix entry in order,
-including entries whose reply records survived. Never deduplicate away replay
-needed to rebuild application state. The engine suppresses external replies
-until the relevant application state has caught up. Arbitrary external side
-effects still require application-level transactional/idempotency discipline.
+| Load | Success data in `vsr_loaded.items` |
+| --- | --- |
+| `RECOVERY` | Exactly one `vsr_recovered`; returned sequence equals recovered sequence |
+| `LOG` | Consecutive `vsr_entry[]` beginning at `first`; `next=first+count` |
+| `CLIENT` | Zero or one latest completed `vsr_client_record` for `client` |
+| `REQUEST` | Zero or one latest retained `vsr_entry` for `client`, executed or pending |
 
-## Checkpoints and transfer
+RECOVERY ignores the requested sequence. Other loads read exactly that sequence.
+For LOG, obey both byte and count bounds, return `next=end` when complete, and
+never return empty nonterminal success. Empty ranges are valid. For other loads,
+`next=0`; absent client/index records are successful count-zero results with
+NULL items. Entirely uninitialized storage returns RECOVERY/NOT_FOUND. Expected
+compacted log ranges may return NOT_FOUND; an unexplained hole in retained local
+history or a missing live revision is fatal.
 
-Capture freezes application state and the indexed client-table revision at one
-exact operation boundary. No apply/install overlaps that capture. After the
-capture completes, execution resumes while the snapshot is copied or flushed.
-The adapter includes the client table, epoch/transition metadata, and application
-state in one recoverable snapshot. The capture task identifies the exact store
-revision from which to obtain metadata; it must not use a moving current table.
+STORE success means the complete transaction is readable and independent of its
+operation pin, not necessarily durable. SYNC success certifies all transactions
+through its argument as crash-durable. For example, STORE(41), STORE(42), and
+SYNC(42) can share physical writes and one flush, but each receives a completion.
+SYNC may be issued before earlier STORE completions; the adapter enforces that
+dependency. The core accounts for out-of-order completions before advancing its
+readable and durable prefixes.
 
-In durable mode, snapshot contents become durable before a store transaction
-publishes the recovery anchor, and that publication is itself made durable
-before dependent log trimming. Publishing a locally captured checkpoint does
-not rewind the running application or client table. Installing a received
-checkpoint is different: the core atomically selects a matching logical store
-base, preserves necessary view/epoch fences, then installs the application and
-replays the selected suffix. It does not acknowledge catch-up prematurely.
+Recovery discards torn transactions and their dependents and exposes a complete
+prefix. Previously acknowledged durable transactions cannot be discarded.
+RECLAIM permits collecting revisions below its argument after independent
+readers drain, without deleting data reachable from retained revisions or
+checkpoints. No later core load names a reclaimed revision.
 
-Checkpoint transfer is a logical `FETCH` operation naming a peer, target, and
-optional local basis. The adapter owns bulk transport, page/block selection,
-validation, and local materialization. It must expose a readable immutable
-snapshot on success, without passing every byte through `step`. The source
-adapter serves only authorized snapshot objects and pins them during active
-reads. If an advertised object has expired, fetch fails and the core negotiates
-a current offer. Local manifests may differ between machines; snapshot identity,
-operation boundary, epoch metadata, and logical contents must match.
+## Log and checkpoint transfer
 
-Witnesses never serve application state they do not hold. Witness log trimming
-must preserve reconstructability: enough full members must retain recoverable
-checkpoints covering the trimmed prefix to survive the configured faults.
-Checkpoint advertisements allow the core to track this. Revision reclamation,
-logical log trimming, and snapshot deletion are distinct operations.
+A log offer identifies the source incarnation and exact store sequence, view,
+last normal view, committed position, retained range, epoch, and optional
+checkpoint. `message.number` is the offered last op (`log_end - 1`), never the
+end of the included entry chunk. A bounded portion may accompany the offer.
+The incarnation qualifies the revision, including when a store is reopened with
+the same sequence numbers. Revision zero is reserved for discovery requests.
 
-## Membership, recovery, and reads
+GET_STATE with zero revision and `first=end=0` discovers a current offer. Its
+response has `first=next=0`. Range GET_STATE or GET_LOG names an exact revision
+and `[first,end)` with positive entry/byte limits; GET_LOG is used for the log
+chosen by view change. A successful chunk echoes the nonce and first, contains
+exactly `[first,next)`, and advances toward the requested end. Metadata remains
+fixed for that revision even if the sender's current envelope view advances.
+All responses are checked against the outstanding request and protocol context.
 
-Reconfiguration is a replicated request ending the old epoch. A proposed
-configuration must use exactly the next epoch, fit capacity, and satisfy quorum
-and role constraints. Only one transition proceeds at a time. The old group
-commits the boundary, and the new group obtains the state through it before
-participating. Removed replicas continue serving transfer until the required
-new-group quorum reports readiness. A committed configuration alone is not
-permission to retire its donors; a check-epoch request provides an administrative
-completion fence. Uncommitted reconfiguration at a selected log's tail still
-blocks later old-epoch requests after a view change.
+Unknown/expired revisions or unavailable ranges produce STATE_UNAVAILABLE with
+the echoed nonce and first, `next=first`, and a current offer without chunk data.
+The receiver revalidates that offer. `transfers` bounds retained offers;
+`transfer_timeout_ns` expires idle offers. Active loads/sends retain their pins
+until completion even if the offer expires. A valid range request renews its
+retention. Discovery offers may include a checkpoint instead of older log data.
 
-JOIN warms a node without counting its votes. Changing a witness into a full
-member requires materializing application state before it can execute or lead.
-Member identity is stable across configurations and never interpreted as an
-array index. Transport addresses and permission to request reconfiguration or
-warm-up state transfer are adapter/deployment responsibilities.
+CAPTURE supplies a checkpoint template containing the exact op, view, and epoch,
+and a readable store sequence with the matching completed client table. Return
+the same logical boundary with a fresh snapshot ID and local manifest. Capture
+must freeze both application state and that indexed client revision; it must not
+read a moving current table. The core issues it only when replay is complete and
+client records through that boundary are stored. APPLY and INSTALL cannot overlap
+capture. Completion releases the mutation fence; later copying/flushing is free
+to proceed concurrently.
 
-Durability policy is cluster-wide and immutable in this sketch. Durable mode
-fences protocol actions with recoverable storage. Replicated mode allows the
-normal protocol to proceed without foreground disk durability; restart must
-complete quorum recovery, using a fresh attempt nonce and the applicable
-primary's state. Stale or missing local storage is only a catch-up hint. Both
-modes block voting while state recovery is incomplete and handle epoch changes
-during recovery. A previously removed node cannot use bootstrap to rejoin.
+FETCH names a peer, target checkpoint, and optional locally retained basis.
+The adapter handles bulk transport, validation, and differential materialization
+outside `step`. Success returns the same snapshot identity and logical contents,
+fully readable locally; its local manifest may differ. The source adapter pins
+authorized objects for active readers. An unavailable object causes rediscovery.
+A witness cannot serve a full snapshot; the core chooses a full source.
 
-Client recovery queries return the latest locally known request number, including
-pending log state, and a cached result when available. This is not a linearizable
-read of arbitrary application data. A client preserving its incarnation must
-recover its sequence using the client recovery protocol; alternatively it can
-use a new globally unique incarnation. Duplicate suppression persists across
-cache eviction, checkpoints, and membership changes. Missing older replies
-must produce a stale-request response, never another execution.
+Epoch descriptors retain the current and immediate previous membership plus the
+committed transition boundary. Their phase is the owner's local progress, not
+evidence that the receiver has caught up. EPOCH_STARTED is sent to both old and
+new groups only after the sender has recoverable state through the boundary;
+full members have also rebuilt application/client state. Handoff completion
+combines distinct current-member acknowledgments under DESIGN.md's quorum and
+full-member retention rule. The epoch metadata remains after handoff so a
+restart can recover the configuration and removal boundary.
 
-Before its first unlogged read in each view, a primary must commit a current-view
-no-op after the entire inherited log. Otherwise an old primary's acknowledged
-write could survive in that log but remain unapplied at the new primary, allowing
-a stale read even after a fresh quorum probe. This establishment barrier is
-amortized across subsequent reads in the same view.
+In durable mode the order is SNAPSHOT_SYNC, STORE publication/restoration, SYNC
+of that store revision, then dependent trimming or participation. PUBLISH does
+not rewind the running application or client table. RESTORE selects the indexed
+base; INSTALL then establishes the application boundary before suffix replay.
+A failed INSTALL cannot be reported as partial success. Successful CAPTURE/FETCH
+objects remain available until DROP or STOPPED, including when a subsequent
+transition makes their original purpose obsolete. References from retained store
+revisions and independent adapter readers can keep objects alive beyond either.
 
-Linearizable read fences then use a fresh nonce, epoch, view, and post-request
-quorum confirmation. Only an established primary can initiate them; acknowledgers
-must still be normal in that epoch/view. View/epoch changes invalidate unfinished
-rounds. Wait for the confirmed commit floor and requested minimum to be applied,
-then fence application mutation until the caller captures the read snapshot.
-This quorum-read extension needs correctness tests in the implementation; merely
-being the apparent primary is insufficient. Causal reads omit the quorum and
-promise only the requested applied prefix. A read can return a normal rejection
-`REPLY` using its cookie as the route and a zero client ID, or `READ_READY` on
-success; the outer layer executes and returns the actual read result.
+For witnesses, a published checkpoint is a remote recovery anchor only; no local
+application image or completed-client table is implied. Such anchors may be
+published and trimmed against only with the retention guarantees in DESIGN.md.
+They are rediscovered from full replicas when needed; witnesses do not issue
+CAPTURE, SNAPSHOT_SYNC, or INSTALL for them. Promotion must first materialize a
+full checkpoint or replay the complete log. DROP releases only locally owned
+snapshot objects after adapter readers drain, never another replica's anchor.
 
-## Failures and implementation validation
+## Application operations and failures
 
-Send failures cause protocol retry. Read/transfer unavailability causes retry
-or renewed state discovery. Failed or ambiguous store/sync, snapshot durability,
-application install, or application execution must fence the replica into
-`FAILED`; they cannot be treated as successful progress. Cleanup failures can be
-retried without changing consensus. Failure and retirement still accept
-completions, releases, time updates, and STOP so resources can drain. STOP stops
-new protocol work, disables deadlines, and eventually returns all input leases.
-The adapter finishes or cancels every emitted operation before deinitialization.
-Identifiers/counters must never wrap and silently reuse an earlier identity.
+APPLY contains one nonempty consecutive committed batch. Execute all entries in
+order and return exactly one `vsr_value` per entry, each within `result_bytes`.
+Control entries are application no-ops with empty results. `through` is the last
+entry's op. At most one APPLY is active; execution does not overlap read/capture
+fences or INSTALL. Application result codes are deterministic data, including
+application-level rejection; an unsuccessful completion indicates inability to
+execute the batch and fences the replica.
 
-The supplied checks verify header usability and descriptor layout only:
+Completion data is present only for successful LOAD (`vsr_loaded`), APPLY
+(`vsr_applied`), and CAPTURE/FETCH (`vsr_checkpoint`). Every other completion has
+NULL data and lease zero. Success of SEND/REPLY means buffer access ended, not
+receipt by a peer or client. Successful RECLAIM/DROP ends the core's retention
+obligation; independent adapter readers can delay physical reclamation.
 
-```sh
-cc -std=c11 -Wall -Wextra -Werror -pedantic -Iinclude -fsyntax-only tests/header.c
-c++ -std=c++11 -Wall -Wextra -Werror -pedantic -Iinclude -x c++ -fsyntax-only tests/header.c
-```
+| Operation or condition | Non-success handling |
+| --- | --- |
+| SEND | Retry/coalesce protocol work |
+| REPLY / READ_READY | Abandon local delivery; client may retry |
+| LOAD | Retry transient unavailability; expected absence follows load rules; corruption, unexpected absence, or permanent failure fences storage |
+| STORE / SYNC | Fence storage on every non-success, including cancellation/retry |
+| APPLY / INSTALL | Fence application on every non-success |
+| CAPTURE | Release the capture fence and retry; failure exposes no usable snapshot |
+| FETCH | Retry or discover another valid offer; no partial snapshot is adopted |
+| SNAPSHOT_SYNC | Fence snapshot durability on every non-success |
+| RECLAIM / DROP | Retry cleanup without changing consensus |
+| Identity mismatch / exhausted counter / invariant violation | Fence immediately and latch the corresponding diagnostic |
 
-A future implementation needs deterministic simulations of loss, duplication,
-reordering, view changes during recovery/reconfiguration, disjoint membership
-handoffs, witness promotion, stale read probes, and checkpoint installation.
-Storage testing must crash at every transaction/flush/publish boundary, including
-out-of-order completions. Saturated queues and small arenas must still drain
-completions and release every pin exactly once. Benchmarks, not header layout
-alone, must establish allocation behavior, copy volume, throughput, and latency.
+`vsr_get_status` exposes the first fatal failure, its triggering operation and
+completion status when applicable, and progress counters. Reaching FAILED never
+turns an unsuccessful effect into protocol progress. Shape-invalid completions
+are API errors and remain unconsumed; structurally valid but inconsistent
+storage/application results fence the instance. Diagnostic information remains
+available through STOPPED.
+
+STOP is idempotent, disables deadlines, stops new protocol work, and abandons
+unissued requests. Only TIME, COMPLETE, STOP, and drain calls are then accepted.
+Finish or cancel every emitted operation and continue draining RELEASE outputs;
+STOPPING starts no retries. FAILED and RETIRED also permit draining and STOP;
+other well-formed inputs are consumed without new protocol work. Recovery
+metadata retains its protocol state, not the transient runtime failure/stop state.
+
+STOPPED means no outstanding operations, pins, or queued releases remain.
+`vsr_deinit` then succeeds without freeing the caller's arena; otherwise it
+returns `VSR_EBUSY`. Shutdown does not promise a new durable checkpoint or resolve
+uncertain client requests. At STOPPED the adapter owns any remaining cleanup;
+published recovery data remains subject to store retention and durability.
+A runtime restart still follows the recovery rules.

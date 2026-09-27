@@ -9,24 +9,35 @@ extern "C" {
 #endif
 
 /*
- * Viewstamped Replication core -- interface sketch, not an implementation.
+ * VSR: deterministic, asynchronous Viewstamped Replication for C11 and C++11.
  *
  * One owner thread per instance; no overlapping/reentrant calls, callbacks,
  * I/O, clock reads, randomness, or hidden allocation. All external work is
- * represented by operations and completed by events. See docs/vsr-api.md.
+ * represented by operations and completed by events. See DESIGN.md for protocol
+ * invariants and docs/vsr-api.md for adapter contracts.
  *
  * These are naturally aligned, host-side logical views, NOT wire/disk structs.
  * The adapter owns framing, encoding, checksums, authentication, compression,
  * addresses, file/block layout, buffering, and physical I/O scheduling.
- * Reserved fields must be zero. Counts/ranges must fit configured limits.
+ * Integer enum fields accept only the listed values; unknown flags and reserved
+ * fields must be zero. Unused fields are zero/NULL. Arrays use NULL iff empty;
+ * all pointers must be valid and naturally aligned for their declared types.
+ * Counts/ranges must fit configured limits. Input objects must not overlap the
+ * arena. Object equality is fieldwise, never memcmp over padding or pointers.
  * All operation-number ranges are [first, end); operation numbers start at 1
- * and remain increasing across epochs. Epoch/view numbers start at 0.
+ * and do not reset across epochs. Epochs start at 0; views restart at 0 in each
+ * epoch. Only committed positions are permanent; an uncommitted suffix can be
+ * replaced. UINT64_MAX is not a valid op, epoch, view, sequence, or time; it may
+ * be an exclusive range end. Counters never wrap. Zero op means no progress.
  */
 struct vsr;
 
+#define VSR_API_VERSION 1u        /* Source API, independent of adapter formats. */
 #define VSR_NO_REPLICA UINT64_C(0)
 #define VSR_NO_DEADLINE UINT64_MAX
+#define VSR_MAX_STORE_CHANGES 8u
 
+/* Equality compares both words. The all-zero ID is reserved for absence. */
 struct vsr_id {
     uint64_t hi;
     uint64_t lo;
@@ -37,7 +48,11 @@ struct vsr_span {
     size_t size;
 };
 
-/* No coalescing/copy required: spans can reference registered I/O buffers. */
+/*
+ * Scatter/gather bytes; no flattening required. Every span has nonzero size and
+ * non-NULL data. size is the overflow-checked sum; empty = { NULL, 0, 0, 0 }.
+ * Span boundaries do not affect logical equality or encoded payload contents.
+ */
 struct vsr_blob {
     const struct vsr_span *spans;
     uint64_t size;                /* Sum of span sizes, checked on admission. */
@@ -47,19 +62,19 @@ struct vsr_blob {
 
 enum vsr_result {
     VSR_OK = 0,
-    VSR_AGAIN = 1,               /* Accepted a prefix; see update flags. */
-    VSR_EINVAL = -1,
-    VSR_ELIMIT = -2,
-    VSR_EBUSY = -3
+    VSR_AGAIN = 1,               /* Budget/backpressure; inspect update flags. */
+    VSR_EINVAL = -1,             /* Invalid argument, shape, or completion. */
+    VSR_ELIMIT = -2,             /* Permanent size/capacity/overflow violation. */
+    VSR_EBUSY = -3               /* Deinit before STOPPED. */
 };
 
 enum vsr_io_status {
     VSR_IO_OK = 0,
-    VSR_IO_RETRY,
-    VSR_IO_NOT_FOUND,
-    VSR_IO_CORRUPT,
-    VSR_IO_FAILED,
-    VSR_IO_CANCELLED
+    VSR_IO_RETRY,                /* Transient unavailability, no success implied. */
+    VSR_IO_NOT_FOUND,            /* Absent store/range/snapshot; see LOAD rules. */
+    VSR_IO_CORRUPT,              /* Integrity or logical consistency failure. */
+    VSR_IO_FAILED,               /* Permanent or ambiguous failure. */
+    VSR_IO_CANCELLED             /* Accesses ended; no success implied. */
 };
 
 enum vsr_durability {
@@ -82,8 +97,8 @@ struct vsr_member {
 /*
  * Members are sorted by ID, with no duplicates. count >= 2*faults + 1;
  * quorum = count - faults; at least faults + 1 members must be FULL.
- * A one-member, zero-fault group is permitted for development.
- * Primary selection rotates through FULL members in this canonical order.
+ * A one-member, zero-fault group is valid and has no failure tolerance.
+ * Primary = FULL members[view % full_count], in increasing ID order.
  * Warming nodes are not voters and do not appear here until reconfiguration.
  */
 struct vsr_membership {
@@ -94,16 +109,21 @@ struct vsr_membership {
 };
 
 enum vsr_epoch_phase {
-    VSR_EPOCH_STEADY,
-    VSR_EPOCH_TRANSFERRING,
-    VSR_EPOCH_INSTALLED
+    VSR_EPOCH_STEADY,            /* Initial epoch or completed group handoff. */
+    VSR_EPOCH_TRANSFERRING,      /* Boundary committed; local catch-up pending. */
+    VSR_EPOCH_INSTALLED          /* Local catch-up done; group handoff pending. */
 };
 
+/*
+ * Epoch 0 is STEADY with previous=NULL and boundary=0. Later epochs retain the
+ * immediate predecessor (current.epoch-1) and a nonzero boundary through STEADY.
+ * Peer/snapshot phases describe their owner, not the receiver's readiness.
+ */
 struct vsr_epoch {
-    const struct vsr_membership *current;
-    const struct vsr_membership *previous; /* NULL before any transition. */
-    uint64_t boundary;           /* Reconfiguration op ending previous epoch. */
-    uint32_t phase;
+    const struct vsr_membership *current;  /* Non-NULL, new group in a transition. */
+    const struct vsr_membership *previous; /* Immediate predecessor; NULL at 0. */
+    uint64_t boundary;           /* Reconfiguration ending previous; 0 at epoch 0. */
+    uint32_t phase;              /* enum vsr_epoch_phase; local progress only. */
     uint32_t reserved;
 };
 
@@ -126,15 +146,18 @@ struct vsr_request_id {
 };
 
 enum vsr_request_type {
-    VSR_REQUEST_COMMAND,        /* body: const struct vsr_blob * */
-    VSR_REQUEST_RECONFIGURE,    /* body: const struct vsr_membership * */
-    VSR_REQUEST_CHECK_EPOCH,     /* body: NULL; quorum-confirm requested epoch. */
-    VSR_REQUEST_NOOP            /* Internal only; body: NULL, client ID zero. */
+    VSR_REQUEST_COMMAND,         /* body: vsr_blob, including an empty command. */
+    VSR_REQUEST_RECONFIGURE,     /* body: membership, epoch = request.epoch+1. */
+    VSR_REQUEST_CHECK_EPOCH,     /* body: NULL; logged handoff fence for epoch. */
+    VSR_REQUEST_NOOP             /* Internal only; body: NULL, entire ID zero. */
 };
 
 /*
  * One outstanding request per client incarnation, as in VR. Different clients
  * pipeline freely. Retransmissions are deduplicated and cached replies resent.
+ * IDs/type/body must agree on retry; epoch is a routing precondition and may
+ * follow redirects. Clients durably retain sequence/pending command or use a
+ * new incarnation after losing them. A local CLIENT_QUERY is advisory only.
  * Client IDs must not be reused. Client-table eviction is a cache operation,
  * not permission to forget duplicate suppression in storage/checkpoints.
  * Encode nondeterministic inputs (time, random choices, etc.) in the command.
@@ -151,7 +174,7 @@ struct vsr_request {
 struct vsr_entry {
     uint64_t op;
     uint64_t epoch;
-    uint64_t view;
+    uint64_t view;               /* Original proposal view; not rewritten on fetch. */
     struct vsr_request_id request;
     uint32_t type;               /* enum vsr_request_type */
     uint32_t reserved;
@@ -170,7 +193,11 @@ struct vsr_value {
     uint32_t reserved;
 };
 
-/* Only executed requests live here; pending dedup state comes from the log. */
+/*
+ * Latest executed request per client; op > 0. Retain this record through cache
+ * eviction, checkpointing, and reconfiguration. Older results may be discarded.
+ * Pending requests are indexed separately by LOAD_REQUEST over retained log.
+ */
 struct vsr_client_record {
     struct vsr_request_id request;
     uint64_t op;
@@ -186,7 +213,8 @@ enum vsr_reply_status {
     VSR_REPLY_LIMIT,
     VSR_REPLY_STALE_REQUEST,
     VSR_REPLY_CLIENT_UNKNOWN,
-    VSR_REPLY_CLIENT_STATE
+    VSR_REPLY_CLIENT_STATE,
+    VSR_REPLY_TIMEOUT            /* Local read deadline expired before readiness. */
 };
 
 enum vsr_reply_flags {
@@ -194,17 +222,17 @@ enum vsr_reply_flags {
 };
 
 struct vsr_reply {
-    struct vsr_request_id request;
-    uint64_t op;
+    struct vsr_request_id request; /* Echo; CLIENT_QUERY instead reports latest ID. */
+    uint64_t op;                 /* Known request position; 0 if absent/rejected. */
     uint64_t view;
     uint64_t primary;
-    const struct vsr_membership *membership;
-    struct vsr_value result;
+    const struct vsr_membership *membership; /* Latest known group, else NULL. */
+    struct vsr_value result;     /* Empty unless EXECUTED; controls return code 0. */
     uint32_t status;
     uint32_t flags;
 };
 
-/* Unique across process restarts AND attempts within a process. */
+/* Unique across starts and attempts. counter > 0; incarnation is cluster-unique. */
 struct vsr_nonce {
     struct vsr_id incarnation;   /* Supplied by caller at init, never reused. */
     uint64_t counter;
@@ -217,9 +245,10 @@ struct vsr_revision {
 };
 
 /*
- * Names an immutable snapshot of application state AND the completed client
- * table through op, plus epoch/transition metadata. manifest is adapter-defined
- * metadata, not the snapshot contents. The adapter can use trees, extents,
+ * Nonzero id names an immutable snapshot of application state AND the completed
+ * client table through op, plus epoch/transition metadata. manifest contains
+ * adapter-defined metadata, not snapshot contents. Snapshot IDs are cluster-unique
+ * and never reused for different contents. The adapter can use trees, extents,
  * content-addressed blocks, or other incremental/differential representations.
  */
 struct vsr_checkpoint {
@@ -239,7 +268,7 @@ enum vsr_message_type {
     VSR_MSG_START_VIEW,          /* number: last op; body: vsr_log_state */
     VSR_MSG_RECOVERY,            /* number: 0; body: vsr_recovery */
     VSR_MSG_RECOVERY_RESPONSE,   /* number: last op or 0; body: vsr_recovery */
-    VSR_MSG_GET_STATE,           /* number: 0; body: vsr_fetch */
+    VSR_MSG_GET_STATE,           /* number: 0; body: vsr_fetch (discovery/range) */
     VSR_MSG_NEW_STATE,           /* number: last op; body: vsr_state_chunk */
     VSR_MSG_GET_LOG,             /* number: 0; body: vsr_fetch (chosen log) */
     VSR_MSG_LOG,                 /* number: last op; body: vsr_state_chunk */
@@ -247,7 +276,7 @@ enum vsr_message_type {
     VSR_MSG_START_EPOCH,         /* number: boundary; body: vsr_epoch */
     VSR_MSG_EPOCH_STARTED,       /* number: boundary; body: NULL */
     VSR_MSG_NEW_EPOCH,           /* number: boundary; body: vsr_epoch */
-    VSR_MSG_CHECKPOINT,          /* number: checkpoint op; body: vsr_checkpoint */
+    VSR_MSG_CHECKPOINT,          /* number: retained op; body: vsr_checkpoint */
     VSR_MSG_READ_PROBE,          /* number: commit floor; body: vsr_nonce */
     VSR_MSG_READ_ACK             /* number: commit floor; body: vsr_nonce */
 };
@@ -270,17 +299,22 @@ struct vsr_prepare {
 };
 
 /*
- * A bounded suffix, not necessarily the entire log. last_normal_view is
- * distinct from message.view; it is needed for VR's view-change selection.
- * The receiver fetches missing ranges/checkpoints before using the chosen log.
+ * An immutable log offer. [log_begin, log_end) is the retained range; entries
+ * is any bounded contiguous portion, possibly empty. committed < log_end and
+ * log_begin <= committed+1. Missing prefixes require the offered checkpoint.
+ * view/last_normal_view describe this revision, independently of message.view.
+ * Selection uses (last_normal_view, log_end), never the size of the included
+ * portion. Fetch and validate missing data before adopting a chosen log.
  */
 struct vsr_log_state {
     struct vsr_revision revision;
+    uint64_t view;
     uint64_t last_normal_view;
     uint64_t committed;
     uint64_t log_begin;
+    uint64_t log_end;
     const struct vsr_epoch *epoch;
-    struct vsr_entries suffix;
+    struct vsr_entries entries;
     const struct vsr_checkpoint *checkpoint;
 };
 
@@ -292,16 +326,27 @@ struct vsr_recovery {
 struct vsr_fetch {
     struct vsr_nonce nonce;
     struct vsr_revision revision; /* Zero for GET_STATE discovery. */
-    uint64_t first;
-    uint64_t end;
-    uint64_t max_bytes;
-    uint32_t max_entries;
+    uint64_t first;              /* Discovery: first=end=0; otherwise first>=1. */
+    uint64_t end;                /* Exact requested range in the named revision. */
+    uint64_t max_bytes;          /* Positive payload-byte bound; see limits. */
+    uint32_t max_entries;        /* Positive, <= batch_entries. */
     uint32_t reserved;
 };
 
 struct vsr_state_chunk {
     struct vsr_nonce nonce;
     struct vsr_log_state state;
+    uint64_t first;              /* Echo fetch.first; zero for discovery. */
+    uint64_t next;               /* Next missing op; fetch.end if done; discovery=0. */
+};
+
+/* Only these protocol states may be persisted; runtime stop/failure is local. */
+enum vsr_hard_state_type {
+    VSR_HARD_NORMAL,
+    VSR_HARD_VIEW_CHANGE,
+    VSR_HARD_RECOVERING,
+    VSR_HARD_TRANSITIONING,
+    VSR_HARD_RETIRED
 };
 
 /* Logical recovery metadata; no physical WAL/file format is implied. */
@@ -310,42 +355,48 @@ struct vsr_hard_state {
     uint64_t last_normal_view;
     uint64_t committed;
     const struct vsr_epoch *epoch;
-    uint32_t state;              /* Protocol state, including retirement. */
+    uint32_t state;              /* enum vsr_hard_state_type */
+    uint32_t role;               /* Local materialized/warming role; survives restart. */
+};
+
+/* Immutable store identity, written once in transaction 1 of an empty store. */
+struct vsr_store_identity {
+    struct vsr_id cluster;
+    uint64_t replica;
+    uint32_t durability;
     uint32_t reserved;
 };
 
 struct vsr_recovered {
-    struct vsr_id cluster;
-    uint64_t replica;
+    struct vsr_store_identity identity;
     uint64_t sequence;           /* Last complete recovered store transaction. */
     uint64_t log_begin;
     uint64_t log_end;
     struct vsr_hard_state hard;
     const struct vsr_checkpoint *checkpoint;
-    uint32_t durability;
-    uint32_t reserved;
 };
 
-enum vsr_read_type {
+enum vsr_load_type {
     VSR_LOAD_RECOVERY,           /* One vsr_recovered; only at startup. */
     VSR_LOAD_LOG,                /* Contiguous vsr_entry array. */
-    VSR_LOAD_CLIENT              /* Zero/one vsr_client_record. */
+    VSR_LOAD_CLIENT,             /* Zero/one latest completed vsr_client_record. */
+    VSR_LOAD_REQUEST             /* Zero/one latest retained vsr_entry for client. */
 };
 
 struct vsr_store_read {
     uint64_t sequence;           /* Read this exact logical revision. */
-    uint64_t first;
-    uint64_t end;
-    struct vsr_id client;
-    uint64_t max_bytes;
-    uint32_t type;
-    uint32_t max_count;
+    uint64_t first;              /* LOG only; other read types use zero. */
+    uint64_t end;                /* LOG only. */
+    struct vsr_id client;        /* CLIENT/REQUEST only. */
+    uint64_t max_bytes;          /* Sum of blob payload bytes returned. */
+    uint32_t type;               /* enum vsr_load_type */
+    uint32_t max_count;          /* LOG: <= batch_entries; otherwise 1. */
 };
 
 struct vsr_loaded {
     const void *items;           /* Type selected by the matching LOAD op. */
-    uint64_t sequence;
-    uint64_t next;               /* LOG continuation; end means complete. */
+    uint64_t sequence;           /* Exact read revision; recovered one at startup. */
+    uint64_t next;               /* LOG continuation; end means complete; else 0. */
     uint32_t count;
     uint32_t reserved;
 };
@@ -357,7 +408,8 @@ enum vsr_change_type {
     VSR_STORE_HARD_STATE,        /* count=1, data: vsr_hard_state. */
     VSR_STORE_PUBLISH_CHECKPOINT, /* count=1, data: vsr_checkpoint. */
     VSR_STORE_RESTORE_CHECKPOINT, /* count=1, data: vsr_checkpoint; reset base. */
-    VSR_STORE_TRIM               /* Remove prefix < first; no data. */
+    VSR_STORE_TRIM,              /* Remove prefix < first; no data. */
+    VSR_STORE_IDENTITY           /* count=1, data: vsr_store_identity; only once. */
 };
 
 struct vsr_change {
@@ -368,13 +420,17 @@ struct vsr_change {
 };
 
 /*
- * A logical atomic transaction. Sequences increase by one, independently of
+ * A logical atomic transaction, with 1..VSR_MAX_STORE_CHANGES changes.
+ * Sequences start at 1 and increase by one, independently of
  * log op numbers. Apply changes in array order and transactions in sequence
  * order. Physical writes/completions may be batched, concurrent, or reordered.
  * Recovery must expose a complete prefix: no partial transaction or holes.
  * APPEND after TRUNCATE can replace a divergent suffix without rewriting a log.
  * Neither operation may remove/overwrite committed entries. PUBLISH changes
  * the recovery anchor, not the running application or current client table.
+ * APPEND/TRUNCATE/TRIM also update the per-client retained-request index.
+ * CLIENTS updates latest completed results monotonically by request number;
+ * replay of older completed requests must not move that index backwards.
  * RESTORE resets the indexed log/client base; the same transaction includes
  * the appropriate hard state and any retained suffix. It is not application I/O.
  */
@@ -387,8 +443,8 @@ struct vsr_store {
 
 struct vsr_apply {
     struct vsr_entries batch;
-    uint64_t through;
-    uint32_t replay;             /* Rebuilding from checkpoint after restart. */
+    uint64_t through;            /* Last entry op; nonempty batch, consecutive. */
+    uint32_t replay;             /* 0/1: rebuilding application state from a base. */
     uint32_t reserved;
 };
 
@@ -405,6 +461,7 @@ enum vsr_read_consistency {
 
 struct vsr_read_barrier {
     uint64_t min_op;
+    uint64_t deadline_ns;        /* Absolute TIME domain; NO_DEADLINE disables. */
     uint32_t consistency;
     uint32_t reserved;
 };
@@ -417,22 +474,22 @@ struct vsr_read_fence {
 };
 
 struct vsr_snapshot_task {
-    uint64_t op;
-    uint64_t sequence;           /* Matching indexed client-table revision. */
+    uint64_t op;                 /* checkpoint.op, or 0 at genesis. */
+    uint64_t sequence;           /* CAPTURE: client revision; INSTALL: base; else 0. */
     uint64_t peer;               /* FETCH source; zero for local tasks. */
-    const struct vsr_checkpoint *checkpoint;
-    const struct vsr_checkpoint *basis; /* Optional differential-transfer base. */
+    const struct vsr_checkpoint *checkpoint; /* Template on CAPTURE; NULL at genesis. */
+    const struct vsr_checkpoint *basis; /* FETCH only: optional differential base. */
 };
 
 enum vsr_event_type {
     VSR_EVENT_TIME,              /* id: monotonic nanoseconds; data: NULL. */
     VSR_EVENT_MESSAGE,           /* data: vsr_message; id: 0. */
     VSR_EVENT_REQUEST,           /* data: vsr_request; id: nonzero reply route. */
-    VSR_EVENT_CLIENT_QUERY,      /* data: vsr_id; id: nonzero reply route. */
+    VSR_EVENT_CLIENT_QUERY,      /* data: nonzero vsr_id; id: local reply route. */
     VSR_EVENT_READ,              /* data: vsr_read_barrier; id: local cookie. */
     VSR_EVENT_CHECKPOINT,        /* Hint to take a checkpoint; id: 0, data: NULL. */
     VSR_EVENT_COMPLETE,          /* id: operation ID; status: vsr_io_status. */
-    VSR_EVENT_STOP               /* Stop protocol work and drain; no payload. */
+    VSR_EVENT_STOP               /* Stop protocol work and drain; id=0, data=NULL. */
 };
 
 /*
@@ -506,16 +563,28 @@ enum vsr_op_type {
  *        the inherited log, then fresh quorum confirmation and applied progress.
  * CAPTURE: success data = vsr_checkpoint. Freeze application and indexed client
  *        state at (op, sequence); completion releases the application fence.
+ *        task.checkpoint supplies op/view/epoch with zero id/manifest; return
+ *        those same logical fields with a fresh id and local manifest.
  *        Only capture is fenced: later copying/flushing can run concurrently.
  * FETCH: success data = vsr_checkpoint matching the requested logical snapshot,
  *        fully verified/readable locally. Bulk transfer bypasses the core;
  *        the adapter may stream pages/blocks or use differential transfer.
  * SNAPSHOT_SYNC: success means snapshot content/metadata are crash-durable.
- * INSTALL: success means the application is exactly at checkpoint.op.
+ * INSTALL: success means the application is exactly at checkpoint.op. A NULL
+ *        checkpoint with op=sequence=0 resets to the agreed genesis state;
+ *        this is also emitted when starting/recovering without a checkpoint.
  * DROP: releases the named local snapshot, after the adapter's own readers drain.
  *        The core emits DROP only when its recovery/transfer obligations permit.
+ * On witnesses, PUBLISH may record a remote recovery anchor without a local
+ * snapshot; no SYNC/INSTALL/DROP snapshot operation is issued for that anchor.
+ * Such publication/trimming requires retained full-member checkpoint coverage.
  * All other successes and all failures have NULL data. Failure is reported as
  * an event, not a failed vsr_step call. No partial APPLY/STORE successes.
+ * Every non-OK STORE/SYNC/APPLY/INSTALL/SNAPSHOT_SYNC completion fences the
+ * replica, even RETRY/CANCELLED. SEND failures retry protocol work; REPLY/READ
+ * delivery failures abandon that local route. LOAD corruption/unexpected
+ * absence is fatal; FETCH unavailability restarts discovery. CAPTURE/cleanup
+ * failures may retry. STOPPING consumes completions without starting retries.
  */
 struct vsr_op {
     uint32_t type;
@@ -527,9 +596,9 @@ struct vsr_op {
 
 enum vsr_update_flags {
     VSR_UPDATE_MORE = 1u << 0,       /* Runnable work: drain with no new events. */
-    VSR_UPDATE_OUTPUT_FULL = 1u << 1, /* More output needs caller slots. */
+    VSR_UPDATE_OUTPUT_FULL = 1u << 1, /* More output needs slots; implies MORE. */
     VSR_UPDATE_INPUT_BLOCKED = 1u << 2, /* Head event needs freed resources. */
-    VSR_UPDATE_STATE_CHANGED = 1u << 3  /* Inspect vsr_get_status if interested. */
+    VSR_UPDATE_STATE_CHANGED = 1u << 3  /* State/role/epoch/phase/view/failure changed. */
 };
 
 struct vsr_update {
@@ -547,11 +616,24 @@ enum vsr_start_mode {
     VSR_START_JOIN               /* Nonvoting warm-up using seed membership. */
 };
 
-/* Fixed arena capacities, not limits on total disk log/client-table size. */
+/*
+ * Positive fixed capacities, independent of total indexed history. Byte limits
+ * count blob.size values (not host headers, span arrays, codecs, or backing
+ * allocations), once per occurrence in an input graph. Across leases, shared
+ * bytes count again; outgoing references to the same lease do not count again.
+ * Completion reservations count against these budgets before work is emitted.
+ * batch_entries <= log_cache_entries; message_bytes >= command_bytes +
+ * manifest_bytes (checked for overflow), so a transfer can include both.
+ * Configuration, batch, span, and per-object byte limits must be compatible
+ * across all replicas; cache/queue capacities may differ. No size negotiation.
+ */
 struct vsr_limits {
     uint32_t members;            /* Per config; reserve old AND new membership. */
     uint32_t operations;         /* Outstanding effects, independent of batches. */
     uint32_t input_leases;
+    uint32_t pending_requests;   /* Local request/query reply routes. */
+    uint32_t pending_reads;      /* Waiting read barriers and active read fences. */
+    uint32_t transfers;          /* Concurrent incoming/outgoing log offers. */
     uint32_t log_cache_entries;
     uint32_t client_cache_entries;
     uint32_t batch_entries;
@@ -559,7 +641,8 @@ struct vsr_limits {
     uint32_t work_per_step;      /* Bounded internal transitions per call. */
     uint64_t command_bytes;
     uint64_t result_bytes;
-    uint64_t message_bytes;
+    uint64_t manifest_bytes;     /* Per checkpoint descriptor, not snapshot data. */
+    uint64_t message_bytes;      /* Aggregate blob bytes per message/log load. */
     uint64_t pinned_payload_bytes;
 };
 
@@ -567,15 +650,17 @@ struct vsr_options {
     struct vsr_id cluster;
     struct vsr_id incarnation;   /* Fresh across starts, including storage loss. */
     uint64_t replica;
-    const struct vsr_membership *seed;
+    const struct vsr_membership *seed; /* Required: genesis group or discovery hint. */
     struct vsr_limits limits;
     uint64_t heartbeat_ns;
     uint64_t view_timeout_ns;    /* Greater than heartbeat_ns > 0. */
     uint64_t retry_ns;           /* Nonzero. */
+    uint64_t transfer_timeout_ns; /* Nonzero; idle log-offer retention. */
     uint64_t batch_delay_ns;     /* 0: no intentional batching delay. */
     uint64_t checkpoint_interval; /* In operations; 0: explicit requests only. */
-    uint32_t start_mode;
-    uint32_t durability;
+    uint32_t start_mode;         /* enum vsr_start_mode */
+    uint32_t durability;         /* enum vsr_durability */
+    uint32_t join_role;          /* JOIN: FULL/WITNESS; otherwise MEMBER_NONE. */
     uint32_t cache_line_bytes;   /* Power of two; 0 selects 64, not CPU detection. */
     uint32_t reserved;
 };
@@ -585,27 +670,49 @@ struct vsr_layout {
     size_t alignment;
 };
 
+enum vsr_failure_code {
+    VSR_FAILURE_NONE,
+    VSR_FAILURE_IDENTITY,        /* Cluster/replica/policy mismatch or NEW reused. */
+    VSR_FAILURE_STORAGE,         /* Unsafe/unreadable logical storage. */
+    VSR_FAILURE_APPLICATION,     /* Failed apply/install or invalid app output. */
+    VSR_FAILURE_SNAPSHOT,        /* Snapshot durability/integrity failure. */
+    VSR_FAILURE_EXHAUSTED,       /* Counter/time domain exhausted; never wrap. */
+    VSR_FAILURE_INVARIANT        /* Internally inconsistent protocol state. */
+};
+
+/* First fatal failure is latched through STOPPED; zero fields without an op. */
+struct vsr_failure {
+    uint64_t operation;
+    uint32_t code;               /* enum vsr_failure_code */
+    uint32_t operation_type;     /* enum vsr_op_type, valid if operation != 0. */
+    int32_t status;              /* enum vsr_io_status, or OK for core detection. */
+    uint32_t reserved;
+};
+
 struct vsr_status {
     uint64_t epoch;
     uint64_t view;
     uint64_t primary;
     uint64_t committed;
-    uint64_t applied;
-    uint64_t stored_sequence;
-    uint64_t durable_sequence;
-    uint64_t checkpoint_op;
+    uint64_t applied;            /* 0 for witnesses. */
+    uint64_t stored_sequence;    /* Contiguous successfully completed STORE prefix. */
+    uint64_t durable_sequence;   /* Completed SYNC prefix, <= stored_sequence. */
+    uint64_t checkpoint_op;      /* Published recovery anchor (remote on witness). */
     uint64_t transition_op;
-    uint32_t state;
-    uint32_t role;
+    uint32_t state;              /* enum vsr_state */
+    uint32_t role;               /* Effective role, including nonvoting warm-up. */
     uint32_t outstanding_ops;
     uint32_t outstanding_leases;
-    const struct vsr_epoch *configuration; /* Borrowed until next step. */
+    const struct vsr_epoch *configuration; /* NULL until known; borrowed to next step. */
+    struct vsr_failure failure;
 };
 
 /*
  * Compute the arena requirement, including progress reserves, from the limits.
  * No allocation. Sizes are checked for overflow. Configurations exceeding
  * limits are rejected before admission; exhaustion never drops accepted work.
+ * Returns OK, EINVAL, or ELIMIT. On error a valid layout is set to {0, 0}.
+ * NULL arguments return EINVAL; inaccessible non-NULL pointers are caller errors.
  */
 int vsr_layout(const struct vsr_options *options, struct vsr_layout *layout);
 
@@ -616,8 +723,17 @@ int vsr_layout(const struct vsr_options *options, struct vsr_layout *layout);
  * A zero-event step starts boot operations; TIME establishes the clock origin.
  * All participants use the same durability policy, immutable across epochs.
  * NEW requires an empty store and a common epoch-0 seed configuration. RECOVER
- * loads metadata/log lazily; missing/untrusted state requires quorum recovery,
+ * loads metadata/log lazily; missing/stale state requires quorum recovery,
  * never bootstrap. JOIN cannot vote or execute as primary before admission.
+ * NEW requires replica in seed; JOIN requires it absent. Only one live instance
+ * may use a replica identity/store. NEW/JOIN require an empty store verified by
+ * LOAD_RECOVERY; missing store returns NOT_FOUND, not an invented recovered row.
+ * Cluster/incarnation/replica IDs are nonzero. Options/seed are borrowed only
+ * during this call. Supply at least layout.size bytes at layout.alignment.
+ * Returns OK, EINVAL, or ELIMIT; *out=NULL on error when out is valid. The arena
+ * has no valid instance after failure. A live instance must not be reinitialized.
+ * NULL arguments/misalignment return EINVAL; insufficient size returns ELIMIT.
+ * memory must not overlap options, seed metadata, or out.
  */
 int vsr_init(void *memory, size_t size, const struct vsr_options *options,
              struct vsr **out);
@@ -634,10 +750,13 @@ int vsr_step(struct vsr *v, const struct vsr_event *event,
  * Process a prefix in input order, coalescing prepares, stores, and replies.
  * count=0 permits events=NULL. Input/output arrays must not alias each other or
  * live pinned memory. An event is either wholly accepted or not consumed.
- * update is ALWAYS usable on return, even if a later event is invalid: earlier
- * accepted events and emitted operations are not rolled back. A negative result
- * identifies the event at consumed (or invalid call arguments); VSR_AGAIN means
- * budget/capacity stopped progress, not failure. Never resubmit the consumed
+ * With valid v/update/output storage, update is usable on every return, even
+ * if a later event is invalid: accepted events and emitted operations are not
+ * rolled back. A negative result identifies the event at consumed (or invalid
+ * call arguments); VSR_AGAIN means
+ * budget/capacity stopped progress (possibly after consuming all input), not
+ * failure. OK means all input consumed and no immediately runnable work remains;
+ * asynchronous operations may still be outstanding. Never resubmit the consumed
  * prefix. Service output before reusing its array; retained op bodies stay valid
  * until completion even after the array is overwritten.
  *
@@ -650,11 +769,24 @@ int vsr_step(struct vsr *v, const struct vsr_event *event,
  * unknown/duplicate operation completions are API errors. A request's acceptance
  * is not a promise of commitment: clients retry an uncertain outcome with the
  * same identity. Membership changes/redirects/rejections are ordinary replies.
+ * TIME/STOP/COMPLETE take priority in a driver's queue. STOP is idempotent;
+ * after STOP, only those events and zero-input drains are accepted. FAILED and
+ * RETIRED also consume other well-formed events without admitting new work.
+ * A valid completion is eventually admissible through the reserved capacity;
+ * a full output array or exhausted work budget may still require drain calls.
+ * Null v/update, inaccessible memory, and unsynchronized/reentrant calls are
+ * programming errors. Other invalid call arguments return EINVAL with zero
+ * output counts/flags and the current deadline. Invalid event: consumed points
+ * at that event; process output, then correct/drop it before submitting the rest.
  */
 int vsr_step_many(struct vsr *v, const struct vsr_event *events, uint32_t count,
                   struct vsr_update *update);
 
-/* Cold-path observation; status copies are not imposed on each event. */
+/*
+ * Cold-path observation; no mutation/allocation. Both pointers must be valid.
+ * Does not extend configuration pointer lifetime or grant protocol authority.
+ * All instance calls, including observation, require the same exclusive owner.
+ */
 void vsr_get_status(const struct vsr *v, struct vsr_status *status);
 
 /*
@@ -663,6 +795,8 @@ void vsr_get_status(const struct vsr *v, struct vsr_status *status);
  * EBUSY. It does not free caller memory. STOP is not a guarantee that pending
  * requests committed. RETIRED reports safe membership removal; merely learning
  * a new configuration is not permission to shut down an old state-transfer donor.
+ * At STOPPED core snapshot holds end; persistent store references and the
+ * adapter's own readers still govern reclamation of stored snapshot objects.
  */
 int vsr_deinit(struct vsr *v);
 
