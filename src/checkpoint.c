@@ -463,18 +463,28 @@ static uint32_t covered(const struct vsr *v, uint64_t op)
     return count;
 }
 
+/* A witness may discard retained entries through op only once f + 1 full
+ * members advertise coverage of them. Entries it never retained, such as an
+ * empty log adopting a donor's newer anchor, need no coverage. */
+static bool prefix_covered(const struct vsr *v, uint64_t op)
+{
+    const struct vsr_protocol *protocol = vsr_protocol_const(v);
+    if (protocol->written_end <= protocol->log_begin)
+        return true;
+    uint64_t last = op < protocol->written_end ? op : protocol->written_end - 1;
+    return last < protocol->log_begin ||
+           covered(v, last) >= protocol->current.faults + 1u;
+}
+
 /* Optional maintenance must not turn a completed snapshot into a permanent
  * consumer of the resources needed to admit the next maximal command. The
- * planner supplies the baseline; old pinned images can temporarily defer hints. */
+ * planner supplies the baseline; old pinned images can temporarily defer hints.
+ * The extra arguments credit capacity that the caller could release first. */
 static bool maintenance_capacity(const struct vsr *v, bool new_completion,
-                                 uint32_t replacing)
+                                 uint32_t extra_leases, uint64_t extra_bytes)
 {
-    uint64_t bytes = vsr_protocol_available_bytes(v);
-    uint32_t leases = v->lease_free_count - v->reserved_leases;
-    if (replacing != VSR_INDEX_NONE && v->leases[replacing].references == 1) {
-        leases++;
-        bytes += v->leases[replacing].bytes;
-    }
+    uint64_t bytes = vsr_protocol_available_bytes(v) + extra_bytes;
+    uint32_t leases = v->lease_free_count - v->reserved_leases + extra_leases;
     /* Three transient transfer leases plus the ordinary three-slot reserve. */
     if (leases < (new_completion ? 7u : 6u))
         return false;
@@ -498,21 +508,54 @@ static bool maintenance_capacity(const struct vsr *v, bool new_completion,
     return bytes >= v->options.limits.message_bytes;
 }
 
+/* A retained input graph frees its lease and bytes only when nothing else
+ * still references it. */
+static bool lease_credit(const struct vsr *v, uint32_t lease, uint32_t *leases,
+                         uint64_t *bytes)
+{
+    if (lease == VSR_INDEX_NONE || v->leases[lease].references != 1)
+        return false;
+    (*leases)++;
+    *bytes += v->leases[lease].bytes;
+    return true;
+}
+
+/* Cache entries that are applied, stored, and already announced to the
+ * extensions are optional: no pending notification or replay reloads them. */
+static bool maintenance_optional(const struct vsr *v,
+                                 const struct vsr_log_slot *slot)
+{
+    const struct vsr_protocol *protocol = vsr_protocol_const(v);
+    return slot->used && slot->entry.op <= v->status.applied &&
+           slot->entry.op <= protocol->notified_commit && slot->sequence != 0 &&
+           slot->sequence <= v->status.stored_sequence;
+}
+
+/* Release one optional cache entry, but only when releasing every optional
+ * entry restores the capture baseline. Evicting an entry the protocol is about
+ * to reload, or evicting while capture stays deferred anyway, would trade a
+ * deferred hint for an endless load/evict cycle instead of idling. */
 static bool maintenance_evict(struct vsr *v)
 {
     struct vsr_protocol *protocol = vsr_protocol(v);
+    uint32_t leases = 0;
+    uint64_t bytes = 0;
+    uint32_t chosen = VSR_INDEX_NONE;
     for (uint32_t i = 0; i < v->options.limits.log_cache_entries; i++) {
-        struct vsr_log_slot *slot = &protocol->log[i];
-        if (slot->used && slot->entry.op <= v->status.applied &&
-            slot->sequence != 0 &&
-            slot->sequence <= v->status.stored_sequence) {
-            vsr_lease_release(v, slot->lease);
-            slot->lease = VSR_INDEX_NONE;
-            slot->used = false;
-            return true;
-        }
+        const struct vsr_log_slot *slot = &protocol->log[i];
+        if (maintenance_optional(v, slot) &&
+            lease_credit(v, slot->lease, &leases, &bytes) &&
+            chosen == VSR_INDEX_NONE)
+            chosen = i;
     }
-    return false;
+    if (chosen == VSR_INDEX_NONE ||
+        !maintenance_capacity(v, true, leases, bytes))
+        return false;
+    struct vsr_log_slot *slot = &protocol->log[chosen];
+    vsr_lease_release(v, slot->lease);
+    slot->lease = VSR_INDEX_NONE;
+    slot->used = false;
+    return true;
 }
 
 int vsr_checkpoint_event(struct vsr *v, const struct vsr_event *event,
@@ -543,11 +586,14 @@ int vsr_checkpoint_event(struct vsr *v, const struct vsr_event *event,
             return VSR_OK;
         /* Retain at most one manifest: the smallest newer candidate can become
          * covered without pinning one input payload graph for every member. */
+        uint32_t leases = 0;
+        uint64_t bytes = 0;
+        (void)lease_credit(v, checkpoint->remote_lease, &leases, &bytes);
         if (v->status.role == VSR_MEMBER_WITNESS &&
             object->op > v->status.checkpoint_op &&
             (!checkpoint->remote_present ||
              object->op < checkpoint->remote.op) &&
-            maintenance_capacity(v, false, checkpoint->remote_lease)) {
+            maintenance_capacity(v, false, leases, bytes)) {
             if (!vsr_lease_retain(v, lease))
                 return VSR_AGAIN;
             release_remote(v);
@@ -589,8 +635,15 @@ static bool capture_poll(struct vsr *v)
     if (protocol->application_busy || protocol->results_pending ||
         protocol->clients_stored < v->status.applied)
         return false;
-    if (!maintenance_capacity(v, true, VSR_INDEX_NONE))
-        return maintenance_evict(v);
+    if (!maintenance_capacity(v, true, 0, 0)) {
+        if (maintenance_evict(v))
+            return true;
+        /* A pending capture counts as busy for transitions and replay. Defer
+         * the hint itself instead of holding them until capacity returns. */
+        release_slot(v, checkpoint->candidate);
+        finish(v, VSR_IO_OK);
+        return true;
+    }
     if (!emit_snapshot(v, VSR_OP_SNAPSHOT_CAPTURE, CHECKPOINT_CAPTURE, &task,
                        VSR_INDEX_NONE, v->options.limits.manifest_bytes))
         return false;
@@ -647,7 +700,7 @@ static bool store_poll(struct vsr *v)
     if (checkpoint->restoring &&
         checkpoint->target_role == VSR_MEMBER_WITNESS &&
         slot->checkpoint.op + 1 > protocol->log_begin &&
-        covered(v, slot->checkpoint.op) < protocol->current.faults + 1u)
+        !prefix_covered(v, slot->checkpoint.op))
         return false;
     changes[0] = (struct vsr_change){checkpoint->restoring
                                          ? VSR_STORE_RESTORE_CHECKPOINT
@@ -766,8 +819,7 @@ static bool trim_poll(struct vsr *v)
         checkpoint->stage != CHECKPOINT_IDLE || protocol->log_loading)
         return false;
     if (v->status.role == VSR_MEMBER_WITNESS &&
-        (checkpoint->guarded ||
-         covered(v, published->op) < protocol->current.faults + 1u))
+        (checkpoint->guarded || !prefix_covered(v, published->op)))
         return false;
     {
         const struct vsr_change change = {VSR_STORE_TRIM, 0, published->op + 1,
@@ -935,7 +987,7 @@ bool vsr_checkpoint_poll(struct vsr *v)
             v->status.applied <= v->status.checkpoint_op) {
             protocol->checkpoint_requested = false;
         } else {
-            if (!maintenance_capacity(v, true, VSR_INDEX_NONE))
+            if (!maintenance_capacity(v, true, 0, 0))
                 return maintenance_evict(v);
             const uint32_t index = free_slot(checkpoint);
             if (index != VSR_INDEX_NONE) {

@@ -90,6 +90,7 @@ struct mem_node {
     struct vsr_op *output;
     uint32_t output_capacity;
     bool runnable;
+    size_t effect_cursor;
     uint64_t applied;
     uint64_t checksum;
     void *application;
@@ -1577,14 +1578,24 @@ size_t mem_cluster_run(struct mem_cluster *cluster, size_t budget)
             }
             /* MORE may mean a budget-limited poll encountered an input whose
              * dependency is an outstanding effect. Fair completion service
-             * must share the turn with drains, even at work_per_step == 1. */
-            for (size_t j = 0; j < node->effect_count && actions < budget; j++) {
+             * must share the turn with drains, even at work_per_step == 1.
+             * A completion offered while output is pending may spend the work
+             * quantum on that output and remain unconsumed; rotating the first
+             * effect tried keeps every effect eventually served. */
+            const size_t count = node->effect_count;
+            bool completed = false;
+            for (size_t k = 0; k < count && actions < budget; k++) {
+                const size_t j = (node->effect_cursor + k) % count;
                 if (mem_node_complete(node, j, VSR_IO_OK)) {
+                    node->effect_cursor = j;
+                    completed = true;
                     actions++;
                     progress = true;
                     break;
                 }
             }
+            if (!completed && count != 0)
+                node->effect_cursor = (node->effect_cursor + 1) % count;
         }
         for (size_t i = 0; i < cluster->message_count && actions < budget;
              i++) {
@@ -1607,6 +1618,7 @@ void mem_node_crash(struct mem_node *node)
     for (size_t i = 0; i < node->effect_count; i++)
         effect_destroy(node->effects[i]);
     node->effect_count = 0;
+    node->effect_cursor = 0;
     for (size_t i = 0; i < node->lease_count; i++)
         mem_graph_destroy(node->leases[i].graph);
     node->lease_count = 0;

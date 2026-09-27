@@ -47,6 +47,8 @@ bool vsr_extension_boot_missing(struct vsr *v);
 /* Hooks for handoff/read mutation fences. A committed notification does not
  * grant permission to apply; every application batch also checks eligibility. */
 bool vsr_extension_apply_allowed(struct vsr *v, const struct vsr_entry *entry);
+/* Entry-independent part of that eligibility, checked before loading a batch. */
+bool vsr_extension_apply_ready(const struct vsr *v);
 void vsr_extension_committed(struct vsr *v, const struct vsr_entry *entry);
 
 uint64_t vsr_extension_min_sequence(const struct vsr *v);

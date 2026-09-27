@@ -406,7 +406,10 @@ operation fences the instance with `VSR_FAILURE_SNAPSHOT`.
 
 CHECKPOINT events and `checkpoint_interval` are coalescible scheduling hints,
 not completion promises. They capture only eligible applied progress, and may
-be deferred while replay, transfer, or another application fence is active.
+be deferred while replay, transfer, or another application fence is active, or
+while retained inputs leave less than the capture baseline; deferral releases
+only applied cache entries whose release restores that baseline and never
+blocks a transition.
 Witnesses ignore local capture hints. Observe `checkpoint_op` to track published
 coverage; snapshot capture alone does not advance it.
 
@@ -414,8 +417,10 @@ For witnesses, a published checkpoint is a remote recovery anchor only; no local
 application image or completed-client table is implied. Such anchors may be
 published and trimmed against only with the retention guarantees in DESIGN.md.
 They are rediscovered from full replicas when needed; witnesses do not issue
-CAPTURE, SNAPSHOT_SYNC, or INSTALL for them. Promotion must first materialize a
-full checkpoint or replay the complete log. DROP releases only locally owned
+CAPTURE, SNAPSHOT_SYNC, or INSTALL for them. Coverage by `f + 1` full members
+is required only for retained entries a RESTORE or TRIM discards; adopting an
+anchor beyond an empty or shorter retained range needs none. Promotion must
+first materialize a full checkpoint or replay the complete log. DROP releases only locally owned
 snapshot objects after adapter readers drain, never another replica's anchor.
 
 ## Application operations and failures
