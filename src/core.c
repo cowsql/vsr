@@ -241,12 +241,15 @@ int vsr_init(void *memory, size_t size, const struct vsr_options *options,
         *out = NULL;
         return VSR_EINVAL;
     }
-    /* Reject overlapping arguments before writing through out or the arena. */
-    if (overlaps(memory, size, out, sizeof(*out)) ||
-        overlaps(memory, size, options, sizeof(*options))) {
+    /* An out pointer inside the arena is never written; every other error
+     * clears it as promised, before any other overlap is rejected. */
+    if (overlaps(memory, size, out, sizeof(*out))) {
         return VSR_EINVAL;
     }
     *out = NULL;
+    if (overlaps(memory, size, options, sizeof(*options))) {
+        return VSR_EINVAL;
+    }
     struct arena_plan plan;
     int result = plan_arena(options, &plan);
     if (result != VSR_OK) {
