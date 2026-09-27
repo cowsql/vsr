@@ -16,9 +16,10 @@ src_libvsr_a_SOURCES = \
   src/epochs.c src/epochs.h src/reads.c src/reads.h
 noinst_HEADERS = tests/lib/check.h
 noinst_PROGRAMS = examples/replication examples/failover examples/checkpoint \
-  examples/epochs examples/reads
+  examples/epochs examples/reads examples/witness
 EXAMPLE_HOST = tests/lib/memory.c tests/lib/memory.h \
-  tests/lib/memory_cluster.c tests/lib/memory_cluster.h examples/common.h
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h \
+  examples/common.c examples/common.h examples/kv.c examples/kv.h
 examples_replication_SOURCES = examples/replication.c $(EXAMPLE_HOST)
 examples_replication_LDADD = src/libvsr.a
 examples_failover_SOURCES = examples/failover.c $(EXAMPLE_HOST)
@@ -29,6 +30,8 @@ examples_epochs_SOURCES = examples/epochs.c $(EXAMPLE_HOST)
 examples_epochs_LDADD = src/libvsr.a
 examples_reads_SOURCES = examples/reads.c $(EXAMPLE_HOST)
 examples_reads_LDADD = src/libvsr.a
+examples_witness_SOURCES = examples/witness.c $(EXAMPLE_HOST)
+examples_witness_LDADD = src/libvsr.a
 
 UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/memory \
   tests/unit/validate tests/unit/runtime tests/unit/reads tests/unit/memory_watch
@@ -104,7 +107,7 @@ tests_benchmark_core_SOURCES = tests/benchmark/core.c \
 tests_benchmark_core_LDADD = src/libvsr.a
 tests_benchmark_core_LDFLAGS = $(AM_LDFLAGS) -Wl,--wrap=vsr_step
 TESTS = $(check_PROGRAMS) examples/replication examples/failover examples/checkpoint \
-  examples/epochs examples/reads
+  examples/epochs examples/reads examples/witness
 
 # Keep the public signatures and descriptor layouts checked independently.
 check_LIBRARIES = tests/integration/libheader.a

@@ -82,7 +82,7 @@ cd build/asan
 make -j"$(nproc)" check
 ```
 
-The build produces `src/libvsr.a` and five runnable [in-memory examples](examples/README.md)
+The build produces `src/libvsr.a` and six runnable [in-memory examples](examples/README.md)
 in `examples/`. `make check` runs unit tests, public protocol/adapter scenarios,
 deterministic seeded fault simulations, and the examples. The simulator checks
 agreement, storage prerequisites, buffer immutability, and eventual progress

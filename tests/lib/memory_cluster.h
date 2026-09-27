@@ -17,8 +17,28 @@ struct mem_step {
     uint64_t deadline;
 };
 
+/* Pluggable deterministic application. The default records a rolling checksum
+ * of every command (see mem_node_checksum). Each node owns one opaque state
+ * object; each snapshot owns one opaque serialized image of such a state.
+ * apply writes at most capacity result bytes and returns the result code;
+ * capture returns a malloc'd image the host frees. reset returns the state to
+ * genesis (crash, or a genesis SNAPSHOT_INSTALL). Witnesses never apply. */
+struct mem_application {
+    void *(*create)(void);
+    void (*destroy)(void *state);
+    void (*reset)(void *state);
+    int32_t (*apply)(void *state, const struct vsr_entry *entry, char *result,
+                     size_t capacity, size_t *length);
+    void *(*capture)(const void *state, size_t *size);
+    void (*install)(void *state, const void *image, size_t size);
+};
+
 struct mem_cluster *mem_cluster_create(void);
 void mem_cluster_destroy(struct mem_cluster *cluster);
+/* Select the application before adding nodes; NULL keeps the checksum. */
+void mem_cluster_set_application(struct mem_cluster *cluster,
+                                 const struct mem_application *application);
+void *mem_node_application(const struct mem_node *node);
 struct mem_node *mem_cluster_add(struct mem_cluster *cluster,
                                  const struct vsr_options *options);
 struct vsr_options mem_options(uint64_t replica,

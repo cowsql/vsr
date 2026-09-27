@@ -1,36 +1,31 @@
+/*
+ * reads: serving reads without logging them.
+ *
+ * A linearizable read is a barrier, not a log entry. The primary confirms
+ * with a fresh quorum that it still leads, then hands the host a READ_READY
+ * effect naming the applied position the read may observe. The host reads its
+ * application state and completes the effect. Until it does, the core will
+ * not APPLY anything newer, so the state the host is reading cannot move.
+ * A causal read on a backup only waits until that backup has applied the
+ * caller's minimum op.
+ *
+ * Scenario:
+ *   1. Client A commits "set counter 1".
+ *   2. Replica 1 receives a linearizable read barrier. The host runs every
+ *      other effect but deliberately keeps READ_READY pending: it is "reading".
+ *   3. Client A submits "incr counter". It commits (op 2) but is not applied
+ *      while the fence is held: the store still says counter=1.
+ *   4. The host completes the fence; op 2 is applied and counter becomes 2.
+ *   5. Backup replica 2 serves a causal read with minimum op 2.
+ *
+ * What to look for: committed runs ahead of applied while the fence is held,
+ * and the store on replica 1 does not change until the fence is released.
+ */
 #include "common.h"
 #include "config.h"
 
-/* Finish network/storage work while the host retains READ_READY. Production
- * hosts complete that effect after capturing their application snapshot. */
-static void pump_with_held_snapshot(struct example_cluster *cluster)
-{
-    for (uint32_t steps = 0; steps < 100000; ++steps) {
-        bool progress = false;
-        for (uint32_t i = 0; i < cluster->count; ++i) {
-            struct mem_node *node = cluster->nodes[i];
-            struct mem_step step = mem_node_event(node, NULL);
-            progress |= step.emitted != 0 || (step.flags & VSR_UPDATE_MORE);
-            for (size_t j = 0; j < mem_node_effects(node); ++j) {
-                if (mem_node_effect(node, j)->type == VSR_OP_READ_READY)
-                    continue;
-                if (mem_node_complete(node, j, VSR_IO_OK)) {
-                    progress = true;
-                    break;
-                }
-            }
-        }
-        for (size_t i = 0; i < mem_cluster_messages(cluster->host); ++i) {
-            if (mem_cluster_deliver(cluster->host, i)) {
-                progress = true;
-                break;
-            }
-        }
-        if (!progress)
-            return;
-    }
-    CHECK(false);
-}
+enum { REPLICAS = 3, FAULTS = 1 };
+enum { COOKIE_LINEARIZABLE = 10, COOKIE_CAUSAL = 11 }; /* Local read IDs. */
 
 static void read_barrier(struct mem_node *node, uint64_t cookie,
                          uint32_t consistency, uint64_t min_op)
@@ -42,43 +37,70 @@ static void read_barrier(struct mem_node *node, uint64_t cookie,
     CHECK(mem_node_event(node, &event).consumed == 1);
 }
 
+/* The pending READ_READY effect on a replica, or SIZE_MAX. Completing other
+ * effects shifts queue positions, so the search is repeated when needed. */
+static size_t pending_fence(struct mem_node *node)
+{
+    for (size_t i = 0; i < mem_node_effects(node); ++i)
+        if (mem_node_effect(node, i)->type == VSR_OP_READ_READY)
+            return i;
+    return SIZE_MAX;
+}
+
 int main(void)
 {
-    struct example_cluster cluster = example_create(3, 1, VSR_DURABLE, NULL);
-    example_command(cluster.nodes[0], 1, 1, 0, 1, "initial value");
-    example_run(&cluster);
-    read_barrier(cluster.nodes[0], 10, VSR_READ_LINEARIZABLE, 1);
-    pump_with_held_snapshot(&cluster);
-    size_t held = SIZE_MAX;
-    for (size_t i = 0; i < mem_node_effects(cluster.nodes[0]); ++i)
-        if (mem_node_effect(cluster.nodes[0], i)->type == VSR_OP_READ_READY)
-            held = i;
+    struct example_cluster cluster =
+        example_start("reads", REPLICAS, FAULTS, VSR_DURABLE, NULL);
+    struct mem_node *primary = example_primary(&cluster);
+    struct mem_node *backup = example_replica(&cluster, 2);
+    struct example_client client_a = example_client("client A", 1);
+
+    CHECK(example_call(&cluster, primary, &client_a, "set counter 1")->op == 1);
+
+    say("linearizable read barrier on replica %" PRIu64 " (min op 1)",
+        mem_node_id(primary));
+    read_barrier(primary, COOKIE_LINEARIZABLE, VSR_READ_LINEARIZABLE, 1);
+    example_run_holding(&cluster, primary, VSR_OP_READ_READY);
+    size_t held = pending_fence(primary);
     CHECK(held != SIZE_MAX);
     const struct vsr_read_fence fence =
-        *(const struct vsr_read_fence *)mem_node_effect(cluster.nodes[0], held)
-             ->data;
-    CHECK(fence.applied == 1);
+        *(const struct vsr_read_fence *)mem_node_effect(primary, held)->data;
+    CHECK(fence.cookie == COOKIE_LINEARIZABLE && fence.applied == 1);
+    say("-> READ_READY at applied op %" PRIu64
+        "; the host keeps it pending while it reads counter=%s",
+        fence.applied, kv_get(example_store(primary), "counter"));
 
-    example_command(cluster.nodes[0], 1, 2, 0, 2, "next value");
-    pump_with_held_snapshot(&cluster);
-    struct vsr_status status = example_status(cluster.nodes[0]);
+    say("client A sends \"incr counter\" while the fence is held");
+    example_submit(&cluster, primary, &client_a, "incr counter");
+    example_run_holding(&cluster, primary, VSR_OP_READ_READY);
+    struct vsr_status status = example_status(primary);
     CHECK(status.committed == 2 && status.applied == 1);
-    /* Other completions can move array positions; identify the retained effect. */
-    for (size_t i = 0; i < mem_node_effects(cluster.nodes[0]); ++i)
-        if (mem_node_effect(cluster.nodes[0], i)->type == VSR_OP_READ_READY) {
-            CHECK(mem_node_complete(cluster.nodes[0], i, VSR_IO_OK));
-            break;
-        }
-    example_run(&cluster);
-    CHECK(example_status(cluster.nodes[0]).applied == 2);
+    CHECK(strcmp(kv_get(example_store(primary), "counter"), "1") == 0);
+    say("-> op 2 is committed but not applied: counter is still %s",
+        kv_get(example_store(primary), "counter"));
 
-    read_barrier(cluster.nodes[1], 11, VSR_READ_CAUSAL, 2);
+    say("the host completes the fence");
+    held = pending_fence(primary);
+    CHECK(held != SIZE_MAX);
+    CHECK(mem_node_complete(primary, held, VSR_IO_OK));
     example_run(&cluster);
-    CHECK(mem_node_reads(cluster.nodes[1]) == 1);
-    CHECK(mem_node_read(cluster.nodes[1], 0)->applied >= 2);
-    printf("linear read captured op %" PRIu64 "; held fence delayed APPLY "
-           "of committed op 2; causal backup read reached op 2\n",
-           fence.applied);
-    mem_cluster_destroy(cluster.host);
+    status = example_status(primary);
+    CHECK(status.applied == 2);
+    CHECK(strcmp(kv_get(example_store(primary), "counter"), "2") == 0);
+    say("-> op 2 applied: counter is now %s",
+        kv_get(example_store(primary), "counter"));
+
+    say("causal read barrier on backup replica %" PRIu64 " (min op 2)",
+        mem_node_id(backup));
+    read_barrier(backup, COOKIE_CAUSAL, VSR_READ_CAUSAL, 2);
+    example_run(&cluster);
+    CHECK(mem_node_reads(backup) == 1);
+    CHECK(mem_node_read(backup, 0)->cookie == COOKIE_CAUSAL);
+    CHECK(mem_node_read(backup, 0)->applied >= 2);
+    say("-> READ_READY at applied op %" PRIu64
+        " without contacting the primary",
+        mem_node_read(backup, 0)->applied);
+    example_show_store(backup);
+    example_finish(&cluster);
     return 0;
 }
