@@ -1,8 +1,10 @@
 # Development
 
-Public headers go in `include/`, private C code in `src/`, and all tests in
-`tests/`. The protocol is not implemented yet. The small checked-arithmetic
-module builds into `src/libvsr.a`, a development archive that is not installed.
+Public headers go in `include/`, private C code in `src/`, runnable examples in
+`examples/`, and all tests in `tests/`. The library builds into `src/libvsr.a`,
+which `make install` installs with `include/vsr.h` and `vsr.pc`. It depends on
+nothing beyond `memcpy`, `memmove`, `memset`, `memcmp`/`bcmp` and the stack
+protector; check with `nm -u src/libvsr.a` in a `--disable-sanitize` build.
 
 ## Build
 
@@ -66,9 +68,13 @@ make format                # apply the checked-in style
 make compile-commands      # clean rebuild through Bear
 make lint                  # format, ShellCheck, clang-tidy, Cppcheck
 make analyze               # clean rebuild with Clang Static Analyzer
-make check-valgrind         # full leak and origin checks; no sanitizers
+make check-valgrind        # full leak and origin checks; no sanitizers
 make distcheck             # build/test/clean a source distribution
+make benchmark             # tests/benchmark/core; use --disable-sanitize
 ```
+
+`make check-unit`, `make check-integration`, `make check-regression` and
+`make check-fuzzy` run one test layer. The examples run as part of `make check`.
 
 Run `compile-commands` and `analyze` sequentially: both clean the build.
 Regenerate `compile_commands.json` after changing flags or adding files.
@@ -77,11 +83,13 @@ LLVM tools are located through Clang so Debian's versioned packages work;
 commands can be overridden, e.g. `make tidy CLANG_TIDY=clang-tidy-21`.
 Older Valgrind versions may need `CFLAGS='-O1 -g -gdwarf-4'`.
 
-In a separate build configured with `--enable-fuzzing`, run `make fuzz`.
-See [test layers and replay](../tests/README.md). In a build configured with
-`--enable-coverage`, run `make coverage` for fresh profiles, a terminal report,
-`coverage/html/index.html` and `coverage/coverage.lcov`. LLVM tools must match
-the compiler's major. Coverage currently measures only the arithmetic scaffold.
+In a separate build configured with `--enable-fuzzing`, run `make fuzz`;
+`FUZZ_RUNS` and `FUZZ_ARGS` can be set in the environment or on the command
+line. See [test layers and replay](../tests/README.md). In a build configured
+with `--enable-coverage`, run `make coverage` for fresh profiles, a terminal
+report, `coverage/html/index.html` and `coverage/coverage.lcov`. LLVM tools must
+match the compiler's major. Coverage measures `src/` across every test program
+run by `make check`; test sources and system headers are excluded.
 
 CI runs Clang, GCC, sanitizers, lint, static analysis, Valgrind, fuzzing, coverage
 and `distcheck` on native runners. Generated Autotools files are ignored in Git

@@ -152,8 +152,9 @@ SCAN_BUILD = $(shell $(CC) -print-prog-name=scan-build)
 LLVM_COV = $(shell $(CC) -print-prog-name=llvm-cov)
 LLVM_PROFDATA = $(shell $(CC) -print-prog-name=llvm-profdata)
 FORMAT_FILES = find $(srcdir)/include $(srcdir)/src $(srcdir)/tests $(srcdir)/examples -type f \( -name '*.c' -o -name '*.h' \) -print0
-FUZZ_RUNS = 10000
-FUZZ_ARGS =
+# Overridable from the environment as well as the command line.
+FUZZ_RUNS ?= 10000
+FUZZ_ARGS ?=
 
 .PHONY: check-build check-unit check-integration check-regression check-fuzzy \
   format format-check lint \
