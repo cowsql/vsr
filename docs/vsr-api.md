@@ -22,7 +22,7 @@ are stable across membership changes and independent of transport addresses.
 | Start mode | Seed and store | Startup behavior |
 | --- | --- | --- |
 | `NEW` | Common epoch-0 membership containing this replica; empty store | Establish the agreed genesis state and initialize storage |
-| `RECOVER` | A discovery seed; matching local store if available | Restore local state and perform quorum recovery when required |
+| `RECOVER` | A discovery seed; matching local store if available | Restore local state and perform quorum recovery when required; a replica absent from its group resumes warm-up |
 | `JOIN` | Known membership excluding this replica; empty store | Warm as `join_role` without voting; await logged admission |
 
 The first step starts asynchronous `LOAD_RECOVERY`. `NOT_FOUND` means no
@@ -32,6 +32,13 @@ never automatic bootstrap. Stale but internally valid state in replicated mode
 is only a recovery hint. A restart uses `RECOVER`, including during warm-up.
 The persisted hard-state role records whether application state is being
 maintained; it does not grant a vote to a replica absent from the membership.
+A restarted learner resumes nonvoting warm-up in that role; quorum recovery is
+for members. When no store survives (replicated mode, or a durable crash before
+the first SYNC), `join_role` names the role to warm up as from the seed and
+`MEMBER_NONE` warms as a witness; a surviving store's persisted role takes
+precedence. Warm-up is continuous: a WARMING learner rediscovers the members it
+knows every heartbeat and catches up, or follows a later epoch, until a
+reconfiguration admits it.
 A learned later epoch can be persisted before its boundary is locally present:
 only `HARD_RECOVERING` or `HARD_TRANSITIONING` with epoch phase `TRANSFERRING`
 permits `epoch.boundary > committed`. This records authenticated configuration

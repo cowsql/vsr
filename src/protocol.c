@@ -157,9 +157,13 @@ void vsr_protocol_init(struct vsr *v, void *memory, size_t size)
     const struct vsr_epoch epoch = {v->options.seed, NULL, 0, VSR_EPOCH_STEADY,
                                     0};
     vsr_protocol_configuration(v, &epoch);
-    v->status.role = p->self == VSR_INDEX_NONE
-                         ? v->options.join_role
-                         : p->current.members[p->self].role;
+    /* A replica absent from its seed warms as a learner. RECOVER may name
+     * the role to resume with when no store survives; a persisted role
+     * replaces it once loaded, and a witness maintains no application state. */
+    v->status.role =
+        p->self != VSR_INDEX_NONE ? p->current.members[p->self].role
+        : v->options.join_role != VSR_MEMBER_NONE ? v->options.join_role
+                                                  : VSR_MEMBER_WITNESS;
     vsr_extension_init(v, b + a.extension, a.extension_size);
 }
 

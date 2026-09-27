@@ -704,7 +704,8 @@ struct vsr_options {
         checkpoint_interval; /* In operations; 0: explicit requests only. */
     uint32_t start_mode;     /* enum vsr_start_mode */
     uint32_t durability;     /* enum vsr_durability */
-    uint32_t join_role;      /* JOIN: FULL/WITNESS; otherwise MEMBER_NONE. */
+    uint32_t join_role;      /* JOIN: FULL/WITNESS. RECOVER: warm-up role
+                                when no store survives, or MEMBER_NONE. */
     uint32_t
         cache_line_bytes; /* Power of two; 0 selects 64, not CPU detection. */
     uint32_t reserved;

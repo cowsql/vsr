@@ -1647,9 +1647,9 @@ int mem_node_restart(struct mem_node *node, struct vsr_id incarnation)
     CHECK(node->core == NULL &&
           !same_id(node->options.incarnation, incarnation));
     node->options.incarnation = incarnation;
+    /* A restart uses RECOVER even during warm-up; a learner keeps its join
+     * role as the warm-up role to resume with should its store be lost. */
     node->options.start_mode = VSR_START_RECOVER;
-    /* A restart uses RECOVER even during warm-up; join_role is JOIN-only. */
-    node->options.join_role = VSR_MEMBER_NONE;
     return node_init(node);
 }
 

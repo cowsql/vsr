@@ -42,7 +42,8 @@ INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
   tests/regression/witness_prefix tests/regression/boundary_from_view_change \
-  tests/regression/review_epoch_recovery_vote
+  tests/regression/review_epoch_recovery_vote tests/regression/learner_restart \
+  tests/regression/learner_follows
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 # Reproductions of open safety bugs found in review; they turn into XPASS
 # once the core is fixed and should then move to the ordinary regressions.
@@ -126,6 +127,14 @@ tests_regression_boundary_from_view_change_SOURCES = \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_boundary_from_view_change_LDADD = src/libvsr.a
+tests_regression_learner_restart_SOURCES = tests/regression/learner_restart.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_learner_restart_LDADD = src/libvsr.a
+tests_regression_learner_follows_SOURCES = tests/regression/learner_follows.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_learner_follows_LDADD = src/libvsr.a
 CLUSTER_SCENARIO = tests/fuzzy/scenario.c tests/fuzzy/scenario.h \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h

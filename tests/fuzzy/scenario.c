@@ -906,6 +906,25 @@ static void event(struct simulation *s)
 
 /* Liveness after faults cease. */
 
+/* A learner rediscovers the group through the members it knows. Once every
+ * one of them has retired or stopped, nothing can redirect it to the current
+ * epoch: RETIRED is terminal and answers no discovery. */
+static bool learner_reachable(struct simulation *s, uint32_t index)
+{
+    struct vsr_status current = state(s->nodes[index]);
+    if (current.configuration == NULL)
+        return false;
+    for (uint32_t i = 0; i < current.configuration->current->count; ++i) {
+        uint64_t id = current.configuration->current->members[i].id;
+        uint32_t peer = (uint32_t)(id - 1);
+        if (id == 0 || id > s->count || !alive(s, peer))
+            continue;
+        if (state(s->nodes[peer]).state != VSR_STATE_RETIRED)
+            return true;
+    }
+    return false;
+}
+
 static bool converged(struct simulation *s, uint64_t target)
 {
     for (uint32_t i = 0; i < s->count; ++i) {
@@ -931,6 +950,15 @@ static bool converged(struct simulation *s, uint64_t target)
                 return false;
         } else if (current.state != VSR_STATE_WARMING) {
             return false;
+        } else if (learner_reachable(s, i) &&
+                   (current.epoch != s->known.epoch ||
+                    current.configuration == NULL ||
+                    current.configuration->phase != VSR_EPOCH_STEADY ||
+                    current.committed < target)) {
+            /* Warm-up is continuous: a learner that can still reach a live
+             * member follows the group into the current epoch and keeps up
+             * with what it commits. */
+            return false;
         }
     }
     return true;
@@ -946,7 +974,8 @@ static void heal(struct simulation *s)
             restart(s, i);
     /* A stable network, available members, and fair effect completions must
      * eventually admit and execute a new request on every full replica of the
-     * current membership; removed members retire and learners keep warming. */
+     * current membership; removed members retire and reachable learners warm
+     * up to that request in the current epoch. */
     for (unsigned round = 0; round < 1000; ++round) {
         s->now += 5;
         record(s, "heal", round, s->now);

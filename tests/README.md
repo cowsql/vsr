@@ -9,7 +9,7 @@ seeded fault simulation share one directory.
 | `unit/` | Small deterministic tests of private modules | Arithmetic, equality, RNG, runtime, graph validation, reads, host storage |
 | `integration/` | Public API and host adapter contracts | Replication, resource minima, reads, checkpoints, epoch handoff |
 | `fuzzy/` | Coverage-guided fuzzing and seeded cluster/fault simulation | Arithmetic, graph, and cluster-scenario libFuzzer harnesses; seeded cluster scheduler |
-| `regression/` | Minimal reproducers for fixed bugs and crashes | Trimmed-prefix resend to a lagging peer (`trim_resend`); witness anchor adoption during recovery and transfer (`recovery_coverage`, `transfer_anchor`, `witness_prefix`); add with each bug fix |
+| `regression/` | Minimal reproducers for fixed bugs and crashes | Trimmed-prefix resend to a lagging peer (`trim_resend`); witness anchor adoption during recovery and transfer (`recovery_coverage`, `transfer_anchor`, `witness_prefix`); learner restart and continuous warm-up (`learner_restart`, `learner_follows`); add with each bug fix |
 | `benchmark/` | Repeatable latency, throughput, allocation and copy measurements | Reserved; implementation required |
 | `lib/` | Shared test-only assertions and fixtures | In-memory immutable storage validating each transaction's shape at issuance; cluster host with always-active oracles for fence exclusion, read-fence bounds, a cluster-wide client execution/reply table, offer-versus-store equality, LOAD/RECLAIM/DROP retention rules, lease release, and STOPPED accounting; seeded RNG |
 
@@ -110,7 +110,10 @@ group left to recover from, so it is treated as stopped and never restarted.
 With flag `32`, liveness after faults cease is judged against the current
 membership: every current member must be `NORMAL` and `STEADY` in that epoch
 with the new request committed and, for full members, applied; removed members
-must be `RETIRED` or stopped; learners must be `WARMING`.
+must be `RETIRED` or stopped; a learner that can still reach a live,
+unretired member of the membership it knows must be `WARMING` and `STEADY` in
+the current epoch with the new request committed, and any other learner need
+only be `WARMING`.
 
 Campaign mode. A trailing `SEEDS` argument (`quiet` required) runs seeds
 `SEED..SEED+SEEDS-1` in one process, ignores `COUNT`, prints only the header
