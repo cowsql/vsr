@@ -1034,11 +1034,21 @@ static bool network_poll(struct vsr *v)
             continue;
         uint64_t first =
             (peer->sent > peer->prepared ? peer->sent : peer->prepared) + 1;
-        if (first < p->stable_end) {
+        /* Entries below log_begin are recoverable only through the published
+         * checkpoint. A COMMIT beyond such a peer's log makes it discover that
+         * transfer; withholding it would also withhold every later commit
+         * notification, and with it this replica's own application. */
+        if (first < p->stable_end && first >= p->log_begin) {
             struct vsr_log_slot *s = vsr_protocol_log_find(v, first);
             if (s == NULL) {
-                if (vsr_protocol_load_log(v, first, p->stable_end))
+                if (vsr_protocol_load_log(v, first, p->stable_end)) {
+                    /* Serve this peer first once its entries arrive. A small
+                     * cache cannot hold every lagging peer's next entry at
+                     * once; rotating past it would evict the loaded entry
+                     * for another peer's load before it is ever sent. */
+                    p->peer_cursor = i;
                     return true;
+                }
                 continue;
             }
             struct vsr_operation *op = vsr_operation_acquire(
@@ -1103,6 +1113,11 @@ static bool apply_poll(struct vsr *v)
         (p->boot != BOOT_READY && !p->replay))
         return false;
     uint64_t first = v->status.applied + 1;
+    /* A transition that forbids application must not load entries it cannot
+     * use: the pinned cache entry would only be evicted under input pressure
+     * and reloaded here, starving the input that ends the transition. */
+    if (first > p->notified_commit || !vsr_extension_apply_ready(v))
+        return false;
     if (vsr_protocol_log_find(v, first) == NULL)
         return vsr_protocol_load_log(v, first, p->stable_commit + 1);
     uint64_t available = vsr_protocol_available_bytes(v);

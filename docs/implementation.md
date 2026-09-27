@@ -76,7 +76,16 @@ budget with requests, incoming chunks, and loaded comparisons. A layout must
 reserve enough capacity for these dependencies even when operation concurrency,
 cache capacity, or output capacity is one. Optional snapshot generations must
 not occupy the reserves required to complete an accepted transfer. The runtime
-planner and minimum-capacity integration tests are being reconciled against the
-simultaneous hold categories; increasing test defaults is not a substitute for
-checking the accepted minimum. Large command/small manifest and small
-command/large manifest configurations need separate fault campaigns.
+planner and minimum-capacity integration tests have been reconciled against the
+simultaneous hold categories at the documented minimum; the seeded profile 2
+stalls were scheduling cycles rather than reservation leaks. Optional
+maintenance now releases only applied, announced cache entries and only when
+that restores the capture baseline; a capture hint whose baseline is
+unavailable is deferred instead of holding transitions busy; a lagging peer is
+served before the cache slot loaded for it can be reused; entries are not
+loaded for application while a transition forbids it; a primary announces
+commits to peers whose next entry lies below its trimmed log; and a witness
+needs coverage only for retained entries it actually discards. Increasing test
+defaults is not a substitute for checking the accepted minimum. Large
+command/small manifest and small command/large manifest configurations need
+separate fault campaigns.

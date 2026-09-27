@@ -188,6 +188,11 @@ bool vsr_extension_apply_allowed(struct vsr *v, const struct vsr_entry *entry)
            vsr_transition_apply_allowed(v);
 }
 
+bool vsr_extension_apply_ready(const struct vsr *v)
+{
+    return vsr_transition_apply_allowed(v);
+}
+
 void vsr_extension_committed(struct vsr *v, const struct vsr_entry *entry)
 {
     vsr_epochs_committed(v, entry);
