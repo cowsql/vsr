@@ -34,3 +34,4 @@
 /tests/unit/checked
 /tests/fuzzy/checked
 __pycache__/
+/.claude/
