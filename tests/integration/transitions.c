@@ -31,7 +31,8 @@ static void drive(struct group *group, enum schedule schedule)
                 continue;
             struct mem_step step = mem_node_event(node, NULL);
             CHECK(step.result == VSR_OK || step.result == VSR_AGAIN);
-            progress |= step.emitted != 0 || (step.flags & VSR_UPDATE_MORE) != 0;
+            progress |=
+                step.emitted != 0 || (step.flags & VSR_UPDATE_MORE) != 0;
             for (size_t j = 0; j < mem_node_effects(node); j++) {
                 const struct vsr_op *operation = mem_node_effect(node, j);
                 if (schedule == HOLD_LOG && operation->type == VSR_OP_LOAD &&
@@ -72,7 +73,7 @@ static void drive(struct group *group, enum schedule schedule)
 }
 
 static struct group create(uint32_t count, uint32_t durability,
-                            uint32_t operations, bool minimum)
+                           uint32_t operations, bool minimum)
 {
     struct group result = {.cluster = mem_cluster_create(), .count = count};
     struct vsr_member members[5];
@@ -143,7 +144,7 @@ static void converge(struct group *group, uint64_t first, uint64_t committed)
 }
 
 static void inherited_suffix(uint32_t durability, uint32_t operations,
-                              bool minimum)
+                             bool minimum)
 {
     struct group group = create(3, durability, operations, minimum);
     command(group.nodes[0], 1);
@@ -216,7 +217,8 @@ static void recovered_reconfiguration_fence(void)
     const struct vsr_membership next = {1, members, 3, 1};
     const struct vsr_request request = {
         {{101, 1}, 1}, 0, VSR_REQUEST_RECONFIGURE, 0, &next};
-    const struct vsr_event input = {VSR_EVENT_REQUEST, VSR_IO_OK, 1, &request, 1};
+    const struct vsr_event input = {VSR_EVENT_REQUEST, VSR_IO_OK, 1, &request,
+                                    1};
     CHECK(mem_node_event(group.nodes[0], &input).consumed == 1);
     drive(&group, NO_ACKS);
     CHECK(status(group.nodes[0]).committed == 0);
@@ -224,8 +226,8 @@ static void recovered_reconfiguration_fence(void)
     CHECK(mem_node_restart(group.nodes[0], (struct vsr_id){99, 1}) == VSR_OK);
     /* Messages racing LOAD_RECOVERY cannot cause a STORE against unknown
      * identity/frontiers or advance a view before durable recovery finishes. */
-    const struct vsr_message early = {{1, 1}, 0, 9, 2,
-                                       VSR_MSG_START_VIEW_CHANGE, 0, 0, NULL};
+    const struct vsr_message early = {
+        {1, 1}, 0, 9, 2, VSR_MSG_START_VIEW_CHANGE, 0, 0, NULL};
     const struct vsr_event message = {VSR_EVENT_MESSAGE, 0, 0, &early, 1};
     CHECK(mem_node_event(group.nodes[0], &message).consumed == 1);
     drive(&group, NO_ACKS);
