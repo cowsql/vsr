@@ -1,6 +1,6 @@
 # VSR
 
-VSR is a C library interface for Viewstamped Replication: one ordered history of
+VSR is a C interface for Viewstamped Replication: one ordered history of
 commands, replicated across a group that can recover from crashes and change
 membership.
 
@@ -8,9 +8,6 @@ The core is deterministic, single-threaded, and asynchronous. An application
 supplies events and receives operations to execute. The core performs no I/O,
 reads no clocks, invokes no callbacks, and allocates no memory. Transport,
 storage, application execution, and scheduling belong to the host.
-
-The repository contains the public API, design specification, and compile-time
-interface checks. A replica engine and runtime tests are not yet included.
 
 ## Execution model
 
@@ -61,10 +58,18 @@ witnesses store protocol state and log entries. `VSR_DURABLE` persists safety
 state before dependent protocol actions. `VSR_REPLICATED` relies on surviving
 replicas and requires quorum recovery after every restart.
 
+Reconfiguration ends an epoch at a committed log entry and transfers that history
+to the next group. A successful `CHECK_EPOCH` for the target epoch certifies that
+the old donors can retire. Client retries retain their original request identity
+and body across redirects. Full replicas preserve duplicate suppression in
+indexed storage and checkpoints, independently of the in-memory cache.
+
 ## Documentation and checks
 
 - [Design](DESIGN.md): assumptions, invariants, and performance constraints.
 - [Public header](include/vsr.h): types, lifetimes, limits, and function contracts.
+- [Protocol contract](docs/protocol.md): quorums, message validation, recovery,
+  reads, and membership transitions.
 - [Adapter reference](docs/vsr-api.md): driving, storage, snapshots, and failures.
 
 Run the interface checks with:
@@ -73,5 +78,6 @@ Run the interface checks with:
 make check
 ```
 
-These checks compile the API and verify descriptor layouts on supported test
-ABIs. They do not establish protocol correctness or measured performance.
+These checks verify C11/C++11 compatibility, function signatures, and descriptor
+layouts. The design specifies the separate protocol and performance validation
+requirements.

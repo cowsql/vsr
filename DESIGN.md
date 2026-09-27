@@ -9,8 +9,9 @@ actions and reports their outcomes. The public contract is
 The protocol foundation is Liskov and Cowling's
 [Viewstamped Replication Revisited](https://pages.cs.wisc.edu/~remzi/Classes/739/Papers/vr-revisited.pdf).
 Logical storage transactions, explicit ownership, bounded scheduling, and fresh
-quorum read barriers are library contracts. Their correctness must be validated
-together with the protocol.
+quorum read barriers are library contracts. The
+[protocol contract](docs/protocol.md) specifies their interaction with recovery,
+membership changes, and witness retention.
 
 ## Assumptions
 
@@ -22,8 +23,10 @@ and storage that falsely acknowledges durability are outside the model.
 Commands and their results are deterministic from the same initial application
 state. Time, randomness, and other nondeterministic choices enter as command
 data. Timeouts affect progress, not safety. Progress requires an available
-quorum, an eligible full replica, eventual communication, and continued service
-of time events and external operations.
+quorum, an eligible full replica, communication and execution delays eventually
+within the configured timeouts, and continued service of time events and external
+operations. At most `f` members may have lost unrecovered safety state; successive
+restarts do not reset that failure budget.
 
 A configuration has `n >= 2f + 1` members and quorum size `n - f`. At least
 `f + 1` are full replicas; witnesses never lead or execute commands. Membership
@@ -49,6 +52,9 @@ A replica acknowledges only a contiguous prepared prefix. A primary commits
 only after the required quorum has prepared that prefix in the current epoch
 and view. Full replicas execute committed entries in order; commitment,
 application, readable storage, and durable storage are separate progress values.
+Every quorum counts distinct members of one configuration. The local replica
+counts only after satisfying the same state and persistence requirements as a
+remote voter. Witnesses vote but never supply application results.
 
 View change selects a log by its last normal view, then its last operation,
 and preserves the greatest known committed prefix. Bounded log offers are
@@ -90,6 +96,8 @@ copying, transfer, and persistence proceed asynchronously afterwards. Durable
 contents precede durable publication, which precedes dependent trimming.
 Installing a checkpoint selects a matching store base without weakening current
 view or epoch fences, then restores the application and replays its suffix.
+Restoration retains validated suffix entries by reference, so transaction size
+does not grow with history. Missing entries arrive in bounded subsequent batches.
 
 Replay executes every committed entry after the checkpoint, including requests
 whose result records survived the crash. Duplicate suppression must not skip
@@ -113,6 +121,11 @@ new full members with recoverable state through the boundary. Removed replicas
 serve transfer until this condition holds, then become `RETIRED`. With witnesses,
 this conservative retention rule can delay retirement while a full member is
 unavailable, even when normal commands can commit.
+`CHECK_EPOCH` has an immutable target independent of its routing epoch. Its
+successful result cannot be executed, cached, or replied to before that handoff
+is safe. Another reconfiguration is admitted only after the current handoff is
+complete. Demoted full members retain their donor state until then; voting and
+primary eligibility follow the new membership immediately on entering its epoch.
 
 Full replicas retain a checkpoint plus its subsequent log. Witnesses can trim a
 prefix only after at least `f + 1` full members in the responsible configuration
@@ -134,7 +147,8 @@ Local client queries describe local knowledge; they cannot safely allocate a
 replacement request number after a client loses its own sequence state.
 
 An unlogged linearizable read requires a normal primary that has committed a
-current-view no-op after its inherited log. After admitting the read, it obtains
+current-view entry after its inherited log. An existing command can establish
+this fence; otherwise the core proposes a no-op. After admitting the read, it obtains
 fresh quorum confirmation tied to a nonce, epoch, view, and commit floor. It
 waits for that floor and the requested minimum to be applied, then fences
 application mutation while the host captures a read snapshot. An unfinished
@@ -175,4 +189,7 @@ transaction and checkpoint boundaries, and exhaustive ownership accounting under
 small arenas and saturated queues. Safety cases include stale read probes,
 recovery during view change, disjoint membership handoff, and witness promotion.
 Allocation, copying, cache behavior, throughput, and latency require measurement;
-public structure sizes alone are not performance evidence.
+public structure sizes alone are not performance evidence. The validation matrix
+also covers maximum-size commands/results under completion backpressure,
+checkpoint restore with a suffix larger than one transaction, duplicate
+CHECK_EPOCH requests across redirects, and demotion during disjoint handoff.

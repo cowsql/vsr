@@ -20,6 +20,7 @@ CHECK_LAYOUT(sizeof(struct vsr_member) == 16, member_is_16_bytes);
 CHECK_LAYOUT(sizeof(struct vsr_client_record) == 64, client_record_is_64_bytes);
 CHECK_LAYOUT(sizeof(struct vsr_read_barrier) == 24, read_barrier_is_24_bytes);
 CHECK_LAYOUT(sizeof(struct vsr_failure) == 24, failure_is_24_bytes);
+CHECK_LAYOUT(sizeof(struct vsr_check_epoch) == 8, epoch_target_is_8_bytes);
 CHECK_LAYOUT(offsetof(struct vsr_event, data) == 16, event_body_offset);
 CHECK_LAYOUT(offsetof(struct vsr_op, data) == 16, operation_body_offset);
 CHECK_LAYOUT(offsetof(struct vsr_message, body) == 56, message_body_offset);
@@ -99,7 +100,20 @@ int vsr_header_payload_check(struct vsr *v,
         { UINT64_C(1), UINT64_C(2) }, 0, 0, UINT64_C(7),
         VSR_MSG_NEW_STATE, 0, 0, &chunk
     };
+    /* Routing can advance without changing the logged handoff target. */
+    const struct vsr_check_epoch target = { UINT64_C(1) };
+    const struct vsr_request check_epoch = {
+        { { UINT64_C(9), UINT64_C(10) }, UINT64_C(2) },
+        UINT64_C(2), VSR_REQUEST_CHECK_EPOCH, 0, &target
+    };
+    const struct vsr_entry epoch_entry = {
+        UINT64_C(12), UINT64_C(2), 0,
+        { { UINT64_C(9), UINT64_C(10) }, UINT64_C(2) },
+        VSR_REQUEST_CHECK_EPOCH, 0, &target
+    };
     struct vsr_status status;
+    (void)check_epoch;
+    (void)epoch_entry;
     (void)completion;
     (void)read;
     (void)transaction;

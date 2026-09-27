@@ -1,8 +1,9 @@
 # Adapter reference
 
 [include/vsr.h](../include/vsr.h) defines the public types and entry points.
-[DESIGN.md](../DESIGN.md) defines the protocol invariants. This reference specifies
-how an adapter drives an instance and implements its external operations.
+[DESIGN.md](../DESIGN.md) defines the design principles, and the
+[protocol contract](protocol.md) defines quorum and message rules. This reference
+specifies how an adapter drives an instance and implements its external operations.
 
 ## Initialization
 
@@ -46,6 +47,17 @@ Admission additionally reserves space for each operation's maximum completion.
 Limit exhaustion must defer new work before consuming those reserves.
 Configuration, entry-count, span-count, command, result, manifest, and message
 limits are deployment compatibility requirements; there is no peer negotiation.
+Replicas in a deployment use identical values for those limits. Operational
+queue/cache capacities, timing, and checkpoint intervals may differ. The planner
+checks all completion-size arithmetic, including `batch_entries * result_bytes`.
+APPLY batches may be shortened to fit current reservations. A legal maximum-size
+command must remain processable with its maximum-size result and a checkpoint
+manifest; otherwise `vsr_layout` returns `VSR_ELIMIT`.
+
+`VSR_API_VERSION` identifies the source contract. It is not a wire, storage, or
+application-schema version. Build adapters and the library against the same
+header. The deployment owns codec/schema compatibility; it must not negotiate
+away quorum, durability, identity, or retention requirements.
 
 ## Driving the core
 
@@ -130,6 +142,11 @@ once per occurrence in each admitted graph, including duplicate references;
 sharing across leases counts again. Core-generated references to an existing
 lease add no charge. Reserved completion capacity is unavailable to new input.
 Adapters separately account for backing allocation sizes and external queues.
+Admission also reserves the resources needed to make accepted input releasable:
+an input queue cannot consume the final slots needed for its own LOAD, STORE,
+APPLY, or result. Peer control traffic and bounded completions retain a path to
+progress while proposal traffic is throttled. A permanently inadmissible graph
+returns `ELIMIT`; temporary resource pressure returns `AGAIN` without consuming it.
 
 ## Requests, replies, and reads
 
@@ -172,6 +189,22 @@ command; a query alone cannot reconstruct a safe next number. A fresh incarnatio
 avoids number reuse but does not resolve an old command's uncertain outcome.
 No client-record deletion API is provided: eviction removes a memory cache entry,
 not persistent duplicate suppression.
+Identity reuse with different contents violates the client contract. The core
+can reject conflicts while the original entry is available; completed records
+do not retain command bodies for indefinite comparison. A newer request cannot
+overtake a known pending request from the same client: it receives `BUSY` until
+that request resolves. Applications needing multiple outstanding commands use
+independent client incarnations.
+
+`CHECK_EPOCH` carries `struct vsr_check_epoch`, whose `epoch` is immutable across
+retries. The target may equal or precede the routing epoch; a future target is
+`INVALID`. Success certifies completion of handoff into the target, with epoch 0
+trivially ready. The request is logged in the current epoch. Application progress
+stops before a CHECK_EPOCH entry whose target handoff is unfinished; it produces
+no completed client record or successful duplicate reply before readiness. Since
+successive reconfigurations require the preceding handoff to complete, a target
+older than the current epoch is already safe. RECONFIGURE similarly preserves
+its target membership on retry; a fresh proposal must target routing epoch + 1.
 
 `READ` carries an applied minimum and an absolute deadline, or
 `VSR_NO_DEADLINE`. A zero deadline is already expired once time is established.
@@ -187,6 +220,10 @@ the operation. Evaluation and delivery may continue independently on that
 snapshot. No APPLY, INSTALL, or CAPTURE overlaps the fence. Once READ_READY is
 emitted, its deadline no longer cancels the pin; the adapter must complete it.
 Failed read delivery abandons the local route. The core produces no read value.
+Fences are serialized; each READY describes the exact captured boundary, not a
+promise that the live application will remain there after completion. Causal
+reads provide dependency ordering only when the caller propagates committed
+positions from this cluster. They do not establish cross-cluster causality.
 
 ## Indexed storage
 
@@ -203,14 +240,23 @@ and transactions in sequence order, regardless of physical write scheduling.
 | `CLIENTS` | `first=0, count>0`; update latest completed client records |
 | `HARD_STATE` | `first=0, count=1`; replace protocol metadata without weakening fences |
 | `PUBLISH_CHECKPOINT` | `first=0, count=1`; replace recovery anchor without resetting live state |
-| `RESTORE_CHECKPOINT` | `first=0, count=1`; reset log/client base to the selected checkpoint |
+| `RESTORE_CHECKPOINT` | `first=0, count=1`; replace checkpoint/client base, retaining validated log entries above its op |
 | `TRIM` | `first>=1, count=0, data=NULL`; remove covered log entries below first |
 
 APPEND and CLIENTS arrays each contain at most `batch_entries` items. Every
 transaction has at most `VSR_MAX_STORE_CHANGES` changes. TRUNCATE followed by
-APPEND replaces an uncommitted suffix. RESTORE includes the appropriate hard
-state and any retained suffix in the same atomic transaction; it neither
-installs the application nor resets local identity or storage sequence.
+APPEND replaces an uncommitted suffix. RESTORE replaces the completed-client
+table with the checkpoint's table and removes log entries through checkpoint.op.
+Entries above it remain by reference; the retained-request index is rebuilt
+logically from that suffix. The resulting range begins at checkpoint.op + 1 and
+ends at the greater of that position and the previous log end. A preceding
+TRUNCATE in the transaction removes any divergent uncommitted tail. The core
+validates every retained suffix against the selected history before RESTORE.
+The same transaction includes HARD_STATE, without reducing known commitment or
+view/epoch fences. Missing suffix entries arrive through bounded later APPENDs;
+no voting or normal service resumes before the selected history is installed.
+RESTORE neither installs the application nor resets local identity or storage
+sequence. On witnesses it installs only the remote anchor and protocol indexes.
 
 Maintain an index from client ID to its latest retained log entry. APPEND,
 TRUNCATE, RESTORE, and TRIM update that index atomically with the log. Completed
@@ -233,6 +279,13 @@ never return empty nonterminal success. Empty ranges are valid. For other loads,
 NULL items. Entirely uninitialized storage returns RECOVERY/NOT_FOUND. Expected
 compacted log ranges may return NOT_FOUND; an unexplained hole in retained local
 history or a missing live revision is fatal.
+Because LOAD addresses an exact retained revision, compaction of a newer revision
+cannot make its entries disappear. A requested range outside a known retained
+range is expected absence; an issued valid read losing its data is not. Non-LOG
+loads use `first=end=0`; RECOVERY uses sequence 0 and a zero client ID. LOG uses
+a zero client ID. All returned blobs obey both the operation's byte budget and
+their per-object limits. The recovered log/checkpoint bounds are the same as
+those for a log offer in the protocol contract.
 
 STORE success means the complete transaction is readable and independent of its
 operation pin, not necessarily durable. SYNC success certifies all transactions
@@ -264,6 +317,12 @@ chosen by view change. A successful chunk echoes the nonce and first, contains
 exactly `[first,next)`, and advances toward the requested end. Metadata remains
 fixed for that revision even if the sender's current envelope view advances.
 All responses are checked against the outstanding request and protocol context.
+`max_bytes` bounds every blob in the response, including its checkpoint manifest,
+and `max_entries` bounds its entry array. Every fetch reserves at least
+`command_bytes + manifest_bytes` and at most `message_bytes`. A nonempty range
+must return at least one entry on success; an empty range returns `next=first=end`. Discovery
+has no entries. STATE_UNAVAILABLE also obeys the byte limit. Responding to a
+fetch never changes the source revision's commitment or epoch metadata.
 
 Unknown/expired revisions or unavailable ranges produce STATE_UNAVAILABLE with
 the echoed nonce and first, `next=first`, and a current offer without chunk data.
@@ -295,7 +354,9 @@ new groups only after the sender has recoverable state through the boundary;
 full members have also rebuilt application/client state. Handoff completion
 combines distinct current-member acknowledgments under DESIGN.md's quorum and
 full-member retention rule. The epoch metadata remains after handoff so a
-restart can recover the configuration and removal boundary.
+restart can recover the configuration and removal boundary. A demoted full
+member keeps its donor image and materialized FULL role until handoff permits
+release, even though voting and primary eligibility use the new membership.
 
 In durable mode the order is SNAPSHOT_SYNC, STORE publication/restoration, SYNC
 of that store revision, then dependent trimming or participation. PUBLISH does
@@ -305,6 +366,19 @@ A failed INSTALL cannot be reported as partial success. Successful CAPTURE/FETCH
 objects remain available until DROP or STOPPED, including when a subsequent
 transition makes their original purpose obsolete. References from retained store
 revisions and independent adapter readers can keep objects alive beyond either.
+A successful RECOVERY load on a materialized full replica acquires a local hold
+on its recovered checkpoint. Local core holds are keyed by snapshot ID: repeated
+successful FETCH of the same ID shares one hold and requires one eventual DROP, not a DROP for each FETCH.
+The core does not FETCH an ID while its DROP is in flight. After a completed
+DROP, a subsequent FETCH can establish a new hold. An adapter cleans up private
+partial CAPTURE/FETCH objects after failure. Corruption reported by any snapshot
+operation fences the instance with `VSR_FAILURE_SNAPSHOT`.
+
+CHECKPOINT events and `checkpoint_interval` are coalescible scheduling hints,
+not completion promises. They capture only eligible applied progress, and may
+be deferred while replay, transfer, or another application fence is active.
+Witnesses ignore local capture hints. Observe `checkpoint_op` to track published
+coverage; snapshot capture alone does not advance it.
 
 For witnesses, a published checkpoint is a remote recovery anchor only; no local
 application image or completed-client table is implied. Such anchors may be
@@ -336,11 +410,11 @@ obligation; independent adapter readers can delay physical reclamation.
 | REPLY / READ_READY | Abandon local delivery; client may retry |
 | LOAD | Retry transient unavailability; expected absence follows load rules; corruption, unexpected absence, or permanent failure fences storage |
 | STORE / SYNC | Fence storage on every non-success, including cancellation/retry |
-| APPLY / INSTALL | Fence application on every non-success |
-| CAPTURE | Release the capture fence and retry; failure exposes no usable snapshot |
-| FETCH | Retry or discover another valid offer; no partial snapshot is adopted |
+| APPLY / INSTALL | Fence application on every non-success; INSTALL corruption latches snapshot failure |
+| CAPTURE | Retry ordinary failures; corruption fences snapshot state; no partial object is adopted |
+| FETCH | Retry unavailability or discover another valid offer; corruption fences snapshot state |
 | SNAPSHOT_SYNC | Fence snapshot durability on every non-success |
-| RECLAIM / DROP | Retry cleanup without changing consensus |
+| RECLAIM / DROP | Retry cleanup; reported corruption fences the affected storage or snapshot state |
 | Identity mismatch / exhausted counter / invariant violation | Fence immediately and latch the corresponding diagnostic |
 
 `vsr_get_status` exposes the first fatal failure, its triggering operation and
