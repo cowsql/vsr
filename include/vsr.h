@@ -4,12 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /*
- * VSR: deterministic, asynchronous Viewstamped Replication for C11 and C++11.
+ * VSR: deterministic, asynchronous Viewstamped Replication for C11.
  *
  * One owner thread per instance; no overlapping/reentrant calls, callbacks,
  * I/O, clock reads, randomness, or hidden allocation. All external work is
@@ -35,7 +31,7 @@ extern "C" {
  */
 struct vsr;
 
-#define VSR_API_VERSION 1u        /* Source API, independent of adapter formats. */
+#define VSR_API_VERSION 1u /* Source API, independent of adapter formats. */
 #define VSR_NO_REPLICA UINT64_C(0)
 #define VSR_NO_DEADLINE UINT64_MAX
 #define VSR_MAX_STORE_CHANGES 8u
@@ -58,42 +54,42 @@ struct vsr_span {
  */
 struct vsr_blob {
     const struct vsr_span *spans;
-    uint64_t size;                /* Sum of span sizes, checked on admission. */
+    uint64_t size; /* Sum of span sizes, checked on admission. */
     uint32_t count;
     uint32_t reserved;
 };
 
 enum vsr_result {
     VSR_OK = 0,
-    VSR_AGAIN = 1,               /* Budget/backpressure; inspect update flags. */
-    VSR_EINVAL = -1,             /* Invalid argument, shape, or completion. */
-    VSR_ELIMIT = -2,             /* Permanent size/capacity/overflow violation. */
-    VSR_EBUSY = -3               /* Deinit before STOPPED. */
+    VSR_AGAIN = 1,   /* Budget/backpressure; inspect update flags. */
+    VSR_EINVAL = -1, /* Invalid argument, shape, or completion. */
+    VSR_ELIMIT = -2, /* Permanent size/capacity/overflow violation. */
+    VSR_EBUSY = -3   /* Deinit before STOPPED. */
 };
 
 enum vsr_io_status {
     VSR_IO_OK = 0,
-    VSR_IO_RETRY,                /* Transient unavailability, no success implied. */
-    VSR_IO_NOT_FOUND,            /* Absent store/range/snapshot; see LOAD rules. */
-    VSR_IO_CORRUPT,              /* Integrity or logical consistency failure. */
-    VSR_IO_FAILED,               /* Permanent or ambiguous failure. */
-    VSR_IO_CANCELLED             /* Accesses ended; no success implied. */
+    VSR_IO_RETRY,     /* Transient unavailability, no success implied. */
+    VSR_IO_NOT_FOUND, /* Absent store/range/snapshot; see LOAD rules. */
+    VSR_IO_CORRUPT,   /* Integrity or logical consistency failure. */
+    VSR_IO_FAILED,    /* Permanent or ambiguous failure. */
+    VSR_IO_CANCELLED  /* Accesses ended; no success implied. */
 };
 
 enum vsr_durability {
-    VSR_DURABLE,                 /* Persist safety state before relying on it. */
-    VSR_REPLICATED               /* VR recovery quorum required after restart. */
+    VSR_DURABLE,   /* Persist safety state before relying on it. */
+    VSR_REPLICATED /* VR recovery quorum required after restart. */
 };
 
 enum vsr_member_role {
-    VSR_MEMBER_NONE,             /* Status only; invalid in a membership list. */
-    VSR_MEMBER_FULL,             /* Stores/applies state; eligible as primary. */
-    VSR_MEMBER_WITNESS           /* Votes/stores log; never primary or executor. */
+    VSR_MEMBER_NONE,   /* Status only; invalid in a membership list. */
+    VSR_MEMBER_FULL,   /* Stores/applies state; eligible as primary. */
+    VSR_MEMBER_WITNESS /* Votes/stores log; never primary or executor. */
 };
 
 struct vsr_member {
-    uint64_t id;                 /* Stable, nonzero; independent of array index. */
-    uint32_t role;               /* enum vsr_member_role */
+    uint64_t id;   /* Stable, nonzero; independent of array index. */
+    uint32_t role; /* enum vsr_member_role */
     uint32_t reserved;
 };
 
@@ -112,9 +108,9 @@ struct vsr_membership {
 };
 
 enum vsr_epoch_phase {
-    VSR_EPOCH_STEADY,            /* Initial epoch or completed group handoff. */
-    VSR_EPOCH_TRANSFERRING,      /* Boundary committed; local catch-up pending. */
-    VSR_EPOCH_INSTALLED          /* Local catch-up done; group handoff pending. */
+    VSR_EPOCH_STEADY,       /* Initial epoch or completed group handoff. */
+    VSR_EPOCH_TRANSFERRING, /* Boundary committed; local catch-up pending. */
+    VSR_EPOCH_INSTALLED     /* Local catch-up done; group handoff pending. */
 };
 
 /*
@@ -123,10 +119,12 @@ enum vsr_epoch_phase {
  * Peer/snapshot phases describe their owner, not the receiver's readiness.
  */
 struct vsr_epoch {
-    const struct vsr_membership *current;  /* Non-NULL, new group in a transition. */
-    const struct vsr_membership *previous; /* Immediate predecessor; NULL at 0. */
-    uint64_t boundary;           /* Reconfiguration ending previous; 0 at epoch 0. */
-    uint32_t phase;              /* enum vsr_epoch_phase; local progress only. */
+    const struct vsr_membership
+        *current; /* Non-NULL, new group in a transition. */
+    const struct vsr_membership
+        *previous;     /* Immediate predecessor; NULL at 0. */
+    uint64_t boundary; /* Reconfiguration ending previous; 0 at epoch 0. */
+    uint32_t phase;    /* enum vsr_epoch_phase; local progress only. */
     uint32_t reserved;
 };
 
@@ -137,22 +135,22 @@ enum vsr_state {
     VSR_STATE_NORMAL,
     VSR_STATE_VIEW_CHANGE,
     VSR_STATE_TRANSITIONING,
-    VSR_STATE_RETIRED,           /* Removal handoff completed; safe to stop. */
+    VSR_STATE_RETIRED, /* Removal handoff completed; safe to stop. */
     VSR_STATE_FAILED,
     VSR_STATE_STOPPING,
     VSR_STATE_STOPPED
 };
 
 struct vsr_request_id {
-    struct vsr_id client;        /* Stable, globally unique client incarnation. */
-    uint64_t number;             /* Nonzero, increasing; retry with same bytes. */
+    struct vsr_id client; /* Stable, globally unique client incarnation. */
+    uint64_t number;      /* Nonzero, increasing; retry with same bytes. */
 };
 
 enum vsr_request_type {
-    VSR_REQUEST_COMMAND,         /* body: vsr_blob, including an empty command. */
-    VSR_REQUEST_RECONFIGURE,     /* body: membership, epoch = request.epoch+1. */
-    VSR_REQUEST_CHECK_EPOCH,     /* body: vsr_check_epoch; logged handoff fence. */
-    VSR_REQUEST_NOOP             /* Internal only; body: NULL, entire ID zero. */
+    VSR_REQUEST_COMMAND,     /* body: vsr_blob, including an empty command. */
+    VSR_REQUEST_RECONFIGURE, /* body: membership, epoch = request.epoch+1. */
+    VSR_REQUEST_CHECK_EPOCH, /* body: vsr_check_epoch; logged handoff fence. */
+    VSR_REQUEST_NOOP         /* Internal only; body: NULL, entire ID zero. */
 };
 
 /*
@@ -161,7 +159,7 @@ enum vsr_request_type {
  * completed client record precedes target handoff readiness, including retries.
  */
 struct vsr_check_epoch {
-    uint64_t epoch;              /* Success certifies handoff into this epoch. */
+    uint64_t epoch; /* Success certifies handoff into this epoch. */
 };
 
 /*
@@ -179,7 +177,7 @@ struct vsr_check_epoch {
  */
 struct vsr_request {
     struct vsr_request_id id;
-    uint64_t epoch;              /* Routing epoch; not part of request identity. */
+    uint64_t epoch; /* Routing epoch; not part of request identity. */
     uint32_t type;
     uint32_t reserved;
     const void *body;
@@ -189,11 +187,11 @@ struct vsr_request {
 struct vsr_entry {
     uint64_t op;
     uint64_t epoch;
-    uint64_t view;               /* Original proposal view; not rewritten on fetch. */
+    uint64_t view; /* Original proposal view; not rewritten on fetch. */
     struct vsr_request_id request;
-    uint32_t type;               /* enum vsr_request_type */
+    uint32_t type; /* enum vsr_request_type */
     uint32_t reserved;
-    const void *body;            /* Same type mapping as vsr_request. */
+    const void *body; /* Same type mapping as vsr_request. */
 };
 
 struct vsr_entries {
@@ -204,7 +202,7 @@ struct vsr_entries {
 
 struct vsr_value {
     struct vsr_blob data;
-    int32_t code;               /* Deterministic application result, not I/O. */
+    int32_t code; /* Deterministic application result, not I/O. */
     uint32_t reserved;
 };
 
@@ -229,7 +227,7 @@ enum vsr_reply_status {
     VSR_REPLY_STALE_REQUEST,
     VSR_REPLY_CLIENT_UNKNOWN,
     VSR_REPLY_CLIENT_STATE,
-    VSR_REPLY_TIMEOUT            /* Local read deadline expired before readiness. */
+    VSR_REPLY_TIMEOUT /* Local read deadline expired before readiness. */
 };
 
 enum vsr_reply_flags {
@@ -237,19 +235,22 @@ enum vsr_reply_flags {
 };
 
 struct vsr_reply {
-    struct vsr_request_id request; /* Echo; CLIENT_QUERY instead reports latest ID. */
-    uint64_t op;                 /* Known request position; 0 if absent/rejected. */
+    struct vsr_request_id
+        request; /* Echo; CLIENT_QUERY instead reports latest ID. */
+    uint64_t op; /* Known request position; 0 if absent/rejected. */
     uint64_t view;
     uint64_t primary;
-    const struct vsr_membership *membership; /* Latest known group, else NULL. */
-    struct vsr_value result;     /* Empty unless EXECUTED; controls return code 0. */
+    const struct vsr_membership
+        *membership; /* Latest known group, else NULL. */
+    struct vsr_value
+        result; /* Empty unless EXECUTED; controls return code 0. */
     uint32_t status;
     uint32_t flags;
 };
 
 /* Unique across starts and attempts. counter > 0; incarnation is cluster-unique. */
 struct vsr_nonce {
-    struct vsr_id incarnation;   /* Supplied by caller at init, never reused. */
+    struct vsr_id incarnation; /* Supplied by caller at init, never reused. */
     uint64_t counter;
 };
 
@@ -269,31 +270,31 @@ struct vsr_revision {
 struct vsr_checkpoint {
     struct vsr_id id;
     uint64_t op;
-    uint64_t view;               /* Proposal view of entry at op; zero at genesis. */
+    uint64_t view; /* Proposal view of entry at op; zero at genesis. */
     const struct vsr_epoch *epoch;
     struct vsr_blob manifest;
 };
 
 enum vsr_message_type {
-    VSR_MSG_PREPARE,             /* number: last op; body: vsr_prepare */
-    VSR_MSG_PREPARE_OK,          /* number: last prepared op; body: NULL */
-    VSR_MSG_COMMIT,              /* number: commit op; body: NULL */
-    VSR_MSG_START_VIEW_CHANGE,   /* number: 0; body: NULL */
-    VSR_MSG_DO_VIEW_CHANGE,      /* number: last op; body: vsr_log_state */
-    VSR_MSG_START_VIEW,          /* number: last op; body: vsr_log_state */
-    VSR_MSG_RECOVERY,            /* number: 0; body: vsr_recovery */
-    VSR_MSG_RECOVERY_RESPONSE,   /* number: last op or 0; body: vsr_recovery */
-    VSR_MSG_GET_STATE,           /* number: 0; body: vsr_fetch (discovery/range) */
-    VSR_MSG_NEW_STATE,           /* number: last op; body: vsr_state_chunk */
-    VSR_MSG_GET_LOG,             /* number: 0; body: vsr_fetch (chosen log) */
-    VSR_MSG_LOG,                 /* number: last op; body: vsr_state_chunk */
-    VSR_MSG_STATE_UNAVAILABLE,   /* number: last op; body: vsr_state_chunk */
-    VSR_MSG_START_EPOCH,         /* number: boundary; body: vsr_epoch */
-    VSR_MSG_EPOCH_STARTED,       /* number: boundary; body: NULL; retention promise */
-    VSR_MSG_NEW_EPOCH,           /* number: boundary; body: vsr_epoch */
-    VSR_MSG_CHECKPOINT,          /* number: retained op; body: vsr_checkpoint */
-    VSR_MSG_READ_PROBE,          /* number: commit floor; body: vsr_nonce */
-    VSR_MSG_READ_ACK             /* number: commit floor; body: vsr_nonce */
+    VSR_MSG_PREPARE,           /* number: last op; body: vsr_prepare */
+    VSR_MSG_PREPARE_OK,        /* number: last prepared op; body: NULL */
+    VSR_MSG_COMMIT,            /* number: commit op; body: NULL */
+    VSR_MSG_START_VIEW_CHANGE, /* number: 0; body: NULL */
+    VSR_MSG_DO_VIEW_CHANGE,    /* number: last op; body: vsr_log_state */
+    VSR_MSG_START_VIEW,        /* number: last op; body: vsr_log_state */
+    VSR_MSG_RECOVERY,          /* number: 0; body: vsr_recovery */
+    VSR_MSG_RECOVERY_RESPONSE, /* number: last op or 0; body: vsr_recovery */
+    VSR_MSG_GET_STATE, /* number: 0; body: vsr_fetch (discovery/range) */
+    VSR_MSG_NEW_STATE, /* number: last op; body: vsr_state_chunk */
+    VSR_MSG_GET_LOG,   /* number: 0; body: vsr_fetch (chosen log) */
+    VSR_MSG_LOG,       /* number: last op; body: vsr_state_chunk */
+    VSR_MSG_STATE_UNAVAILABLE, /* number: last op; body: vsr_state_chunk */
+    VSR_MSG_START_EPOCH,       /* number: boundary; body: vsr_epoch */
+    VSR_MSG_EPOCH_STARTED, /* number: boundary; body: NULL; retention promise */
+    VSR_MSG_NEW_EPOCH,     /* number: boundary; body: vsr_epoch */
+    VSR_MSG_CHECKPOINT,    /* number: retained op; body: vsr_checkpoint */
+    VSR_MSG_READ_PROBE,    /* number: commit floor; body: vsr_nonce */
+    VSR_MSG_READ_ACK       /* number: commit floor; body: vsr_nonce */
 };
 
 /* A 64-byte hot envelope on common 64-bit ABIs. flags must be zero. */
@@ -339,24 +340,25 @@ struct vsr_log_state {
 
 struct vsr_recovery {
     struct vsr_nonce nonce;
-    const struct vsr_log_state *state; /* NULL in request/non-primary response. */
+    const struct vsr_log_state
+        *state; /* NULL in request/non-primary response. */
 };
 
 struct vsr_fetch {
     struct vsr_nonce nonce;
     struct vsr_revision revision; /* Zero for GET_STATE discovery. */
-    uint64_t first;              /* Discovery: first=end=0; otherwise first>=1. */
-    uint64_t end;                /* Exact requested range in the named revision. */
-    uint64_t max_bytes;          /* >= command_bytes+manifest_bytes; <= message_bytes. */
-    uint32_t max_entries;        /* Positive, <= batch_entries. */
+    uint64_t first;     /* Discovery: first=end=0; otherwise first>=1. */
+    uint64_t end;       /* Exact requested range in the named revision. */
+    uint64_t max_bytes; /* >= command_bytes+manifest_bytes; <= message_bytes. */
+    uint32_t max_entries; /* Positive, <= batch_entries. */
     uint32_t reserved;
 };
 
 struct vsr_state_chunk {
     struct vsr_nonce nonce;
     struct vsr_log_state state;
-    uint64_t first;              /* Echo fetch.first; zero for discovery. */
-    uint64_t next;               /* Next missing op; fetch.end if done; discovery=0. */
+    uint64_t first; /* Echo fetch.first; zero for discovery. */
+    uint64_t next;  /* Next missing op; fetch.end if done; discovery=0. */
 };
 
 /* Only these protocol states may be persisted; runtime stop/failure is local. */
@@ -371,11 +373,11 @@ enum vsr_hard_state_type {
 /* Logical recovery metadata; no physical WAL/file format is implied. */
 struct vsr_hard_state {
     uint64_t view;
-    uint64_t last_normal_view;   /* <= view; equal in HARD_NORMAL. */
+    uint64_t last_normal_view; /* <= view; equal in HARD_NORMAL. */
     uint64_t committed;
     const struct vsr_epoch *epoch;
-    uint32_t state;              /* enum vsr_hard_state_type */
-    uint32_t role;               /* Local materialized/warming role; survives restart. */
+    uint32_t state; /* enum vsr_hard_state_type */
+    uint32_t role;  /* Local materialized/warming role; survives restart. */
 };
 
 /* Immutable store identity, written once in transaction 1 of an empty store. */
@@ -388,7 +390,7 @@ struct vsr_store_identity {
 
 struct vsr_recovered {
     struct vsr_store_identity identity;
-    uint64_t sequence;           /* Last complete recovered store transaction. */
+    uint64_t sequence; /* Last complete recovered store transaction. */
     uint64_t log_begin;
     uint64_t log_end;
     struct vsr_hard_state hard;
@@ -396,39 +398,39 @@ struct vsr_recovered {
 };
 
 enum vsr_load_type {
-    VSR_LOAD_RECOVERY,           /* One vsr_recovered; only at startup. */
-    VSR_LOAD_LOG,                /* Contiguous vsr_entry array. */
-    VSR_LOAD_CLIENT,             /* Zero/one latest completed vsr_client_record. */
-    VSR_LOAD_REQUEST             /* Zero/one latest retained vsr_entry for client. */
+    VSR_LOAD_RECOVERY, /* One vsr_recovered; only at startup. */
+    VSR_LOAD_LOG,      /* Contiguous vsr_entry array. */
+    VSR_LOAD_CLIENT,   /* Zero/one latest completed vsr_client_record. */
+    VSR_LOAD_REQUEST   /* Zero/one latest retained vsr_entry for client. */
 };
 
 struct vsr_store_read {
-    uint64_t sequence;           /* Read this exact logical revision. */
-    uint64_t first;              /* LOG only; other read types use zero. */
-    uint64_t end;                /* LOG only. */
-    struct vsr_id client;        /* CLIENT/REQUEST only. */
-    uint64_t max_bytes;          /* Sum of blob payload bytes returned. */
-    uint32_t type;               /* enum vsr_load_type */
-    uint32_t max_count;          /* LOG: <= batch_entries; otherwise 1. */
+    uint64_t sequence;    /* Read this exact logical revision. */
+    uint64_t first;       /* LOG only; other read types use zero. */
+    uint64_t end;         /* LOG only. */
+    struct vsr_id client; /* CLIENT/REQUEST only. */
+    uint64_t max_bytes;   /* Sum of blob payload bytes returned. */
+    uint32_t type;        /* enum vsr_load_type */
+    uint32_t max_count;   /* LOG: <= batch_entries; otherwise 1. */
 };
 
 struct vsr_loaded {
-    const void *items;           /* Type selected by the matching LOAD op. */
-    uint64_t sequence;           /* Exact read revision; recovered one at startup. */
-    uint64_t next;               /* LOG continuation; end means complete; else 0. */
+    const void *items; /* Type selected by the matching LOAD op. */
+    uint64_t sequence; /* Exact read revision; recovered one at startup. */
+    uint64_t next;     /* LOG continuation; end means complete; else 0. */
     uint32_t count;
     uint32_t reserved;
 };
 
 enum vsr_change_type {
-    VSR_STORE_APPEND,            /* first/count/data: consecutive vsr_entry[]. */
-    VSR_STORE_TRUNCATE,          /* Remove uncommitted suffix at first; no data. */
-    VSR_STORE_CLIENTS,           /* count/data: completed vsr_client_record[]. */
-    VSR_STORE_HARD_STATE,        /* count=1, data: vsr_hard_state. */
+    VSR_STORE_APPEND,     /* first/count/data: consecutive vsr_entry[]. */
+    VSR_STORE_TRUNCATE,   /* Remove uncommitted suffix at first; no data. */
+    VSR_STORE_CLIENTS,    /* count/data: completed vsr_client_record[]. */
+    VSR_STORE_HARD_STATE, /* count=1, data: vsr_hard_state. */
     VSR_STORE_PUBLISH_CHECKPOINT, /* count=1, data: vsr_checkpoint. */
     VSR_STORE_RESTORE_CHECKPOINT, /* count=1, data: vsr_checkpoint; reset base. */
-    VSR_STORE_TRIM,              /* Remove prefix < first; no data. */
-    VSR_STORE_IDENTITY           /* count=1, data: vsr_store_identity; only once. */
+    VSR_STORE_TRIM,               /* Remove prefix < first; no data. */
+    VSR_STORE_IDENTITY /* count=1, data: vsr_store_identity; only once. */
 };
 
 struct vsr_change {
@@ -466,8 +468,8 @@ struct vsr_store {
 
 struct vsr_apply {
     struct vsr_entries batch;
-    uint64_t through;            /* Last entry op; nonempty batch, consecutive. */
-    uint32_t replay;             /* 0/1: rebuilding application state from a base. */
+    uint64_t through; /* Last entry op; nonempty batch, consecutive. */
+    uint32_t replay;  /* 0/1: rebuilding application state from a base. */
     uint32_t reserved;
 };
 
@@ -478,41 +480,43 @@ struct vsr_applied {
 };
 
 enum vsr_read_consistency {
-    VSR_READ_LINEARIZABLE,       /* Established view + fresh quorum confirmation. */
-    VSR_READ_CAUSAL              /* Full backup allowed; caller propagates min_op. */
+    VSR_READ_LINEARIZABLE, /* Established view + fresh quorum confirmation. */
+    VSR_READ_CAUSAL        /* Full backup allowed; caller propagates min_op. */
 };
 
 struct vsr_read_barrier {
-    uint64_t min_op;             /* Committed position in this cluster, or zero. */
-    uint64_t deadline_ns;        /* Absolute TIME domain; NO_DEADLINE disables. */
+    uint64_t min_op;      /* Committed position in this cluster, or zero. */
+    uint64_t deadline_ns; /* Absolute TIME domain; NO_DEADLINE disables. */
     uint32_t consistency;
     uint32_t reserved;
 };
 
 struct vsr_read_fence {
-    uint64_t cookie;             /* READ event ID, not a replicated request ID. */
+    uint64_t cookie; /* READ event ID, not a replicated request ID. */
     uint64_t applied;
     uint64_t epoch;
     uint64_t view;
 };
 
 struct vsr_snapshot_task {
-    uint64_t op;                 /* checkpoint.op, or 0 at genesis. */
-    uint64_t sequence;           /* CAPTURE: client revision; INSTALL: base; else 0. */
-    uint64_t peer;               /* FETCH source; zero for local tasks. */
-    const struct vsr_checkpoint *checkpoint; /* Template on CAPTURE; NULL at genesis. */
-    const struct vsr_checkpoint *basis; /* FETCH only: optional differential base. */
+    uint64_t op;       /* checkpoint.op, or 0 at genesis. */
+    uint64_t sequence; /* CAPTURE: client revision; INSTALL: base; else 0. */
+    uint64_t peer;     /* FETCH source; zero for local tasks. */
+    const struct vsr_checkpoint
+        *checkpoint; /* Template on CAPTURE; NULL at genesis. */
+    const struct vsr_checkpoint
+        *basis; /* FETCH only: optional differential base. */
 };
 
 enum vsr_event_type {
-    VSR_EVENT_TIME,              /* id: monotonic nanoseconds; data: NULL. */
-    VSR_EVENT_MESSAGE,           /* data: vsr_message; id: 0. */
-    VSR_EVENT_REQUEST,           /* data: vsr_request; id: nonzero reply route. */
-    VSR_EVENT_CLIENT_QUERY,      /* data: nonzero vsr_id; id: local reply route. */
-    VSR_EVENT_READ,              /* data: vsr_read_barrier; id: local cookie. */
-    VSR_EVENT_CHECKPOINT,        /* Coalescible local hint; id: 0, data: NULL. */
-    VSR_EVENT_COMPLETE,          /* id: operation ID; status: vsr_io_status. */
-    VSR_EVENT_STOP               /* Stop protocol work and drain; id=0, data=NULL. */
+    VSR_EVENT_TIME,         /* id: monotonic nanoseconds; data: NULL. */
+    VSR_EVENT_MESSAGE,      /* data: vsr_message; id: 0. */
+    VSR_EVENT_REQUEST,      /* data: vsr_request; id: nonzero reply route. */
+    VSR_EVENT_CLIENT_QUERY, /* data: nonzero vsr_id; id: local reply route. */
+    VSR_EVENT_READ,         /* data: vsr_read_barrier; id: local cookie. */
+    VSR_EVENT_CHECKPOINT,   /* Coalescible local hint; id: 0, data: NULL. */
+    VSR_EVENT_COMPLETE,     /* id: operation ID; status: vsr_io_status. */
+    VSR_EVENT_STOP          /* Stop protocol work and drain; id=0, data=NULL. */
 };
 
 /*
@@ -536,20 +540,20 @@ struct vsr_event {
 };
 
 enum vsr_op_type {
-    VSR_OP_SEND,                 /* data: vsr_message; arg: destination member. */
-    VSR_OP_REPLY,                /* data: vsr_reply; arg: local reply route. */
-    VSR_OP_LOAD,                 /* data: vsr_store_read; arg: 0. */
-    VSR_OP_STORE,                /* data: vsr_store; arg: 0. */
-    VSR_OP_SYNC,                 /* data: NULL; arg: store sequence to flush. */
-    VSR_OP_RECLAIM,              /* data: NULL; arg: oldest revision still needed. */
-    VSR_OP_APPLY,                /* data: vsr_apply; arg: 0. */
-    VSR_OP_READ_READY,           /* data: vsr_read_fence; arg: 0. */
-    VSR_OP_SNAPSHOT_CAPTURE,     /* data: vsr_snapshot_task; arg: 0. */
-    VSR_OP_SNAPSHOT_FETCH,       /* data: vsr_snapshot_task; arg: 0. */
-    VSR_OP_SNAPSHOT_SYNC,        /* data: vsr_snapshot_task; arg: 0. */
-    VSR_OP_SNAPSHOT_INSTALL,     /* data: vsr_snapshot_task; arg: 0. */
-    VSR_OP_SNAPSHOT_DROP,        /* data: vsr_snapshot_task; arg: 0. */
-    VSR_OP_RELEASE               /* data: NULL; arg: lease; id: 0; no completion. */
+    VSR_OP_SEND,       /* data: vsr_message; arg: destination member. */
+    VSR_OP_REPLY,      /* data: vsr_reply; arg: local reply route. */
+    VSR_OP_LOAD,       /* data: vsr_store_read; arg: 0. */
+    VSR_OP_STORE,      /* data: vsr_store; arg: 0. */
+    VSR_OP_SYNC,       /* data: NULL; arg: store sequence to flush. */
+    VSR_OP_RECLAIM,    /* data: NULL; arg: oldest revision still needed. */
+    VSR_OP_APPLY,      /* data: vsr_apply; arg: 0. */
+    VSR_OP_READ_READY, /* data: vsr_read_fence; arg: 0. */
+    VSR_OP_SNAPSHOT_CAPTURE, /* data: vsr_snapshot_task; arg: 0. */
+    VSR_OP_SNAPSHOT_FETCH,   /* data: vsr_snapshot_task; arg: 0. */
+    VSR_OP_SNAPSHOT_SYNC,    /* data: vsr_snapshot_task; arg: 0. */
+    VSR_OP_SNAPSHOT_INSTALL, /* data: vsr_snapshot_task; arg: 0. */
+    VSR_OP_SNAPSHOT_DROP,    /* data: vsr_snapshot_task; arg: 0. */
+    VSR_OP_RELEASE           /* data: NULL; arg: lease; id: 0; no completion. */
 };
 
 /*
@@ -626,25 +630,27 @@ struct vsr_op {
 };
 
 enum vsr_update_flags {
-    VSR_UPDATE_MORE = 1u << 0,       /* Runnable work: drain with no new events. */
-    VSR_UPDATE_OUTPUT_FULL = 1u << 1, /* More output needs slots; implies MORE. */
+    VSR_UPDATE_MORE = 1u << 0, /* Runnable work: drain with no new events. */
+    VSR_UPDATE_OUTPUT_FULL = 1u
+                             << 1, /* More output needs slots; implies MORE. */
     VSR_UPDATE_INPUT_BLOCKED = 1u << 2, /* Head event needs freed resources. */
-    VSR_UPDATE_STATE_CHANGED = 1u << 3  /* State/role/epoch/phase/view/failure changed. */
+    VSR_UPDATE_STATE_CHANGED =
+        1u << 3 /* State/role/epoch/phase/view/failure changed. */
 };
 
 struct vsr_update {
-    struct vsr_op *ops;           /* Caller-owned contiguous array. */
-    uint32_t capacity;           /* Input; must be >= 1. */
-    uint32_t count;              /* Output: populated operation descriptors. */
-    uint32_t consumed;           /* Output: accepted prefix of input events. */
+    struct vsr_op *ops; /* Caller-owned contiguous array. */
+    uint32_t capacity;  /* Input; must be >= 1. */
+    uint32_t count;     /* Output: populated operation descriptors. */
+    uint32_t consumed;  /* Output: accepted prefix of input events. */
     uint32_t flags;
-    uint64_t deadline_ns;        /* Replaces prior deadline; NO_DEADLINE cancels. */
+    uint64_t deadline_ns; /* Replaces prior deadline; NO_DEADLINE cancels. */
 };
 
 enum vsr_start_mode {
-    VSR_START_NEW,               /* Explicit new cluster, never lost-state reset. */
-    VSR_START_RECOVER,           /* Load local state, then recover as required. */
-    VSR_START_JOIN               /* Nonvoting warm-up using seed membership. */
+    VSR_START_NEW,     /* Explicit new cluster, never lost-state reset. */
+    VSR_START_RECOVER, /* Load local state, then recover as required. */
+    VSR_START_JOIN     /* Nonvoting warm-up using seed membership. */
 };
 
 /*
@@ -661,40 +667,45 @@ enum vsr_start_mode {
  * across all replicas; cache/queue capacities may differ. No size negotiation.
  */
 struct vsr_limits {
-    uint32_t members;            /* Per config; reserve old AND new membership. */
-    uint32_t operations;         /* Outstanding effects, independent of batches. */
+    uint32_t members;    /* Per config; reserve old AND new membership. */
+    uint32_t operations; /* Outstanding effects, independent of batches. */
     uint32_t input_leases;
-    uint32_t pending_requests;   /* Local request/query reply routes. */
-    uint32_t pending_reads;      /* Waiting read barriers and active read fences. */
-    uint32_t transfers;          /* Concurrent incoming/outgoing log offers. */
+    uint32_t pending_requests; /* Local request/query reply routes. */
+    uint32_t pending_reads; /* Waiting read barriers and active read fences. */
+    uint32_t transfers;     /* Concurrent incoming/outgoing log offers. */
     uint32_t log_cache_entries;
     uint32_t client_cache_entries;
     uint32_t batch_entries;
     uint32_t spans_per_blob;
-    uint32_t work_per_step;      /* Bounded internal transitions per call. */
+    uint32_t work_per_step; /* Bounded internal transitions per call. */
     uint64_t command_bytes;
     uint64_t result_bytes;
-    uint64_t manifest_bytes;     /* Per checkpoint descriptor, not snapshot data. */
-    uint64_t message_bytes;      /* Aggregate blob bytes per message/log load. */
-    uint64_t pinned_payload_bytes; /* Includes reserved LOAD/APPLY/snapshot results. */
+    uint64_t manifest_bytes; /* Per checkpoint descriptor, not snapshot data. */
+    uint64_t message_bytes;  /* Aggregate blob bytes per message/log load. */
+    uint64_t
+        pinned_payload_bytes; /* Includes reserved LOAD/APPLY/snapshot results. */
 };
 
 struct vsr_options {
     struct vsr_id cluster;
-    struct vsr_id incarnation;   /* Fresh across starts, including storage loss. */
+    struct vsr_id
+        incarnation; /* Fresh across starts, including storage loss. */
     uint64_t replica;
-    const struct vsr_membership *seed; /* Required: genesis group or discovery hint. */
+    const struct vsr_membership
+        *seed; /* Required: genesis group or discovery hint. */
     struct vsr_limits limits;
     uint64_t heartbeat_ns;
-    uint64_t view_timeout_ns;    /* Greater than heartbeat_ns > 0. */
-    uint64_t retry_ns;           /* Nonzero. */
+    uint64_t view_timeout_ns;     /* Greater than heartbeat_ns > 0. */
+    uint64_t retry_ns;            /* Nonzero. */
     uint64_t transfer_timeout_ns; /* Nonzero; idle log-offer retention. */
-    uint64_t batch_delay_ns;     /* 0: no intentional batching delay. */
-    uint64_t checkpoint_interval; /* In operations; 0: explicit requests only. */
-    uint32_t start_mode;         /* enum vsr_start_mode */
-    uint32_t durability;         /* enum vsr_durability */
-    uint32_t join_role;          /* JOIN: FULL/WITNESS; otherwise MEMBER_NONE. */
-    uint32_t cache_line_bytes;   /* Power of two; 0 selects 64, not CPU detection. */
+    uint64_t batch_delay_ns;      /* 0: no intentional batching delay. */
+    uint64_t
+        checkpoint_interval; /* In operations; 0: explicit requests only. */
+    uint32_t start_mode;     /* enum vsr_start_mode */
+    uint32_t durability;     /* enum vsr_durability */
+    uint32_t join_role;      /* JOIN: FULL/WITNESS; otherwise MEMBER_NONE. */
+    uint32_t
+        cache_line_bytes; /* Power of two; 0 selects 64, not CPU detection. */
     uint32_t reserved;
 };
 
@@ -705,20 +716,20 @@ struct vsr_layout {
 
 enum vsr_failure_code {
     VSR_FAILURE_NONE,
-    VSR_FAILURE_IDENTITY,        /* Cluster/replica/policy mismatch or NEW reused. */
-    VSR_FAILURE_STORAGE,         /* Unsafe/unreadable logical storage. */
-    VSR_FAILURE_APPLICATION,     /* Failed apply/install or invalid app output. */
-    VSR_FAILURE_SNAPSHOT,        /* Snapshot durability/integrity failure. */
-    VSR_FAILURE_EXHAUSTED,       /* Counter/time domain exhausted; never wrap. */
-    VSR_FAILURE_INVARIANT        /* Internally inconsistent protocol state. */
+    VSR_FAILURE_IDENTITY, /* Cluster/replica/policy mismatch or NEW reused. */
+    VSR_FAILURE_STORAGE,  /* Unsafe/unreadable logical storage. */
+    VSR_FAILURE_APPLICATION, /* Failed apply/install or invalid app output. */
+    VSR_FAILURE_SNAPSHOT,    /* Snapshot durability/integrity failure. */
+    VSR_FAILURE_EXHAUSTED,   /* Counter/time domain exhausted; never wrap. */
+    VSR_FAILURE_INVARIANT    /* Internally inconsistent protocol state. */
 };
 
 /* First fatal failure is latched through STOPPED; zero fields without an op. */
 struct vsr_failure {
     uint64_t operation;
-    uint32_t code;               /* enum vsr_failure_code */
-    uint32_t operation_type;     /* enum vsr_op_type, valid if operation != 0. */
-    int32_t status;              /* enum vsr_io_status, or OK for core detection. */
+    uint32_t code;           /* enum vsr_failure_code */
+    uint32_t operation_type; /* enum vsr_op_type, valid if operation != 0. */
+    int32_t status;          /* enum vsr_io_status, or OK for core detection. */
     uint32_t reserved;
 };
 
@@ -727,16 +738,18 @@ struct vsr_status {
     uint64_t view;
     uint64_t primary;
     uint64_t committed;
-    uint64_t applied;            /* 0 for witnesses. */
-    uint64_t stored_sequence;    /* Contiguous successfully completed STORE prefix. */
-    uint64_t durable_sequence;   /* Completed SYNC prefix, <= stored_sequence. */
-    uint64_t checkpoint_op;      /* Published recovery anchor (remote on witness). */
+    uint64_t applied; /* 0 for witnesses. */
+    uint64_t
+        stored_sequence; /* Contiguous successfully completed STORE prefix. */
+    uint64_t durable_sequence; /* Completed SYNC prefix, <= stored_sequence. */
+    uint64_t checkpoint_op; /* Published recovery anchor (remote on witness). */
     uint64_t transition_op;
-    uint32_t state;              /* enum vsr_state */
-    uint32_t role;               /* Materialized role; membership governs voting. */
+    uint32_t state; /* enum vsr_state */
+    uint32_t role;  /* Materialized role; membership governs voting. */
     uint32_t outstanding_ops;
     uint32_t outstanding_leases;
-    const struct vsr_epoch *configuration; /* NULL until known; borrowed to next step. */
+    const struct vsr_epoch
+        *configuration; /* NULL until known; borrowed to next step. */
     struct vsr_failure failure;
 };
 
@@ -832,9 +845,5 @@ void vsr_get_status(const struct vsr *v, struct vsr_status *status);
  * adapter's own readers still govern reclamation of stored snapshot objects.
  */
 int vsr_deinit(struct vsr *v);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif /* VSR_H */

@@ -1,14 +1,10 @@
 /* Compile-only API/layout checks; no library implementation is linked. */
 #include "vsr.h"
+
+/* Verify that the public header can be included more than once. */
 #include "vsr.h"
 
-#if defined(__cplusplus)
-#define CHECK_LAYOUT(test, name) static_assert((test), #name)
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define CHECK_LAYOUT(test, name) _Static_assert((test), #name)
-#else
-#define CHECK_LAYOUT(test, name) typedef char name[(test) ? 1 : -1]
-#endif
 
 #if UINTPTR_MAX == UINT64_MAX
 CHECK_LAYOUT(sizeof(struct vsr_event) == 32, event_is_32_bytes);
@@ -28,14 +24,18 @@ CHECK_LAYOUT(offsetof(struct vsr_entry, body) == 56, entry_body_offset);
 #endif
 
 /* Exercise both step signatures with caller-owned contiguous queue storage. */
+int vsr_header_compile_check(struct vsr *v, const struct vsr_event *completion);
+void vsr_header_lifecycle_signatures(void);
+int vsr_header_payload_check(const struct vsr *v,
+                             const struct vsr_membership *membership,
+                             uint64_t operation_id, uint64_t lease);
+
 int vsr_header_compile_check(struct vsr *v, const struct vsr_event *completion)
 {
     struct vsr_op operations[8];
-    struct vsr_update update = { operations, 8, 0, 0, 0, VSR_NO_DEADLINE };
-    struct vsr_event events[2] = {
-        { VSR_EVENT_TIME, 0, UINT64_C(1000), NULL, 0 },
-        { VSR_EVENT_TIME, 0, UINT64_C(1000), NULL, 0 }
-    };
+    struct vsr_update update = {operations, 8, 0, 0, 0, VSR_NO_DEADLINE};
+    struct vsr_event events[2] = {{VSR_EVENT_TIME, 0, UINT64_C(1000), NULL, 0},
+                                  {VSR_EVENT_TIME, 0, UINT64_C(1000), NULL, 0}};
     struct vsr_status status;
     int result;
 
@@ -52,65 +52,67 @@ int vsr_header_compile_check(struct vsr *v, const struct vsr_event *completion)
 /* Check less frequent lifecycle signatures without constructing fake state. */
 void vsr_header_lifecycle_signatures(void)
 {
-    int (*layout_fn)(const struct vsr_options *, struct vsr_layout *) = vsr_layout;
-    int (*init_fn)(void *, size_t, const struct vsr_options *, struct vsr **) = vsr_init;
+    int (*layout_fn)(const struct vsr_options *, struct vsr_layout *) =
+        vsr_layout;
+    int (*init_fn)(void *, size_t, const struct vsr_options *, struct vsr **) =
+        vsr_init;
     int (*deinit_fn)(struct vsr *) = vsr_deinit;
     (void)layout_fn;
     (void)init_fn;
     (void)deinit_fn;
 }
 
-/* Exercise cold-path payloads as a C and C++ adapter would construct them. */
-int vsr_header_payload_check(struct vsr *v,
+/* Exercise cold-path payloads as a C adapter would construct them. */
+int vsr_header_payload_check(const struct vsr *v,
                              const struct vsr_membership *membership,
                              uint64_t operation_id, uint64_t lease)
 {
-    const struct vsr_epoch epoch = {
-        membership, NULL, 0, VSR_EPOCH_STEADY, 0
-    };
+    const struct vsr_epoch epoch = {membership, NULL, 0, VSR_EPOCH_STEADY, 0};
     const struct vsr_store_identity identity = {
-        { UINT64_C(1), UINT64_C(2) }, UINT64_C(7), VSR_DURABLE, 0
-    };
+        {UINT64_C(1), UINT64_C(2)}, UINT64_C(7), VSR_DURABLE, 0};
     const struct vsr_hard_state hard = {
-        0, 0, 0, &epoch, VSR_HARD_NORMAL, VSR_MEMBER_FULL
-    };
+        0, 0, 0, &epoch, VSR_HARD_NORMAL, VSR_MEMBER_FULL};
     const struct vsr_recovered recovered = {
-        identity, UINT64_C(1), UINT64_C(1), UINT64_C(1), hard, NULL
-    };
-    const struct vsr_loaded loaded = { &recovered, UINT64_C(1), 0, 1, 0 };
-    const struct vsr_event completion = {
-        VSR_EVENT_COMPLETE, VSR_IO_OK, operation_id, &loaded, lease
-    };
-    const struct vsr_read_barrier read = {
-        0, VSR_NO_DEADLINE, VSR_READ_LINEARIZABLE, 0
-    };
-    const struct vsr_change changes[] = {
-        { VSR_STORE_IDENTITY, 1, 0, &identity },
-        { VSR_STORE_HARD_STATE, 1, 0, &hard }
-    };
-    const struct vsr_store transaction = { UINT64_C(1), changes, 2, 0 };
+        identity, UINT64_C(1), UINT64_C(1), UINT64_C(1), hard, NULL};
+    const struct vsr_loaded loaded = {&recovered, UINT64_C(1), 0, 1, 0};
+    const struct vsr_event completion = {VSR_EVENT_COMPLETE, VSR_IO_OK,
+                                         operation_id, &loaded, lease};
+    const struct vsr_read_barrier read = {0, VSR_NO_DEADLINE,
+                                          VSR_READ_LINEARIZABLE, 0};
+    const struct vsr_change changes[] = {{VSR_STORE_IDENTITY, 1, 0, &identity},
+                                         {VSR_STORE_HARD_STATE, 1, 0, &hard}};
+    const struct vsr_store transaction = {UINT64_C(1), changes, 2, 0};
     const struct vsr_log_state offer = {
-        { { UINT64_C(3), UINT64_C(4) }, UINT64_C(1) },
-        0, 0, 0, UINT64_C(1), UINT64_C(1), &epoch, { NULL, 0, 0 }, NULL
-    };
+        {{UINT64_C(3), UINT64_C(4)}, UINT64_C(1)},
+        0,
+        0,
+        0,
+        UINT64_C(1),
+        UINT64_C(1),
+        &epoch,
+        {NULL, 0, 0},
+        NULL};
     const struct vsr_state_chunk chunk = {
-        { { UINT64_C(5), UINT64_C(6) }, UINT64_C(1) }, offer, 0, 0
-    };
+        {{UINT64_C(5), UINT64_C(6)}, UINT64_C(1)}, offer, 0, 0};
     const struct vsr_message message = {
-        { UINT64_C(1), UINT64_C(2) }, 0, 0, UINT64_C(7),
-        VSR_MSG_NEW_STATE, 0, 0, &chunk
-    };
+        {UINT64_C(1), UINT64_C(2)}, 0, 0, UINT64_C(7),
+        VSR_MSG_NEW_STATE,          0, 0, &chunk};
     /* Routing can advance without changing the logged handoff target. */
-    const struct vsr_check_epoch target = { UINT64_C(1) };
+    const struct vsr_check_epoch target = {UINT64_C(1)};
     const struct vsr_request check_epoch = {
-        { { UINT64_C(9), UINT64_C(10) }, UINT64_C(2) },
-        UINT64_C(2), VSR_REQUEST_CHECK_EPOCH, 0, &target
-    };
+        {{UINT64_C(9), UINT64_C(10)}, UINT64_C(2)},
+        UINT64_C(2),
+        VSR_REQUEST_CHECK_EPOCH,
+        0,
+        &target};
     const struct vsr_entry epoch_entry = {
-        UINT64_C(12), UINT64_C(2), 0,
-        { { UINT64_C(9), UINT64_C(10) }, UINT64_C(2) },
-        VSR_REQUEST_CHECK_EPOCH, 0, &target
-    };
+        UINT64_C(12),
+        UINT64_C(2),
+        0,
+        {{UINT64_C(9), UINT64_C(10)}, UINT64_C(2)},
+        VSR_REQUEST_CHECK_EPOCH,
+        0,
+        &target};
     struct vsr_status status;
     (void)check_epoch;
     (void)epoch_entry;

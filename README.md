@@ -36,7 +36,7 @@ reads constrained by an applied-operation minimum.
 
 ## Integration
 
-Include [include/vsr.h](include/vsr.h). The header supports C11 and C++11;
+Include [include/vsr.h](include/vsr.h). The header supports C11;
 its structures are logical host objects, not wire or disk formats.
 
 1. Define replica identities, membership, durability policy, and resource limits.
@@ -72,12 +72,22 @@ indexed storage and checkpoints, independently of the in-memory cache.
   reads, and membership transitions.
 - [Adapter reference](docs/vsr-api.md): driving, storage, snapshots, and failures.
 
-Run the interface checks with:
+Build from Git and run the tests with Clang, ASan and UBSan:
 
 ```sh
-make check
+./bootstrap
+mkdir -p build/asan
+cd build/asan
+../../configure --enable-werror
+make -j"$(nproc)" check
 ```
 
-These checks verify C11/C++11 compatibility, function signatures, and descriptor
-layouts. The design specifies the separate protocol and performance validation
-requirements.
+Public headers live in `include/`, private C code in `src/`, and all tests in
+`tests/`. The current implementation is only a small internal checked-arithmetic
+module; the protocol API remains a contract to implement. Tests cover arithmetic
+boundaries and C11 compatibility, signatures, and descriptor layouts.
+
+See [development](docs/development.md) for dependencies, compiler options,
+formatting, static analysis, Valgrind, coverage, fuzzing, and distribution checks.
+The [test layout](tests/README.md) has unit, integration, fuzzing and fault
+simulation, regression, and benchmark layers.

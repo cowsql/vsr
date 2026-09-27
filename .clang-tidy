@@ -1,0 +1,14 @@
+Checks: >-
+  -*,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  performance-*,
+  portability-*
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(include|src|tests)/.*'
+FormatStyle: file
+# Annex K *_s functions are optional and unavailable on our libc; this checker
+# flags even constant-format fprintf and bounded memcpy. Keep other checks on.

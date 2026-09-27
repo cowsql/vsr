@@ -1,0 +1,86 @@
+name: C checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: clang-18, sanitize: 'yes' }
+          - { cc: gcc, sanitize: 'yes' }
+          - { cc: clang-18, sanitize: 'address,undefined,integer' }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake clang-18 libclang-rt-18-dev gcc
+      - run: ./bootstrap
+      - name: Configure and test
+        env:
+          CC: ${{ matrix.cc }}
+          SANITIZE: ${{ matrix.sanitize }}
+        run: |
+          mkdir -p build/test
+          cd build/test
+          ../../configure --enable-werror --enable-sanitize="$SANITIZE"
+          make -j2 check
+      - name: Check distribution
+        if: matrix.cc == 'clang-18' && matrix.sanitize == 'yes'
+        run: make -C build/test -j2 distcheck DISTCHECK_CONFIGURE_FLAGS=--enable-werror
+      - name: Print failure logs
+        if: failure()
+        run: find build -name test-suite.log -exec cat {} +
+
+  analysis:
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake clang-18 clang-tools-18 \
+            clang-format-18 clang-tidy-18 bear cppcheck valgrind shellcheck
+      - run: ./bootstrap
+      - name: Lint and analyze
+        run: |
+          mkdir -p build/analysis
+          cd build/analysis
+          ../../configure --enable-werror --disable-sanitize CFLAGS='-O1 -g -gdwarf-4'
+          make compile-commands
+          make lint
+          make analyze
+          make check-valgrind
+
+  instrumentation:
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install instrumentation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake clang-18 llvm-18 libclang-rt-18-dev
+      - run: ./bootstrap
+      - name: Fuzz smoke test
+        run: |
+          mkdir -p build/fuzz
+          cd build/fuzz
+          ../../configure --enable-werror --enable-fuzzing
+          make -j2 check
+          make fuzz FUZZ_RUNS=10000
+      - name: Coverage
+        run: |
+          mkdir -p build/coverage
+          cd build/coverage
+          ../../configure --enable-werror --enable-coverage
+          make coverage

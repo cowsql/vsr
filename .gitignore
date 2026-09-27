@@ -1,0 +1,35 @@
+# Autotools output; regenerate with ./bootstrap.
+/aclocal.m4
+/autom4te.cache/
+/build-aux/
+/configure
+/configure~
+/config.h.in
+/config.h.in~
+/Makefile.in
+
+# Keep each build configuration under build/.
+/build/
+/Makefile
+/config.h
+/config.log
+/config.status
+/stamp-h1
+.deps/
+.dirstamp
+*.o
+*.a
+*.log
+*.trs
+*.profraw
+*.profdata
+/compile_commands.json
+/analysis/
+/coverage/
+/tests/fuzz/corpus/
+/tests/fuzz/artifacts/
+/vsr-*.tar.*
+/vsr-*/
+/tests/unit/checked
+/tests/fuzz/checked
+__pycache__/
