@@ -40,6 +40,8 @@ struct mem_snapshot {
     struct mem_store *source;
     const struct vsr_entry **history;
     uint64_t checksum;
+    void *image;
+    size_t image_size;
 };
 
 struct mem_snapshot_hold {
@@ -66,6 +68,7 @@ struct mem_node {
     bool runnable;
     uint64_t applied;
     uint64_t checksum;
+    void *application;
     struct mem_graph *history_graph;
     const struct vsr_entry **history;
     size_t history_count;
@@ -88,6 +91,7 @@ struct mem_cluster {
     size_t message_capacity;
     struct mem_snapshot **snapshots;
     size_t snapshot_count;
+    const struct mem_application *application;
 };
 
 static void action_prerequisites(struct mem_node *node,
@@ -124,6 +128,18 @@ struct mem_cluster *mem_cluster_create(void)
     CHECK(cluster != NULL);
     cluster->message_vectors = mem_graph_create();
     return cluster;
+}
+
+void mem_cluster_set_application(struct mem_cluster *cluster,
+                                 const struct mem_application *application)
+{
+    CHECK(cluster->node_count == 0);
+    cluster->application = application;
+}
+
+void *mem_node_application(const struct mem_node *node)
+{
+    return node->application;
 }
 
 struct vsr_options mem_options(uint64_t replica,
@@ -194,6 +210,8 @@ struct mem_node *mem_cluster_add(struct mem_cluster *cluster,
     node->history_graph = mem_graph_create();
     node->next_lease = 1;
     node->next_snapshot = 1;
+    if (cluster->application != NULL)
+        node->application = cluster->application->create();
     mem_node_output_capacity(node, 16);
     CHECK(node_init(node) == VSR_OK);
     cluster->nodes = resize(cluster->nodes, cluster->node_count + 1,
@@ -441,11 +459,29 @@ static uint64_t checksum_byte(uint64_t checksum, unsigned char byte)
 }
 
 static int32_t application_apply(struct mem_node *node,
-                                 const struct vsr_entry *entry)
+                                 const struct vsr_entry *entry,
+                                 struct mem_graph *graph,
+                                 struct vsr_value *value)
 {
+    const struct mem_application *application = node->cluster->application;
     CHECK(entry->op == node->applied + 1);
     history_record(node, entry);
     node->applied = entry->op;
+    value->data = (struct vsr_blob){NULL, 0, 0, 0};
+    if (application != NULL) {
+        const size_t capacity = (size_t)node->options.limits.result_bytes;
+        char *bytes = mem_graph_alloc(graph, capacity + 1, 1);
+        size_t length = 0;
+        const int32_t code = application->apply(node->application, entry, bytes,
+                                                capacity, &length);
+        CHECK(length <= capacity);
+        if (length != 0) {
+            struct vsr_span *span = mem_graph_alloc(graph, 1, sizeof(*span));
+            *span = (struct vsr_span){bytes, length};
+            value->data = (struct vsr_blob){span, length, 1, 0};
+        }
+        return code;
+    }
     if (entry->type == VSR_REQUEST_COMMAND) {
         const struct vsr_blob *command = entry->body;
         node->checksum = checksum_byte(node->checksum, 255);
@@ -457,6 +493,14 @@ static int32_t application_apply(struct mem_node *node,
         return (int32_t)(node->checksum & INT32_MAX);
     }
     return 0;
+}
+
+static void application_reset(struct mem_node *node)
+{
+    node->applied = 0;
+    node->checksum = 0;
+    if (node->cluster->application != NULL)
+        node->cluster->application->reset(node->application);
 }
 
 static struct mem_snapshot_hold *snapshot_hold(struct mem_node *node,
@@ -693,6 +737,9 @@ snapshot_capture(struct mem_node *node, const struct vsr_snapshot_task *task)
     snapshot->checkpoint = checkpoint;
     snapshot->source = node->store;
     snapshot->checksum = node->checksum;
+    if (node->cluster->application != NULL)
+        snapshot->image = node->cluster->application->capture(
+            node->application, &snapshot->image_size);
     snapshot->history = mem_graph_alloc(snapshot->graph, (size_t)task->op,
                                         sizeof(*snapshot->history));
     for (uint64_t i = 0; i < task->op; i++)
@@ -724,8 +771,7 @@ static int snapshot_execute(struct mem_node *node, struct mem_effect *effect)
     if (effect->op.type == VSR_OP_SNAPSHOT_INSTALL &&
         task->checkpoint == NULL) {
         CHECK(task->op == 0 && task->sequence == 0);
-        node->applied = 0;
-        node->checksum = 0;
+        application_reset(node);
         return VSR_IO_OK;
     }
     CHECK(task->checkpoint != NULL);
@@ -762,6 +808,10 @@ static int snapshot_execute(struct mem_node *node, struct mem_effect *effect)
             history_record(node, hold->snapshot->history[(size_t)i]);
         node->applied = task->op;
         node->checksum = hold->snapshot->checksum;
+        if (node->cluster->application != NULL)
+            node->cluster->application->install(node->application,
+                                                hold->snapshot->image,
+                                                hold->snapshot->image_size);
         return VSR_IO_OK;
     case VSR_OP_SNAPSHOT_DROP:
         hold->held = false;
@@ -856,8 +906,12 @@ bool mem_node_execute(struct mem_node *node, size_t index, int status)
         struct vsr_value *results = mem_graph_alloc(
             effect->result_graph, apply->batch.count, sizeof(*results));
         CHECK(apply->batch.count != 0);
-        for (uint32_t i = 0; i < apply->batch.count; i++)
-            results[i].code = application_apply(node, &apply->batch.entries[i]);
+        for (uint32_t i = 0; i < apply->batch.count; i++) {
+            results[i].reserved = 0;
+            results[i].code =
+                application_apply(node, &apply->batch.entries[i],
+                                  effect->result_graph, &results[i]);
+        }
         CHECK(node->applied == apply->through);
         applied->results = results;
         applied->count = apply->batch.count;
@@ -1055,8 +1109,7 @@ void mem_node_crash(struct mem_node *node)
     node->arena = NULL;
     node->core = NULL;
     node->runnable = false;
-    node->applied = 0;
-    node->checksum = 0;
+    application_reset(node);
     mem_store_crash(node->store);
     for (size_t i = node->snapshot_count; i > 0; i--) {
         const size_t index = i - 1;
@@ -1173,6 +1226,8 @@ void mem_cluster_destroy(struct mem_cluster *cluster)
         mem_graph_destroy(node->metadata);
         mem_graph_destroy(node->history_graph);
         mem_store_destroy(node->store);
+        if (cluster->application != NULL)
+            cluster->application->destroy(node->application);
         free(node->snapshots);
         free(node->reads);
         free(node->answers);
@@ -1185,6 +1240,7 @@ void mem_cluster_destroy(struct mem_cluster *cluster)
     }
     for (size_t i = 0; i < cluster->snapshot_count; i++) {
         mem_graph_destroy(cluster->snapshots[i]->graph);
+        free(cluster->snapshots[i]->image);
         free(cluster->snapshots[i]);
     }
     free(cluster->snapshots);
