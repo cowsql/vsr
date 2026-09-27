@@ -41,7 +41,7 @@ INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
   tests/integration/audit tests/integration/transfer_audit
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
-  tests/regression/witness_prefix
+  tests/regression/witness_prefix tests/regression/boundary_from_view_change
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
@@ -109,6 +109,11 @@ tests_regression_witness_prefix_SOURCES = tests/regression/witness_prefix.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_witness_prefix_LDADD = src/libvsr.a
+tests_regression_boundary_from_view_change_SOURCES = \
+  tests/regression/boundary_from_view_change.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_boundary_from_view_change_LDADD = src/libvsr.a
 CLUSTER_SCENARIO = tests/fuzzy/scenario.c tests/fuzzy/scenario.h \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h

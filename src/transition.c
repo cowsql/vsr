@@ -2034,6 +2034,21 @@ bool vsr_transition_busy(const struct vsr *v)
     return t->target.active || t->boot_restore || t->round != ROUND_NONE;
 }
 
+void vsr_transition_epoch_entered(struct vsr *v)
+{
+    struct vsr_transition *t = transition(v);
+    /* The committed boundary closes the old epoch. A view change or
+     * catch-up still running for it has nothing left to select: its offers,
+     * votes, and pending acknowledgments describe old-epoch views and must
+     * not carry into the new epoch, which starts at view zero. The committed
+     * floor survives because positions continue across the boundary. */
+    reset_round(v);
+    t->round = ROUND_NONE;
+    t->highest_view = 0;
+    t->retry_at = VSR_NO_DEADLINE;
+    t->election_at = VSR_NO_DEADLINE;
+}
+
 void vsr_transition_hard(struct vsr *v, struct vsr_hard_state *hard)
 {
     (void)v;

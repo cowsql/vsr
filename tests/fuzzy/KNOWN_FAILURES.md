@@ -6,30 +6,6 @@ trace). Failures below are liveness stalls inside the documented failure model:
 every member is available and fairly scheduled once faults cease, yet the group
 never converges. Remove an entry once its regression test passes.
 
-## A. Boundary committed from VIEW_CHANGE leaves the old primary TRANSFERRING
-
-Mechanism: the primary holds a PREPARE_OK quorum for a RECONFIGURE entry but
-its commit work is deferred (output slots or work budget exhausted); a
-START_VIEW_CHANGE quorum then moves it to VIEW_CHANGE, and the next drain
-commits the boundary from that state. The node enters the new epoch as
-TRANSITIONING with phase TRANSFERRING although it already holds the complete
-history through the boundary (committed == applied == boundary), issues no
-fetch, never promises EPOCH_STARTED, and later flaps through views forever
-(state VIEW_CHANGE, view climbing) while the other members, or a learner that
-needs `f + 1` full-member promises, wait in INSTALLED. Deterministic
-reproduction: three members, output capacity 1 at the primary, deliver
-PREPARE_OK then both START_VIEW_CHANGE without an intervening drain, then
-drain.
-
-```sh
-./tests/fuzzy/cluster 4 1 470 quiet 32
-./tests/fuzzy/cluster 4 1 600 quiet 32
-```
-
-Profile 32 (seeds 1..200, 600 steps): 4, 22, 42, 81, 95, 115, 124, 136, 160,
-174, 188 (42 and 95 show the learner side: witness learners stay
-TRANSITIONING/INSTALLED waiting for the stuck member's promise).
-
 ## C. Recovering witness blocked on full-member coverage of the donor anchor
 
 Mechanism: a witness whose store was lost (crash before its first SYNC in

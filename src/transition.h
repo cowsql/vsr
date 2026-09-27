@@ -24,6 +24,7 @@ uint64_t vsr_transition_min_sequence(const struct vsr *v);
 bool vsr_transition_epoch_fence(struct vsr *v);
 bool vsr_transition_epoch(struct vsr *v, uint64_t peer, uint64_t boundary);
 bool vsr_transition_busy(const struct vsr *v);
+void vsr_transition_epoch_entered(struct vsr *v);
 void vsr_transition_hard(struct vsr *v, struct vsr_hard_state *hard);
 
 #endif

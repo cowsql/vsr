@@ -198,10 +198,15 @@ static void begin(struct vsr *v, const struct vsr_epoch *epoch, uint64_t peer)
 {
     struct vsr_protocol *p = vsr_protocol(v);
     /* The boundary has been authenticated as committed, but local catch-up
-     * is separate. No voter/leader path remains enabled after this fence. */
+     * is separate. No voter/leader path remains enabled after this fence.
+     * Commitment can be learned from any state, including VIEW_CHANGE: the
+     * quorum was collected in the old epoch, whose rounds end here. A replica
+     * that already holds the complete history through the boundary then
+     * installs directly, exactly as it would from NORMAL. */
     v->status.state = VSR_STATE_TRANSITIONING;
     v->status.view = 0;
     p->last_normal_view = 0;
+    vsr_transition_epoch_entered(v);
     vsr_protocol_configuration(v, epoch);
     p->epoch.phase = VSR_EPOCH_TRANSFERRING;
     p->replay = v->status.role == VSR_MEMBER_FULL;

@@ -139,7 +139,13 @@ RECONFIGURE is an ordinary client request whose body names the next membership.
 Its boundary is committed by the old group. START_EPOCH and NEW_EPOCH describe
 that committed boundary; an uncommitted proposal cannot introduce an epoch.
 The next epoch starts at view zero and the next log position after the boundary.
-Its membership may be disjoint and may change `f` or member roles.
+Its membership may be disjoint and may change `f` or member roles. Commitment
+of the boundary can be learned in any state, including VIEW_CHANGE or during
+log selection, because its quorum was collected in the old epoch. Entering the
+epoch abandons every old-epoch round: no old-epoch vote, offer, or pending
+acknowledgment carries over. A replica that already holds the complete history
+through the boundary installs directly, exactly as it would from NORMAL, and
+is TRANSFERRING only while history is actually missing.
 
 An authenticated peer already known in the receiver's current membership or
 seed may report a later committed epoch, including a jump over compacted
