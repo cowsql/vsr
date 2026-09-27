@@ -9,15 +9,16 @@ seeded fault simulation share one directory.
 | `unit/` | Small deterministic tests of private modules | Arithmetic, equality, RNG, runtime, graph validation, reads, host storage |
 | `integration/` | Public API and host adapter contracts | Replication, resource minima, reads, checkpoints, epoch handoff |
 | `fuzzy/` | Coverage-guided fuzzing and seeded cluster/fault simulation | Arithmetic and graph libFuzzer harnesses; seeded cluster scheduler |
-| `regression/` | Minimal reproducers for fixed bugs and crashes | Reserved; add with each bug fix |
+| `regression/` | Minimal reproducers for fixed bugs and crashes | Trimmed-prefix resend to a lagging peer (`trim_resend`); add with each bug fix |
 | `benchmark/` | Repeatable latency, throughput, allocation and copy measurements | Reserved; implementation required |
 | `lib/` | Shared test-only assertions and fixtures | In-memory immutable storage, cluster host, seeded RNG, always-active checks |
 
 `make check` builds the contract archives and runs executable tests using
 Automake's parallel test harness. Failures appear in `test-suite.log` and
-per-test `.log` files in the build tree. `make check-unit` and
-`make check-integration` select the existing layers. Empty layers deliberately
-have no passing placeholder tests or misleading coverage claims.
+per-test `.log` files in the build tree. `make check-unit`,
+`make check-integration`, and `make check-regression` select the existing
+layers. Empty layers deliberately have no passing placeholder tests or
+misleading coverage claims.
 
 ASan and UBSan are on by default, including in the library under test. Keep the
 shared `AM_CFLAGS` and `AM_LDFLAGS` when adding a target so every executable

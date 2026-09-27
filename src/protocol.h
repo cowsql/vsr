@@ -80,6 +80,7 @@ struct vsr_transaction {
     uint64_t append_end;
     uint64_t committed;
     uint64_t clients_through;
+    uint64_t begin; /* retained log begin after TRIM/RESTORE; zero otherwise */
     bool completed;
 };
 
@@ -100,7 +101,11 @@ struct vsr_protocol {
     uint64_t safe_sequence;
     uint64_t sync_requested;
     uint64_t sync_completed;
+    /* log_begin describes the safe revision that offers name; readable_begin
+     * describes stored_sequence, which every LOAD names. A TRIM or RESTORE is
+     * readable before it is safe, so readable_begin >= log_begin always. */
     uint64_t log_begin;
+    uint64_t readable_begin;
     uint64_t log_end;
     uint64_t written_end;
     uint64_t stable_end;
