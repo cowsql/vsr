@@ -94,7 +94,11 @@ does not downgrade VIEW_CHANGE to NORMAL, undo RETIRED, or turn TRANSFERRING int
 readiness. Application reconstruction precedes normal service on a full member.
 Missing state requires quorum recovery; malformed or corrupt local state fences
 the instance. Rolling a store back behind acknowledged durability is outside
-the storage contract.
+the storage contract. Quorum recovery is for members. A replica in neither
+group of its configuration is a learner: with a store it resumes nonvoting
+warm-up in the persisted warming role, and without one it warms up from its
+seed again in the role its start names. It never recovers from a group it does
+not belong to and never persists a role its own validation rejects.
 
 Replicated-mode restarts that can participate enter RECOVERING, even when a
 plausible local checkpoint exists; a retained removal tombstone remains RETIRED.
@@ -178,7 +182,12 @@ ready; this also prevents a cached duplicate from bypassing the retention fence.
 Removed members serve as donors while TRANSITIONING, then persist retirement
 and become RETIRED. A learner that installs through the boundary is never
 retired: at STEADY it resumes nonvoting warm-up in the learned epoch and awaits
-logged admission. A full member demoted to witness retains its full donor
+logged admission. Warm-up is continuous: an idle learner periodically
+rediscovers the members it knows, catches up to their latest committed
+position, follows a later committed epoch it learns of, and establishes STEADY
+there by collecting the same promises, so the transfer required at admission
+stays small. A learner never votes, acknowledges preparation, or answers
+recovery or read probes. A full member demoted to witness retains its full donor
 state through handoff; its materialized `status.role` can therefore remain FULL
 while the new membership permits only witness voting. It cannot lead or serve
 application reads in that epoch. A promoted witness cannot vote as a new full

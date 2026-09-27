@@ -833,7 +833,10 @@ int vsr_validate_options(const struct vsr_options *options)
                        options->join_role != VSR_MEMBER_WITNESS)) {
             return VSR_EINVAL;
         }
-    } else if (options->join_role != VSR_MEMBER_NONE) {
+    } else if (options->join_role != VSR_MEMBER_NONE &&
+               (options->start_mode != VSR_START_RECOVER ||
+                (options->join_role != VSR_MEMBER_FULL &&
+                 options->join_role != VSR_MEMBER_WITNESS))) {
         return VSR_EINVAL;
     }
     return VSR_OK;

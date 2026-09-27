@@ -129,6 +129,8 @@ struct vsr_transition {
     uint64_t election_at;
     uint64_t discovery_peer;
     uint64_t redirect_peer;
+    uint64_t warm_at;
+    uint32_t warm_cursor;
     uint32_t best_lease;
     uint32_t best_offer;
     uint32_t local_offer;
@@ -151,6 +153,7 @@ struct vsr_transition {
     bool uninitialized_hint;
     bool hint_recover;
     bool redirect_pending;
+    bool warmed;
 };
 
 struct transition_plan {
@@ -243,12 +246,23 @@ void vsr_transition_init(struct vsr *v, void *memory, size_t size)
     t->best_lease = t->best_offer = t->local_offer = VSR_INDEX_NONE;
     t->target.lease = t->target.offer = t->target.entries_lease =
         VSR_INDEX_NONE;
-    t->retry_at = t->election_at = VSR_NO_DEADLINE;
+    t->retry_at = t->election_at = t->warm_at = VSR_NO_DEADLINE;
 }
 
 static bool expired(const struct vsr *v, uint64_t at)
 {
     return v->time_set && at != VSR_NO_DEADLINE && v->now >= at;
+}
+
+/* A replica in neither group of its current configuration: a JOIN learner,
+ * warming without a vote, or one restarted during warm-up. */
+static bool learner(const struct vsr *v)
+{
+    const struct vsr_protocol *p = vsr_protocol_const(v);
+    return p->self == VSR_INDEX_NONE &&
+           (p->epoch.previous == NULL ||
+            vsr_member_index(p->epoch.previous, v->options.replica) ==
+                VSR_INDEX_NONE);
 }
 
 static bool hard_safe(const struct vsr *v)
@@ -471,6 +485,7 @@ static void reset_round(struct vsr *v)
     t->discovery_waiting = false;
     t->start_pending = false;
     t->ack_pending = false;
+    t->warm_at = VSR_NO_DEADLINE;
     if (t->committed_floor < vsr_protocol(v)->desired_commit)
         t->committed_floor = vsr_protocol(v)->desired_commit;
     if (t->committed_floor < v->status.committed)
@@ -608,9 +623,29 @@ static void begin_recovery(struct vsr *v)
     vsr_changed(v);
 }
 
+/* A learner is not bound to one donor: any NORMAL full member can answer
+ * its discovery. Rotate through the membership it knows so a crashed peer
+ * cannot stall warm-up indefinitely. */
+static uint64_t warm_peer(struct vsr *v)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    for (uint32_t i = 0; i < p->current.count; i++) {
+        uint32_t index = (t->warm_cursor + i) % p->current.count;
+        const struct vsr_member *member = &p->current.members[index];
+        if (member->role == VSR_MEMBER_FULL &&
+            member->id != v->options.replica) {
+            t->warm_cursor = index + 1;
+            return member->id;
+        }
+    }
+    return v->status.primary;
+}
+
 static void begin_discovery(struct vsr *v, uint64_t peer, bool warming)
 {
     struct vsr_transition *t = transition(v);
+    uint32_t state = warming ? VSR_STATE_WARMING : VSR_STATE_VIEW_CHANGE;
     reset_round(v);
     t->enabled = true;
     t->round = warming ? ROUND_WARM : ROUND_CATCHUP;
@@ -619,10 +654,15 @@ static void begin_discovery(struct vsr *v, uint64_t peer, bool warming)
     t->election_at = vsr_after(v, v->options.view_timeout_ns);
     /* Missing messages do not invalidate an intact voting history. Persist a
      * view-change fence so a later durable restart retains that eligibility;
-     * only state-loss recovery requires a quorum of other normal replicas. */
-    v->status.state = warming ? VSR_STATE_WARMING : VSR_STATE_VIEW_CHANGE;
-    vsr_protocol(v)->hard_dirty = true;
-    vsr_changed(v);
+     * only state-loss recovery requires a quorum of other normal replicas.
+     * A learner has no vote to fence: its warm-up record was persisted when
+     * its store was created, and repeated discovery must not rewrite it. */
+    bool changed = !warming || v->status.state != state;
+    if (!warming)
+        vsr_protocol(v)->hard_dirty = true;
+    v->status.state = state;
+    if (changed)
+        vsr_changed(v);
 }
 
 static void restart_selection(struct vsr *v)
@@ -1036,6 +1076,11 @@ static bool target_poll(struct vsr *v)
             vsr_checkpoint_published(v, &lease);
         if (checkpoint != NULL && target->next <= checkpoint->op)
             target->next = checkpoint->op + 1;
+        /* A warmed learner already holds the committed prefix, which every
+         * offer shares; only its suffix can differ from the donor's. */
+        if (target->goal == TARGET_WARM && !target->rebuild &&
+            target->next <= p->stable_commit)
+            target->next = p->stable_commit + 1;
         if (target->next > target->state.log_end) {
             vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
             return true;
@@ -1132,6 +1177,7 @@ static bool target_poll(struct vsr *v)
             p->replay = false;
             clear_target(v);
             t->round = ROUND_NONE;
+            t->warmed = true;
             v->status.state =
                 epoch ? VSR_STATE_TRANSITIONING : VSR_STATE_WARMING;
             return true;
@@ -1366,6 +1412,8 @@ static bool discovery_poll(struct vsr *v)
         return false;
     if (t->discovery_waiting && !expired(v, t->retry_at))
         return false;
+    if (t->discovery_waiting && t->round == ROUND_WARM)
+        t->discovery_peer = warm_peer(v);
     struct vsr_fetch request = {
         .max_bytes =
             v->options.limits.command_bytes + v->options.limits.manifest_bytes,
@@ -1379,6 +1427,27 @@ static bool discovery_poll(struct vsr *v)
     t->discovery_nonce = request.nonce;
     t->discovery_waiting = true;
     t->retry_at = vsr_after(v, v->options.retry_ns);
+    return true;
+}
+
+/* Warm-up is continuous: an idle learner periodically rediscovers the
+ * membership it knows and catches up to the latest committed position, or
+ * is redirected to a later epoch, so the transfer at admission stays small.
+ * One discovery per heartbeat, never while a transfer, an epoch handoff, or
+ * a hard-state transaction is in progress. */
+static bool warm_poll(struct vsr *v)
+{
+    struct vsr_transition *t = transition(v);
+    if (v->status.state != VSR_STATE_WARMING || t->round != ROUND_NONE ||
+        t->target.active || t->boot_restore || !v->time_set)
+        return false;
+    if (t->warm_at == VSR_NO_DEADLINE) {
+        t->warm_at = vsr_after(v, v->options.heartbeat_ns);
+        return false;
+    }
+    if (!expired(v, t->warm_at) || !hard_safe(v))
+        return false;
+    begin_discovery(v, v->status.primary, true);
     return true;
 }
 
@@ -1445,6 +1514,7 @@ static bool boot_restore_poll(struct vsr *v)
         vsr_protocol_log_find(v, p->log_end - 1) == NULL)
         return vsr_protocol_load_log(v, p->log_end - 1, p->log_end);
     t->boot_restore = false;
+    t->warmed = true;
     p->replay = false;
     if (t->restore_state == VSR_HARD_NORMAL)
         vsr_protocol_normal(v);
@@ -1507,7 +1577,8 @@ bool vsr_transition_poll(struct vsr *v)
         expired(v, p->election_at))
         return next_view(v);
     return view_poll(v) || recovery_poll(v) || discovery_poll(v) ||
-           start_view_poll(v) || recover_response_poll(v) || server_poll(v);
+           warm_poll(v) || start_view_poll(v) || recover_response_poll(v) ||
+           server_poll(v);
 }
 
 int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
@@ -1584,7 +1655,9 @@ int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
                 p->hard_dirty = true;
                 v->status.view = message->view;
                 p->last_normal_view = 0;
-                if (recover) {
+                /* A replica absent from the discovered membership cannot
+                 * recover from it; it resumes warm-up as a learner. */
+                if (recover && p->self != VSR_INDEX_NONE) {
                     begin_recovery(v);
                     return VSR_OK;
                 }
@@ -1596,13 +1669,17 @@ int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
                 return VSR_OK;
             consider_offer(v, message->from, &chunk->state, lease,
                            VSR_INDEX_NONE);
+            /* A learner rebuilds once per incarnation; later warm-ups only
+             * extend the state it already materialized. */
             select_best(v,
                         t->round == ROUND_EPOCH  ? TARGET_EPOCH
                         : t->round == ROUND_WARM ? TARGET_WARM
                                                  : TARGET_CATCHUP,
-                        t->round == ROUND_WARM || t->round == ROUND_EPOCH);
+                        t->round == ROUND_EPOCH ||
+                            (t->round == ROUND_WARM && !t->warmed));
             t->discovery_waiting = false;
-            p->hard_dirty = true;
+            if (t->round != ROUND_WARM)
+                p->hard_dirty = true;
         }
         return VSR_OK;
     }
@@ -1867,6 +1944,8 @@ uint64_t vsr_transition_deadline(const struct vsr *v)
         result = t->election_at;
     if (t->target.active && t->target.waiting && t->target.retry_at < result)
         result = t->target.retry_at;
+    if (t->warm_at < result)
+        result = t->warm_at;
     for (uint32_t i = 0; i < v->options.limits.transfers; i++) {
         if (t->offers[i].used && t->offers[i].references == 0 &&
             t->offers[i].expires < result)
@@ -1914,9 +1993,19 @@ bool vsr_transition_boot_loaded(struct vsr *v,
         vsr_changed(v);
         return true;
     }
-    if (p->self == VSR_INDEX_NONE &&
-        recovered->hard.state == VSR_HARD_RECOVERING) {
-        begin_discovery(v, v->status.primary, true);
+    /* A learner belongs to neither group of its persisted configuration.
+     * Quorum recovery is for members; a learner resumes the nonvoting
+     * warm-up its hard state records, in the role it recorded. In a STEADY
+     * epoch it rediscovers the group; an unfinished epoch installation
+     * restores like a member's and the handoff resumes. */
+    if (learner(v)) {
+        if (p->epoch.phase == VSR_EPOCH_STEADY) {
+            begin_discovery(v, v->status.primary, true);
+            return true;
+        }
+        t->restore_state = VSR_HARD_TRANSITIONING;
+        t->boot_restore = true;
+        p->replay = true;
         return true;
     }
     if (v->options.durability == VSR_REPLICATED ||
@@ -1942,7 +2031,10 @@ bool vsr_transition_boot_missing(struct vsr *v)
         t->hint_recover = v->options.start_mode == VSR_START_RECOVER;
         p->identity_pending = false;
         p->hard_dirty = false;
-    } else if (v->options.start_mode == VSR_START_JOIN) {
+    } else if (v->options.start_mode == VSR_START_JOIN ||
+               p->self == VSR_INDEX_NONE) {
+        /* Nothing to restore and no group to recover from: a replica absent
+         * from its seed can only warm up from scratch as a learner. */
         begin_discovery(v, v->status.primary, true);
     } else {
         begin_recovery(v);

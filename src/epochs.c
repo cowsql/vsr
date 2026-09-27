@@ -398,6 +398,23 @@ int vsr_epochs_event(struct vsr *v, const struct vsr_event *event,
     return VSR_OK;
 }
 
+/* A learner that discovered its epoch while the boundary was still ahead of
+ * it recorded the descriptor as TRANSFERRING. Once warm-up has carried it
+ * through the boundary it installs like a member and collects the group's
+ * promises, since only STEADY makes it admissible. */
+static bool learner_installs(struct vsr *v)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    if (v->status.state != VSR_STATE_WARMING ||
+        p->epoch.phase != VSR_EPOCH_TRANSFERRING || !learner(v) ||
+        vsr_transition_busy(v) || !stable_configuration(v))
+        return false;
+    v->status.state = VSR_STATE_TRANSITIONING;
+    arm(v);
+    vsr_changed(v);
+    return true;
+}
+
 static bool persist_phase(struct vsr *v, bool steady)
 {
     struct vsr_protocol *p = vsr_protocol(v);
@@ -497,7 +514,7 @@ bool vsr_epochs_poll(struct vsr *v)
     if (v->status.state == VSR_STATE_RETIRED)
         return false;
     if (e->stage == EPOCH_IDLE)
-        return send_announcements(v);
+        return learner_installs(v) || send_announcements(v);
     if (e->stage == EPOCH_NEW_FENCE) {
         if (p->stable_commit < e->pending->boundary &&
             !vsr_transition_epoch_fence(v))

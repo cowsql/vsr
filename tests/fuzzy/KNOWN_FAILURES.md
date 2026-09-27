@@ -26,9 +26,10 @@ drain.
 ./tests/fuzzy/cluster 4 1 600 quiet 32
 ```
 
-Profile 32 (seeds 1..200, 600 steps): 4, 22, 42, 81, 95, 115, 124, 136, 160,
-174, 188 (42 and 95 show the learner side: witness learners stay
-TRANSITIONING/INSTALLED waiting for the stuck member's promise).
+Profile 32 (seeds 1..200, 600 steps): 4, 22, 42, 124, 136, 174; profile 120:
+122; profile 125: 188. Learners show the other side: with warm-up continuous
+they follow the group into the new epoch and stay TRANSITIONING/INSTALLED, or
+WARMING behind it, waiting for the stuck member's promise.
 
 ## C. Recovering witness blocked on full-member coverage of the donor anchor
 
@@ -61,48 +62,6 @@ within one logical instant, so the host's action budget is exhausted.
 ```sh
 ./tests/fuzzy/cluster 77 1 600 quiet 8
 ```
-
-## F. Learner restart enters quorum recovery as a non-member
-
-Mechanism: a JOIN learner restarted with `RECOVER` and its epoch-0 seed
-(the documented restart during warm-up) takes the `begin_recovery` path when
-no complete durable state exists (durable mode before the first SYNC, and
-replicated mode before warm-up completed) and, in durable mode, even after it
-had warmed. It is not a member of the seed, so recovery never completes: the
-node stays RECOVERING with role NONE forever. Deterministic reproduction:
-three full members, one JOIN learner, crash and restart the learner.
-
-```sh
-./tests/fuzzy/cluster 1 1 600 quiet 125
-./tests/fuzzy/cluster 3 1 600 quiet 125
-```
-
-This mechanism dominates the profiles that combine `8` and `32`.
-
-## G. A restarted learner persists a hard state its own validator rejects
-
-Mechanism: the non-member recovery of mechanism F stores a hard state with
-`state = HARD_RECOVERING` and `role = VSR_MEMBER_NONE`. On the learner's next
-restart the successful `LOAD_RECOVERY` completion carries that row, and
-`vsr_validate_recovered` rejects `role == NONE` with `VSR_EINVAL`, so the
-completion is never consumed and the instance cannot boot at all (the host's
-`mem_node_complete` check fails). Observed as
-`memory_cluster.c: check failed: step.result == VSR_OK || step.result == VSR_AGAIN`
-for a learner restarted twice.
-
-```sh
-./tests/fuzzy/cluster 3 1 600 quiet 120
-```
-
-## Observation: an idle learner does not follow later commitments
-
-A warmed learner transfers state once, at join, and then neither receives
-PREPARE/COMMIT nor re-discovers: its committed and applied positions stay
-where warm-up left them, and it does not learn later epochs until a
-reconfiguration names it. The scheduler therefore only requires learners to be
-WARMING (in any epoch) after faults cease. Whether continuous warm-up is
-required is a contract question; `docs/vsr-api.md` says a learner "resumes
-nonvoting warm-up" only after installing a later epoch.
 
 ## Pre-existing failures of profile 2 (minimum budgets)
 
