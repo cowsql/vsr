@@ -60,6 +60,11 @@ struct mem_store *mem_store_create(void);
 void mem_store_destroy(struct mem_store *store);
 int mem_store_submit(struct mem_store *store,
                      const struct vsr_store *transaction);
+/* Checks a transaction's logical shape against the revision it extends
+ * (sequence - 1, readable or itself still pending) without making it readable.
+ * Out-of-order submission later applies the same rules to the same base. */
+int mem_store_validate(struct mem_store *store,
+                       const struct vsr_store *transaction);
 int mem_store_sync(struct mem_store *store, uint64_t sequence);
 void mem_store_crash(struct mem_store *store);
 void mem_store_reclaim(struct mem_store *store, uint64_t oldest);

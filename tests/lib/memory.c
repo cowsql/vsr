@@ -564,6 +564,9 @@ struct mem_checkpoint {
 struct mem_store {
     struct mem_revision **revisions;
     struct mem_pending *pending;
+    /* Logical shape of an issued but not yet readable transaction, built on
+     * its predecessor so a malformed one is attributed at submission. */
+    struct mem_revision **projected;
     size_t capacity;
     uint64_t readable;
     uint64_t durable;
@@ -592,12 +595,14 @@ void mem_store_destroy(struct mem_store *store)
         return;
     for (size_t i = 0; i < store->capacity; i++) {
         revision_destroy(store->revisions[i]);
+        revision_destroy(store->projected[i]);
         mem_graph_destroy(store->pending[i].graph);
     }
     for (size_t i = 0; i < store->checkpoint_count; i++)
         mem_graph_destroy(store->checkpoints[i].graph);
     free(store->checkpoints);
     free(store->pending);
+    free(store->projected);
     free(store->revisions);
     free(store);
 }
@@ -614,6 +619,7 @@ static void store_grow(struct mem_store *store, uint64_t sequence)
 {
     size_t capacity = store->capacity == 0 ? 16 : store->capacity;
     struct mem_revision **revisions;
+    struct mem_revision **projected;
     struct mem_pending *pending;
     CHECK(sequence < SIZE_MAX / sizeof(*pending));
     while (capacity <= sequence) {
@@ -623,16 +629,21 @@ static void store_grow(struct mem_store *store, uint64_t sequence)
     if (capacity == store->capacity)
         return;
     revisions = calloc(capacity, sizeof(*revisions));
+    projected = calloc(capacity, sizeof(*projected));
     pending = calloc(capacity, sizeof(*pending));
-    CHECK(revisions != NULL && pending != NULL);
+    CHECK(revisions != NULL && projected != NULL && pending != NULL);
     if (store->capacity != 0) {
         memcpy(revisions, store->revisions,
                store->capacity * sizeof(*revisions));
+        memcpy(projected, store->projected,
+               store->capacity * sizeof(*projected));
         memcpy(pending, store->pending, store->capacity * sizeof(*pending));
     }
     free(store->revisions);
+    free(store->projected);
     free(store->pending);
     store->revisions = revisions;
+    store->projected = projected;
     store->pending = pending;
     store->capacity = capacity;
 }
@@ -837,6 +848,78 @@ static int apply_change(const struct mem_store *store,
     }
 }
 
+/* Builds the immutable revision that transaction `sequence` produces on top
+ * of `base`, or reports the first logical violation and leaves no revision. */
+static int revision_build(const struct mem_store *store,
+                          const struct mem_revision *base,
+                          const struct vsr_store *transaction,
+                          uint64_t sequence, struct mem_revision **out)
+{
+    struct mem_revision *revision = revision_clone(base);
+    uint32_t final_role = revision->recovered.hard.role;
+    *out = NULL;
+    for (uint32_t i = 0; i < transaction->count; i++) {
+        const struct vsr_change *change = &transaction->changes[i];
+        if (change->type == VSR_STORE_HARD_STATE)
+            final_role = ((const struct vsr_hard_state *)change->data)->role;
+    }
+    for (uint32_t i = 0; i < transaction->count; i++) {
+        const int result = apply_change(
+            store, revision, &transaction->changes[i], sequence, final_role);
+        if (result != VSR_IO_OK) {
+            revision_destroy(revision);
+            return result;
+        }
+    }
+    if (revision->recovered.identity.replica == 0 ||
+        revision->recovered.hard.epoch == NULL ||
+        revision->recovered.hard.committed >= revision->recovered.log_end ||
+        revision->recovered.log_begin >
+            revision->recovered.hard.committed + 1 ||
+        (revision->recovered.log_begin > 1 &&
+         revision->recovered.checkpoint == NULL) ||
+        (revision->recovered.checkpoint != NULL &&
+         (revision->recovered.checkpoint->op >
+              revision->recovered.hard.committed ||
+          revision->recovered.checkpoint->op + 1 <
+              revision->recovered.log_begin ||
+          revision->recovered.checkpoint->op >= revision->recovered.log_end)) ||
+        revision->recovered.log_end - revision->recovered.log_begin !=
+            revision->entry_count) {
+        revision_destroy(revision);
+        return VSR_IO_CORRUPT;
+    }
+    revision->recovered.sequence = sequence;
+    *out = revision;
+    return VSR_IO_OK;
+}
+
+int mem_store_validate(struct mem_store *store,
+                       const struct vsr_store *transaction)
+{
+    const struct mem_revision *base;
+    struct mem_revision *projected;
+    int result;
+    if (transaction->sequence == 0 || transaction->sequence == UINT64_MAX ||
+        transaction->sequence <= store->readable || transaction->count == 0 ||
+        transaction->count > VSR_MAX_STORE_CHANGES)
+        return VSR_IO_CORRUPT;
+    store_grow(store, transaction->sequence);
+    if (store->projected[(size_t)transaction->sequence] != NULL)
+        return VSR_IO_CORRUPT;
+    if (transaction->sequence == store->readable + 1)
+        base = revision_get(store, store->readable);
+    else
+        base = store->projected[(size_t)transaction->sequence - 1];
+    if (base == NULL && transaction->sequence != 1)
+        return VSR_IO_CORRUPT;
+    result = revision_build(store, base, transaction, transaction->sequence,
+                            &projected);
+    if (result == VSR_IO_OK)
+        store->projected[(size_t)transaction->sequence] = projected;
+    return result;
+}
+
 int mem_store_submit(struct mem_store *store,
                      const struct vsr_store *transaction)
 {
@@ -854,55 +937,21 @@ int mem_store_submit(struct mem_store *store,
     while (store->readable + 1 < store->capacity) {
         const uint64_t next = store->readable + 1;
         struct mem_revision *revision;
-        uint32_t final_role;
+        int result;
         pending = &store->pending[(size_t)next];
         if (pending->graph == NULL)
             break;
-        revision = revision_clone(revision_get(store, store->readable));
-        final_role = revision->recovered.hard.role;
-        for (uint32_t i = 0; i < pending->transaction->count; i++) {
-            const struct vsr_change *change = &pending->transaction->changes[i];
-            if (change->type == VSR_STORE_HARD_STATE)
-                final_role =
-                    ((const struct vsr_hard_state *)change->data)->role;
-        }
-        for (uint32_t i = 0; i < pending->transaction->count; i++) {
-            const int result =
-                apply_change(store, revision, &pending->transaction->changes[i],
-                             next, final_role);
-            if (result != VSR_IO_OK) {
-                revision_destroy(revision);
-                mem_graph_destroy(pending->graph);
-                *pending = (struct mem_pending){0};
-                return result;
-            }
-        }
-        if (revision->recovered.identity.replica == 0 ||
-            revision->recovered.hard.epoch == NULL ||
-            revision->recovered.hard.committed >= revision->recovered.log_end ||
-            revision->recovered.log_begin >
-                revision->recovered.hard.committed + 1 ||
-            (revision->recovered.log_begin > 1 &&
-             revision->recovered.checkpoint == NULL) ||
-            (revision->recovered.checkpoint != NULL &&
-             (revision->recovered.checkpoint->op >
-                  revision->recovered.hard.committed ||
-              revision->recovered.checkpoint->op + 1 <
-                  revision->recovered.log_begin ||
-              revision->recovered.checkpoint->op >=
-                  revision->recovered.log_end)) ||
-            revision->recovered.log_end - revision->recovered.log_begin !=
-                revision->entry_count) {
-            revision_destroy(revision);
-            mem_graph_destroy(pending->graph);
-            *pending = (struct mem_pending){0};
-            return VSR_IO_CORRUPT;
-        }
-        revision->recovered.sequence = next;
-        store->revisions[(size_t)next] = revision;
-        store->readable = next;
+        result = revision_build(store, revision_get(store, store->readable),
+                                pending->transaction, next, &revision);
         mem_graph_destroy(pending->graph);
         *pending = (struct mem_pending){0};
+        if (result != VSR_IO_OK)
+            return result;
+        /* The projection built at submission is now superseded by the fact. */
+        revision_destroy(store->projected[(size_t)next]);
+        store->projected[(size_t)next] = NULL;
+        store->revisions[(size_t)next] = revision;
+        store->readable = next;
     }
     return VSR_IO_OK;
 }
@@ -923,6 +972,8 @@ void mem_store_crash(struct mem_store *store)
             revision_destroy(store->revisions[i]);
             store->revisions[i] = NULL;
         }
+        revision_destroy(store->projected[i]);
+        store->projected[i] = NULL;
         mem_graph_destroy(store->pending[i].graph);
         store->pending[i] = (struct mem_pending){0};
     }

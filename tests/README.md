@@ -11,7 +11,7 @@ seeded fault simulation share one directory.
 | `fuzzy/` | Coverage-guided fuzzing and seeded cluster/fault simulation | Arithmetic and graph libFuzzer harnesses; seeded cluster scheduler |
 | `regression/` | Minimal reproducers for fixed bugs and crashes | Trimmed-prefix resend to a lagging peer (`trim_resend`); add with each bug fix |
 | `benchmark/` | Repeatable latency, throughput, allocation and copy measurements | Reserved; implementation required |
-| `lib/` | Shared test-only assertions and fixtures | In-memory immutable storage, cluster host, seeded RNG, always-active checks |
+| `lib/` | Shared test-only assertions and fixtures | In-memory immutable storage validating each transaction's shape at issuance; cluster host with always-active oracles for fence exclusion, read-fence bounds, a cluster-wide client execution/reply table, offer-versus-store equality, LOAD/RECLAIM/DROP retention rules, lease release, and STOPPED accounting; seeded RNG |
 
 `make check` builds the contract archives and runs executable tests using
 Automake's parallel test harness. Failures appear in `test-suite.log` and
