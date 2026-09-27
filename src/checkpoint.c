@@ -642,13 +642,16 @@ static bool store_poll(struct vsr *v)
     uint32_t count = 1;
     uint64_t end = protocol->written_end;
     uint64_t committed = 0;
-    /* RESTORE removes a prefix just as TRIM does. A remote anchor does not
-     * replace the independent full-member retention promises. */
-    if (checkpoint->restoring &&
-        checkpoint->target_role == VSR_MEMBER_WITNESS &&
-        slot->checkpoint.op + 1 > protocol->log_begin &&
-        covered(v, slot->checkpoint.op) < protocol->current.faults + 1u)
-        return false;
+    /* RESTORE only replaces a prefix the witness cannot vouch for: recovery
+     * rebuilds a failed member, and a transfer restores the donor's anchor
+     * only when the entry it closes with is absent or divergent here, so this
+     * witness belonged to none of the quorums that committed the anchored
+     * prefix. Every member of those quorums retains or covers the whole
+     * prefix, and at least one survives the configured failures, so the local
+     * copy decides nothing. Waiting for f + 1 advertisements instead deadlocks
+     * against a recovering full member that needs this witness normal before
+     * it can advertise again. Retention promises still gate every later TRIM,
+     * and a remote anchor never counts as a fresh promise. */
     changes[0] = (struct vsr_change){checkpoint->restoring
                                          ? VSR_STORE_RESTORE_CHECKPOINT
                                          : VSR_STORE_PUBLISH_CHECKPOINT,
@@ -905,8 +908,11 @@ bool vsr_checkpoint_poll(struct vsr *v)
     }
     if (trim_poll(v) || drop_poll(v))
         return true;
+    /* Publishing a remote anchor compacts the log. A transfer already
+     * positioned its fetch cursor against the prefix retained at selection;
+     * moving log_begin under it turns its next comparison into a fatal LOAD. */
     if (checkpoint->remote_present && v->status.role == VSR_MEMBER_WITNESS &&
-        !checkpoint->guarded &&
+        !checkpoint->guarded && !vsr_transition_busy(v) &&
         checkpoint->remote.op <= protocol->stable_commit &&
         checkpoint->remote.op > v->status.checkpoint_op &&
         covered(v, checkpoint->remote.op) >= protocol->current.faults + 1u) {

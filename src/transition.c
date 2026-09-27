@@ -14,6 +14,7 @@ enum transition_tag {
     TAG_SERVE_LOAD,
     TAG_TARGET_LOAD,
     TAG_COMPARE_LOAD,
+    TAG_ANCHOR_LOAD,
     TAG_OFFER_SEND
 };
 
@@ -44,6 +45,8 @@ enum target_phase {
     TARGET_NORMAL
 };
 enum server_phase { SERVER_FREE, SERVER_LOAD, SERVER_LOADING, SERVER_REPLY };
+/* Whether a witness retains the entry a selected remote anchor closes with. */
+enum anchor_state { ANCHOR_UNKNOWN, ANCHOR_RETAINED, ANCHOR_MISSING };
 
 struct round_peer {
     struct vsr_nonce reply_nonce;
@@ -94,6 +97,7 @@ struct selected_target {
     uint64_t sequence;
     uint64_t load_id;
     uint64_t compare_id;
+    uint64_t anchor_id;
     uint64_t retry_at;
     uint32_t lease;
     uint32_t offer;
@@ -102,6 +106,7 @@ struct selected_target {
     uint32_t append_offset;
     uint32_t goal;
     uint32_t phase;
+    uint32_t anchor;
     bool active;
     bool waiting;
     bool snapshot_started;
@@ -341,8 +346,8 @@ static uint32_t offer_current(struct vsr *v)
     struct vsr_protocol *p = vsr_protocol(v);
     struct vsr_transition *t = transition(v);
     if (p->epoch.boundary > p->stable_commit || !hard_safe(v) ||
-        !vsr_checkpoint_revision_ready(v) ||
-        p->stable_end != p->written_end || p->written_end != p->log_end)
+        !vsr_checkpoint_revision_ready(v) || p->stable_end != p->written_end ||
+        p->written_end != p->log_end)
         return VSR_INDEX_NONE;
     uint32_t free_index = VSR_INDEX_NONE;
     uint32_t victim = VSR_INDEX_NONE;
@@ -764,6 +769,24 @@ static bool target_load(struct vsr *v, uint64_t sequence, uint64_t first,
     return true;
 }
 
+/* A proposal is identified by its epoch, view, and op: one primary assigns
+ * each op once per view, and a boundary entry belongs to the epoch it ends.
+ * A witness holding that exact entry accepted it after installing the
+ * proposing view's history, so its whole retained prefix is the committed one
+ * and needs no anchor. Anything else at that op was never part of the quorum
+ * that committed it, and such an unverifiable prefix must be replaced. */
+static bool anchor_retained(const struct vsr *v, const struct vsr_entry *entry,
+                            const struct vsr_checkpoint *checkpoint)
+{
+    const struct vsr_protocol *p = vsr_protocol_const(v);
+    uint64_t epoch = p->current.epoch;
+    if (checkpoint->op != 0 && checkpoint->op == p->epoch.boundary &&
+        p->epoch.previous != NULL)
+        epoch = p->epoch.previous->epoch;
+    return entry->op == checkpoint->op && entry->view == checkpoint->view &&
+           entry->epoch == epoch;
+}
+
 static void reject_discarded_routes(struct vsr *v, uint64_t first)
 {
     struct vsr_protocol *p = vsr_protocol(v);
@@ -870,9 +893,9 @@ static bool append_chunk(struct vsr *v)
             {VSR_STORE_HARD_STATE, 1, 0, &hard},
         };
         uint64_t sequence;
-        if (!vsr_protocol_store(v, changes + (replace ? 0 : 1),
-                                replace ? 3 : 2, &target->entries_lease, 1,
-                                next, committed, 0, &sequence))
+        if (!vsr_protocol_store(v, changes + (replace ? 0 : 1), replace ? 3 : 2,
+                                &target->entries_lease, 1, next, committed, 0,
+                                &sequence))
             return false;
         if (replace)
             reject_discarded_routes(v, entries[0].op);
@@ -944,12 +967,33 @@ static bool target_poll(struct vsr *v)
             bool adopt = target->rebuild ||
                          (checkpoint != NULL &&
                           (existing == NULL || checkpoint->op > existing->op));
-            /* A witness already retaining the committed prefix need not trim
-             * it to copy the donor's newer anchor. Such an unnecessary RESTORE
-             * can wait for retention advertisements from the very full replica
-             * whose recovery needs this witness to rejoin the normal quorum. */
+            /* A witness keeps a prefix it can vouch for instead of copying
+             * the donor's newer anchor: a known-committed prefix, or one that
+             * ends in the very entry the anchor closes with. The donor cannot
+             * resend entries behind its anchor, so that check reads the local
+             * copy here rather than in the ordinary chunk comparison. */
+            if (adopt && role == VSR_MEMBER_WITNESS && !target->rebuild &&
+                checkpoint->op > p->stable_commit &&
+                checkpoint->op >= p->readable_begin &&
+                checkpoint->op < p->written_end &&
+                target->anchor == ANCHOR_UNKNOWN) {
+                const struct vsr_log_slot *slot =
+                    vsr_protocol_log_find(v, checkpoint->op);
+                if (slot == NULL) {
+                    if (target->anchor_id != 0)
+                        return false;
+                    return target_load(v, v->status.stored_sequence,
+                                       checkpoint->op, checkpoint->op + 1,
+                                       TAG_ANCHOR_LOAD, &target->anchor_id);
+                }
+                target->anchor = anchor_retained(v, &slot->entry, checkpoint)
+                                     ? ANCHOR_RETAINED
+                                     : ANCHOR_MISSING;
+                return true;
+            }
             if (role == VSR_MEMBER_WITNESS &&
-                (checkpoint == NULL || checkpoint->op <= p->stable_commit))
+                (checkpoint == NULL || checkpoint->op <= p->stable_commit ||
+                 target->anchor == ANCHOR_RETAINED))
                 adopt = false;
             if (adopt) {
                 /* A newer local anchor may cover an older selected checkpoint,
@@ -1455,9 +1499,8 @@ bool vsr_transition_poll(struct vsr *v)
         return true;
     if (expired(v, t->election_at) &&
         (t->round == ROUND_CATCHUP ||
-         (t->target.active &&
-          (t->target.goal == TARGET_PRIMARY ||
-           t->target.goal == TARGET_BACKUP))))
+         (t->target.active && (t->target.goal == TARGET_PRIMARY ||
+                               t->target.goal == TARGET_BACKUP))))
         return next_view(v);
     if (v->status.state == VSR_STATE_NORMAL && !t->target.active &&
         p->self != VSR_INDEX_NONE && v->status.primary != v->options.replica &&
@@ -1497,6 +1540,11 @@ int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
         *handled = true;
         return VSR_OK;
     }
+    /* Retention advertisements are epoch-scoped, never view-scoped. A member
+     * recovering or changing views still needs the promises that RESTORE and
+     * TRIM count; dropping them below keeps a wiped witness waiting forever. */
+    if (message->type == VSR_MSG_CHECKPOINT)
+        return VSR_OK;
     if (message->type == VSR_MSG_GET_STATE ||
         message->type == VSR_MSG_GET_LOG) {
         *handled = true;
@@ -1681,8 +1729,8 @@ int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
         if (message->view > v->status.view || gap ||
             v->status.state != VSR_STATE_NORMAL) {
             *handled = true;
-            bool new_round = t->round != ROUND_CATCHUP ||
-                             message->view > v->status.view;
+            bool new_round =
+                t->round != ROUND_CATCHUP || message->view > v->status.view;
             v->status.view = message->view;
             v->status.primary = message->from;
             if (new_round)
@@ -1753,6 +1801,27 @@ void vsr_transition_complete(struct vsr *v, struct vsr_operation *operation,
             return;
         }
         take_chunk(v, loaded->items, loaded->count, lease);
+    } else if (tag == TAG_ANCHOR_LOAD &&
+               target->anchor_id == operation->output.id) {
+        target->anchor_id = 0;
+        if (event->status == VSR_IO_RETRY)
+            return;
+        /* Absence means the prefix is not retained readably: replace it. */
+        if (event->status == VSR_IO_NOT_FOUND) {
+            target->anchor = ANCHOR_MISSING;
+            return;
+        }
+        if (event->status != VSR_IO_OK) {
+            vsr_fail(v, VSR_FAILURE_STORAGE, operation, event->status);
+            return;
+        }
+        const struct vsr_loaded *loaded = event->data;
+        const struct vsr_entry *entries = loaded->items;
+        target->anchor =
+            loaded->count == 1 &&
+                    anchor_retained(v, &entries[0], target->state.checkpoint)
+                ? ANCHOR_RETAINED
+                : ANCHOR_MISSING;
     } else if (tag == TAG_COMPARE_LOAD &&
                target->compare_id == operation->output.id) {
         target->compare_id = 0;
@@ -1772,7 +1841,8 @@ void vsr_transition_complete(struct vsr *v, struct vsr_operation *operation,
         for (uint32_t i = 0; i < loaded->count; i++) {
             if (!vsr_entry_equal(&entries[i], &target->entries[i])) {
                 if (entries[i].op <= vsr_protocol(v)->stable_commit) {
-                    vsr_fail(v, VSR_FAILURE_INVARIANT, operation, event->status);
+                    vsr_fail(v, VSR_FAILURE_INVARIANT, operation,
+                             event->status);
                     return;
                 }
                 target->append_offset = i;
@@ -1792,7 +1862,8 @@ uint64_t vsr_transition_deadline(const struct vsr *v)
     if (t->round != ROUND_NONE)
         result = t->retry_at;
     if ((t->round == ROUND_VIEW || t->round == ROUND_CATCHUP ||
-         t->target.active) && t->election_at < result)
+         t->target.active) &&
+        t->election_at < result)
         result = t->election_at;
     if (t->target.active && t->target.waiting && t->target.retry_at < result)
         result = t->target.retry_at;

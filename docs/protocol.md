@@ -193,7 +193,12 @@ the sender's own retained image; forwarding a remote anchor is not an ownership
 advertisement. Coverage promises are monotonic: replacing an image must preserve
 at least its recoverable prefix. Recovered witnesses reacquire advertisements
 before extending trim coverage; they cannot treat their remote anchor as a set
-of fresh promises.
+of fresh promises. Installing a remote anchor during recovery or state transfer
+needs no promises: a witness holding the anchor's own boundary entry (same
+epoch, view, and op) keeps its retained prefix instead, and otherwise it
+replaces only a prefix it never prepared, which the quorums that committed it
+retain or cover independently. A witness in a transfer defers adopting an
+advertised anchor until that transfer completes.
 
 During handoff, old promises remain binding until new coverage is established.
 This rule permits a quorum containing mostly witnesses without losing the
