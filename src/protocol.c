@@ -144,8 +144,8 @@ void vsr_protocol_init(struct vsr *v, void *memory, size_t size)
     p->batch = (void *)(b + a.batch);
     p->results = (void *)(b + a.results);
     p->transaction_capacity = v->options.limits.operations + 1u;
-    p->next_sequence = p->log_begin = p->log_end = p->written_end =
-        p->stable_end = 1;
+    p->next_sequence = p->log_begin = p->readable_begin = p->log_end =
+        p->written_end = p->stable_end = 1;
     p->results_lease = VSR_INDEX_NONE;
     p->heartbeat_at = p->election_at = p->retry_at = p->append_at =
         VSR_NO_DEADLINE;
@@ -459,6 +459,8 @@ static void advance_transactions(struct vsr *v)
         if (t->sequence != v->status.stored_sequence + 1 || !t->completed)
             break;
         v->status.stored_sequence++;
+        if (t->begin > p->readable_begin)
+            p->readable_begin = t->begin;
         if (t->clients_through > p->clients_stored) {
             p->clients_stored = t->clients_through;
             p->clients_sequence = t->sequence;
@@ -558,9 +560,12 @@ static bool store_poll(struct vsr *v)
         vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
         return true;
     }
-    *t = (struct vsr_transaction){p->next_sequence, p->written_end + appended,
+    *t = (struct vsr_transaction){p->next_sequence,
+                                  p->written_end + appended,
                                   hard_changed ? hard.committed : 0,
-                                  results ? p->results_through : 0, false};
+                                  results ? p->results_through : 0,
+                                  0,
+                                  false};
     for (uint32_t i = 0; i < appended; ++i)
         vsr_protocol_log_find(v, p->written_end + i)->sequence =
             p->next_sequence;
@@ -599,7 +604,9 @@ static bool sync_poll(struct vsr *v)
 bool vsr_protocol_load_log(struct vsr *v, uint64_t first, uint64_t end)
 {
     struct vsr_protocol *p = vsr_protocol(v);
-    if (p->log_loading || first >= end || first < p->log_begin ||
+    /* Every LOAD names stored_sequence, so it may only address the range that
+     * revision retains; a compacted prefix is expected absence, never fatal. */
+    if (p->log_loading || first >= end || first < p->readable_begin ||
         first >= p->written_end)
         return false;
     uint64_t bytes = vsr_protocol_available_bytes(v);
@@ -654,12 +661,23 @@ bool vsr_protocol_store(struct vsr *v, const struct vsr_change *changes,
     if (t->sequence != 0)
         return false;
     struct vsr_store store = {p->next_sequence, changes, count, 0};
+    /* Mirror the store's retained range so the readable frontier can follow
+     * this transaction the moment it is readable, before it is durable. */
+    uint64_t begin = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (changes[i].type == VSR_STORE_TRIM) {
+            begin = changes[i].first;
+        } else if (changes[i].type == VSR_STORE_RESTORE_CHECKPOINT) {
+            const struct vsr_checkpoint *checkpoint = changes[i].data;
+            begin = checkpoint->op + 1;
+        }
+    }
     if (!vsr_protocol_emit(v, VSR_OP_STORE, 0, VSR_TAG_STORE, &store, leases,
                            lease_count, 0))
         return false;
     *sequence = p->next_sequence++;
-    *t = (struct vsr_transaction){*sequence, append_end, committed,
-                                  clients_through, false};
+    *t = (struct vsr_transaction){*sequence,       append_end, committed,
+                                  clients_through, begin,      false};
     return true;
 }
 
@@ -1034,7 +1052,10 @@ static bool network_poll(struct vsr *v)
             continue;
         uint64_t first =
             (peer->sent > peer->prepared ? peer->sent : peer->prepared) + 1;
-        if (first < p->stable_end) {
+        /* PREPARE can only resume from the retained log. A peer acknowledged
+         * below it falls through to COMMIT: the commit number is beyond its
+         * history, so it discovers an offer and fetches state instead. */
+        if (first < p->stable_end && first >= p->readable_begin) {
             struct vsr_log_slot *s = vsr_protocol_log_find(v, first);
             if (s == NULL) {
                 if (vsr_protocol_load_log(v, first, p->stable_end))
@@ -1308,7 +1329,7 @@ static void boot_complete(struct vsr *v, struct vsr_operation *op,
     p->safe_sequence = p->sync_requested = p->sync_completed = r->sequence;
     v->status.stored_sequence = v->status.durable_sequence = r->sequence;
     p->hard_sequence = r->sequence;
-    p->log_begin = r->log_begin;
+    p->log_begin = p->readable_begin = r->log_begin;
     p->log_end = p->written_end = p->stable_end = r->log_end;
     p->desired_commit = p->stable_commit = v->status.committed =
         r->hard.committed;
@@ -1603,8 +1624,10 @@ bool vsr_protocol_poll(struct vsr *v)
                 return true;
         } else {
             uint64_t next = p->notified_commit + 1;
-            if (next < p->log_begin) {
-                p->notified_commit = p->log_begin - 1;
+            if (next < p->readable_begin) {
+                /* A durably published checkpoint already covers the
+                 * compacted prefix, whether or not its trim is durable yet. */
+                p->notified_commit = p->readable_begin - 1;
                 return true;
             }
             struct vsr_log_slot *s = vsr_protocol_log_find(v, next);

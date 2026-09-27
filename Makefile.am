@@ -36,8 +36,9 @@ INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contr
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
   tests/integration/audit tests/integration/transfer_audit
+REGRESSION_TESTS = tests/regression/trim_resend
 FUZZY_TESTS = tests/fuzzy/cluster
-check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(FUZZY_TESTS)
+check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
 tests_unit_checked_LDADD = src/libvsr.a
 tests_unit_objects_SOURCES = tests/unit/objects.c
@@ -87,6 +88,10 @@ tests_integration_transfer_audit_SOURCES = tests/integration/transfer_audit.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_integration_transfer_audit_LDADD = src/libvsr.a
+tests_regression_trim_resend_SOURCES = tests/regression/trim_resend.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_trim_resend_LDADD = src/libvsr.a
 tests_fuzzy_cluster_SOURCES = tests/fuzzy/cluster.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h \
@@ -133,7 +138,8 @@ FORMAT_FILES = find $(srcdir)/include $(srcdir)/src $(srcdir)/tests $(srcdir)/ex
 FUZZ_RUNS = 10000
 FUZZ_ARGS =
 
-.PHONY: check-build check-unit check-integration check-fuzzy format format-check lint \
+.PHONY: check-build check-unit check-integration check-regression check-fuzzy \
+  format format-check lint \
   compile-commands tidy cppcheck analyze shellcheck check-valgrind coverage fuzz
 
 .PHONY: benchmark
@@ -148,6 +154,9 @@ check-unit: check-build
 
 check-integration: check-build
 	$(MAKE) check TESTS='$(INTEGRATION_TESTS)'
+
+check-regression: check-build
+	$(MAKE) check TESTS='$(REGRESSION_TESTS)'
 
 check-fuzzy: check-build
 	$(MAKE) check TESTS='$(FUZZY_TESTS)'

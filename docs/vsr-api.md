@@ -299,11 +299,14 @@ compacted log ranges may return NOT_FOUND; an unexplained hole in retained local
 history or a missing live revision is fatal.
 Because LOAD addresses an exact retained revision, compaction of a newer revision
 cannot make its entries disappear. A requested range outside a known retained
-range is expected absence; an issued valid read losing its data is not. Non-LOG
-loads use `first=end=0`; RECOVERY uses sequence 0 and a zero client ID. LOG uses
-a zero client ID. All returned blobs obey both the operation's byte budget and
-their per-object limits. The recovered log/checkpoint bounds are the same as
-those for a log offer in the protocol contract.
+range is expected absence; an issued valid read losing its data is not. The
+core therefore never issues a LOAD below the range that the named revision
+retains: a TRIM or RESTORE bounds later loads as soon as its STORE completes,
+before it is durable, even though offers keep describing the safe revision.
+Non-LOG loads use `first=end=0`; RECOVERY uses sequence 0 and a zero client ID.
+LOG uses a zero client ID. All returned blobs obey both the operation's byte
+budget and their per-object limits. The recovered log/checkpoint bounds are the
+same as those for a log offer in the protocol contract.
 
 STORE success means the complete transaction is readable and independent of its
 operation pin, not necessarily durable. SYNC success certifies all transactions

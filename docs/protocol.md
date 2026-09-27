@@ -59,7 +59,9 @@ when re-proposed after view change. Newly allocated entries use the current
 epoch and view; request identity and contents never change during retransmission.
 COMMIT carries no entries and also acts as the idle heartbeat. A received commit
 beyond local history is a catch-up target; local commitment advances only once
-the prefix is present. PREPARE_OK certifies a contiguous prefix in the envelope's
+the prefix is present. A primary never resends entries below its retained log:
+a backup acknowledged below that log receives COMMIT and catches up through
+state transfer. PREPARE_OK certifies a contiguous prefix in the envelope's
 epoch and view, never mere receipt of a batch or transport completion.
 
 Only the designated primary sends PREPARE, COMMIT, and START_VIEW. A backup
