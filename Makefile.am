@@ -200,9 +200,16 @@ tidy: compile_commands.json
 	  $(CLANG_TIDY) --quiet -p . $(srcdir)/$$file; \
 	done
 
+# The const* suggestions are style-only and keep signatures symmetric with
+# callbacks and mutating siblings. Tests mutate objects that stores, graphs
+# and memberships hold by pointer, which the flow analysis reads as unused
+# or redundant stores. The other checks stay fatal.
 cppcheck: compile_commands.json
 	cppcheck --project=compile_commands.json --enable=warning,style,performance,portability \
-	  --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem
+	  --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem \
+	  --suppress=constParameterPointer --suppress=constVariablePointer \
+	  --suppress=constParameterCallback --suppress=constVariable \
+	  --suppress='unreadVariable:*/tests/*' --suppress='redundantAssignment:*/tests/*'
 
 lint: format-check shellcheck tidy cppcheck
 

@@ -3,7 +3,9 @@ Checks: >-
   clang-analyzer-*,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   bugprone-*,
+  -bugprone-branch-clone,
   -bugprone-easily-swappable-parameters,
+  -bugprone-multi-level-implicit-pointer-conversion,
   -bugprone-reserved-identifier,
   performance-*,
   portability-*
@@ -12,3 +14,6 @@ HeaderFilterRegex: '(include|src|tests)/.*'
 FormatStyle: file
 # Annex K *_s functions are optional and unavailable on our libc; this checker
 # flags even constant-format fprintf and bounded memcpy. Keep other checks on.
+# branch-clone: request routing chains repeat the same reply on purpose so
+# each rule reads on its own. multi-level-implicit-pointer-conversion: C
+# passes T ** to malloc/realloc/memcpy through void * by design.
