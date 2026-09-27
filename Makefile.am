@@ -42,7 +42,7 @@ INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
   tests/regression/witness_prefix
-FUZZY_TESTS = tests/fuzzy/cluster
+FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
 tests_unit_checked_LDADD = src/libvsr.a
@@ -109,11 +109,18 @@ tests_regression_witness_prefix_SOURCES = tests/regression/witness_prefix.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_witness_prefix_LDADD = src/libvsr.a
-tests_fuzzy_cluster_SOURCES = tests/fuzzy/cluster.c \
+CLUSTER_SCENARIO = tests/fuzzy/scenario.c tests/fuzzy/scenario.h \
   tests/lib/memory.c tests/lib/memory.h \
-  tests/lib/memory_cluster.c tests/lib/memory_cluster.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_fuzzy_cluster_SOURCES = tests/fuzzy/cluster.c $(CLUSTER_SCENARIO) \
   tests/lib/random.c tests/lib/random.h
 tests_fuzzy_cluster_LDADD = src/libvsr.a
+# The same scheduler with the widest passing flag union by default: 16 seeds
+# of 1+4+8+16+64 (flag 32 hits known core failures, see tests/fuzzy/KNOWN_FAILURES.md).
+tests_fuzzy_cluster_extended_SOURCES = $(tests_fuzzy_cluster_SOURCES)
+tests_fuzzy_cluster_extended_CPPFLAGS = $(AM_CPPFLAGS) \
+  -DCLUSTER_DEFAULT_COUNT=16 -DCLUSTER_DEFAULT_PROFILE=93
+tests_fuzzy_cluster_extended_LDADD = src/libvsr.a
 EXTRA_PROGRAMS = tests/benchmark/core
 tests_benchmark_core_SOURCES = tests/benchmark/core.c \
   tests/lib/memory.c tests/lib/memory.h \
@@ -128,13 +135,16 @@ check_LIBRARIES = tests/integration/libheader.a
 tests_integration_libheader_a_SOURCES = tests/integration/header.c
 
 if FUZZING
-noinst_PROGRAMS += tests/fuzzy/checked tests/fuzzy/validation
+noinst_PROGRAMS += tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz
 tests_fuzzy_checked_SOURCES = tests/fuzzy/checked.c
 tests_fuzzy_checked_LDADD = src/libvsr.a
 tests_fuzzy_checked_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 tests_fuzzy_validation_SOURCES = tests/fuzzy/validation.c
 tests_fuzzy_validation_LDADD = src/libvsr.a
 tests_fuzzy_validation_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
+tests_fuzzy_cluster_fuzz_SOURCES = tests/fuzzy/cluster_fuzz.c $(CLUSTER_SCENARIO)
+tests_fuzzy_cluster_fuzz_LDADD = src/libvsr.a
+tests_fuzzy_cluster_fuzz_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 endif
 
 EXTRA_DIST = \
@@ -230,12 +240,15 @@ coverage:
 endif
 
 if FUZZING
-fuzz: tests/fuzzy/checked tests/fuzzy/validation
-	$(MKDIR_P) tests/fuzzy/corpus/checked tests/fuzzy/corpus/validation tests/fuzzy/artifacts
+fuzz: tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz
+	$(MKDIR_P) tests/fuzzy/corpus/checked tests/fuzzy/corpus/validation \
+	  tests/fuzzy/corpus/cluster tests/fuzzy/artifacts
 	./tests/fuzzy/checked -runs=$(FUZZ_RUNS) -max_len=64 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/checked
 	./tests/fuzzy/validation -runs=$(FUZZ_RUNS) -max_len=256 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/validation
+	./tests/fuzzy/cluster_fuzz -runs=$(FUZZ_RUNS) -max_len=512 \
+	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/cluster
 else
 fuzz:
 	@echo 'Configure a separate build with --enable-fuzzing first.' >&2; exit 1
