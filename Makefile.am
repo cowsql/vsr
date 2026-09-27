@@ -188,8 +188,9 @@ SCAN_BUILD = $(shell $(CC) -print-prog-name=scan-build)
 LLVM_COV = $(shell $(CC) -print-prog-name=llvm-cov)
 LLVM_PROFDATA = $(shell $(CC) -print-prog-name=llvm-profdata)
 FORMAT_FILES = find $(srcdir)/include $(srcdir)/src $(srcdir)/tests $(srcdir)/examples -type f \( -name '*.c' -o -name '*.h' \) -print0
-FUZZ_RUNS = 10000
-FUZZ_ARGS =
+# Overridable from the environment as well as the command line.
+FUZZ_RUNS ?= 10000
+FUZZ_ARGS ?=
 
 .PHONY: check-build check-unit check-integration check-regression check-fuzzy \
   format format-check lint \
@@ -236,9 +237,16 @@ tidy: compile_commands.json
 	  $(CLANG_TIDY) --quiet -p . $(srcdir)/$$file; \
 	done
 
+# The const* suggestions are style-only and keep signatures symmetric with
+# callbacks and mutating siblings. Tests mutate objects that stores, graphs
+# and memberships hold by pointer, which the flow analysis reads as unused
+# or redundant stores. The other checks stay fatal.
 cppcheck: compile_commands.json
 	cppcheck --project=compile_commands.json --enable=warning,style,performance,portability \
-	  --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem
+	  --error-exitcode=1 --inline-suppr --suppress=missingIncludeSystem \
+	  --suppress=constParameterPointer --suppress=constVariablePointer \
+	  --suppress=constParameterCallback --suppress=constVariable \
+	  --suppress='unreadVariable:*/tests/*' --suppress='redundantAssignment:*/tests/*'
 
 lint: format-check shellcheck tidy cppcheck
 

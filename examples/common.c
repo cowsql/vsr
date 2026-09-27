@@ -71,6 +71,8 @@ struct example_cluster example_start(const char *title, uint32_t count,
 {
     struct example_cluster cluster = {.host = mem_cluster_create(),
                                       .durability = durability,
+                                      .genesis = count,
+                                      .faults = faults,
                                       .next_route = 1};
     char text[EXAMPLE_TEXT_BYTES];
     size_t length = 0;
@@ -83,12 +85,12 @@ struct example_cluster example_start(const char *title, uint32_t count,
             text + length, sizeof(text) - length, "%sreplica %" PRIu32 " (%s)",
             i == 0 ? "" : ", ", i + 1, example_role_name(role));
     }
-    cluster.seed = (struct vsr_membership){0, cluster.members, count, faults};
     say("== %s ==", title);
     say("group: %s; f = %" PRIu32 ", quorum = %" PRIu32 ", %s storage", text,
         faults, count - faults, durability_name(durability));
     for (uint32_t i = 0; i < count; ++i) {
-        struct vsr_options options = mem_options(i + 1, &cluster.seed);
+        const struct vsr_membership seed = example_seed(&cluster);
+        struct vsr_options options = mem_options(i + 1, &seed);
         add_node(&cluster, &options);
     }
     example_run(&cluster);
@@ -98,10 +100,18 @@ struct example_cluster example_start(const char *title, uint32_t count,
     return cluster;
 }
 
+struct vsr_membership example_seed(const struct example_cluster *cluster)
+{
+    /* The struct is returned by value, so the pointer is rebuilt from the
+     * caller's copy instead of being stored inside the struct itself. */
+    return (struct vsr_membership){0, cluster->members, cluster->genesis,
+                                   cluster->faults};
+}
+
 struct mem_node *example_join(struct example_cluster *cluster, uint32_t role)
 {
-    struct vsr_options options =
-        mem_options(cluster->count + 1, &cluster->seed);
+    const struct vsr_membership seed = example_seed(cluster);
+    struct vsr_options options = mem_options(cluster->count + 1, &seed);
     struct mem_node *node;
     options.start_mode = VSR_START_JOIN;
     options.join_role = role;
@@ -222,7 +232,8 @@ size_t example_run_counting(struct example_cluster *cluster, uint64_t from,
 
 void example_elapse(struct example_cluster *cluster, uint64_t duration)
 {
-    const uint64_t step = mem_options(1, &cluster->seed).retry_ns;
+    const struct vsr_membership seed = example_seed(cluster);
+    const uint64_t step = mem_options(1, &seed).retry_ns;
     const uint64_t until = cluster->now + duration;
     while (cluster->now < until) {
         cluster->now =

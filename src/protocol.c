@@ -715,8 +715,10 @@ static bool proposal_room(struct vsr *v)
         vsr_fail(v, VSR_FAILURE_EXHAUSTED, NULL, VSR_IO_OK);
         return false;
     }
-    struct vsr_log_slot *s =
-        &p->log[(p->log_end - 1) % v->options.limits.log_cache_entries];
+    const uint32_t entries = v->options.limits.log_cache_entries;
+    if (entries == 0) /* Rejected by validation; keeps analyzers honest. */
+        return false;
+    struct vsr_log_slot *s = &p->log[(p->log_end - 1) % entries];
     if (s->used &&
         (s->sequence == 0 || s->sequence > v->status.stored_sequence))
         return false;

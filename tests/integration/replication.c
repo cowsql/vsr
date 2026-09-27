@@ -52,7 +52,7 @@ static void normal_group(uint32_t count, uint32_t faults, bool witness,
     const struct vsr_id client = {100, 200};
     uint64_t last_op;
 
-    CHECK(count <= 5);
+    CHECK(count >= 1 && count <= 5);
     for (uint32_t i = 0; i < count; ++i) {
         members[i] = (struct vsr_member){
             (uint64_t)i + 1,

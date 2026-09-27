@@ -16,8 +16,8 @@ seeded fault simulation share one directory.
 `make check` builds the contract archives and runs executable tests using
 Automake's parallel test harness. Failures appear in `test-suite.log` and
 per-test `.log` files in the build tree. `make check-unit`,
-`make check-integration`, and `make check-regression` select the existing
-layers. Empty layers deliberately have no passing placeholder tests or
+`make check-integration`, `make check-regression`, and `make check-fuzzy`
+select the existing layers. Empty layers deliberately have no passing placeholder tests or
 misleading coverage claims.
 
 ASan and UBSan are on by default, including in the library under test. Keep the

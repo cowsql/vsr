@@ -25,7 +25,8 @@ int main(void)
 {
     struct example_cluster cluster =
         example_start("failover", REPLICAS, FAULTS, VSR_DURABLE, NULL);
-    const uint64_t view_timeout = mem_options(1, &cluster.seed).view_timeout_ns;
+    const struct vsr_membership seed = example_seed(&cluster);
+    const uint64_t view_timeout = mem_options(1, &seed).view_timeout_ns;
     struct mem_node *replica_1 = example_replica(&cluster, 1);
     struct mem_node *replica_2 = example_replica(&cluster, 2);
     struct example_client client_a = example_client("client A", 1);

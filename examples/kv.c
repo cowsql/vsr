@@ -170,10 +170,14 @@ static void kv_install(void *state, const void *image, size_t size)
         char key[KV_KEY_BYTES];
         char value[KV_VALUE_BYTES];
         CHECK(equals != NULL && newline != NULL && equals < newline);
-        snprintf(key, sizeof(key), "%.*s", (int)(equals - (bytes + at)),
-                 bytes + at);
-        snprintf(value, sizeof(value), "%.*s", (int)(newline - equals - 1),
-                 equals + 1);
+        const size_t key_length = (size_t)(equals - (bytes + at));
+        const size_t value_length = (size_t)(newline - equals - 1);
+        /* Images come from kv_capture, so every field fits its slot. */
+        CHECK(key_length < sizeof(key) && value_length < sizeof(value));
+        memcpy(key, bytes + at, key_length);
+        key[key_length] = '\0';
+        memcpy(value, equals + 1, value_length);
+        value[value_length] = '\0';
         kv_set(store, key, value);
         at = (size_t)(newline - bytes) + 1;
     }
@@ -190,14 +194,30 @@ const char *kv_get(const struct kv *store, const char *key)
     return NULL;
 }
 
+/* Appends text, keeping whatever fits and the terminator. */
+static void kv_append(char *buffer, size_t size, size_t *length,
+                      const char *text)
+{
+    const size_t room = size - *length - 1;
+    const size_t wanted = strlen(text);
+    const size_t copied = wanted < room ? wanted : room;
+    memcpy(buffer + *length, text, copied);
+    *length += copied;
+    buffer[*length] = '\0';
+}
+
 const char *kv_format(const struct kv *store, char *buffer, size_t size)
 {
     size_t length = 0;
     if (store->count == 0)
         return "(empty)";
-    for (uint32_t i = 0; i < store->count && length < size; i++)
-        length += (size_t)snprintf(buffer + length, size - length, "%s%s=%s",
-                                   i == 0 ? "" : " ", store->entries[i].key,
-                                   store->entries[i].value);
+    CHECK(size > 0);
+    buffer[0] = '\0';
+    for (uint32_t i = 0; i < store->count; i++) {
+        kv_append(buffer, size, &length, i == 0 ? "" : " ");
+        kv_append(buffer, size, &length, store->entries[i].key);
+        kv_append(buffer, size, &length, "=");
+        kv_append(buffer, size, &length, store->entries[i].value);
+    }
     return buffer;
 }

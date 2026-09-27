@@ -126,7 +126,9 @@ static void stale_request_lookup(uint32_t durability, bool replace)
     drive(&fixture);
     for (uint32_t view = 2; view <= 3; view++) {
         for (uint32_t n = 0; n < 3; n++)
-            CHECK(mem_node_time(fixture.nodes[n], 55 * view).consumed == 1);
+            CHECK(
+                mem_node_time(fixture.nodes[n], 55 * (uint64_t)view).consumed ==
+                1);
         drive(&fixture);
     }
     struct vsr_status current = status(fixture.nodes[0]);

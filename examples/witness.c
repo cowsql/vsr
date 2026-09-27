@@ -40,7 +40,8 @@ int main(void)
 {
     struct example_cluster cluster =
         example_start("witness", REPLICAS, FAULTS, VSR_DURABLE, ROLES);
-    const uint64_t view_timeout = mem_options(1, &cluster.seed).view_timeout_ns;
+    const struct vsr_membership seed = example_seed(&cluster);
+    const uint64_t view_timeout = mem_options(1, &seed).view_timeout_ns;
     struct mem_node *primary = example_primary(&cluster);
     struct mem_node *backup = example_replica(&cluster, 2);
     struct mem_node *witness = example_replica(&cluster, WITNESS_ID);

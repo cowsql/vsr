@@ -43,7 +43,8 @@ struct example_cluster {
     uint32_t count;
     uint32_t durability;
     struct vsr_member members[EXAMPLE_MAX_REPLICAS]; /* Genesis group. */
-    struct vsr_membership seed;
+    uint32_t genesis;    /* Members in the genesis group. */
+    uint32_t faults;     /* Tolerated faults of the genesis group. */
     uint64_t now;        /* Logical clock, nanoseconds. */
     uint64_t next_route; /* Reply route per submitted request. */
     uint64_t generation[EXAMPLE_MAX_REPLICAS]; /* Incarnations per replica. */
@@ -60,6 +61,8 @@ const char *example_reply_status_name(uint32_t status);
 struct example_cluster example_start(const char *title, uint32_t count,
                                      uint32_t faults, uint32_t durability,
                                      const uint32_t *roles);
+/* The genesis membership, pointing at the cluster's own member array. */
+struct vsr_membership example_seed(const struct example_cluster *cluster);
 /* Adds a nonvoting replica that joins an existing group with the given role. */
 struct mem_node *example_join(struct example_cluster *cluster, uint32_t role);
 struct mem_node *example_replica(struct example_cluster *cluster, uint64_t id);
