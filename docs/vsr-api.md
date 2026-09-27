@@ -1,5 +1,7 @@
 # VSR API sketch
 
+Project-wide architectural principles are defined in [DESIGN.md](../DESIGN.md).
+
 The public surface is in [include/vsr.h](../include/vsr.h). It describes a
 replica engine and its contracts, not an implementation or a verified protocol.
 The protocol reference is Liskov and Cowling's
