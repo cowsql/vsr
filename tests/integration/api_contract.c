@@ -827,7 +827,9 @@ static void test_layout_validation(void)
     o.start_mode = VSR_START_RECOVER;
     o.replica = 9; /* A discovery seed need not contain the replica. */
     CHECK(layout_of(&o, &layout) == VSR_OK);
-    o.join_role = VSR_MEMBER_WITNESS;
+    o.join_role = VSR_MEMBER_WITNESS; /* Warm-up role if no store survives. */
+    CHECK(layout_of(&o, &layout) == VSR_OK);
+    o.join_role = VSR_MEMBER_WITNESS + 1;
     CHECK(layout_of(&o, &layout) == VSR_EINVAL);
     o = base;
     in->seed.epoch = 1; /* NEW requires an epoch-0 seed. */
