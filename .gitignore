@@ -26,10 +26,11 @@
 /compile_commands.json
 /analysis/
 /coverage/
-/tests/fuzz/corpus/
-/tests/fuzz/artifacts/
+/tests/fuzzy/corpus/
+/tests/fuzzy/artifacts/
 /vsr-*.tar.*
 /vsr-*/
+/vsr.pc
 /tests/unit/checked
-/tests/fuzz/checked
+/tests/fuzzy/checked
 __pycache__/

@@ -6,12 +6,12 @@ seeded fault simulation share one directory.
 
 | Directory | Purpose | Current state |
 | --- | --- | --- |
-| `unit/` | Small deterministic tests of private modules | Checked size arithmetic, including overflow boundaries |
-| `integration/` | Public API and host adapter contracts | Existing C11 compile-only signature/layout checks |
-| `fuzz/` | Coverage-guided fuzzing and seeded cluster/fault simulation | Arithmetic libFuzzer harness; simulation awaits the protocol |
+| `unit/` | Small deterministic tests of private modules | Arithmetic, equality, RNG, runtime, graph validation, reads, host storage |
+| `integration/` | Public API and host adapter contracts | Replication, resource minima, reads, checkpoints, epoch handoff |
+| `fuzzy/` | Coverage-guided fuzzing and seeded cluster/fault simulation | Arithmetic and graph libFuzzer harnesses; seeded cluster scheduler |
 | `regression/` | Minimal reproducers for fixed bugs and crashes | Reserved; add with each bug fix |
 | `benchmark/` | Repeatable latency, throughput, allocation and copy measurements | Reserved; implementation required |
-| `lib/` | Shared test-only assertions and future fixtures | Always-active `CHECK` macro |
+| `lib/` | Shared test-only assertions and fixtures | In-memory immutable storage, cluster host, seeded RNG, always-active checks |
 
 `make check` builds the contract archives and runs executable tests using
 Automake's parallel test harness. Failures appear in `test-suite.log` and
@@ -38,12 +38,36 @@ See [development workflows](../docs/development.md) for tools and commands.
 
 `make fuzz` uses libFuzzer with ASan/UBSan and defaults to 10,000 executions.
 Use `FUZZ_RUNS=0 FUZZ_ARGS='-max_total_time=60'` for a time budget. Corpora and
-crashes live in the build tree under `tests/fuzz/corpus/` and
-`tests/fuzz/artifacts/`, and survive `make clean`. Replay with
-`./tests/fuzz/checked PATH_TO_ARTIFACT`; keep useful minimized inputs in source
+crashes live in the build tree under `tests/fuzzy/corpus/` and
+`tests/fuzzy/artifacts/`, and survive `make clean`. Replay with
+`./tests/fuzzy/checked PATH_TO_ARTIFACT`; keep useful minimized inputs in source
 control and list them in `EXTRA_DIST`.
 
-Future fault simulations in `fuzz/` should drive logical time, network delivery
-and a fake durable store from a recorded seed. Check safety after every event;
-check eventual progress after restoring delivery and scheduling. Cover message
-loss/reordering, partitions, crashes, checkpoint boundaries and backpressure.
+The seeded scheduler accepts `SEED COUNT STEPS [trace|quiet] [PROFILE]`
+(defaults: `1 32 600 quiet 0`).
+For example, from a build directory:
+
+```sh
+./tests/fuzzy/cluster 1 1000 2000
+./tests/fuzzy/cluster 9 1 600 trace > seed9.log 2>&1
+./tests/fuzzy/cluster 1 1000 2000 quiet 7
+```
+
+Each run prints its seed and configuration before executing. The optional trace
+prints the exact actions with stable node indices, queue indices, effect IDs,
+and logical times; replay uses no process addresses or wall-clock inputs.
+The scheduler separates effect execution from completion, reorders messages,
+drops and duplicates traffic, changes logical time, crashes and restarts a
+member, issues checkpoint hints and read barriers, retries segmented commands,
+and varies work/output/effect/cache limits. The independent host checks safety
+after each action. Once faults stop, fair scheduling must commit a new request
+and catch up all full members. A restart counts as unavailable until recovery
+finishes; another crash cannot silently destroy the quorum required by the
+replicated durability policy. Additional out-of-quorum safety scenarios belong
+in targeted tests without an impossible liveness requirement.
+
+Profile flags combine by addition: `1` begins with 16 committed commands and
+optional checkpoints; `2` uses the exact minimum lease and payload budgets with
+maximum-size commands; `4` adds changing network partitions. Profile `7` enables
+all three. Profile `0` keeps the original cold-start event schedules stable for
+regression replay. The seed header records the profile as part of the scenario.

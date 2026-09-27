@@ -162,6 +162,6 @@ AC_SUBST([VSR_INSTRUMENT_LDFLAGS])
 AC_SUBST([VSR_SANITIZE], [$enable_sanitize])
 AM_CONDITIONAL([COVERAGE], [test "x$enable_coverage" = xyes])
 AM_CONDITIONAL([FUZZING], [test "x$enable_fuzzing" = xyes])
-AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([Makefile vsr.pc])
 AC_OUTPUT
 AC_MSG_NOTICE([compiler: $CC; sanitizers: $enable_sanitize; coverage: $enable_coverage; fuzzing: $enable_fuzzing])

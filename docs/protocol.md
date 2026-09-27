@@ -42,7 +42,12 @@ committed entry; irreconcilable authoritative histories fence the replica with
 The primary is the full member at `view % full_count` in sorted-ID order.
 No message can appoint another primary. Learning a higher view fences the old
 view before any response endorsing the new one. Learning a committed later
-epoch fences the earlier epoch; it does not establish local catch-up. Epoch
+epoch fences the earlier epoch; it does not establish local catch-up.
+A persisted RECOVERING/TRANSITIONING hard state may record that later descriptor
+with phase TRANSFERRING even when its boundary exceeds local commitment. Such a
+record grants no vote and survives restart as an unfinished installation. Only
+this explicit nonvoting combination permits the local history to lag the known
+epoch boundary; log offers always describe an actually available complete history. Epoch
 discovery can skip obsolete configurations using authenticated committed state,
 but membership hints alone never establish recovery or voting readiness.
 
@@ -89,8 +94,9 @@ Missing state requires quorum recovery; malformed or corrupt local state fences
 the instance. Rolling a store back behind acknowledged durability is outside
 the storage contract.
 
-Replicated-mode restarts always enter RECOVERING, even when a plausible local
-checkpoint exists. Such a replica does not vote, lead, acknowledge reads, or
+Replicated-mode restarts that can participate enter RECOVERING, even when a
+plausible local checkpoint exists; a retained removal tombstone remains RETIRED.
+A recovering replica does not vote, lead, acknowledge reads, or
 answer recovery requests. Recovery responses come only from NORMAL current
 members and echo a fresh nonce. Non-primary responses have `state=NULL` and
 `number=0`; the highest-view primary supplies the authoritative complete log
@@ -132,6 +138,16 @@ Its boundary is committed by the old group. START_EPOCH and NEW_EPOCH describe
 that committed boundary; an uncommitted proposal cannot introduce an epoch.
 The next epoch starts at view zero and the next log position after the boundary.
 Its membership may be disjoint and may change `f` or member roles.
+
+An authenticated peer already known in the receiver's current membership or
+seed may report a later committed epoch, including a jump over compacted
+intermediate epochs. This relies on the crash-only, non-Byzantine peer model;
+self and unknown unsolicited senders cannot introduce such knowledge. Learning
+metadata preserves the local committed floor and fences the receiver as
+TRANSFERRING until it verifies and installs the required history. Locally
+proposed RECONFIGURE requests still name exactly the next epoch. Surviving
+peers answer stale-epoch traffic, including authorized learner discovery, with
+NEW_EPOCH so loss of earlier handoff announcements does not strand a seed.
 
 `vsr_epoch.phase` is local materialization/retention progress, independent of
 NORMAL or VIEW_CHANGE. TRANSFERRING prohibits voting. Once installed, a new

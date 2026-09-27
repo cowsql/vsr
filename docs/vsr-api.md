@@ -32,6 +32,16 @@ never automatic bootstrap. Stale but internally valid state in replicated mode
 is only a recovery hint. A restart uses `RECOVER`, including during warm-up.
 The persisted hard-state role records whether application state is being
 maintained; it does not grant a vote to a replica absent from the membership.
+A learned later epoch can be persisted before its boundary is locally present:
+only `HARD_RECOVERING` or `HARD_TRANSITIONING` with epoch phase `TRANSFERRING`
+permits `epoch.boundary > committed`. This records authenticated configuration
+knowledge and fences the previous epoch; it does not assert possession of that
+history. Restart preserves this nonvoting state until installation completes.
+NORMAL state, INSTALLED/STEADY phases, and every advertised log offer retain the
+ordinary complete-history bounds. A later-epoch seed is only a membership hint;
+JOIN first discovers the full committed epoch descriptor before initializing
+its store, rather than inventing its predecessor or transition boundary.
+
 
 Transaction 1 of a previously empty store contains `STORE_IDENTITY` and initial
 hard state. Identity is immutable, independent of process incarnation, and
@@ -43,6 +53,14 @@ means reset to the cluster's agreed genesis application state.
 All limits are positive. `message_bytes` must fit the checked sum of one maximum
 command and one maximum checkpoint manifest; `batch_entries` must fit the log cache.
 The planner rejects capacities that cannot support minimum protocol progress.
+The current implementation requires `input_leases >= transfers + 8`. This covers
+retained snapshot generations named by immutable offers, the selected source
+history, snapshot adoption, one incoming history chunk, a comparison load, and
+control/completion progress. Its minimum payload budget is
+`message_bytes + 2 * command_bytes + (transfers + 3) * manifest_bytes + result_bytes`,
+with checked arithmetic. These are conservative implementation reserves, not
+protocol message-size limits; ordinary STORE/APPLY/transfer batches remain
+bounded by the configured batch limit and available completion budget.
 Admission additionally reserves space for each operation's maximum completion.
 Limit exhaustion must defer new work before consuming those reserves.
 Configuration, entry-count, span-count, command, result, manifest, and message
@@ -327,7 +345,9 @@ fetch never changes the source revision's commitment or epoch metadata.
 Unknown/expired revisions or unavailable ranges produce STATE_UNAVAILABLE with
 the echoed nonce and first, `next=first`, and a current offer without chunk data.
 The receiver revalidates that offer. `transfers` bounds retained offers;
-`transfer_timeout_ns` expires idle offers. Active loads/sends retain their pins
+`transfer_timeout_ns` expires idle offers. When capacity is needed for a newer
+fenced revision, the oldest unreferenced offer may be evicted earlier; requests
+for it receive STATE_UNAVAILABLE and must revalidate. Active loads/sends retain their pins
 until completion even if the offer expires. A valid range request renews its
 retention. Discovery offers may include a checkpoint instead of older log data.
 

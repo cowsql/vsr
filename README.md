@@ -1,6 +1,6 @@
 # VSR
 
-VSR is a C interface for Viewstamped Replication: one ordered history of
+VSR is a C11 library for Viewstamped Replication: one ordered history of
 commands, replicated across a group that can recover from crashes and change
 membership.
 
@@ -82,10 +82,23 @@ cd build/asan
 make -j"$(nproc)" check
 ```
 
-Public headers live in `include/`, private C code in `src/`, and all tests in
-`tests/`. The current implementation is only a small internal checked-arithmetic
-module; the protocol API remains a contract to implement. Tests cover arithmetic
-boundaries and C11 compatibility, signatures, and descriptor layouts.
+The build produces `src/libvsr.a` and five runnable [in-memory examples](examples/README.md)
+in `examples/`. `make check` runs unit tests, public protocol/adapter scenarios,
+deterministic seeded fault simulations, and the examples. The simulator checks
+agreement, storage prerequisites, buffer immutability, and eventual progress
+after faults stop. Seeds and optional action traces make failures replayable.
+
+For an uninstrumented installation, configure a separate build with
+`CFLAGS='-O2 -g' ../../configure --disable-sanitize --prefix=/your/prefix`, then
+run `make check` and `make install`. The installation includes `vsr.h`,
+`libvsr.a`, and a `vsr.pc` file for `pkg-config`. Sanitizers default to enabled
+for development; use the uninstrumented build when linking ordinary consumers.
+
+Arena size depends on the explicit capacity limits, independently of stored
+history and payload backing allocations. Batching, output capacity, durability,
+cache sizes, scatter/gather limits, and checkpoint policy remain caller choices.
+`make benchmark` measures arena use and core step timings separately from the
+instrumented host; see [benchmark notes](tests/benchmark/README.md).
 
 See [development](docs/development.md) for dependencies, compiler options,
 formatting, static analysis, Valgrind, coverage, fuzzing, and distribution checks.

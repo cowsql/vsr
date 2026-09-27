@@ -4,32 +4,118 @@ AM_CPPFLAGS = -I$(top_srcdir)/include -I$(top_srcdir)/src -I$(top_srcdir)/tests
 AM_CFLAGS = $(VSR_CFLAGS) $(VSR_INSTRUMENT_CFLAGS)
 AM_LDFLAGS = $(VSR_LDFLAGS) $(VSR_INSTRUMENT_LDFLAGS)
 
-# The protocol is not implemented yet: build an internal archive without
-# installing a library that appears to implement the public API.
-noinst_LIBRARIES = src/libvsr.a
-src_libvsr_a_SOURCES = src/checked.c src/checked.h
-noinst_HEADERS = include/vsr.h tests/lib/check.h
+lib_LIBRARIES = src/libvsr.a
+include_HEADERS = include/vsr.h
+pkgconfigdir = $(libdir)/pkgconfig
+pkgconfig_DATA = vsr.pc
+src_libvsr_a_SOURCES = \
+  src/checked.c src/checked.h src/objects.c src/objects.h \
+  src/validate.c src/validate.h src/core.c src/owned.c src/internal.h \
+  src/protocol.c src/protocol.h src/extension.c src/extension.h \
+  src/transition.c src/transition.h src/checkpoint.c src/checkpoint.h \
+  src/epochs.c src/epochs.h src/reads.c src/reads.h
+noinst_HEADERS = tests/lib/check.h
+noinst_PROGRAMS = examples/replication examples/failover examples/checkpoint \
+  examples/epochs examples/reads
+EXAMPLE_HOST = tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h examples/common.h
+examples_replication_SOURCES = examples/replication.c $(EXAMPLE_HOST)
+examples_replication_LDADD = src/libvsr.a
+examples_failover_SOURCES = examples/failover.c $(EXAMPLE_HOST)
+examples_failover_LDADD = src/libvsr.a
+examples_checkpoint_SOURCES = examples/checkpoint.c $(EXAMPLE_HOST)
+examples_checkpoint_LDADD = src/libvsr.a
+examples_epochs_SOURCES = examples/epochs.c $(EXAMPLE_HOST)
+examples_epochs_LDADD = src/libvsr.a
+examples_reads_SOURCES = examples/reads.c $(EXAMPLE_HOST)
+examples_reads_LDADD = src/libvsr.a
 
-check_PROGRAMS = tests/unit/checked
+UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/memory \
+  tests/unit/validate tests/unit/runtime tests/unit/reads tests/unit/memory_watch
+INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
+  tests/integration/reads tests/integration/checkpoints tests/integration/epochs
+INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
+  tests/integration/audit
+FUZZY_TESTS = tests/fuzzy/cluster
+check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
 tests_unit_checked_LDADD = src/libvsr.a
-TESTS = $(check_PROGRAMS)
+tests_unit_objects_SOURCES = tests/unit/objects.c
+tests_unit_objects_LDADD = src/libvsr.a
+tests_unit_random_SOURCES = tests/unit/random.c tests/lib/random.c tests/lib/random.h
+tests_unit_memory_SOURCES = tests/unit/memory.c tests/lib/memory.c tests/lib/memory.h
+tests_unit_memory_watch_SOURCES = tests/unit/memory_watch.c tests/lib/memory.c tests/lib/memory.h
+tests_unit_validate_SOURCES = tests/unit/validate.c
+tests_unit_validate_LDADD = src/libvsr.a
+tests_unit_runtime_SOURCES = tests/unit/runtime.c
+tests_unit_runtime_LDADD = src/libvsr.a
+tests_unit_reads_SOURCES = tests/unit/reads.c
+tests_unit_reads_LDADD = src/libvsr.a
+tests_integration_replication_SOURCES = tests/integration/replication.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_replication_LDADD = src/libvsr.a
+tests_integration_normal_contract_SOURCES = tests/integration/normal_contract.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_normal_contract_LDADD = src/libvsr.a
+tests_integration_reads_SOURCES = tests/integration/reads.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_reads_LDADD = src/libvsr.a
+tests_integration_checkpoints_SOURCES = tests/integration/checkpoints.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_checkpoints_LDADD = src/libvsr.a
+tests_integration_epochs_SOURCES = tests/integration/epochs.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_epochs_LDADD = src/libvsr.a
+tests_integration_lifecycle_SOURCES = tests/integration/lifecycle.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_lifecycle_LDADD = src/libvsr.a
+tests_integration_transitions_SOURCES = tests/integration/transitions.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_transitions_LDADD = src/libvsr.a
+tests_integration_audit_SOURCES = tests/integration/audit.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_audit_LDADD = src/libvsr.a
+tests_fuzzy_cluster_SOURCES = tests/fuzzy/cluster.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h \
+  tests/lib/random.c tests/lib/random.h
+tests_fuzzy_cluster_LDADD = src/libvsr.a
+EXTRA_PROGRAMS = tests/benchmark/core
+tests_benchmark_core_SOURCES = tests/benchmark/core.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_benchmark_core_LDADD = src/libvsr.a
+tests_benchmark_core_LDFLAGS = $(AM_LDFLAGS) -Wl,--wrap=vsr_step
+TESTS = $(check_PROGRAMS) examples/replication examples/failover examples/checkpoint \
+  examples/epochs examples/reads
 
-# Compile-only contracts may reference API functions with no implementation yet.
+# Keep the public signatures and descriptor layouts checked independently.
 check_LIBRARIES = tests/integration/libheader.a
 tests_integration_libheader_a_SOURCES = tests/integration/header.c
 
 if FUZZING
-noinst_PROGRAMS = tests/fuzz/checked
-tests_fuzz_checked_SOURCES = tests/fuzz/checked.c
-tests_fuzz_checked_LDADD = src/libvsr.a
-tests_fuzz_checked_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
+noinst_PROGRAMS += tests/fuzzy/checked tests/fuzzy/validation
+tests_fuzzy_checked_SOURCES = tests/fuzzy/checked.c
+tests_fuzzy_checked_LDADD = src/libvsr.a
+tests_fuzzy_checked_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
+tests_fuzzy_validation_SOURCES = tests/fuzzy/validation.c
+tests_fuzzy_validation_LDADD = src/libvsr.a
+tests_fuzzy_validation_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 endif
 
 EXTRA_DIST = \
-  bootstrap .clang-format .clang-tidy .editorconfig .gitignore \
+  bootstrap vsr.pc.in .clang-format .clang-tidy .editorconfig .gitignore \
   .github/workflows/ci.yml \
   README.md DESIGN.md docs/protocol.md docs/vsr-api.md docs/development.md \
+  docs/implementation.md examples/README.md \
   tests/README.md tests/regression/README.md tests/benchmark/README.md
 
 # Ask Clang for matching tools, including Debian's versioned installations.
@@ -39,19 +125,28 @@ CLANG_TIDY = $(shell $(CC) -print-prog-name=clang-tidy)
 SCAN_BUILD = $(shell $(CC) -print-prog-name=scan-build)
 LLVM_COV = $(shell $(CC) -print-prog-name=llvm-cov)
 LLVM_PROFDATA = $(shell $(CC) -print-prog-name=llvm-profdata)
-FORMAT_FILES = find $(srcdir)/include $(srcdir)/src $(srcdir)/tests -type f \( -name '*.c' -o -name '*.h' \) -print0
+FORMAT_FILES = find $(srcdir)/include $(srcdir)/src $(srcdir)/tests $(srcdir)/examples -type f \( -name '*.c' -o -name '*.h' \) -print0
 FUZZ_RUNS = 10000
 FUZZ_ARGS =
 
-.PHONY: check-build check-unit check-integration format format-check lint \
+.PHONY: check-build check-unit check-integration check-fuzzy format format-check lint \
   compile-commands tidy cppcheck analyze shellcheck check-valgrind coverage fuzz
 
-check-build: all $(check_PROGRAMS) $(check_LIBRARIES)
+.PHONY: benchmark
+benchmark: tests/benchmark/core
+	./tests/benchmark/core
+
+check-build: all
+	$(MAKE) $(check_PROGRAMS) $(check_LIBRARIES)
 
 check-unit: check-build
-	$(MAKE) check TESTS='tests/unit/checked'
+	$(MAKE) check TESTS='$(UNIT_TESTS)'
 
-check-integration: $(check_LIBRARIES)
+check-integration: check-build
+	$(MAKE) check TESTS='$(INTEGRATION_TESTS)'
+
+check-fuzzy: check-build
+	$(MAKE) check TESTS='$(FUZZY_TESTS)'
 
 format:
 	$(FORMAT_FILES) | xargs -0 $(CLANG_FORMAT) -i
@@ -105,10 +200,12 @@ coverage:
 endif
 
 if FUZZING
-fuzz: tests/fuzz/checked
-	$(MKDIR_P) tests/fuzz/corpus/checked tests/fuzz/artifacts
-	./tests/fuzz/checked -runs=$(FUZZ_RUNS) -max_len=64 \
-	  -artifact_prefix=tests/fuzz/artifacts/ $(FUZZ_ARGS) tests/fuzz/corpus/checked
+fuzz: tests/fuzzy/checked tests/fuzzy/validation
+	$(MKDIR_P) tests/fuzzy/corpus/checked tests/fuzzy/corpus/validation tests/fuzzy/artifacts
+	./tests/fuzzy/checked -runs=$(FUZZ_RUNS) -max_len=64 \
+	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/checked
+	./tests/fuzzy/validation -runs=$(FUZZ_RUNS) -max_len=256 \
+	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/validation
 else
 fuzz:
 	@echo 'Configure a separate build with --enable-fuzzing first.' >&2; exit 1
