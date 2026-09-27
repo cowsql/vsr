@@ -84,8 +84,10 @@ that restores the capture baseline; a capture hint whose baseline is
 unavailable is deferred instead of holding transitions busy; a lagging peer is
 served before the cache slot loaded for it can be reused; entries are not
 loaded for application while a transition forbids it; a primary announces
-commits to peers whose next entry lies below its trimmed log; and a witness
-needs coverage only for retained entries it actually discards. Increasing test
+commits to peers whose next entry lies below its trimmed log; a witness
+needs coverage only for retained entries it actually discards; and a refused
+input releases a readable cache pin only once the protocol poll is idle, so a
+pin the next poll consumes is never evicted and reloaded around the retry. Increasing test
 defaults is not a substitute for checking the accepted minimum. Large
 command/small manifest and small command/large manifest configurations need
 separate fault campaigns.

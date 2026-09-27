@@ -799,9 +799,14 @@ static int admit_event(struct vsr *v, const struct vsr_event *event,
                                    v->reserved_bytes) {
                 /* Available space can exceed the standing reserve and still
                  * be too small for this specific input plus that reserve.
-                 * Release a readable cache pin only after actual pressure;
-                 * queued RELEASE output precedes retrying this input. */
-                (void)vsr_protocol_relieve_pressure(v);
+                 * Release a readable cache pin only after actual pressure,
+                 * and only once the protocol poll is idle: the next poll may
+                 * consume the pin (a commit notification, an application
+                 * batch head, a lagging peer's resend) and would otherwise
+                 * reload it before this input is retried, evicting and
+                 * reloading the same entry forever. The queued RELEASE
+                 * output still precedes retrying this input. */
+                v->relief_pending = true;
                 *blocked = true;
                 return VSR_AGAIN;
             }
@@ -941,6 +946,7 @@ int vsr_step_many(struct vsr *v, const struct vsr_event *events, uint32_t count,
             if (result != VSR_OK) {
                 break;
             }
+            v->relief_pending = false;
             update->consumed++;
             continue;
         }
@@ -949,6 +955,13 @@ int vsr_step_many(struct vsr *v, const struct vsr_event *events, uint32_t count,
         }
         budget--;
         if (!vsr_protocol_poll(v)) {
+            /* Idle: no poll will consume a readable cache pin before the
+             * blocked input is retried, so one may be released for it. */
+            if (v->relief_pending) {
+                v->relief_pending = false;
+                if (vsr_protocol_relieve_pressure(v))
+                    continue;
+            }
             idle = true;
             break;
         }

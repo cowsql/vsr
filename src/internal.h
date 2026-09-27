@@ -70,6 +70,9 @@ struct vsr {
     bool stopping;
     bool protocol_quiesced;
     bool state_changed;
+    /* A blocked input asked for a readable cache pin to be released; the
+     * release waits until the protocol poll is idle. */
+    bool relief_pending;
 };
 
 /* Protocol-private arena is laid out with checked arithmetic; no allocation. */
