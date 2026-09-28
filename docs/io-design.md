@@ -60,8 +60,9 @@ vectorized zero-copy send from registered buffers (`SEND_ZC` with
 `IORING_SEND_VECTORIZED` and `IORING_RECVSEND_FIXED_BUF`), vectored
 fixed-buffer disk reads and writes, registered wait arguments with
 minimum-timeout batching, bind and listen as ring operations, direct
-descriptors, peek receives, and splice with a pipe for file-range sends. Zero-copy receive (`RECV_ZC`) requires NIC support for
-header and data split and is deferred.
+descriptors and peek receives. Zero-copy receive (`RECV_ZC`) requires NIC
+support for header and data split and is deferred. Splice and pipes are not
+used (decision 39).
 
 Machine facts that informed defaults: 8 logical CPUs, an NVMe device
 reporting 512-byte logical and physical blocks, and 15 GiB of RAM. The store
@@ -104,8 +105,8 @@ with LTO is a mechanical change that touches no contract.
 ┌────────────────────────┴───────────────────▼─────────────────┐ │
 │ engine: struct vsr_io (one per thread)                       │ │
 │                                                              │ │
-│  replica[g] ──┐    links          store         timers pools │ │
-│   vsr core    │    codec + link   log layout    heap   slabs │ │
+│  replica[g] ──┐    links          store        deadlines pool│ │
+│   vsr core    │    codec + link   log layout    set     slabs│ │
 │   (vsr.h)     │    state machine  + indexes                  │ │
 │               │                                              │ │
 │  executes: SEND, network REPLY, LOAD, STORE, SYNC, RECLAIM,  │ │
@@ -154,8 +155,8 @@ ready-made loop built from them for callers that have none. One iteration:
    vsr_io_prepare(io, now, batch, cap, &count, &deadline)
            // flushes internal queues into records: sends coalesced per
            // link, STOREs packed into one write (+ one flush if a SYNC
-           // is pending), recv/accept re-armed, recycled slabs provided,
-           // timers armed; returns the earliest engine deadline
+           // is pending), recv/accept re-armed, recycled slabs provided;
+           // returns the earliest engine deadline (no engine timer records)
    deadline = min(deadline, app_prepare(app, batch))   // caller's records
 
    ── 4. block once ─────────────────────────────────────────────────────
@@ -306,24 +307,30 @@ that adding it later changes no contract.
 
 ### Send path
 
-Each link has a bounded queue of pending core SEND ops
-(`vsr_io_limits.link_queue`). At prepare time the messages queued for one
-peer are gathered into one vectored send of at most `send_coalesce_bytes`,
-with the frame headers in engine memory and the bodies referenced from their
-slabs. Sends at or above `zero_copy_bytes` use `SEND_ZERO_COPY`, whose second
-completion, the `NOTIF`, is exactly the moment the core's SEND completion rule
-asks for: buffers no longer read. Smaller sends copy in the kernel and
-complete on their single completion. Bodies in registered memory, that is
-pool slabs, tail buffers and slabs the caller has taken from the pool, go as
-fixed-buffer sends; caller bytes outside registered memory go zero-copy
-without registration at or above the same threshold, which pins their pages
-per send, and are copied by the kernel below it. An application whose
-request bodies are hot, such as a database submitting its own pages, places
-them in pool slabs it takes through `vsr_io_slab_acquire`, so the primary's
-hottest send is a fixed-buffer one. A full queue completes the oldest SEND
-with `RETRY`; the core already coalesces retries under its retry timer, so
-this is bounded and never silent. Changing a node's address or revoking its
-authorization closes its links and retries their queued sends the same way.
+Each node has a bounded queue of pending core SEND ops
+(`vsr_io_limits.link_queue`); several links to a node may exist (decision
+41) and the carrier link drains the queue. At prepare time the messages
+queued for one peer are gathered into one vectored send of at most
+`send_coalesce_bytes`, with the frame headers written into a pool slab the
+link owns (its send slab) and the bodies referenced from where they live; a
+message that does not fit continues in the next send, since the connection
+is a byte stream. One kernel send is in flight per link, because two sends
+on one socket may complete out of order. The flag rule is exact (decision
+38): a send whose vectors all lie inside the pool region, which covers
+frame headers, received bytes and caller bytes in taken slabs, goes
+`SEND_ZERO_COPY | VECTORED` with `FIXED_BUFFER` on the pool's single
+registered region; a send with any vector outside the pool (tail ring, core
+arena, caller memory) goes zero-copy without `FIXED_BUFFER`, which pins the
+pages per send, at or above `zero_copy_bytes`, and plain `SEND` (kernel
+copy) below. The second completion of a zero-copy send, the `NOTIF`, is
+exactly the moment the core's SEND completion rule asks for: buffers no
+longer read. An application whose request bodies are hot, such as a
+database submitting its own pages, places them in pool slabs it takes
+through `vsr_io_slab_acquire`, so the primary's hottest send is a
+fixed-buffer one. A full queue completes the oldest SEND with `RETRY`; the
+core already coalesces retries under its retry timer, so this is bounded
+and never silent. Changing a node's address or revoking its authorization
+closes its links and retries their queued sends the same way.
 
 ## 5. Network
 
@@ -434,7 +441,7 @@ through ops and events:
                                                           └─▶ STREAM_SERVE {stream, node, request} ─▶ app
                                                    engine ◀── STREAM_WRITE {stream, buffers | file} ── app
         engine ◀── chunks, CRC32C each ◀──────────────── engine sends: zero-copy from buffers,
- app ◀── STREAM_DATA {cookie, offset, slab bytes}                 splice for file ranges
+ app ◀── STREAM_DATA {cookie, offset, slab bytes}                 file ranges read into slabs
  app ── COMPLETE(STREAM_DATA) releases the slab ─▶ engine  app ◀── STREAM_WRITTEN {stream, write}
         ...                                        engine ◀── STREAM_CLOSE {stream, status} ── app
  app ◀── STREAM_END {cookie, bytes, status}
@@ -451,9 +458,13 @@ through ops and events:
 - Data arrives in pool slabs straight from the receive buffer ring, so the
   application can write a slab to its own file with a fixed-buffer write and
   the buffered path is network to disk with no user-space copy.
-- File-range writes are sent with splice through a pipe pair the engine owns
-  per stream, which is zero copy from the page cache; buffer writes go
-  zero-copy from the caller's lease.
+- A file-range write is served by reading the range into pool slabs,
+  `stream_chunk_bytes` at a time with fixed-buffer reads, and sending each
+  slab as a chunk exactly like a buffer write; there is no splice and no
+  pipe (decision 39). Buffer writes go zero-copy from the caller's lease.
+- The engine's own stream requests (the clients half of a snapshot fetch,
+  decision 43) begin with `VSR_IO_LIBRARY_MAGIC` and are served by the
+  source engine itself; caller requests must not use that prefix.
 - Connection loss ends the stream on both sides with `RETRY`; the application
   fails its FETCH with `RETRY` and the core rediscovers a source, as its
   contract already says.
@@ -469,8 +480,8 @@ checkpoint.
  │ superblock │ superblock │ segment 0 │ segment 1 │ ... │ segment N │
  │     A      │     B      │  64 MiB   │           │     │           │
  └────────────┴────────────┴───────────┴───────────┴─────┴───────────┘
- segment: [record][record][record]...[pad to block]   append-only ring
- record:  header {seq, generation, length, crc(header), crc(payload)}
+ segment: [header block(s)][record][record]...[pad to block][record]...
+ record:  header {seq, generation, run, length, crc(header), crc(payload)}
           + change descriptors + payload (entries, client records,
           hard state, checkpoint descriptors)
 ```
@@ -478,26 +489,37 @@ checkpoint.
 ### Records and recovery
 
 - Every transaction is one record, in sequence order, in a ring of segment
-  slots. Records pack back to back; only each physical write is padded to
-  `block_bytes`. The file grows by fallocate up to `max_segments`; a block
-  device is the same layout at a fixed size.
-- The superblocks are a double-buffered metadata checkpoint, written lazily
-  on segment roll or every so many transactions and never per transaction.
-  They hold identity, format, geometry, the log range, the recovery anchor and
-  hard state as of some sequence, and the segment to start scanning from.
-  Hard-state changes travel inside transaction records, so nothing forces a
-  superblock write per transaction.
-- Torn-tail rule: records must be contiguous by sequence and CRC-clean. The
-  first record that is short, fails its CRC, or does not carry the expected
-  next sequence ends the log. A stale record from a recycled slot can never
-  match, because sequences never repeat. A bad record below the acknowledged
-  durable prefix is `CORRUPT` and fences the replica; a bad record above it is
+  slots. Records pack back to back inside a physical write; a write starts
+  at a block boundary, covers whole blocks and pads its last block with a
+  PAD marker, and the next write starts at the next block boundary, so a
+  written block is never rewritten (decision 33). The file grows by
+  fallocate up to `max_segments`; a block device is the same layout at a
+  fixed size.
+- Every segment begins with a header holding the store's complete logical
+  state as of its first record: identity, log bounds, hard state with both
+  memberships, the anchor checkpoint with its manifest, the client base and
+  the last sequence before the segment (decision 34). The superblocks are a
+  double-buffered pointer to the segment to start scanning from plus
+  identity, geometry, the run counter and a durable floor; they are
+  rewritten only when the start segment changes or slots grow, never per
+  transaction. Hard-state changes travel inside transaction records.
+- Torn-tail rule: records must be contiguous by sequence, CRC-clean and
+  non-decreasing in their run counter. The first record that is short,
+  fails its CRC, does not carry the expected next sequence, or carries a
+  run below its predecessor's ends the log. A stale record from a recycled
+  slot can never match, because sequences never repeat; a persisted block
+  of a torn write that survives behind a block rewritten by a later run is
+  rejected by the run rule. A bad record at or below the acknowledged
+  durable prefix, whose lower bound the superblock and the segment headers
+  persist, is `CORRUPT` and fences the replica; a bad record above it is
   the expected torn tail.
-- Recovery loads the newer valid superblock and scans live segments
-  sequentially from its start segment, rebuilding every index. At NVMe speeds
-  a few gigabytes take seconds, so index records that would shorten the scan
-  are a later optimization and not part of the format now. Fewer format
-  elements, fewer bugs.
+- Recovery loads the newer valid superblock, reads every slot's header to
+  map segment numbers to slots, loads the state of the start segment and
+  replays the records after it in sequence order across segments in number
+  order, rebuilding every index. At NVMe speeds a few gigabytes take
+  seconds, so index records that would shorten the scan are a later
+  optimization and not part of the format now. Fewer format elements, fewer
+  bugs.
 - The client table of a checkpoint lives in `clients-<snapshot id>`, written
   at CAPTURE and unlinked at DROP; the log only references it. Two reasons: a
   live checkpoint record inside the ring would pin its segment slot against
@@ -520,18 +542,27 @@ checkpoint.
   O_DIRECT needs block-aligned iovecs and TCP lands bytes at arbitrary slab
   offsets, so the copy is needed anyway for the default and one path means
   fewer bugs.
-- The tail buffers are also the read cache: the last `cache_bytes` of the log
-  stay in memory in their on-disk form, hot LOADs never touch the disk, and
-  receive slabs are held only by core leases and in-flight sends.
+- The tail buffers are one block-aligned ring that mirrors the file byte
+  for byte and doubles as the read cache (decision 36): the last
+  `cache_bytes` of the log stay in memory in their on-disk form, writes are
+  issued straight from the ring with fixed buffers, hot LOAD results point
+  into it, and receive slabs are held only by core leases and in-flight
+  sends. A LOAD lease pins its ring range and unwritten bytes are pinned
+  until their write completes; a STORE whose record would overwrite pinned
+  bytes is held, and the attach-time rule `cache_bytes >=
+  write_behind_bytes + pinned_payload_bytes + 2 * max_record_bytes` makes
+  every hold end.
 - Group commit per loop iteration: one write covers everything packed since
   the last one, then one flush if a SYNC is pending, either an O_DSYNC write
   or a plain write followed by fdatasync (`sync_mode`). `sync_delay_ns` holds
   the flush to batch more SYNCs at the cost of latency.
 - Backpressure: `write_behind_bytes` bounds unwritten data; when reached,
-  STORE completions wait, which is the only time storage latency reaches the
-  core. `inflight_writes` record writes may be in flight; the acknowledged
-  prefix stays contiguous because SYNC acknowledges only after every earlier
-  write completed and the flush returned.
+  STORE completions wait. Together with the pinned-floor hold and the
+  clients-file read a RESTORE needs (decision 43), these are the only times
+  storage latency reaches the core. `inflight_writes` record writes may be
+  in flight; the acknowledged prefix stays contiguous because SYNC
+  acknowledges only after every earlier write completed and the flush
+  returned.
 - A failed write fences by default (`VSR_IO_WRITE_ERROR_FENCE`). In
   replicated mode `VSR_IO_WRITE_ERROR_CONTINUE` keeps serving from memory,
   since the local log there is only a recovery hint.
@@ -553,28 +584,36 @@ back from disk.
 All indexes are fixed-capacity arrays from the replica's metadata region.
 
 - Op to record location is a ring indexed by op number, since the retained
-  range is dense. Versions created by TRUNCATE followed by APPEND go to a
-  small overflow table until RECLAIM passes their revision, which is how LOAD
+  range is dense; it holds every op an unreclaimed revision can still name,
+  which RECLAIM advances. Versions removed by TRUNCATE go to a versions
+  table with their validity range until RECLAIM passes it, which is how LOAD
   can name an older retained revision.
-- Client to latest completed record and client to latest retained entry are
-  two open-addressing tables over the 128-bit IDs with capacity
-  `max_clients`. The contract retains every client's latest record forever
-  and provides no deletion, so the client set is unbounded by design while
-  the arena is not. `max_clients` is therefore a deployment-wide limit,
-  identical on every replica, enforced where new incarnations enter:
-  `vsr_io_submit` leaves a REQUEST from an incarnation the store does not
-  know unconsumed with `ELIMIT` when the table, counting incarnations in
-  flight, is full, and the application answers `LIMIT`. Only the primary
-  admits requests and every replica holds the same set, so no backup ever
-  overflows; an overflow reached any other way still fences, as an invariant
-  rather than a policy. A logged request that retires an incarnation on a
-  clean client disconnect would bound growth further and is a core
-  follow-up.
-- A segment slot is freed only when every record in it is below both the trim
-  point and the reclaim floor.
-- LOAD reads the covering byte range into pool slabs with a fixed-buffer
-  read, checks CRCs, and builds the loaded graph in a per-load arena region
-  with one span per body; the lease is that slab reference plus the region.
+- One open-addressing table over the 128-bit client IDs with capacity
+  `max_clients` holds, per incarnation, its latest completed record (and the
+  one it replaced, since the core loads at a stored sequence that trails by
+  at most one poll), its latest retained entry, its offset in the current
+  base file and an in-flight flag (decisions 35, 44 and 47). The contract
+  retains every client's latest record forever and provides no deletion, so
+  the client set is unbounded by design while the arena is not.
+  `max_clients` is therefore a deployment-wide limit, identical on every
+  replica, enforced where new incarnations enter: `vsr_io_submit` leaves a
+  REQUEST from an incarnation the table does not know unconsumed with
+  `ELIMIT` when the table, counting incarnations in flight, is full, and the
+  application answers `LIMIT`. Only the primary admits requests and every
+  replica holds the same set, so no backup ever overflows; an overflow
+  reached any other way still fences, as an invariant rather than a policy.
+  A logged request that retires an incarnation on a clean client disconnect
+  would bound growth further and is a core follow-up.
+- A segment slot is freed only when every record in it is below all of: the
+  record holding the oldest retained entry, the RECLAIM revision, the client
+  base sequence plus one, and any capture still reading result bytes from
+  it (decision 35). The client index is recovered from `clients-<anchor>`
+  plus the CLIENTS records after the client base sequence.
+- A cold LOAD reads the covering record range into one pool slab with a
+  fixed-buffer read (a record fits a slab by construction, decision 37),
+  checks CRCs, and builds the loaded graph in a load region with one span
+  per body; the lease is that slab reference plus the region, or a ring pin
+  plus the region when the records are still in the tail ring.
 
 ### Tunables
 
@@ -587,7 +626,7 @@ All indexes are fixed-capacity arrays from the replica's metadata region.
 | `sync_delay_ns` | 0 | Batch more SYNCs per flush at the cost of latency |
 | `flush_interval_ns` | 100 ms, replicated mode only | How far the write-behind log may lag |
 | `write_behind_bytes` | 64 MiB | Backpressure point |
-| `cache_bytes` | 256 MiB | Tail kept in memory |
+| `cache_bytes` | 256 MiB | Tail ring; at least `write_behind_bytes + pinned_payload_bytes + 2 * max_record_bytes` |
 | `max_entries`, `max_clients` | required | Index capacities; the arena is sized from them |
 | `inflight_writes` | 2 | Concurrent record writes; the acknowledged prefix stays contiguous |
 | `on_write_error` | fence | Or continue memory-only in replicated mode |
@@ -633,11 +672,11 @@ library finds its own half by snapshot ID.
 
 | Core op | Library does | Application does |
 | --- | --- | --- |
-| CAPTURE | Generates the snapshot ID, records the client table at the named store revision | Freezes its state, returns its manifest; completion releases the fence, copying continues after |
-| SNAPSHOT_SYNC | Makes its client-table file durable | Makes its files durable; the library completes to the core when both halves are |
-| FETCH | Pulls its client-table half from the peer over its own stream first, then forwards | Pulls its image with a bulk stream or any channel it prefers, then completes |
+| CAPTURE | Generates the snapshot ID from executor entropy, snapshots the client table at the task's sequence before any later STORE, writes `clients-<id>` streaming through one staging slab, forwards the op with the ID in its template | Freezes its state, returns its manifest with that ID; the core's completion follows when both halves are done and releases the fence |
+| SNAPSHOT_SYNC | Makes `clients-<id>` and the directory entry durable | Makes its files durable; the library completes to the core when both halves are |
+| FETCH | Pulls `clients-<id>` from the peer over its own stream into a temporary file, verifies it, renames it, then forwards | Pulls its image with a bulk stream or any channel it prefers, then completes |
 | INSTALL | Nothing; the store's RESTORE already reset the client base | Loads the image so the state is exactly at checkpoint.op |
-| DROP | Deletes its client-table file once no reader needs it | Deletes its files once its own readers drain |
+| DROP | Forwards, then unlinks `clients-<id>` once no served stream reads it | Deletes its files once its own readers drain |
 
 ### Reads are local
 
@@ -682,8 +721,9 @@ engine then sends and writes with fixed-buffer operations, and
 `vsr_io_slab_release` returns it once nothing of the caller's covers it. The
 first application's request bodies are its own database pages, so this is
 the difference between registered and unregistered zero-copy on the
-primary's hottest send. A CRC32C routine and an atomic-publish sequence
-(write a temporary file, fsync, rename, fsync the directory) remain deferred
+primary's hottest send. CRC32C exists internally (`src/io/crc32c.h`) and the
+atomic-publish sequence (write a temporary file, fsync, rename, fsync the
+directory) is what the fetch of a clients file does; neither is public
 until a need appears.
 
 ## 8. Client
@@ -818,7 +858,11 @@ allocation inside its core.
 - Relation to existing tests: the in-memory host in `tests/lib` and the
   seeded scheduler in `tests/fuzzy` remain the core-level layer. The new
   layer composes the real engine, store and links over the simulated executor
-  and extends the existing profile-flag vocabulary of `tests/README.md`.
+  and extends the existing profile-flag vocabulary of `tests/README.md`;
+  the executor contract is checked by one conformance suite that runs
+  byte-identical over the simulation and over io_uring, and real-I/O tests
+  run under a seeded fault-injecting wrapper executor (decisions 45 and
+  46). The plan is in docs/io-implementation.md.
 - The simulation is a public library, not test-only code, because
   applications build their own end-to-end tests on it. It may allocate
   internally; the application core it hosts does not.
@@ -860,6 +904,24 @@ In the order the decisions were taken.
 | 29 | Sends from registered memory use fixed buffers, other caller memory is zero-copy without registration; pool slabs are lendable to the caller | The primary's hottest send is its own request bodies, which live in application memory | Leaving caller-memory sends unspecified; deferring the slab helper |
 | 30 | Cross-engine wakeup is the executor's wake plus an application queue; socket options are two operations | No engine needs `MSG_RING` yet; get and set have different result semantics | `MSG_RING` in the first executor; one ambiguous SOCKOPT |
 | 31 | The simulation splits segments across receive completions | Real stacks do; reassembly across completions and slabs is the path most likely to hide bugs | Whole-segment delivery only |
+| 32 | One `src/libvsr.a` holds the core, the I/O engine, the io_uring executor, the simulation and the client; sources under `src/io`, `src/sim`, `src/client` | One archive and one pkg-config file are simpler to ship and test; the core's zero-dependency property is a property of its sources, checked by which objects a core-only program pulls in | A separate `libvsr-io.a` |
+| 33 | A written block is never rewritten: every write starts at a block boundary, covers whole blocks, pads its last block with a PAD marker; the next write starts at the next boundary | A torn rewrite can never damage data already relied on; the scanner's rules stay local to one block | Filling partial blocks in place |
+| 34 | Format: superblocks A/B with identity, geometry, start segment, run and durable floor; segment headers with the full logical state as of the segment's first record; records with sequence, generation, run and two CRCs; a run counter incremented at every open | Recovery loads one header and replays; the run rule rejects a persisted block of a torn write behind a rewritten one; the durable floor makes CORRUPT detectable | Hard state in the superblock; index records; a single CRC |
+| 35 | Freeing floor = min(record of the oldest retained entry, RECLAIM revision, client base + 1, capture read floor); client index recovered from `clients-<anchor>` plus CLIENTS records after the base; one client table holding completed, retained and in-flight state | One floor rule covers every reader; one table keeps `max_clients` accounting exact | Two client tables; freeing by trim point and reclaim floor only |
+| 36 | The tail ring mirrors the file, is write staging and read cache, and has a pinned floor; `cache_bytes >= write_behind_bytes + pinned_payload_bytes + 2 * max_record_bytes` | Writes go from the ring with fixed buffers, hot loads point into it, and the rule guarantees a held STORE always proceeds | A separate read cache; unbounded holds |
+| 37 | `max_record_bytes` is computed from the core limits; a record fits one slab (plus two blocks of alignment) and one segment; cold LOADs read into one slab, one at a time per replica; the wire decoder and the record reader share the boundary-aware cursor | Sizes derive from limits the deployment already fixes; one cold read at a time keeps the pool bound simple | Multi-slab reads; per-replica read parallelism |
+| 38 | Send flag rule: all vectors in the pool -> `SEND_ZERO_COPY \| VECTORED \| FIXED_BUFFER`; any vector outside -> zero-copy without `FIXED_BUFFER` at or above `zero_copy_bytes`, plain send below; send queues are per node; one kernel send in flight per link; frame headers in a per-link send slab | The pool is one registered region, so the check is a range test; two sends on one socket may complete out of order | Per-link queues; pipelined sends |
+| 39 | No splice and no pipes: a FILE stream write is read into pool slabs and sent like buffers; `PIPE` and `SPLICE` removed from the executor; `file_slots` no longer counts pipe ends. Supersedes 13 | One send path for both write kinds; two fewer executor operations to specify and simulate; the copy is a page-cache read the NIC would do anyway | Splice from the page cache |
+| 40 | The engine arms no `TIMEOUT` record; every engine deadline is an entry of a deadline set reported by `vsr_io_prepare` | One mechanism, no kernel timers to cancel or update, and the loop already blocks with a deadline | Timer records per deadline |
+| 41 | Several established links to one node are legal; the carrier is the link dialed by the lower node identity, oldest first; idle timeout closes the rest | Simultaneous dial is normal; a rule both ends compute needs no protocol | Refusing the second connection; a tie-break message |
+| 42 | A MESSAGE lease is one slab reference plus one decode region from a per-replica pool of `input_leases + events` regions sized from the core limits; LOAD leases are a slab reference or ring pin plus a load region; slabs are refcounted by leases, in-flight vectors, stream DATA ops, cold reads and caller holds | Regions bound decoding memory without allocation; one count per slab covers every holder | Decoding into caller-visible slabs; per-message allocation |
+| 43 | Joint snapshot ops: the engine generates the snapshot id and the forwarded CAPTURE carries it; it writes, syncs, fetches (over a library stream whose request starts with `VSR_IO_LIBRARY_MAGIC`) and unlinks `clients-<id>`; the core's completion follows both halves; a RESTORE, or a PUBLISH of an id other than the latest capture, waits for the file to be read; the clients file is versioned with a CRC per record and a count | The library owns the client table, so it owns the file and the id; waiting on the rare RESTORE avoids a staging table | Caller-generated ids; staging tables for fetched files |
+| 44 | `max_clients` admission tracks in-flight incarnations as a flag in the client table entry, cleared when the incarnation is indexed or replied to | No second structure; the count is the table's | A separate in-flight set |
+| 45 | Executor semantics are specified once in docs/io-implementation.md and checked by `tests/integration/executor_conformance` over both executors; the first completion of a zero-copy send carries `MORE`; `FIXED_BUFFER` addresses are validated against the region; listeners are set up asynchronously through the executor and a failure is fatal through `vsr_io_stats.failure` | Two implementations of one contract need the contract written down; init that blocks on the ring would steal the caller's completions | Probing semantics from the kernel; synchronous bind in init |
+| 46 | Test plan: unit tests per module, libFuzzer harnesses for the frame decoder and store recovery, engine contracts over the simulation, the conformance suite, and `tests/fuzzy/iocluster` with fault profiles and a seeded fault-injecting wrapper executor for real I/O | Mirrors the core's layers; every randomized failure replays from its seed | Real-I/O-only integration tests |
+| 47 | CLIENT and REQUEST loads answer from the current record and the one it replaced; a load older than both fails as an invariant | The core issues them at its stored sequence, which trails the readable one by at most one poll, and replaces a client's record at most once per poll | Full history per client |
+| 48 | Recovery successor rule: after replaying a segment, continue in the segment with the greatest number among those whose header names the replayed sequence with a run at or above the current one; a header naming a lower sequence is stale and its slot is free; the durable floor is the maximum persisted floor | Stale headers of torn segments are distinguishable without rewriting them | Zeroing stale headers at recovery |
+| 49 | `vsr_io_detach` is EBUSY while write-behind writes or flushes are in flight; `vsr_io_close` cancels listeners and receives, closes links and streams, and reports `closed` when every slot is free | Nothing is torn down under an in-flight kernel operation | Synchronous teardown |
 
 ## 11. Open items and implementation order
 
@@ -872,7 +934,7 @@ Open items, each behind an existing seam:
 - Index records to shorten recovery of very large retained logs.
 - A store-only executor with IOPOLL for polled NVMe access.
 - Zero-copy receive on NICs that support it.
-- Helpers: slab allocation for application I/O, CRC32C, atomic publish.
+- A public atomic-publish helper, if an application asks for one.
 - The bounded-lane client alternative, if an application with short-lived
   clients ever needs it.
 - Multi-slab frame bodies, delivered as one span per slab, once a
@@ -894,7 +956,7 @@ Implementation order, each milestone with its own deterministic tests:
 3. Store layout and recovery: records, superblocks, indexes, torn-tail
    handling, per-checkpoint client tables, crash injection at block
    granularity.
-4. Timers and the deadline heap.
+4. The deadline set.
 5. The io_uring executor, `vsr_io_uring_*`, and the engine over it.
 6. The simulated executor and world, `vsr-sim.h`.
 7. The virtual cluster harness composing engines over the simulation, with
@@ -904,5 +966,8 @@ Implementation order, each milestone with its own deterministic tests:
 9. Benchmarks: throughput and latency across the tunables, memory and copies.
 10. The application-specific pass.
 
-The library ships as a separate static library with its own pkg-config file
-so the core keeps its zero-dependency property.
+The module boundaries, private headers, formats and tests of these
+milestones are specified in [io-implementation.md](io-implementation.md).
+Everything ships in the one `src/libvsr.a` with the one `vsr.pc`; the core
+keeps its zero-dependency property as a property of its sources (decision
+32).

@@ -155,6 +155,32 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[
 CFLAGS=$vsr_save_CFLAGS
 LDFLAGS=$vsr_save_LDFLAGS
 
+# The I/O layer in the same libvsr.a drives io_uring through liburing. The
+# baseline is Linux 7.2 with liburing 2.15, without probing or fallbacks
+# (docs/io-design.md, section 2). URING_CFLAGS and URING_LIBS in the
+# environment override pkg-config; the link check below verifies either way.
+m4_ifndef([PKG_CHECK_MODULES],
+  [m4_fatal([pkg.m4 is missing: install pkg-config (or pkgconf) and rerun ./bootstrap])])
+PKG_PROG_PKG_CONFIG
+PKG_CHECK_MODULES([URING], [liburing >= 2.15], [],
+  [AC_MSG_ERROR([liburing >= 2.15 is required (Debian: liburing-dev); set URING_CFLAGS and URING_LIBS to override pkg-config:
+$URING_PKG_ERRORS])])
+vsr_save_CPPFLAGS=$CPPFLAGS
+vsr_save_LIBS=$LIBS
+CPPFLAGS="$CPPFLAGS $URING_CFLAGS"
+LIBS="$URING_LIBS $LIBS"
+AC_MSG_CHECKING([whether liburing >= 2.15 compiles and links])
+AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+  #include <liburing.h>
+  #if IO_URING_VERSION_MAJOR < 2 || (IO_URING_VERSION_MAJOR == 2 && IO_URING_VERSION_MINOR < 15)
+  #error liburing headers older than 2.15
+  #endif
+]], [[return io_uring_major_version() == 2 && io_uring_minor_version() < 15;]])],
+  [AC_MSG_RESULT([yes])],
+  [AC_MSG_FAILURE([liburing >= 2.15 headers or library unusable; see config.log])])
+CPPFLAGS=$vsr_save_CPPFLAGS
+LIBS=$vsr_save_LIBS
+
 AC_SUBST([VSR_CFLAGS])
 AC_SUBST([VSR_LDFLAGS])
 AC_SUBST([VSR_INSTRUMENT_CFLAGS])
@@ -164,4 +190,4 @@ AM_CONDITIONAL([COVERAGE], [test "x$enable_coverage" = xyes])
 AM_CONDITIONAL([FUZZING], [test "x$enable_fuzzing" = xyes])
 AC_CONFIG_FILES([Makefile vsr.pc])
 AC_OUTPUT
-AC_MSG_NOTICE([compiler: $CC; sanitizers: $enable_sanitize; coverage: $enable_coverage; fuzzing: $enable_fuzzing])
+AC_MSG_NOTICE([compiler: $CC; sanitizers: $enable_sanitize; coverage: $enable_coverage; fuzzing: $enable_fuzzing; liburing: $URING_LIBS])

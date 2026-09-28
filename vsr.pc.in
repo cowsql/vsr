@@ -4,7 +4,8 @@ libdir=@libdir@
 includedir=@includedir@
 
 Name: vsr
-Description: Deterministic allocation-free Viewstamped Replication core
+Description: Deterministic allocation-free Viewstamped Replication core with an io_uring host
 Version: @PACKAGE_VERSION@
+Requires.private: liburing >= 2.15
 Libs: -L${libdir} -lvsr
 Cflags: -I${includedir}

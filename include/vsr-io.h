@@ -47,6 +47,10 @@
  * every peer or stream connection, so a caller-owned listener can tell peers
  * from its own clients (see vsr_io_adopt). */
 #define VSR_IO_WIRE_MAGIC UINT64_C(0x0000004F49525356)
+/* "VSRLIB" little-endian: the first eight bytes of a bulk stream request
+ * the engine makes for itself (the clients half of a snapshot fetch);
+ * caller requests must not begin with it. */
+#define VSR_IO_LIBRARY_MAGIC UINT64_C(0x000042494C525356)
 
 /* -------------------------------------------------------------------------
  * Executor: a virtual io_uring
@@ -55,8 +59,11 @@
  * record (CQE) reports its result. Records are plain C11 structs so that a
  * simulation can implement the same semantics without kernel headers. The
  * operation set is the subset the library needs; semantics follow io_uring
- * exactly where a flag is named after an io_uring flag. user_data is opaque
- * to the executor and is returned unchanged in the completion.
+ * exactly where a flag is named after an io_uring flag, and the "Executor
+ * contract" section of docs/io-implementation.md states them once for both
+ * implementations; tests/integration/executor_conformance checks them.
+ * user_data is opaque to the executor and is returned unchanged in the
+ * completion.
  *
  * Ownership of user_data: the top byte is the OWNER tag. The engine uses the
  * tag from vsr_io_options.owner (default 0); the caller uses any other tag for
@@ -101,12 +108,10 @@ enum vsr_io_sqe_opcode {
                             length: count); FIXED_BUFFER: buffer_index */
     VSR_IO_SQE_SHUTDOWN,  /* length: SHUT_* how */
     VSR_IO_SQE_SETSOCKOPT, /* op_flags: level << 16 | name; addr/length: value */
-    VSR_IO_SQE_GETSOCKOPT, /* same fields; result is the value's length */
-    VSR_IO_SQE_PIPE,    /* addr: int[2] or, with DIRECT, two slots from fd2 */
-    VSR_IO_SQE_SPLICE,  /* fd/offset: source; fd2: destination; length; a
-                           pipe must be one end; op_flags: SPLICE_F_* */
-    VSR_IO_SQE_TIMEOUT, /* offset: ns, ABSOLUTE in the executor clock or
-                           relative; completes with -ETIME when it fires */
+    VSR_IO_SQE_GETSOCKOPT,     /* same fields; result is the value's length */
+    VSR_IO_SQE_TIMEOUT,        /* offset: ns, ABSOLUTE in the executor clock or
+                           relative; completes with -ETIME when it fires;
+                           for callers: the engine arms none for itself */
     VSR_IO_SQE_TIMEOUT_UPDATE, /* addr2: target user_data as uint64; offset */
     VSR_IO_SQE_CANCEL          /* offset: target user_data; op_flags: BY_FD (all
                             operations on fd), ALL (every match) */
@@ -159,7 +164,9 @@ struct vsr_io_sqe {
 };
 
 enum vsr_io_cqe_flags {
-    VSR_IO_CQE_MORE = 1u << 0,        /* Multishot: more completions follow. */
+    VSR_IO_CQE_MORE = 1u << 0,        /* Multishot: more completions follow;
+                                         also on the first of the two
+                                         completions of a zero-copy send. */
     VSR_IO_CQE_BUFFER = 1u << 1,      /* buffer_id names the provided buffer. */
     VSR_IO_CQE_BUFFER_MORE = 1u << 2, /* Incremental consumption: the kernel
                                          keeps the rest of that buffer. */
@@ -240,7 +247,8 @@ struct vsr_io_executor {
  * ring. sqpoll_idle_ms > 0 selects SQPOLL; napi_busy_poll_us > 0 registers
  * NAPI busy polling. IOPOLL rings cannot serve sockets and are not created
  * here. file_slots and buffer_regions size the sparse registered tables;
- * buffer_ring_memory sizes the memory later handed to buffer_ring.
+ * the memory of a provided-buffer ring is the caller's, handed to
+ * buffer_ring (the engine keeps it in its metadata region).
  */
 struct vsr_io_uring_options {
     uint32_t sq_entries;
@@ -322,7 +330,7 @@ struct vsr_io_limits {
     uint32_t nodes;          /* Node table entries. */
     uint32_t authorizations; /* (cluster, replica) -> node entries. */
     uint32_t links;          /* Connections of every kind, both directions. */
-    uint32_t link_queue;     /* Pending SEND ops per link before RETRY. */
+    uint32_t link_queue;     /* Pending SEND ops per node before RETRY. */
     uint32_t streams;        /* Concurrent bulk streams, both roles. */
     uint32_t stream_window;  /* Outstanding DATA or WRITE per stream. */
     uint32_t events;         /* Queued caller events per replica. */
@@ -336,20 +344,29 @@ struct vsr_io_limits {
 
 /*
  * Sizing rules, checked by vsr_io_layout and vsr_io_attach (ELIMIT):
- * slab_bytes must hold the largest frame of every attached replica, that is
- * its message_bytes plus framing, and one stream chunk plus framing, so any
- * frame fits one slab and a frame that straddles two is copied into a fresh
- * one. file_slots covers the listeners, every link, two pipe ends per
- * stream, and per replica one log file plus one transient checkpoint file.
- * buffer_regions covers one region for the payload pool plus one per
- * attached replica for its tail buffers.
+ * slab_bytes must hold the largest frame of every attached replica (its
+ * message_bytes plus every header the frame carries, computed from the
+ * core limits), one stream chunk plus framing, and the largest store record
+ * plus two blocks of alignment, so a frame fits one slab, a straddling
+ * frame is copied into a fresh one, and a cold LOAD reads its records into
+ * one slab. slabs must be at least links + streams * (stream_window + 1) +
+ * 2 * replicas + 4: every established link holds one slab for its frame
+ * headers, streams hold their windows, and each replica needs one for cold
+ * loads and one for capture staging, beyond what receives consume.
+ * file_slots covers the listeners, every link, one per stream (the file a
+ * served stream reads), and per replica the log plus one transient
+ * clients file. buffer_regions covers one region for the payload pool plus
+ * one per attached replica for its tail buffers.
  */
 
 struct vsr_io_options {
     struct vsr_io_executor executor;
     uint64_t node;                       /* Own node identity, nonzero. */
     const struct vsr_io_address *listen; /* Accept peers and streams here;
-                                             copied by vsr_io_init. */
+                                             copied by vsr_io_init; set up
+                                             through the executor on the first
+                                             prepare, a bind or listen failure
+                                             is fatal: vsr_io_stats.failure. */
     uint32_t listen_count;               /* Zero: dial only. */
     uint32_t handshake;                  /* enum vsr_io_handshake_mode */
     struct vsr_io_limits limits;
@@ -381,9 +398,10 @@ int vsr_io_layout(const struct vsr_io_options *options,
                   struct vsr_io_layout *layout);
 /*
  * Copies options; registers the payload pool, the provided-buffer ring, and
- * the engine's file slots with the executor; binds and listens. Regions must
- * satisfy the layout and stay fixed until deinit. Returns OK, EINVAL, ELIMIT,
- * or a negative errno from the executor.
+ * the engine's file slots with the executor; queues the listener setup for
+ * the first prepare. Regions must satisfy the layout and stay fixed until
+ * deinit. Returns OK, EINVAL, ELIMIT, or a negative errno from the
+ * executor's registrations.
  */
 int vsr_io_init(const struct vsr_io_options *options,
                 const struct vsr_io_region *metadata,
@@ -432,7 +450,11 @@ enum vsr_io_adopt_flags {
 
 int vsr_io_adopt(struct vsr_io *io, int fd, uint64_t node, uint32_t flags);
 
-/* Link state toward one node, for role and health decisions. */
+/* Link state toward one node, for role and health decisions. Several
+ * established links to one node are legal (both ends dialed at once): the
+ * link dialed by the lower node identity, oldest first, carries the sends,
+ * so both ends agree and the others go idle and are closed by the idle
+ * timeout. */
 enum vsr_io_node_state {
     VSR_IO_NODE_UNLINKED, /* No link and none in progress. */
     VSR_IO_NODE_PENDING,  /* Dialing, waiting for the caller, or handshaking. */
@@ -471,8 +493,12 @@ int vsr_io_node_status(const struct vsr_io *io, uint64_t node,
  * queues, and returns the forwarded ops. vsr_io_prepare flushes those queues
  * into records: sends coalesced per link, STOREs packed into one write and,
  * if a SYNC is pending, one flush; receives and accepts re-armed; recycled
- * slabs provided; timers armed. The iteration is therefore the batching
- * boundary, and wait_min_ns/want in step 4 trade latency for batching.
+ * slabs provided. The engine arms no timer of its own: every engine
+ * deadline (core deadlines, dial backoff, handshake and idle timeouts,
+ * flush interval, sync delay, stream inactivity) is reported as the
+ * *deadline_ns of vsr_io_prepare, which the loop passes to submit_and_wait.
+ * The iteration is therefore the batching boundary, and wait_min_ns/want
+ * in step 4 trade latency for batching.
  * now_ns is read once per iteration from the executor and shared by caller
  * and engine so simulation time reaches the core through the same path.
  * ---------------------------------------------------------------------- */
@@ -496,7 +522,8 @@ int vsr_io_poll(struct vsr_io *io, uint64_t now_ns, struct vsr_io_op *ops,
 int vsr_io_submit(struct vsr_io *io, const struct vsr_io_event *events,
                   uint32_t count, uint32_t *consumed);
 /* Fills at most capacity records; *deadline_ns is the earliest engine
- * deadline or VSR_NO_DEADLINE. Records left over stay queued. */
+ * deadline or VSR_NO_DEADLINE, and must reach submit_and_wait. Records left
+ * over stay queued. */
 int vsr_io_prepare(struct vsr_io *io, uint64_t now_ns, struct vsr_io_sqe *sqes,
                    uint32_t capacity, uint32_t *count, uint64_t *deadline_ns);
 
@@ -534,6 +561,18 @@ int vsr_io_run(struct vsr_io *io, const struct vsr_io_hooks *hooks);
  * Leases: caller lease IDs must have VSR_IO_LEASE_ENGINE clear; the engine's
  * own leases have it set and never reach the caller. Reply routes and read
  * cookies are the caller's; the engine passes them through unchanged.
+ *
+ * Snapshot ops are joint (docs/io-design.md, "Joint snapshot ops"). The
+ * engine generates the snapshot id: the SNAPSHOT_CAPTURE it forwards
+ * carries a task whose checkpoint template already has the id, and the
+ * caller returns that id with its manifest; the engine writes the
+ * checkpoint's client table to clients-<id> meanwhile and completes to
+ * the core only when both halves are done. SNAPSHOT_FETCH is forwarded
+ * only after the engine pulled its clients file from the peer over its
+ * own stream (a lost stream completes the core op with RETRY without
+ * involving the caller); SNAPSHOT_SYNC and SNAPSHOT_DROP are forwarded and
+ * completed to the core when the file is durable, or unlinked, and the
+ * caller completed. SNAPSHOT_INSTALL is forwarded unchanged.
  * ---------------------------------------------------------------------- */
 
 #define VSR_IO_LEASE_ENGINE (UINT64_C(1) << 63)
@@ -613,8 +652,12 @@ struct vsr_io_link_wanted {
  * events, each either caller buffers under a lease or a file range on a
  * registered slot, in order; STREAM_WRITTEN reports when a write's bytes are
  * no longer read; submit STREAM_CLOSE {stream, status} last. The engine sends
- * buffers zero-copy and file ranges with splice through a pipe pair it owns.
- * Connection loss ends the stream on both sides with VSR_IO_RETRY.
+ * buffers zero-copy; a file range is read into pool slabs, stream_chunk_bytes
+ * at a time with fixed-buffer reads, and sent chunk by chunk exactly like
+ * buffers, so no pipe or splice is involved. Connection loss ends the
+ * stream on both sides with VSR_IO_RETRY. Request bytes beginning with
+ * VSR_IO_LIBRARY_MAGIC are the engine's own and are never offered to the
+ * caller as STREAM_SERVE.
  */
 struct vsr_io_stream_serve {
     uint64_t stream;
@@ -694,13 +737,16 @@ struct vsr_io_stream_write {
  * The caller may take slabs of the registered payload pool for its own
  * bytes: request bodies it will submit, file I/O it issues itself. A taken
  * slab is the caller's until released, and the engine does not provide it
- * to the kernel meanwhile. Bytes in any registered region, the pool
- * included, are sent and written by the engine with fixed-buffer
- * operations; caller bytes outside registered memory are sent zero-copy
- * without registration at or above zero_copy_bytes, which pins their pages
- * per send, and copied by the kernel below it. Release a slab only when no
- * lease, op, or record of the caller still covers it. acquire returns OK,
- * ELIMIT when the pool is exhausted, or EINVAL.
+ * to the kernel meanwhile. The send rule is exact: a coalesced vectored
+ * send whose vectors all lie inside the payload pool (frame headers always
+ * do; bodies do when they are received bytes or caller bytes in taken
+ * slabs) goes SEND_ZERO_COPY | VECTORED with FIXED_BUFFER on the pool's
+ * single registered region; a send with any vector outside the pool (tail
+ * buffers, the core arena, caller memory) goes SEND_ZERO_COPY | VECTORED
+ * without FIXED_BUFFER, which pins the pages per send, when its bytes reach
+ * zero_copy_bytes, and plain VECTORED SEND (kernel copy) below. Release a
+ * slab only when no lease, op, or record of the caller still covers it.
+ * acquire returns OK, ELIMIT when the pool is exhausted, or EINVAL.
  * ---------------------------------------------------------------------- */
 
 struct vsr_io_slab {
@@ -725,16 +771,27 @@ int vsr_io_slab_release(struct vsr_io *io, uint16_t id);
  *
  * STORE completes as soon as its record is packed into the tail buffers and
  * indexed: readable, not durable. Only SYNC waits for the write and a flush.
- * Records are packed by copy into block-aligned registered tail buffers,
- * which are also the read cache; the file is opened with O_DIRECT unless
- * direct_io is zero. One write per loop iteration covers everything packed
- * since the last one. In replicated mode the core never issues SYNC, so the
- * log is write-behind: flushed every flush_interval_ns, and its only role is
- * recovery and catch-up. Recovery scans live segments from the newer
- * superblock; a record that is short, fails its CRC, or breaks the sequence
- * ends the log; a bad record below the acknowledged durable prefix is
- * CORRUPT. NEW and JOIN create the store; RECOVER opens it and reports
- * NOT_FOUND when the directory has no log.
+ * Records are packed by copy into the block-aligned registered tail ring,
+ * which mirrors the file and is also the read cache; the file is opened
+ * with O_DIRECT unless direct_io is zero. A written block is never
+ * rewritten: every write starts at a block boundary, pads its last block,
+ * and the next write starts at the next boundary. One write per loop
+ * iteration covers everything packed since the last one. A STORE
+ * completion is held only while its record would overwrite ring bytes
+ * still referenced by a LOAD lease or not yet written, or while unwritten
+ * bytes exceed write_behind_bytes; a RESTORE, or a PUBLISH of a snapshot
+ * other than the latest capture, also waits for its clients file to be
+ * read. Those are the only times storage latency reaches the core. In
+ * replicated mode the core never issues SYNC, so the log is write-behind:
+ * flushed every flush_interval_ns, and its only role is recovery and
+ * catch-up. Recovery scans live segments from the newer superblock; a
+ * record that is short, fails its CRC, or breaks the sequence ends the log;
+ * a bad record below the acknowledged durable prefix is CORRUPT. NEW and
+ * JOIN create the store; RECOVER opens it and reports NOT_FOUND when the
+ * directory has no log. An index overflow (more than max_entries ops
+ * retained by unreclaimed revisions, or more than max_clients incarnations
+ * reached other than through vsr_io_submit) fails the STORE with FAILED,
+ * which fences the replica.
  * ---------------------------------------------------------------------- */
 
 enum vsr_io_sync_mode {
@@ -764,10 +821,13 @@ struct vsr_io_store_options {
     uint64_t sync_delay_ns;      /* Hold a flush to batch SYNCs; default 0. */
     uint64_t flush_interval_ns;  /* Replicated mode write-behind cadence. */
     uint64_t write_behind_bytes; /* Unwritten bytes before STORE waits. */
-    uint64_t cache_bytes;   /* Tail kept in memory; at least one segment. */
-    uint8_t direct_io;      /* Default 1. */
-    uint8_t sync_mode;      /* enum vsr_io_sync_mode */
-    uint8_t on_write_error; /* enum vsr_io_write_error */
+    uint64_t cache_bytes;        /* Tail ring, a multiple of block_bytes and at
+                               least write_behind_bytes + the core's
+                               pinned_payload_bytes + twice the largest
+                               record, so a held STORE always proceeds. */
+    uint8_t direct_io;           /* Default 1. */
+    uint8_t sync_mode;           /* enum vsr_io_sync_mode */
+    uint8_t on_write_error;      /* enum vsr_io_write_error */
     uint8_t reserved[5];
 };
 
@@ -817,9 +877,10 @@ int vsr_io_attach(struct vsr_io *io,
                   const struct vsr_io_region *metadata,
                   const struct vsr_io_region *tail,
                   struct vsr_io_replica **out);
-/* Only after the STATUS op reporting STOPPED: closes the store files and
- * releases the tail registration. EBUSY otherwise. The regions are the
- * caller's again. */
+/* Only after the STATUS op reporting STOPPED and once the store's own
+ * write-behind writes and flushes have completed: closes the store files
+ * and releases the tail registration. EBUSY otherwise; keep driving the
+ * loop. The regions are the caller's again. */
 int vsr_io_detach(struct vsr_io_replica *replica);
 void vsr_io_replica_status(const struct vsr_io_replica *replica,
                            struct vsr_status *core,

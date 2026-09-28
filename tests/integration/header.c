@@ -4,6 +4,29 @@
 /* Verify that the public header can be included more than once. */
 #include "vsr.h"
 
+/* The I/O layer's public contracts and every private header of its modules
+ * compile under the same strict flags; the headers are the interface
+ * specification of docs/io-implementation.md. */
+#include "vsr-client.h"
+#include "vsr-io.h"
+#include "vsr-sim.h"
+
+#include "client/client.h"
+#include "io/codec.h"
+#include "io/crc32c.h"
+#include "io/cursor.h"
+#include "io/deadline.h"
+#include "io/engine.h"
+#include "io/link.h"
+#include "io/pool.h"
+#include "io/slots.h"
+#include "io/snapshot.h"
+#include "io/store.h"
+#include "io/stream.h"
+#include "io/uring.h"
+#include "io/wire.h"
+#include "sim/sim.h"
+
 #define CHECK_LAYOUT(test, name) _Static_assert((test), #name)
 
 #if UINTPTR_MAX == UINT64_MAX
@@ -21,6 +44,13 @@ CHECK_LAYOUT(offsetof(struct vsr_event, data) == 16, event_body_offset);
 CHECK_LAYOUT(offsetof(struct vsr_op, data) == 16, operation_body_offset);
 CHECK_LAYOUT(offsetof(struct vsr_message, body) == 56, message_body_offset);
 CHECK_LAYOUT(offsetof(struct vsr_entry, body) == 56, entry_body_offset);
+/* vsr-io.h documents these record and wrapper sizes. */
+CHECK_LAYOUT(sizeof(struct vsr_io_sqe) == 64, sqe_is_64_bytes);
+CHECK_LAYOUT(sizeof(struct vsr_io_cqe) == 16, cqe_is_16_bytes);
+CHECK_LAYOUT(sizeof(struct vsr_io_op) == 48, io_op_is_48_bytes);
+CHECK_LAYOUT(sizeof(struct vsr_io_event) == 48, io_event_is_48_bytes);
+CHECK_LAYOUT(sizeof(struct vsr_io_vec) == 16, vec_is_16_bytes);
+CHECK_LAYOUT(sizeof(struct vsr_io_buffer) == 16, buffer_is_16_bytes);
 #endif
 
 /* Exercise both step signatures with caller-owned contiguous queue storage. */
