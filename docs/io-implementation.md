@@ -43,7 +43,7 @@ simulation and `vsr_client_` in the client.
  src/sim/           the simulated world
    sim.h             world.c net.c disk.c exec.c
  src/client/        the client bookkeeping
-   client.h          client.c
+                     client.c     structures private to the file
 ```
 
 Dependency order, lowest first; a module includes only headers below it
@@ -507,7 +507,7 @@ synced blocks and dropping unsynced ones with `unsynced_keep_ppm` 0 and
 1000000, directory operations, inspection functions);
 `tests/integration/executor_conformance` over the simulation.
 
-### Client (`src/client/client.h`)
+### Client (`src/client/client.c`)
 
 Purpose: `vsr-client.h`. State machine per lane:
 
@@ -523,8 +523,9 @@ Purpose: `vsr-client.h`. State machine per lane:
 Target choice: `primary` when known; else members in id order starting at
 `rotation`, advancing per attempt; CAUSAL reads round-robin over FULL
 members from `causal_cursor`. `min_op` is the maximum of completed
-replies' `op` and observed applied positions. Export writes the image of
-`client.h` with a trailing CRC32C; import validates and marks pending lanes
+replies' `op` and observed applied positions. Export writes
+the documented little-endian image (see the comment in `client.c`) with a
+trailing CRC32C; import validates and marks pending lanes
 DETACHED.
 
 Tests: `tests/unit/client`: every transition above, backoff doubling and

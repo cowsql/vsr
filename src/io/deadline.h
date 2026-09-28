@@ -48,7 +48,10 @@ struct vsr_io_deadlines {
     uint32_t count;
 };
 
+/* Bytes for capacity handles (entries, then heap); checked arithmetic,
+ * ELIMIT on overflow or capacity UINT32_MAX (the NONE position). */
 int vsr_io_deadlines_size(uint32_t capacity, size_t *bytes);
+/* Every handle starts disarmed and unbound. */
 void vsr_io_deadlines_init(struct vsr_io_deadlines *set, void *memory,
                            uint32_t capacity);
 /* Binds a handle to its owner once; handles are dense per kind and the
@@ -59,8 +62,9 @@ void vsr_io_deadlines_bind(struct vsr_io_deadlines *set, uint32_t handle,
 void vsr_io_deadlines_arm(struct vsr_io_deadlines *set, uint32_t handle,
                           uint64_t when);
 uint64_t vsr_io_deadlines_earliest(const struct vsr_io_deadlines *set);
-/* Pops the earliest entry due at or before now; false when none. The
- * entry is disarmed; a periodic owner re-arms it. */
+/* Pops the earliest entry due at or before now; false when none. Equal
+ * deadlines pop in handle order. The entry is disarmed; a periodic owner
+ * re-arms it. */
 bool vsr_io_deadlines_pop(struct vsr_io_deadlines *set, uint64_t now,
                           uint16_t *kind, uint32_t *index);
 

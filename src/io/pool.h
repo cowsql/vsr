@@ -57,11 +57,15 @@ struct vsr_io_pool {
     uint32_t free_count;
     uint32_t kernel_count; /* Slabs currently in the ring. */
     uint32_t reserve;      /* Free slabs never provided. */
-    uint32_t pending;      /* FREE slabs the next prepare provides. */
+    uint32_t pending;      /* FREE slabs above the reserve: what the next
+                              prepare provides. */
     uint32_t region_index; /* Executor buffer region of the pool. */
     uint16_t group;        /* Buffer group of the ring. */
     uint16_t ring_entries; /* Power of two >= slabs. */
-    bool ring_registered;
+    bool ring_registered;  /* Set by the engine once buffer_ring succeeded,
+                              cleared by ring_lost; provide hands out
+                              nothing while clear. */
+    bool starved;          /* A RECV ended with -ENOBUFS; see was_starved. */
     struct vsr_io_slab_entry *entries; /* [slabs] */
     void *ring_memory;                 /* Provided-ring memory, page aligned:
                                            16 bytes per entry. */
@@ -70,7 +74,10 @@ struct vsr_io_pool {
 #define VSR_IO_INDEX_NONE UINT32_MAX
 
 /* Bookkeeping bytes (entries array plus ring memory) for the limits. The
- * ring memory needs page alignment; the engine places it first. */
+ * ring memory needs page alignment; the engine places it first. EINVAL for
+ * zero slabs, a page size that is not a power of two, or slab_bytes not a
+ * positive multiple of it; ELIMIT beyond 32768 slabs (16-bit ids, a
+ * power-of-two ring) or on overflow. */
 int vsr_io_pool_size(const struct vsr_io_limits *limits, size_t page_bytes,
                      size_t *bytes, size_t *alignment);
 /* base/size is the payload region; memory the bookkeeping region. reserve
@@ -97,7 +104,10 @@ static inline bool vsr_io_pool_contains(const struct vsr_io_pool *pool,
 }
 
 /* Takes a FREE slab as HELD with one reference; INDEX_NONE when none is
- * free. `caller` marks a slab taken through vsr_io_slab_acquire. */
+ * free. `caller` marks a slab taken through vsr_io_slab_acquire, which never
+ * takes the reserve: INDEX_NONE (ELIMIT) once free_count <= reserve, while
+ * internal users (cold loads, reassembly, staging) may take the reserve.
+ * The engine clears `caller` when the caller releases the slab. */
 uint32_t vsr_io_pool_acquire(struct vsr_io_pool *pool, bool caller);
 void vsr_io_pool_retain(struct vsr_io_pool *pool, uint32_t id);
 /* Drops one reference; a slab reaching zero outside the ring becomes FREE
@@ -125,7 +135,9 @@ void vsr_io_pool_recv_end(struct vsr_io_pool *pool, uint16_t buffer_id);
 uint32_t vsr_io_pool_provide(struct vsr_io_pool *pool,
                              struct vsr_io_buffer *buffers, uint32_t capacity);
 void vsr_io_pool_starved(struct vsr_io_pool *pool);
-bool vsr_io_pool_was_starved(struct vsr_io_pool *pool); /* Clears it. */
+/* True once per starvation, as soon as the ring holds a buffer again; it
+ * clears the flag then, so receives are not re-armed into an empty ring. */
+bool vsr_io_pool_was_starved(struct vsr_io_pool *pool);
 /* Ring torn down (close or crash): every KERNEL slab is back to the pool. */
 void vsr_io_pool_ring_lost(struct vsr_io_pool *pool);
 

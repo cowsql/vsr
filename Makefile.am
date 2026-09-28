@@ -23,14 +23,15 @@ src_libvsr_a_SOURCES = \
 # The I/O layer, in the module order of docs/io-implementation.md: sans-IO
 # planners, the engine, and the io_uring executor under src/io; the simulated
 # world under src/sim; the client bookkeeping under src/client.
-src_libvsr_a_SOURCES += src/io/crc32c.c src/io/crc32c.h
+src_libvsr_a_SOURCES += src/io/crc32c.c src/io/crc32c.h src/io/cursor.c \
+  src/io/pool.c src/io/slots.c src/io/deadline.c src/client/client.c
 # Private headers of the I/O layer: the interface specification every
 # module implements (docs/io-implementation.md); compiled by the header
 # check until their sources land.
 src_libvsr_a_SOURCES += src/io/cursor.h src/io/wire.h src/io/codec.h \
   src/io/pool.h src/io/slots.h src/io/deadline.h src/io/link.h \
   src/io/stream.h src/io/store.h src/io/snapshot.h src/io/engine.h \
-  src/io/uring.h src/sim/sim.h src/client/client.h
+  src/io/uring.h src/sim/sim.h
 noinst_HEADERS = tests/lib/check.h
 noinst_PROGRAMS = examples/replication examples/failover examples/checkpoint \
   examples/epochs examples/reads examples/witness
@@ -53,7 +54,8 @@ examples_witness_LDADD = $(LIBVSR)
 UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/memory \
   tests/unit/validate tests/unit/runtime tests/unit/reads tests/unit/memory_watch
 UNIT_TESTS += tests/unit/descriptors tests/unit/layout
-UNIT_TESTS += tests/unit/crc32c
+UNIT_TESTS += tests/unit/crc32c tests/unit/cursor tests/unit/pool \
+  tests/unit/slots tests/unit/deadline tests/unit/client
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
@@ -95,6 +97,17 @@ tests_unit_layout_SOURCES = tests/unit/layout.c
 tests_unit_layout_LDADD = $(LIBVSR)
 tests_unit_crc32c_SOURCES = tests/unit/crc32c.c tests/lib/random.c tests/lib/random.h
 tests_unit_crc32c_LDADD = $(LIBVSR)
+tests_unit_cursor_SOURCES = tests/unit/cursor.c
+tests_unit_cursor_LDADD = $(LIBVSR)
+tests_unit_pool_SOURCES = tests/unit/pool.c tests/lib/random.c tests/lib/random.h
+tests_unit_pool_LDADD = $(LIBVSR)
+tests_unit_slots_SOURCES = tests/unit/slots.c
+tests_unit_slots_LDADD = $(LIBVSR)
+tests_unit_deadline_SOURCES = tests/unit/deadline.c tests/lib/random.c \
+  tests/lib/random.h
+tests_unit_deadline_LDADD = $(LIBVSR)
+tests_unit_client_SOURCES = tests/unit/client.c tests/lib/random.c tests/lib/random.h
+tests_unit_client_LDADD = $(LIBVSR)
 tests_integration_replication_SOURCES = tests/integration/replication.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h

@@ -128,11 +128,12 @@ void vsr_client_lane_status(const struct vsr_client *client, uint32_t lane,
  * DONE or FAILED: a vsr_blob for COMMAND, a vsr_membership for RECONFIGURE,
  * a vsr_check_epoch for CHECK_EPOCH; NOOP is not a client request. The
  * attempt's request is what the caller must transmit: identity, routing
- * epoch, type and body pointer. replica is the advertised primary, or
- * VSR_NO_REPLICA when unknown, in which case any known member may be tried
- * and its NOT_PRIMARY reply will name the primary. Every attempt of one
- * request carries the same identity, type and body; only request.epoch
- * follows redirects, exactly as vsr.h requires.
+ * epoch, type and body pointer. replica is the advertised primary; when that
+ * is unknown, the next known member in ID order after the lane's previous
+ * target, whose NOT_PRIMARY reply will name the primary; VSR_NO_REPLICA only
+ * when no membership is known, and then any node may be tried. Every
+ * attempt of one request carries the same identity, type and body; only
+ * request.epoch follows redirects, exactly as vsr.h requires.
  * ---------------------------------------------------------------------- */
 
 struct vsr_client_attempt {
@@ -179,8 +180,12 @@ struct vsr_client_outcome {
  * open a fresh incarnation. A reply whose request number is not the pending
  * one, or for an IDLE lane, is IGNORE. CLIENT_STATE and CLIENT_UNKNOWN
  * belong to vsr_client_queried; TIMEOUT belongs to reads and is IGNORE here.
- * Returns OK, ELIMIT when a membership could not be adopted (outcome still
- * valid), or EINVAL.
+ * A NOT_PRIMARY naming no primary, or a NEW_EPOCH no newer than the attempt's
+ * routing epoch (a lagging replica), yields WAIT for backoff_ns instead; a
+ * NOT_PRIMARY naming the attempt's own target in its epoch is IGNORE, left to
+ * the attempt's timeout. Only a PENDING lane follows redirects and BUSY; a
+ * WAITING lane still accepts the final statuses. Returns OK, ELIMIT when a
+ * membership could not be adopted (outcome still valid), or EINVAL.
  */
 int vsr_client_reply(struct vsr_client *client, uint32_t lane,
                      const struct vsr_reply *reply, uint64_t now_ns,
@@ -191,7 +196,9 @@ int vsr_client_reply(struct vsr_client *client, uint32_t lane,
  * the earliest lane whose deadline is at or before now_ns, 0 when none is
  * due; call until it returns 0. An expired attempt retries at the current
  * primary if known, else at the next known member in ID order, so a dead
- * primary is eventually bypassed by a NOT_PRIMARY from a live backup.
+ * primary is eventually bypassed by a NOT_PRIMARY from a live backup; an
+ * attempt that expires at the advertised primary makes the primary unknown
+ * until a reply names one again. EINVAL for NULL arguments.
  */
 int vsr_client_time(struct vsr_client *client, uint64_t now_ns,
                     struct vsr_client_outcome *outcome);
@@ -210,6 +217,7 @@ uint64_t vsr_client_deadline(const struct vsr_client *client);
  * query is local knowledge only and cannot prove the request never ran. A
  * caller that cannot supply the body and gets IGNORE must treat the outcome
  * as unknown, close nothing, and open a fresh incarnation for new work.
+ * resume and query return EINVAL unless the lane is DETACHED or QUERYING.
  */
 int vsr_client_resume(struct vsr_client *client, uint32_t lane,
                       const void *body, uint64_t now_ns,
@@ -287,8 +295,10 @@ int vsr_client_export(const struct vsr_client *client, void *bytes, size_t size,
                       size_t *written);
 /* Only into a client with no open lane, initialized with lane and member
  * capacities at least those of the image. Lanes with a pending request come
- * back DETACHED. Returns OK, EINVAL for a malformed or newer image, ELIMIT
- * when capacities do not fit, EBUSY when lanes are open. */
+ * back DETACHED, at their exported lane indexes. The image's topology
+ * replaces the client's unless the client already holds a newer epoch;
+ * min_op is the greater of both. Returns OK, EINVAL for a malformed or newer
+ * image, ELIMIT when capacities do not fit, EBUSY when lanes are open. */
 int vsr_client_import(struct vsr_client *client, const void *bytes,
                       size_t size);
 

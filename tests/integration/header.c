@@ -11,7 +11,6 @@
 #include "vsr-io.h"
 #include "vsr-sim.h"
 
-#include "client/client.h"
 #include "io/codec.h"
 #include "io/crc32c.h"
 #include "io/cursor.h"

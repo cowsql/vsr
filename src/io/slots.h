@@ -50,18 +50,24 @@ struct vsr_io_slot {
     uint64_t cookie; /* Per kind: op id, sequence, byte offset. */
 };
 
+/* index is 24 bits of user_data; a table never has more slots. */
+#define VSR_IO_SLOTS_MAX (UINT32_C(1) << 24)
+
 struct vsr_io_slots {
     struct vsr_io_slot *slots;
     uint32_t count;
     uint32_t free_head;
     uint32_t free_count;
-    uint8_t owner; /* Owner tag of every user_data. */
+    uint8_t owner;     /* Owner tag of every user_data. */
+    uint64_t rejected; /* Completions dropped by resolve. */
 };
 
 /* Slots the engine needs for the limits: listeners, per link recv + send
  * + shutdown + connect, per stream its window plus two, per replica
- * inflight_writes + flush + superblock + load + four file operations, plus
- * a small fixed spare. Checked arithmetic; ELIMIT on overflow. */
+ * inflight_writes + flush + superblock + load + four file operations + one
+ * clients-file chunk, plus a small fixed spare (8). Checked arithmetic;
+ * ELIMIT on overflow or beyond VSR_IO_SLOTS_MAX. *bytes is for an array of
+ * *count struct vsr_io_slot, which init lays out at the start of memory. */
 int vsr_io_slots_size(const struct vsr_io_limits *limits, uint32_t listeners,
                       uint32_t inflight_writes, size_t *bytes, uint32_t *count);
 void vsr_io_slots_init(struct vsr_io_slots *table, void *memory, uint32_t count,
@@ -74,14 +80,24 @@ uint32_t vsr_io_slots_alloc(struct vsr_io_slots *table, uint8_t kind,
                             uint64_t cookie);
 uint64_t vsr_io_slots_user_data(const struct vsr_io_slots *table,
                                 uint32_t index);
-/* Resolves a completion: NULL for a foreign owner tag or a stale
- * generation (the completion is dropped). */
+/* Resolves a completion: NULL for a foreign owner tag, an index out of
+ * range, a FREE slot, a kind that is not the slot's or a stale generation;
+ * the completion is dropped and counted in `rejected`. */
 struct vsr_io_slot *vsr_io_slots_resolve(struct vsr_io_slots *table,
                                          uint64_t user_data, uint32_t *index);
 /* One completion consumed; frees the slot when none is expected. Multishot
- * records call `more` to keep the slot alive while MORE is set. */
+ * records call `more` to keep the slot alive while MORE is set. A
+ * completion with `more` never frees the slot: it counts against
+ * `expected` only while more than one is expected, so the caller passes the
+ * record's MORE flag verbatim and both a multishot record (expected 1, MORE
+ * on all but its last completion) and a zero-copy send (expected 2, MORE on
+ * the result, none on the NOTIF) free on their final completion. A FREE
+ * slot is left alone. */
 void vsr_io_slots_consumed(struct vsr_io_slots *table, uint32_t index,
                            bool more);
+/* Frees the slot whatever it still expects (a record that was never
+ * submitted); a later completion for it is stale. A FREE slot is left
+ * alone. */
 void vsr_io_slots_free(struct vsr_io_slots *table, uint32_t index);
 
 #endif /* VSR_IO_SLOTS_H */

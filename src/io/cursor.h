@@ -29,7 +29,11 @@ struct vsr_io_piece {
 };
 
 struct vsr_io_cursor {
-    const struct vsr_io_piece *pieces; /* Borrowed for the cursor's life. */
+    const struct vsr_io_piece *pieces; /* Borrowed for the cursor's life;
+                                          NULL after init_one, which keeps
+                                          its piece in `one` so that a copy
+                                          of the cursor stays valid. */
+    struct vsr_io_piece one;
     uint32_t count;
     uint32_t piece;  /* Index of the piece holding `position`. */
     size_t offset;   /* Offset of `position` inside that piece. */
@@ -41,7 +45,8 @@ struct vsr_io_cursor {
  * its length is nonzero. The sum of lengths must not overflow size_t. */
 void vsr_io_cursor_init(struct vsr_io_cursor *cursor,
                         const struct vsr_io_piece *pieces, uint32_t count);
-/* One contiguous piece, the common case. */
+/* One contiguous piece, the common case; base may be NULL when length is
+ * zero. */
 void vsr_io_cursor_init_one(struct vsr_io_cursor *cursor, const void *base,
                             size_t length);
 
@@ -72,8 +77,9 @@ bool vsr_io_cursor_align(struct vsr_io_cursor *cursor, size_t alignment);
 const void *vsr_io_cursor_span(struct vsr_io_cursor *cursor, size_t size,
                                bool *contiguous);
 
-/* CRC32C of the next size bytes, chained from crc, without advancing.
- * false: too few bytes. */
+/* CRC32C of the next size bytes, chained from *crc (0 to start, as in
+ * vsr_io_crc32c), stored back in *crc, without advancing. false: too few
+ * bytes, *crc unchanged. */
 bool vsr_io_cursor_crc(const struct vsr_io_cursor *cursor, size_t size,
                        uint32_t *crc);
 
