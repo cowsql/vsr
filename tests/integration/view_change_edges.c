@@ -865,6 +865,8 @@ static void learner_rotates_donor(void)
     CHECK(healthy(g.nodes[1]).view == 1 && healthy(g.nodes[1]).primary == 2);
     submit(g.nodes[1], 100, 1, 1);
     settle(&g, UINT32_MAX, all_applied_one);
+    /* The group was returned by value: point its membership at this copy. */
+    g.membership.members = g.members;
     struct vsr_options options = mem_options(4, &g.membership);
     options.start_mode = VSR_START_JOIN;
     options.join_role = VSR_MEMBER_FULL;

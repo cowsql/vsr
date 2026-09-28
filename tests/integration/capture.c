@@ -506,7 +506,7 @@ static void inconsistent_capture(enum variant variant)
     current.members = members;
     epoch.current = &current;
     crafted.epoch = &epoch;
-    crafted.id = (struct vsr_id){1, variant == VARIANT_DUPLICATE ? 1u : 1u};
+    crafted.id = (struct vsr_id){1, 1};
     switch (variant) {
     case VARIANT_COUNT:
         members[1] = (struct vsr_member){2, VSR_MEMBER_FULL, 0};

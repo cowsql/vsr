@@ -381,6 +381,7 @@ static int step(struct instance *in, const struct vsr_event *events,
     }
     CHECK((u->flags & ~(progress | VSR_UPDATE_STATE_CHANGED)) == 0);
     for (uint32_t i = 0; i < u->consumed; i++) {
+        CHECK(events != NULL);
         const struct vsr_event *event = &events[i];
         if (event->type == VSR_EVENT_TIME)
             in->time_set = true;
