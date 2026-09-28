@@ -36,10 +36,15 @@ The principles of the core carry over unchanged, one level down:
 
 ## 2. Platform baseline
 
-The development machine runs kernel 7.2.6 with liburing 2.15, and the UAPI
-header on the machine comes from the matching `linux-libc-dev` 7.2.6, so the
-header and the running kernel agree. A probe program against the running
-kernel confirmed:
+The baseline is Linux 6.18 (decision 53). The executor drives io_uring through the `io_uring_setup`, `io_uring_enter`
+and `io_uring_register` syscalls over a vendored copy of the kernel's UAPI
+header, `src/io/uapi/io_uring.h` (decision 52): the library depends on
+libc alone and the build needs no io_uring library or header on the
+machine. The vendored header tracks Linux 7.2, so every opcode and flag the
+executor uses is declared regardless of the system's `linux-libc-dev`.
+
+The original development machine ran kernel 7.2.6; a probe program against
+that kernel confirmed:
 
 - All 65 opcodes in the header are reported supported, up to and including
   `RECV_ZC`, `EPOLL_WAIT`, `READV_FIXED`, `WRITEV_FIXED`, `PIPE`, `NOP128` and
@@ -50,19 +55,32 @@ kernel confirmed:
   `REGISTERED_FD_ONLY|NO_MMAP`, `SUBMIT_ALL|R_DISABLED`,
   `COOP_TASKRUN|TASKRUN_FLAG`.
 - A provided-buffer ring with `IOU_PBUF_RING_INC` (incremental consumption).
-- User-provided ring memory through `NO_MMAP` and `io_uring_queue_init_mem`.
+- User-provided ring memory through `NO_MMAP`. The executor does not use
+  it: the kernel finishes a closed ring asynchronously and still writes
+  the ring words then, so ring memory inside the caller's region would be
+  written after deinit had returned it; the rings are the kernel's pages,
+  mapped from the ring descriptor.
 
-Decision: the baseline is kernel 7.2 and liburing 2.15, with no feature
-probing and no fallbacks. Initialization checks once and refuses to run on an
-older kernel with a clear error. The design relies directly on: multishot
-accept and recv, provided-buffer rings with incremental consumption,
-vectorized zero-copy send from registered buffers (`SEND_ZC` with
-`IORING_SEND_VECTORIZED` and `IORING_RECVSEND_FIXED_BUF`), vectored
-fixed-buffer disk reads and writes, registered wait arguments with
-minimum-timeout batching, bind and listen as ring operations, direct
-descriptors and peek receives. Zero-copy receive (`RECV_ZC`) requires NIC
-support for header and data split and is deferred. Splice and pipes are not
-used (decision 39).
+The executor's smoke test (`tests/integration/uring_smoke`) then passed
+completely on a 6.18 kernel, whose one difference that matters is the
+vectored zero-copy send from a registered buffer: `SEND_ZC` accepts
+`IORING_SEND_VECTORIZED` together with `IORING_RECVSEND_FIXED_BUF` only from
+7.x, so the executor issues that send as `SENDMSG_ZC` with a fixed buffer
+and an iovec, supported since 6.15, on every kernel.
+
+Decision: no feature probing beyond one check at initialization, and no
+fallbacks. `vsr_io_uring_init` reads the feature bits the ring reports and
+the opcode table (`IORING_REGISTER_PROBE`) once and refuses an older kernel
+with `-ENOSYS`. The design relies directly on: multishot accept and recv,
+provided-buffer rings with incremental consumption, zero-copy send from
+registered buffers (`SEND_ZC` with `IORING_RECVSEND_FIXED_BUF`, and
+`SENDMSG_ZC` for the vectored form), vectored fixed-buffer disk reads and
+writes, the extended wait argument with minimum-timeout batching
+(`IORING_FEAT_MIN_TIMEOUT`), bind and listen as ring operations, direct
+descriptors and peek receives. Registered wait regions are not needed: the
+wait argument is a stack struct per call. Zero-copy receive (`RECV_ZC`)
+requires NIC support for header and data split and is deferred. Splice and
+pipes are not used (decision 39).
 
 Machine facts that informed defaults: 8 logical CPUs, an NVMe device
 reporting 512-byte logical and physical blocks, and 15 GiB of RAM. The store

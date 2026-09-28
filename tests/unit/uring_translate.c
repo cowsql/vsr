@@ -18,7 +18,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <liburing.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <string.h>
@@ -31,7 +30,8 @@ static unsigned char region_memory[REGION_BYTES];
 static unsigned char outside[64];
 static struct vsr_io_uring_region regions[3];
 static struct vsr_io_uring_direct directs[4];
-static struct vsr_io_uring_timespec timespecs[1];
+static struct __kernel_timespec timespecs[1];
+static struct msghdr msghdrs[1];
 static struct vsr_io_uring uring;
 
 static void reset(void)
@@ -50,7 +50,8 @@ static void reset(void)
     uring.directs = directs;
     uring.directs_capacity = sizeof(directs) / sizeof(directs[0]);
     uring.timespecs = timespecs;
-    uring.timespecs_count = 1;
+    uring.msghdrs = msghdrs;
+    uring.table_entries = 1;
     uring.wake_fd = -1;
 }
 
@@ -503,16 +504,40 @@ static void test_send(void)
           sqe.flags == IOSQE_FIXED_FILE);
     r.addr = outside; /* Left to the kernel: -EFAULT, then NOTIF. */
     CHECK(tr(r, &sqe) == 0 && sqe.addr == ptr(outside));
+    /* Vectored, not fixed: SEND_ZC with the vectorized flag. */
+    r.flags = 0;
     r.addr = vecs;
     r.length = 2;
-    r.buffer_index = 0;
     r.op_flags = VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED;
     CHECK(tr(r, &sqe) == 0);
     CHECK(sqe.opcode == IORING_OP_SEND_ZC &&
-          sqe.ioprio == (IORING_RECVSEND_FIXED_BUF | IORING_SEND_VECTORIZED) &&
-          sqe.addr == ptr(vecs) && sqe.len == 2 && sqe.buf_index == 0);
+          sqe.ioprio == IORING_SEND_VECTORIZED && sqe.addr == ptr(vecs) &&
+          sqe.len == 2 && sqe.buf_index == 0 && sqe.msg_flags == MSG_NOSIGNAL);
+    /* Vectored from a registered region: SENDMSG_ZC with a fixed buffer
+     * and a msghdr from the per-slot table naming the vectors. */
+    r.flags = VSR_IO_SQE_FIXED_BUFFER | VSR_IO_SQE_FIXED_FILE;
+    r.buffer_index = 1;
+    memset(msghdrs, 0xa5, sizeof(msghdrs));
+    CHECK(tr(r, &sqe) == 0);
+    CHECK(sqe.opcode == IORING_OP_SENDMSG_ZC &&
+          sqe.ioprio == IORING_RECVSEND_FIXED_BUF &&
+          sqe.addr == ptr(&msghdrs[0]) && sqe.len == 1 && sqe.off == 0 &&
+          sqe.buf_index == 1 && sqe.msg_flags == MSG_NOSIGNAL &&
+          sqe.flags == IOSQE_FIXED_FILE);
+    CHECK(msghdrs[0].msg_iov == (struct iovec *)vecs &&
+          msghdrs[0].msg_iovlen == 2 && msghdrs[0].msg_name == NULL &&
+          msghdrs[0].msg_namelen == 0 && msghdrs[0].msg_control == NULL &&
+          msghdrs[0].msg_controllen == 0 && msghdrs[0].msg_flags == 0);
+    r.flags |= VSR_IO_SQE_LINK;
+    CHECK(tr(r, &sqe) == 0 && sqe.msg_flags == (MSG_NOSIGNAL | MSG_WAITALL) &&
+          sqe.flags == (IOSQE_FIXED_FILE | IOSQE_IO_LINK));
     r.flags |= VSR_IO_SQE_SKIP_SUCCESS;
     CHECK(rejected(r) == -EINVAL);
+    /* Without msghdr storage the vectored fixed send cannot be issued. */
+    r.flags = VSR_IO_SQE_FIXED_BUFFER;
+    uring.msghdrs = NULL;
+    CHECK(rejected(r) == -EINVAL);
+    reset();
 }
 
 static void test_timeouts(void)

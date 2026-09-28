@@ -1,0 +1,3 @@
+`io_uring.h` is the Linux kernel's `include/uapi/linux/io_uring.h` (GPL-2.0 WITH Linux-syscall-note), copied verbatim as liburing vendors it; nothing here includes the system copy.
+It tracks the header of Linux 7.2 (the copy shipped by liburing 2.15), which declares every opcode and flag the executor uses; the run-time baseline is Linux 6.18 (docs/io-design.md, section 2).
+To refresh it, copy `/usr/include/linux/io_uring.h` from a `linux-libc-dev` package at least that new (or the kernel tree's file) over it unchanged, then rebuild and run `tests/unit/uring_translate` and `tests/integration/uring_smoke`.

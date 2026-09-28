@@ -1,14 +1,13 @@
 ACLOCAL_AMFLAGS = -I m4
 
-AM_CPPFLAGS = -I$(top_srcdir)/include -I$(top_srcdir)/src -I$(top_srcdir)/tests \
-  $(URING_CFLAGS)
+AM_CPPFLAGS = -I$(top_srcdir)/include -I$(top_srcdir)/src -I$(top_srcdir)/tests
 AM_CFLAGS = $(VSR_CFLAGS) $(VSR_INSTRUMENT_CFLAGS)
 AM_LDFLAGS = $(VSR_LDFLAGS) $(VSR_INSTRUMENT_LDFLAGS)
 
 # One static library holds the core, the I/O layer, the simulation and the
-# client bookkeeping, so every program linking it also links liburing.
+# client bookkeeping; it depends on libc alone.
 lib_LIBRARIES = src/libvsr.a
-LIBVSR = src/libvsr.a $(URING_LIBS)
+LIBVSR = src/libvsr.a
 include_HEADERS = include/vsr.h include/vsr-io.h include/vsr-sim.h \
   include/vsr-client.h
 pkgconfigdir = $(libdir)/pkgconfig
@@ -28,11 +27,12 @@ src_libvsr_a_SOURCES += src/io/crc32c.c src/io/crc32c.h src/io/cursor.c \
   src/io/uring.c
 # Private headers of the I/O layer: the interface specification every
 # module implements (docs/io-implementation.md); compiled by the header
-# check until their sources land.
+# check until their sources land. src/io/uapi/io_uring.h is the kernel's
+# io_uring UAPI header, vendored verbatim (src/io/uapi/README.md).
 src_libvsr_a_SOURCES += src/io/cursor.h src/io/wire.h src/io/codec.h \
   src/io/pool.h src/io/slots.h src/io/deadline.h src/io/link.h \
   src/io/stream.h src/io/store.h src/io/snapshot.h src/io/engine.h \
-  src/io/uring.h src/sim/sim.h
+  src/io/uring.h src/io/uapi/io_uring.h src/sim/sim.h
 noinst_HEADERS = tests/lib/check.h
 noinst_PROGRAMS = examples/replication examples/failover examples/checkpoint \
   examples/epochs examples/reads examples/witness
@@ -292,7 +292,7 @@ EXTRA_DIST = \
   .github/workflows/ci.yml \
   README.md DESIGN.md docs/protocol.md docs/vsr-api.md docs/development.md \
   docs/implementation.md docs/changes.md docs/io-design.md \
-  docs/io-implementation.md examples/README.md \
+  docs/io-implementation.md examples/README.md src/io/uapi/README.md \
   tests/README.md tests/regression/README.md tests/benchmark/README.md \
   tests/fuzzy/KNOWN_FAILURES.md
 
@@ -303,7 +303,9 @@ CLANG_TIDY = $(shell $(CC) -print-prog-name=clang-tidy)
 SCAN_BUILD = $(shell $(CC) -print-prog-name=scan-build)
 LLVM_COV = $(shell $(CC) -print-prog-name=llvm-cov)
 LLVM_PROFDATA = $(shell $(CC) -print-prog-name=llvm-profdata)
-FORMAT_FILES = find $(srcdir)/include $(srcdir)/src $(srcdir)/tests $(srcdir)/examples -type f \( -name '*.c' -o -name '*.h' \) -print0
+# The vendored kernel header under src/io/uapi keeps the kernel's style.
+FORMAT_FILES = find $(srcdir)/include $(srcdir)/src $(srcdir)/tests $(srcdir)/examples \
+  -path '*/src/io/uapi' -prune -o -type f \( -name '*.c' -o -name '*.h' \) -print0
 # Overridable from the environment as well as the command line.
 FUZZ_RUNS ?= 10000
 FUZZ_ARGS ?=
