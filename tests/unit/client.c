@@ -1,5 +1,6 @@
 #include "config.h"
 
+#include "io/crc32c.h"
 #include "lib/check.h"
 #include "lib/random.h"
 #include "vsr-client.h"
@@ -19,6 +20,8 @@
 #define TIMEOUT UINT64_C(100)
 #define BACKOFF UINT64_C(10)
 #define BACKOFF_MAX UINT64_C(50)
+/* Pinned trailer of the image_checksum() image. */
+#define IMAGE_CRC UINT32_C(0x6b9859d9)
 
 struct fixture {
     struct vsr_member members[3];
@@ -113,6 +116,11 @@ static struct vsr_reply answer(const struct vsr_client_attempt *attempt,
         reply.flags = VSR_REPLY_EXECUTED;
     }
     return reply;
+}
+
+static bool id_equal(struct vsr_id a, struct vsr_id b)
+{
+    return a.hi == b.hi && a.lo == b.lo;
 }
 
 static bool same_request(const struct vsr_request *a,
@@ -1164,9 +1172,11 @@ static void independent_lanes(void)
 }
 
 /* Randomized: many lanes driven through random replies, timeouts, restarts
- * and resolutions, checking the lane invariants after every step. */
+ * and resolutions, checking the lane invariants after every step. Earlier
+ * replies are replayed, late or duplicated, to their lane or another. */
 #define RANDOM_LANES 6u
 #define RANDOM_BODIES 3u
+#define RANDOM_SENT 16u
 
 struct model {
     bool open;
@@ -1175,6 +1185,15 @@ struct model {
     uint64_t last_number;
     uint64_t last_epoch;
     uint64_t serial;
+    uint64_t target; /* The lane's last target, which rotation follows. */
+};
+
+/* A reply as delivered, with its own copy of the membership. */
+struct sent {
+    struct vsr_reply reply;
+    struct vsr_member members[6];
+    struct vsr_membership membership;
+    uint32_t lane;
 };
 
 struct world {
@@ -1190,7 +1209,34 @@ struct world {
     uint64_t serial;
     uint64_t view;
     uint64_t op;
+    struct sent sent[RANDOM_SENT];
+    uint32_t sent_count;
 };
+
+/* The primary if known, else the first member after the lane's previous
+ * target in ID order, wrapping; NO_REPLICA without a membership. */
+static uint64_t expected_target(const struct vsr_client_status *cs,
+                                uint64_t previous)
+{
+    if (cs->primary != VSR_NO_REPLICA || cs->membership == NULL) {
+        return cs->primary;
+    }
+    for (uint32_t i = 0; i < cs->membership->count; i++) {
+        if (cs->membership->members[i].id > previous) {
+            return cs->membership->members[i].id;
+        }
+    }
+    return cs->membership->members[0].id;
+}
+
+static uint64_t expected_backoff(uint32_t streak)
+{
+    uint64_t delay = BACKOFF;
+    for (uint32_t i = 1; i < streak && delay < BACKOFF_MAX; i++) {
+        delay *= 2;
+    }
+    return delay < BACKOFF_MAX ? delay : BACKOFF_MAX;
+}
 
 static void check_attempt(struct world *w, const struct vsr_client_attempt *a)
 {
@@ -1201,7 +1247,14 @@ static void check_attempt(struct world *w, const struct vsr_client_attempt *a)
     CHECK(a->request.epoch >= m->last_epoch);
     CHECK(a->request.epoch == client_status(w->fixture.client).epoch);
     CHECK(a->deadline_ns > w->now || a->deadline_ns == VSR_NO_DEADLINE - 1);
+    CHECK(a->deadline_ns == w->now + TIMEOUT);
     CHECK(a->attempt >= 1);
+    struct vsr_client_status cs = client_status(w->fixture.client);
+    CHECK(a->replica == expected_target(&cs, m->target));
+    struct vsr_client_lane_status s = lane_status(w->fixture.client, a->lane);
+    CHECK(s.state == VSR_CLIENT_LANE_PENDING && s.replica == a->replica);
+    CHECK(s.attempts == a->attempt && s.deadline_ns == a->deadline_ns);
+    m->target = a->replica;
     m->last_epoch = a->request.epoch;
 }
 
@@ -1260,6 +1313,9 @@ static void check_world(struct world *w)
               s.state != VSR_CLIENT_LANE_CLOSED);
         CHECK(s.pending_number == m->request.id.number);
         CHECK(s.next_number == s.pending_number + 1);
+        if (s.state != VSR_CLIENT_LANE_DETACHED) {
+            CHECK(s.replica == m->target);
+        }
         if (s.state == VSR_CLIENT_LANE_PENDING ||
             s.state == VSR_CLIENT_LANE_WAITING) {
             CHECK(s.deadline_ns != VSR_NO_DEADLINE);
@@ -1302,12 +1358,100 @@ static const struct vsr_membership *random_membership(struct world *w)
     return &w->membership;
 }
 
-static void random_reply(struct world *w, uint32_t lane)
+/* Delivers a reply, fresh or replayed, and checks the outcome against the
+ * contract: IGNORE changes nothing; WAIT carries the lane's backoff. */
+static void deliver(struct world *w, uint32_t lane, const struct vsr_reply *r)
 {
     struct vsr_client *c = w->fixture.client;
     struct model *m = &w->lanes[lane];
     struct vsr_client_lane_status s = lane_status(c, lane);
+    struct vsr_client_status cs = client_status(c);
+    uint64_t known_epoch = cs.membership != NULL ? cs.membership->epoch : 0;
     struct vsr_client_outcome o;
+    int result = vsr_client_reply(c, lane, r, w->now, &o);
+    bool oversized = r->membership != NULL && r->membership->count > 5;
+    CHECK(result == VSR_OK || (result == VSR_ELIMIT && oversized));
+    bool matches = m->outstanding &&
+                   id_equal(r->request.client, s.incarnation) &&
+                   r->request.number == m->request.id.number &&
+                   (s.state == VSR_CLIENT_LANE_PENDING ||
+                    s.state == VSR_CLIENT_LANE_WAITING);
+    if (!matches) {
+        CHECK(o.action == VSR_CLIENT_IGNORE);
+    }
+    /* A NEW_EPOCH in the attempt's own routing epoch answered another. */
+    if (r->status == VSR_REPLY_NEW_EPOCH && r->membership != NULL &&
+        r->membership->epoch == m->last_epoch) {
+        CHECK(o.action == VSR_CLIENT_IGNORE);
+    }
+    struct vsr_client_lane_status t = lane_status(c, lane);
+    struct vsr_client_status ct = client_status(c);
+    switch (o.action) {
+    case VSR_CLIENT_IGNORE:
+        CHECK(result == VSR_OK);
+        CHECK(memcmp(&s, &t, sizeof(s)) == 0);
+        CHECK(ct.epoch == cs.epoch && ct.primary == cs.primary);
+        CHECK(ct.min_op == cs.min_op && ct.membership == cs.membership);
+        CHECK(ct.lanes == cs.lanes && ct.busy == cs.busy);
+        CHECK(ct.membership == NULL || ct.membership->epoch == known_epoch);
+        break;
+    case VSR_CLIENT_DONE:
+        CHECK(r->status == VSR_REPLY_OK);
+        CHECK(vsr_client_min_op(c) >= r->op);
+        break;
+    case VSR_CLIENT_FAILED:
+        CHECK(o.status == r->status);
+        CHECK(r->status == VSR_REPLY_INVALID || r->status == VSR_REPLY_LIMIT ||
+              r->status == VSR_REPLY_STALE_REQUEST);
+        break;
+    case VSR_CLIENT_WAIT: {
+        uint64_t delay = BACKOFF;
+        CHECK(s.state == VSR_CLIENT_LANE_PENDING);
+        if (r->status == VSR_REPLY_BUSY) {
+            CHECK(t.busy_streak == s.busy_streak + 1);
+            delay = expected_backoff(t.busy_streak);
+        } else {
+            CHECK(r->status == VSR_REPLY_NOT_PRIMARY ||
+                  r->status == VSR_REPLY_NEW_EPOCH);
+            CHECK(t.busy_streak == 0);
+        }
+        CHECK(o.deadline_ns == w->now + delay);
+        CHECK(t.state == VSR_CLIENT_LANE_WAITING);
+        CHECK(t.deadline_ns == o.deadline_ns && t.attempts == s.attempts);
+        break;
+    }
+    default:
+        CHECK(o.action == VSR_CLIENT_RETRY);
+        CHECK(s.state == VSR_CLIENT_LANE_PENDING);
+        CHECK(r->status == VSR_REPLY_NOT_PRIMARY ||
+              r->status == VSR_REPLY_NEW_EPOCH);
+        CHECK(o.attempt.attempt == s.attempts + 1);
+        break;
+    }
+    check_outcome(w, lane, &o);
+}
+
+/* Keeps a copy of a reply for later replay; returns the copy. */
+static const struct vsr_reply *record(struct world *w, uint32_t lane,
+                                      const struct vsr_reply *r)
+{
+    struct sent *e = &w->sent[w->sent_count++ % RANDOM_SENT];
+    e->reply = *r;
+    e->lane = lane;
+    if (r->membership != NULL) {
+        memcpy(e->members, r->membership->members,
+               r->membership->count * sizeof(e->members[0]));
+        e->membership = *r->membership;
+        e->membership.members = e->members;
+        e->reply.membership = &e->membership;
+    }
+    return &e->reply;
+}
+
+static void random_reply(struct world *w, uint32_t lane)
+{
+    struct model *m = &w->lanes[lane];
+    struct vsr_client_lane_status s = lane_status(w->fixture.client, lane);
     struct vsr_reply r;
     memset(&r, 0, sizeof(r));
     r.request.client = s.incarnation;
@@ -1328,23 +1472,53 @@ static void random_reply(struct world *w, uint32_t lane)
     r.view = w->view;
     r.membership = random_membership(w);
     r.primary = test_random_bounded(&w->random, 7);
-    int result = vsr_client_reply(c, lane, &r, w->now, &o);
-    bool oversized = r.membership != NULL && r.membership->count > 5;
-    CHECK(result == VSR_OK || (result == VSR_ELIMIT && oversized));
-    bool matches = m->outstanding && r.request.number == m->request.id.number &&
-                   (s.state == VSR_CLIENT_LANE_PENDING ||
-                    s.state == VSR_CLIENT_LANE_WAITING);
-    if (!matches) {
-        CHECK(o.action == VSR_CLIENT_IGNORE);
+    deliver(w, lane, record(w, lane, &r));
+}
+
+/* A late or duplicated copy of an earlier reply, mostly to its own lane. */
+static void random_replay(struct world *w, uint32_t lane)
+{
+    if (w->sent_count == 0) {
+        return;
     }
-    if (o.action == VSR_CLIENT_DONE) {
-        CHECK(r.status == VSR_REPLY_OK);
-        CHECK(vsr_client_min_op(c) >= r.op);
+    uint32_t count = w->sent_count < RANDOM_SENT ? w->sent_count : RANDOM_SENT;
+    const struct sent *e = &w->sent[test_random_bounded(&w->random, count)];
+    if (test_random_bounded(&w->random, 4) != 0) {
+        lane = e->lane;
     }
-    if (o.action == VSR_CLIENT_FAILED) {
-        CHECK(o.status == r.status);
+    if (w->lanes[lane].open) {
+        deliver(w, lane, &e->reply);
     }
-    check_outcome(w, lane, &o);
+}
+
+/* A hint: never moves the epoch back, adopts a newer one with its primary. */
+static void random_learn(struct world *w)
+{
+    struct vsr_client *c = w->fixture.client;
+    const struct vsr_membership *membership = random_membership(w);
+    uint64_t primary = VSR_NO_REPLICA;
+    if (membership != NULL && test_random_bounded(&w->random, 2) == 0) {
+        const struct vsr_member *member =
+            &membership
+                 ->members[test_random_bounded(&w->random, membership->count)];
+        primary = member->role == VSR_MEMBER_FULL ? member->id : primary;
+    }
+    struct vsr_client_status before = client_status(c);
+    int result = vsr_client_learn(c, membership, primary);
+    struct vsr_client_status after = client_status(c);
+    if (membership != NULL && membership->count > 5) {
+        CHECK(result == VSR_ELIMIT);
+        CHECK(after.epoch == before.epoch && after.primary == before.primary);
+        return;
+    }
+    CHECK(result == VSR_OK);
+    if (membership == NULL || membership->epoch < before.epoch) {
+        CHECK(after.epoch == before.epoch && after.primary == before.primary);
+    } else if (membership->epoch > before.epoch) {
+        CHECK(after.epoch == membership->epoch && after.primary == primary);
+        CHECK(after.membership->epoch == membership->epoch);
+        CHECK(after.membership->count == membership->count);
+    }
 }
 
 static void random_resolve(struct world *w, uint32_t lane)
@@ -1368,7 +1542,15 @@ static void random_resolve(struct world *w, uint32_t lane)
     }
     struct vsr_id who;
     uint64_t replica;
+    struct vsr_client_status cs = client_status(c);
     CHECK(vsr_client_query(c, lane, &who, &replica) == VSR_OK);
+    CHECK(id_equal(who, s.incarnation));
+    CHECK(replica == expected_target(&cs, m->target));
+    m->target = replica;
+    CHECK(lane_status(c, lane).state == VSR_CLIENT_LANE_QUERYING);
+    if (test_random_bounded(&w->random, 4) == 0) {
+        return; /* The answer is lost; the lane stays QUERYING. */
+    }
     struct vsr_reply q;
     memset(&q, 0, sizeof(q));
     q.request.client = who;
@@ -1413,9 +1595,16 @@ static void random_restart(struct world *w)
     CHECK(before.epoch == after.epoch && before.primary == after.primary);
     CHECK(before.min_op == after.min_op && before.lanes == after.lanes);
     CHECK(before.busy == after.busy);
+    /* What was imported exports byte for byte. */
+    unsigned char again[1024];
+    size_t size;
+    CHECK(vsr_client_export(next.client, again, sizeof(again), &size) ==
+          VSR_OK);
+    CHECK(size == written && memcmp(again, image, size) == 0);
     teardown(&w->fixture);
     w->fixture = next;
     for (uint32_t i = 0; i < RANDOM_LANES; i++) {
+        w->lanes[i].target = VSR_NO_REPLICA;
         if (w->lanes[i].outstanding) {
             CHECK(lane_status(next.client, i).state ==
                   VSR_CLIENT_LANE_DETACHED);
@@ -1430,7 +1619,7 @@ static void random_step(struct world *w)
     struct model *m = &w->lanes[lane];
     struct vsr_client_attempt a;
     struct vsr_client_outcome o;
-    switch (test_random_bounded(&w->random, 16)) {
+    switch (test_random_bounded(&w->random, 18)) {
     case 0:
         if (!m->open) {
             uint32_t got;
@@ -1450,6 +1639,7 @@ static void random_step(struct world *w)
             m->open = true;
             m->outstanding = false;
             m->last_epoch = 0;
+            m->target = VSR_NO_REPLICA;
         }
         break;
     case 1:
@@ -1517,6 +1707,14 @@ static void random_step(struct world *w)
             random_restart(w);
         }
         break;
+    case 15:
+        if (m->open) {
+            random_replay(w, lane);
+        }
+        break;
+    case 16:
+        random_learn(w);
+        break;
     default: {
         struct vsr_read_barrier barrier;
         uint64_t replica;
@@ -1553,6 +1751,385 @@ static void randomized(uint64_t seed, uint32_t steps)
     teardown(&w.fixture);
 }
 
+/* Review regressions and decision 55. */
+
+/* A replica in the attempt's own routing epoch never answers it with
+ * NEW_EPOCH, so one carrying that epoch is a late or duplicated answer to an
+ * earlier attempt: IGNORE, keeping the attempt and the primary it targets.
+ * Only a NEW_EPOCH from an older epoch is a lagging replica. */
+static void stale_new_epoch(void)
+{
+    struct fixture f;
+    struct vsr_client_outcome o;
+    setup(&f, 2, 3);
+    struct vsr_client *c = f.client;
+    uint32_t lane = open_lane(c, 1, 1);
+    struct vsr_client_attempt first = begin(c, lane, 0);
+    struct vsr_member next[3] = {{2, VSR_MEMBER_FULL, 0},
+                                 {3, VSR_MEMBER_FULL, 0},
+                                 {4, VSR_MEMBER_FULL, 0}};
+    struct vsr_membership epoch1 = {1, next, 3, 1};
+    struct vsr_reply redirect = answer(&first, VSR_REPLY_NEW_EPOCH);
+    redirect.membership = &epoch1;
+    redirect.primary = 4;
+    CHECK(reply(c, lane, &redirect, 1, &o) == VSR_CLIENT_RETRY);
+    struct vsr_client_attempt second = o.attempt;
+    CHECK(second.replica == 4 && second.request.epoch == 1);
+    struct vsr_client_lane_status before = lane_status(c, lane);
+
+    /* The network delivers the redirect twice. */
+    CHECK(reply(c, lane, &redirect, 2, &o) == VSR_CLIENT_IGNORE);
+    struct vsr_client_lane_status after = lane_status(c, lane);
+    CHECK(after.state == VSR_CLIENT_LANE_PENDING);
+    CHECK(after.deadline_ns == before.deadline_ns);
+    CHECK(after.attempts == before.attempts && after.replica == 4);
+    CHECK(client_status(c).primary == 4 && client_status(c).epoch == 1);
+    /* Also when the epoch's primary moved in a newer view meanwhile. */
+    redirect.view = 5;
+    redirect.primary = 3;
+    CHECK(reply(c, lane, &redirect, 3, &o) == VSR_CLIENT_IGNORE);
+    CHECK(client_status(c).primary == 4);
+    CHECK(lane_status(c, lane).deadline_ns == before.deadline_ns);
+
+    /* Another lane's attempt started in epoch 1 ignores it too. */
+    uint32_t other = open_lane(c, 2, 1);
+    struct vsr_client_attempt third = begin(c, other, 4);
+    CHECK(third.request.epoch == 1 && third.replica == 4);
+    redirect = answer(&third, VSR_REPLY_NEW_EPOCH);
+    redirect.membership = &epoch1;
+    redirect.primary = 4;
+    CHECK(reply(c, other, &redirect, 5, &o) == VSR_CLIENT_IGNORE);
+    CHECK(lane_status(c, other).state == VSR_CLIENT_LANE_PENDING);
+
+    /* The attempt's own answer still completes it. */
+    struct vsr_reply done = answer(&second, VSR_REPLY_OK);
+    done.membership = &epoch1;
+    done.primary = 4;
+    CHECK(reply(c, lane, &done, 6, &o) == VSR_CLIENT_DONE);
+    teardown(&f);
+}
+
+/* Decision 55: an incarnation open on any lane of the client, in any state,
+ * cannot be opened again (EINVAL). The last request number is the last one
+ * vsr.h accepts, UINT64_MAX - 1; after it next_number reads UINT64_MAX and
+ * begin is ELIMIT, changing nothing. The exhausted counter survives export
+ * and import, with or without the last request pending. */
+static void counter_limits(void)
+{
+    struct fixture f;
+    struct fixture g;
+    struct vsr_client_outcome o;
+    struct vsr_client_attempt a;
+    unsigned char image[512];
+    size_t written;
+    uint32_t spare = 7;
+    setup(&f, 3, 3);
+    struct vsr_client *c = f.client;
+    CHECK(vsr_client_open(c, incarnation(1), UINT64_MAX, &spare) == VSR_EINVAL);
+    uint32_t lane = open_lane(c, 1, UINT64_MAX - 2);
+    /* Open, IDLE. */
+    CHECK(vsr_client_open(c, incarnation(1), 1, &spare) == VSR_EINVAL);
+    a = begin(c, lane, 0);
+    CHECK(a.request.id.number == UINT64_MAX - 2);
+    struct vsr_reply r = answer(&a, VSR_REPLY_OK);
+    CHECK(reply(c, lane, &r, 1, &o) == VSR_CLIENT_DONE);
+    a = begin(c, lane, 2);
+    CHECK(a.request.id.number == UINT64_MAX - 1);
+    struct vsr_client_lane_status s = lane_status(c, lane);
+    CHECK(s.pending_number == UINT64_MAX - 1 && s.next_number == UINT64_MAX);
+    /* Open, PENDING. */
+    CHECK(vsr_client_open(c, incarnation(1), 1, &spare) == VSR_EINVAL);
+    CHECK(spare == 7 && client_status(c).lanes == 1);
+
+    /* The last request pending round-trips and resumes. */
+    CHECK(vsr_client_export(c, image, sizeof(image), &written) == VSR_OK);
+    setup(&g, 3, 3);
+    CHECK(vsr_client_import(g.client, image, written) == VSR_OK);
+    s = lane_status(g.client, lane);
+    CHECK(s.state == VSR_CLIENT_LANE_DETACHED);
+    CHECK(s.pending_number == UINT64_MAX - 1 && s.next_number == UINT64_MAX);
+    /* Open, DETACHED. */
+    CHECK(vsr_client_open(g.client, incarnation(1), 1, &spare) == VSR_EINVAL);
+    struct vsr_client_attempt resumed;
+    CHECK(vsr_client_resume(g.client, lane, &empty_command, 3, &resumed) ==
+          VSR_OK);
+    CHECK(same_request(&resumed.request, &a.request));
+    r = answer(&resumed, VSR_REPLY_OK);
+    CHECK(reply(g.client, lane, &r, 4, &o) == VSR_CLIENT_DONE);
+    CHECK(vsr_client_begin(g.client, lane, VSR_REQUEST_COMMAND, &empty_command,
+                           5, &resumed) == VSR_ELIMIT);
+    teardown(&g);
+
+    r = answer(&a, VSR_REPLY_OK);
+    CHECK(reply(c, lane, &r, 3, &o) == VSR_CLIENT_DONE);
+    struct vsr_client_lane_status idle = lane_status(c, lane);
+    CHECK(idle.state == VSR_CLIENT_LANE_IDLE && idle.next_number == UINT64_MAX);
+    memset(&a, 0xa5, sizeof(a));
+    CHECK(vsr_client_begin(c, lane, VSR_REQUEST_COMMAND, &empty_command, 4,
+                           &a) == VSR_ELIMIT);
+    s = lane_status(c, lane);
+    CHECK(memcmp(&s, &idle, sizeof(s)) == 0);
+    CHECK(vsr_client_deadline(c) == VSR_NO_DEADLINE);
+    CHECK(client_status(c).busy == 0);
+    /* Validation still comes first. */
+    CHECK(vsr_client_begin(c, lane, VSR_REQUEST_NOOP, NULL, 4, &a) ==
+          VSR_EINVAL);
+
+    /* The exhausted IDLE lane round-trips and stays exhausted. */
+    CHECK(vsr_client_export(c, image, sizeof(image), &written) == VSR_OK);
+    setup(&g, 3, 3);
+    CHECK(vsr_client_import(g.client, image, written) == VSR_OK);
+    CHECK(lane_status(g.client, lane).next_number == UINT64_MAX);
+    CHECK(vsr_client_begin(g.client, lane, VSR_REQUEST_COMMAND, &empty_command,
+                           5, &a) == VSR_ELIMIT);
+    /* Open again after the import, on a fresh client. */
+    CHECK(vsr_client_open(g.client, incarnation(1), 1, &spare) == VSR_EINVAL);
+    CHECK(vsr_client_close(g.client, lane) == VSR_OK);
+    teardown(&g);
+
+    /* A lane opened at the last number has exactly one request. */
+    CHECK(vsr_client_close(c, lane) == VSR_OK);
+    lane = open_lane(c, 2, UINT64_MAX - 1);
+    a = begin(c, lane, 5);
+    CHECK(a.request.id.number == UINT64_MAX - 1);
+    teardown(&f);
+}
+
+/* The image checksum is the CRC-32C of src/io/crc32c. A fixed client state
+ * yields a fixed image, so its trailer is pinned: a change to the layout or
+ * to the checksum is caught here and must bump VSR_CLIENT_STATE_VERSION. */
+static void image_checksum(void)
+{
+    struct fixture f;
+    struct vsr_client_outcome o;
+    unsigned char image[512];
+    size_t written;
+    setup(&f, 3, 3);
+    struct vsr_client *c = f.client;
+    uint32_t idle = open_lane(c, 1, 5);
+    uint32_t closed = open_lane(c, 3, 70);
+    uint32_t pending = open_lane(c, 2, 9);
+    CHECK(idle == 0 && closed == 1 && pending == 2);
+    CHECK(vsr_client_close(c, closed) == VSR_OK);
+    struct vsr_client_attempt a = begin(c, pending, 0);
+    struct vsr_reply r = answer(&a, VSR_REPLY_NOT_PRIMARY);
+    r.membership = &f.seed;
+    r.view = 4;
+    r.primary = 2;
+    CHECK(reply(c, pending, &r, 1, &o) == VSR_CLIENT_RETRY);
+    vsr_client_observe(c, 0x0102030405060708u);
+    CHECK(vsr_client_export(c, image, sizeof(image), &written) == VSR_OK);
+    CHECK(written == 72 + 2 * 48 + 3 * 16 + 4);
+    uint32_t trailer =
+        (uint32_t)image[written - 4] | (uint32_t)image[written - 3] << 8 |
+        (uint32_t)image[written - 2] << 16 | (uint32_t)image[written - 1] << 24;
+    CHECK(trailer == crc32c(image, written - 4));
+    CHECK(trailer == vsr_io_crc32c(0, image, written - 4));
+    if (trailer != IMAGE_CRC) {
+        fprintf(stderr, "client image crc=0x%08" PRIx32 "\n", trailer);
+    }
+    CHECK(trailer == IMAGE_CRC);
+    teardown(&f);
+}
+
+/* Import rejects every corruption and leaves the client as it was: every
+ * truncation and extension, every single-bit flip, and every field made
+ * inconsistent under a valid checksum. Malformed beats oversized. */
+struct corruption {
+    size_t offset;
+    unsigned width; /* 4 or 8 */
+    uint64_t value;
+};
+
+static void put_field(unsigned char *bytes, const struct corruption *c)
+{
+    for (unsigned i = 0; i < c->width; i++) {
+        bytes[c->offset + i] = (unsigned char)((c->value >> (8 * i)) & 0xffu);
+    }
+}
+
+static void check_untouched(struct vsr_client *client,
+                            const struct vsr_client_status *expected)
+{
+    struct vsr_client_status s = client_status(client);
+    CHECK(s.lanes == 0 && s.busy == 0);
+    CHECK(s.epoch == expected->epoch && s.primary == expected->primary);
+    CHECK(s.min_op == expected->min_op);
+    CHECK(s.membership == expected->membership);
+    CHECK(s.membership == NULL ||
+          s.membership->epoch == expected->membership->epoch);
+    for (uint32_t i = 0; i < 3; i++) {
+        CHECK(lane_status(client, i).state == VSR_CLIENT_LANE_CLOSED);
+    }
+}
+
+static void image_rejections(void)
+{
+    struct fixture f;
+    struct fixture g;
+    unsigned char image[512];
+    unsigned char bad[512];
+    size_t size;
+    setup(&f, 3, 3);
+    struct vsr_client *c = f.client;
+    struct vsr_member group[3] = {{1, VSR_MEMBER_FULL, 0},
+                                  {2, VSR_MEMBER_FULL, 0},
+                                  {3, VSR_MEMBER_WITNESS, 0}};
+    struct vsr_membership epoch2 = {2, group, 3, 1};
+    CHECK(vsr_client_learn(c, &epoch2, 2) == VSR_OK);
+    uint32_t idle = open_lane(c, 1, 5);
+    uint32_t gap = open_lane(c, 9, 1);
+    uint32_t busy = open_lane(c, 3, 7);
+    CHECK(idle == 0 && gap == 1 && busy == 2);
+    CHECK(vsr_client_close(c, gap) == VSR_OK);
+    (void)begin(c, busy, 0);
+    vsr_client_observe(c, 11);
+    CHECK(vsr_client_export(c, image, sizeof(image), &size) == VSR_OK);
+    CHECK(size == 72 + 2 * 48 + 3 * 16 + 4);
+
+    /* The target knows another topology, which must survive. */
+    setup(&g, 3, 3);
+    vsr_client_observe(g.client, 3);
+    struct vsr_client_status expected = client_status(g.client);
+    CHECK(expected.membership != NULL);
+
+    for (size_t n = 0; n < size; n++) {
+        CHECK(vsr_client_import(g.client, image, n) == VSR_EINVAL);
+    }
+    memcpy(bad, image, size);
+    for (size_t n = size + 1; n < size + 16; n++) {
+        CHECK(vsr_client_import(g.client, bad, n) == VSR_EINVAL);
+    }
+    for (size_t bit = 0; bit < 8 * size; bit++) {
+        memcpy(bad, image, size);
+        bad[bit / 8] ^= (unsigned char)(1u << (bit % 8));
+        CHECK(vsr_client_import(g.client, bad, size) == VSR_EINVAL);
+    }
+    check_untouched(g.client, &expected);
+
+    const size_t L0 = 72;      /* The IDLE lane record. */
+    const size_t L1 = 72 + 48; /* The pending lane record. */
+    const size_t M0 = 72 + 96; /* The first member record. */
+    const struct corruption fields[] = {
+        {0, 4, 0x43525357},        /* magic */
+        {4, 4, 0},                 /* version */
+        {4, 4, 2},                 /* newer version */
+        {8, 4, 1},                 /* lane records vs size */
+        {8, 4, 3},                 /* lane records vs size */
+        {12, 4, 2},                /* member records vs size */
+        {12, 4, 4},                /* member records vs size */
+        {16, 8, 72 + 96 + 48 + 3}, /* image bytes */
+        {16, 8, 72 + 96 + 48 + 5}, /* image bytes */
+        {24, 8, UINT64_MAX},       /* epoch */
+        {24, 8, 1},                /* epoch below the membership's */
+        {32, 8, UINT64_MAX},       /* view */
+        {48, 8, UINT64_MAX},       /* min_op */
+        {56, 8, 3},                /* membership epoch above epoch */
+        {56, 8, UINT64_MAX},       /* membership epoch */
+        {64, 4, 2},                /* faults: 2 * 2 + 1 > 3 */
+        {68, 4, 0},                /* members without the known flag */
+        {68, 4, 4 | 1},            /* unknown topology flag */
+        {L0, 4, 2},                /* lane indexes not increasing */
+        {L0 + 4, 4, 2},            /* unknown lane flag */
+        {L0 + 24, 8, 0},           /* next_number */
+        {L0 + 32, 8, 4},           /* pending number while IDLE */
+        {L0 + 40, 4, 1},           /* type while IDLE */
+        {L0 + 44, 4, 1},           /* attempts while IDLE */
+        {L1, 4, 0},                /* lane indexes not increasing */
+        {L1 + 16, 8, 1},           /* incarnation of the other lane */
+        {L1 + 24, 8, 9},           /* pending != next - 1 */
+        {L1 + 32, 8, 0},           /* pending flag without a number */
+        {L1 + 32, 8, 8},           /* pending == next */
+        {L1 + 40, 4, VSR_REQUEST_NOOP},
+        {L1 + 40, 4, 99}, /* type */
+        {M0, 8, 0},       /* member id zero */
+        {M0, 8, 2},       /* members not in ID order */
+        {M0 + 16, 8, 1},  /* duplicate member */
+        {M0 + 8, 4, VSR_MEMBER_NONE},
+        {M0 + 8, 4, 3},                   /* role */
+        {M0 + 12, 4, 1},                  /* member reserved */
+        {M0 + 24, 4, VSR_MEMBER_WITNESS}, /* one FULL, faults 1 */
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        memcpy(bad, image, size);
+        put_field(bad, &fields[i]);
+        reseal(bad, size);
+        if (vsr_client_import(g.client, bad, size) != VSR_EINVAL) {
+            fprintf(stderr, "corruption %zu at %zu accepted\n", i,
+                    fields[i].offset);
+            CHECK(false);
+        }
+        check_untouched(g.client, &expected);
+    }
+    /* A zero incarnation. */
+    memcpy(bad, image, size);
+    put_field(bad, &(struct corruption){L0 + 8, 8, 0});
+    put_field(bad, &(struct corruption){L0 + 16, 8, 0});
+    reseal(bad, size);
+    CHECK(vsr_client_import(g.client, bad, size) == VSR_EINVAL);
+    check_untouched(g.client, &expected);
+    /* No known membership, yet membership fields. */
+    {
+        struct fixture e;
+        setup_options(&e, 1, 1);
+        e.options.seed = NULL;
+        create(&e);
+        unsigned char empty[128];
+        size_t n;
+        CHECK(vsr_client_export(e.client, empty, sizeof(empty), &n) == VSR_OK);
+        CHECK(n == 76);
+        const struct corruption unknown[] = {{56, 8, 1}, {64, 4, 1}};
+        for (size_t i = 0; i < 2; i++) {
+            memcpy(bad, empty, n);
+            put_field(bad, &unknown[i]);
+            reseal(bad, n);
+            CHECK(vsr_client_import(g.client, bad, n) == VSR_EINVAL);
+        }
+        CHECK(vsr_client_import(g.client, empty, n) == VSR_OK);
+        teardown(&e);
+    }
+    teardown(&g);
+
+    /* Too many members for the target is ELIMIT, but a malformed record in
+     * such an image is EINVAL. */
+    setup_options(&g, 3, 2);
+    g.options.seed = NULL;
+    create(&g);
+    expected = client_status(g.client);
+    CHECK(vsr_client_import(g.client, image, size) == VSR_ELIMIT);
+    check_untouched(g.client, &expected);
+    memcpy(bad, image, size);
+    put_field(bad, &(struct corruption){M0 + 8, 4, 3});
+    reseal(bad, size);
+    CHECK(vsr_client_import(g.client, bad, size) == VSR_EINVAL);
+    memcpy(bad, image, size);
+    put_field(bad, &(struct corruption){M0 + 16, 8, 1});
+    reseal(bad, size);
+    CHECK(vsr_client_import(g.client, bad, size) == VSR_EINVAL);
+    check_untouched(g.client, &expected);
+    teardown(&g);
+
+    /* Too few lanes for the target is ELIMIT; a malformed lane beats it. */
+    setup(&g, 2, 3);
+    expected = client_status(g.client);
+    CHECK(vsr_client_import(g.client, image, size) == VSR_ELIMIT);
+    memcpy(bad, image, size);
+    put_field(bad, &(struct corruption){L0 + 24, 8, 0});
+    reseal(bad, size);
+    CHECK(vsr_client_import(g.client, bad, size) == VSR_EINVAL);
+    CHECK(client_status(g.client).lanes == 0);
+    teardown(&g);
+
+    /* The pristine image still imports. */
+    setup(&g, 3, 3);
+    CHECK(vsr_client_import(g.client, image, size) == VSR_OK);
+    CHECK(client_status(g.client).epoch == 2);
+    CHECK(client_status(g.client).primary == 2);
+    CHECK(client_status(g.client).min_op == 11);
+    teardown(&g);
+    teardown(&f);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 1;
@@ -1578,6 +2155,10 @@ int main(int argc, char **argv)
     reads();
     persistence();
     independent_lanes();
+    stale_new_epoch();
+    counter_limits();
+    image_checksum();
+    image_rejections();
     for (uint64_t i = 0; i < 8; i++) {
         randomized(seed + i, steps);
     }
