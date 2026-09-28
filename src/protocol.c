@@ -569,6 +569,7 @@ static bool store_poll(struct vsr *v)
                                   hard_changed ? hard.committed : 0,
                                   results ? p->results_through : 0,
                                   0,
+                                  false,
                                   false};
     for (uint32_t i = 0; i < appended; ++i)
         vsr_protocol_log_find(v, p->written_end + i)->sequence =
@@ -668,21 +669,39 @@ bool vsr_protocol_store(struct vsr *v, const struct vsr_change *changes,
     /* Mirror the store's retained range so the readable frontier can follow
      * this transaction the moment it is readable, before it is durable. */
     uint64_t begin = 0;
+    bool restores = false;
     for (uint32_t i = 0; i < count; ++i) {
         if (changes[i].type == VSR_STORE_TRIM) {
             begin = changes[i].first;
         } else if (changes[i].type == VSR_STORE_RESTORE_CHECKPOINT) {
             const struct vsr_checkpoint *checkpoint = changes[i].data;
             begin = checkpoint->op + 1;
+            restores = true;
         }
     }
     if (!vsr_protocol_emit(v, VSR_OP_STORE, 0, VSR_TAG_STORE, &store, leases,
                            lease_count, 0))
         return false;
     *sequence = p->next_sequence++;
-    *t = (struct vsr_transaction){*sequence,       append_end, committed,
-                                  clients_through, begin,      false};
+    *t = (struct vsr_transaction){
+        *sequence, append_end, committed, clients_through,
+        begin,     restores,   false};
     return true;
+}
+
+/* Whether a transaction replacing the indexed client base is still
+ * outstanding: the host may already read past it. */
+static bool restore_pending(const struct vsr *v)
+{
+    const struct vsr_protocol *p = vsr_protocol_const(v);
+    for (uint64_t s = v->status.stored_sequence + 1; s < p->next_sequence;
+         ++s) {
+        const struct vsr_transaction *t =
+            &p->transactions[s % p->transaction_capacity];
+        if (t->sequence == s && t->restores)
+            return true;
+    }
+    return false;
 }
 
 bool vsr_protocol_nonce(struct vsr *v, struct vsr_nonce *nonce)
@@ -981,6 +1000,20 @@ static bool routes_poll(struct vsr *v)
                 return true;
             break;
         case VSR_ROUTE_REPLY:
+            /* Restoring a checkpoint replaces the indexed client base, so an
+             * executed reply decided from the previous revision is no longer
+             * backed by a stored record. Decide it again from the restored
+             * revision, as a load completing after restoration would, and
+             * hold it while a restoration is outstanding: the host may
+             * execute the reply after that store. */
+            if (r->executed) {
+                if (r->history_generation != p->history_generation) {
+                    refresh_route(v, r);
+                    return true;
+                }
+                if (restore_pending(v))
+                    break;
+            }
             if (send_reply(v, r))
                 return true;
             break;

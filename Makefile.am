@@ -45,7 +45,8 @@ REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/witness_prefix tests/regression/boundary_from_view_change \
   tests/regression/review_epoch_recovery_vote tests/regression/learner_restart \
   tests/regression/learner_follows tests/regression/epoch_announcement_recovery \
-  tests/regression/api_init_out
+  tests/regression/api_init_out tests/regression/pressure_reload \
+  tests/regression/anchor_behind_applied tests/regression/reply_restore
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 # Reproductions of open safety bugs found in review; they turn into XPASS
 # once the core is fixed and should then move to the ordinary regressions.
@@ -125,6 +126,19 @@ tests_regression_witness_prefix_SOURCES = tests/regression/witness_prefix.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_witness_prefix_LDADD = src/libvsr.a
+tests_regression_pressure_reload_SOURCES = tests/regression/pressure_reload.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_pressure_reload_LDADD = src/libvsr.a
+tests_regression_anchor_behind_applied_SOURCES = \
+  tests/regression/anchor_behind_applied.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_anchor_behind_applied_LDADD = src/libvsr.a
+tests_regression_reply_restore_SOURCES = tests/regression/reply_restore.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_reply_restore_LDADD = src/libvsr.a
 tests_regression_review_epoch_recovery_vote_SOURCES = \
   tests/regression/review_epoch_recovery_vote.c \
   tests/lib/memory.c tests/lib/memory.h \

@@ -1007,6 +1007,14 @@ static bool target_poll(struct vsr *v)
             bool adopt = target->rebuild ||
                          (checkpoint != NULL &&
                           (existing == NULL || checkpoint->op > existing->op));
+            /* A full member whose application already reached the selected
+             * checkpoint keeps its state: INSTALL establishes the application
+             * boundary before suffix replay, never behind entries a running
+             * application has applied. The fetch cursor still starts at the
+             * donor's retained log, which covers everything past its anchor. */
+            if (adopt && !target->rebuild && role == VSR_MEMBER_FULL &&
+                checkpoint->op <= v->status.applied)
+                adopt = false;
             /* A witness keeps a prefix it can vouch for instead of copying
              * the donor's newer anchor: a known-committed prefix, or one that
              * ends in the very entry the anchor closes with. The donor cannot
