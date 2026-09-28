@@ -499,8 +499,10 @@ static int check_data(struct vsr_sim_node *node, const struct vsr_sim_op *op,
                 vsr_sim_exec_region(node, sqe, vec->base, vec->length) != 0) {
                 return -EFAULT;
             }
-            if (direct && (!aligned((uintptr_t)vec->base, block) ||
-                           !aligned(vec->length, block))) {
+            /* O_DIRECT: offset and length must be block multiples; a
+             * misaligned address is served, as the kernel bounces it
+             * (decision 65). */
+            if (direct && !aligned(vec->length, block)) {
                 return -EINVAL;
             }
             total += vec->length;
@@ -513,8 +515,7 @@ static int check_data(struct vsr_sim_node *node, const struct vsr_sim_op *op,
             vsr_sim_exec_region(node, sqe, sqe->addr, sqe->length) != 0) {
             return -EFAULT;
         }
-        if (direct && (!aligned((uintptr_t)sqe->addr, block) ||
-                       !aligned(sqe->length, block))) {
+        if (direct && !aligned(sqe->length, block)) {
             return -EINVAL;
         }
         total = sqe->length;

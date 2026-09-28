@@ -436,9 +436,10 @@ void vsr_sim_exec_hold(struct vsr_sim_node *node, uint32_t op, uint32_t object);
 /* The object a record's fd names, honouring FIXED_FILE; -EBADF. */
 int vsr_sim_exec_resolve(struct vsr_sim_node *node, int32_t fd, bool fixed,
                          uint32_t *object);
-/* Installs a new object as a descriptor, or a slot with DIRECT (-ENFILE,
- * -EINVAL, -ENXIO); the result is the descriptor or slot. check only
- * reports whether install would succeed. */
+/* Installs a new object as a descriptor, or a slot with DIRECT (-ENFILE
+ * when no slot is free or no table exists, -EINVAL for a slot past the
+ * table); the result is the descriptor or slot. check only reports whether
+ * install would succeed. */
 int vsr_sim_exec_install(struct vsr_sim_node *node,
                          const struct vsr_io_sqe *sqe, uint32_t object,
                          bool check);

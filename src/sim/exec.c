@@ -123,8 +123,9 @@ int vsr_sim_exec_install(struct vsr_sim_node *node,
     if ((sqe->flags & VSR_IO_SQE_DIRECT) != 0) {
         uint32_t slot = 0;
 
+        /* No table is no free slot, as the ring reports it. */
         if (node->slots_count == 0) {
-            return -ENXIO;
+            return -ENFILE;
         }
         if (sqe->fd2 == VSR_IO_SLOT_ALLOC) {
             while (slot < node->slots_count && node->slots[slot] >= 0) {
@@ -906,6 +907,10 @@ static void start(struct vsr_sim_node *node, uint32_t index)
         ((sqe->flags & VSR_IO_SQE_SKIP_SUCCESS) != 0 &&
          (op->multishot || op->zero_copy)) ||
         ((sqe->flags & VSR_IO_SQE_LINK) != 0 && op->multishot)) {
+        /* A record rejected at validation completes exactly once, MORE
+         * clear and without a NOTIF, as the kernel rejects it before it
+         * allocates the notification (decision 62). */
+        op->zero_copy = 0;
         vsr_sim_exec_complete(node, index, -EINVAL, 0, 0);
         return;
     }
@@ -993,6 +998,14 @@ static int submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
 
     if (count > 0 && sqes == NULL) {
         return -EFAULT;
+    }
+    /* user_data UINT64_MAX is reserved (the ring's wake poll carries it):
+     * a batch holding it is refused whole, before anything runs
+     * (decision 65). */
+    for (uint32_t i = 0; i < count; ++i) {
+        if (sqes[i].user_data == UINT64_MAX) {
+            return -EINVAL;
+        }
     }
     indices = vsr_sim_alloc(sizeof(*indices) * ((size_t)count + 1));
     for (uint32_t i = 0; i < count; ++i) {

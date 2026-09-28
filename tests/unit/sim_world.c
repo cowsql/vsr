@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -2024,6 +2025,175 @@ static void test_aborts(void)
     expect_abort(body_stale_handle_restarted);
 }
 
+/* ------------------------------------------------------------------------
+ * Decisions 62 and 65: single completion of a rejected zero-copy send,
+ * reserved user_data, GETSOCKOPT levels, ACCEPT with DIRECT and no slot,
+ * O_DIRECT alignment, registration errno values
+ * --------------------------------------------------------------------- */
+
+static _Alignas(4096) unsigned char direct_buffer[3 * BLOCK];
+
+static void test_contract_details(void)
+{
+    struct vsr_sim_faults faults;
+    struct vsr_sim *sim;
+    struct vsr_io_executor ex0;
+    struct vsr_io_executor ex1;
+    int listener;
+    int client;
+    int server;
+    int fd;
+    int32_t result;
+    int option;
+    unsigned char bytes[64];
+    struct vsr_io_sqe sqes[2];
+    struct vsr_io_cqe cqes[2];
+    struct vsr_io_cqe cqe;
+
+    memset(&faults, 0, sizeof(faults));
+    faults.network.delay_min_ns = 1 * MS;
+    faults.network.delay_max_ns = 1 * MS;
+    sim = make_world(seed, 2, &faults);
+    ex0 = vsr_sim_executor(sim, 0);
+    ex1 = vsr_sim_executor(sim, 1);
+    listener = listen_on(sim, ex1, 1, PORT);
+    connect_pair(sim, ex0, ex1, listener, 1, &client, &server);
+
+    /* A zero-copy send rejected at validation completes exactly once,
+     * MORE clear and without a NOTIF (decision 62). */
+    sqes[0] = make_sqe(VSR_IO_SQE_SEND, client, 0xA0);
+    sqes[0].flags = VSR_IO_SQE_SKIP_SUCCESS;
+    sqes[0].addr = bytes;
+    sqes[0].length = 8;
+    sqes[0].op_flags = VSR_IO_SEND_ZERO_COPY;
+    submit(ex0, sqes, 1);
+    CHECK(reap(ex0, cqes, 2) == 1);
+    CHECK(cqes[0].user_data == 0xA0 && cqes[0].result == -EINVAL &&
+          cqes[0].flags == 0);
+    CHECK(vsr_sim_inflight(sim, 0) == 0);
+    (void)settle(sim);
+    CHECK(reap(ex0, cqes, 2) == 0);
+    sqes[0].flags = 0;
+    sqes[0].op_flags = VSR_IO_SEND_ZERO_COPY | 0x80; /* Unknown flag. */
+    submit(ex0, sqes, 1);
+    CHECK(reap(ex0, cqes, 2) == 1 && cqes[0].result == -EINVAL &&
+          cqes[0].flags == 0);
+    CHECK(vsr_sim_inflight(sim, 0) == 0);
+    /* A zero-copy send that fails later still posts both, result first. */
+    sqes[0].op_flags = VSR_IO_SEND_ZERO_COPY;
+    sqes[0].fd = listener; /* Node 0 has no such socket: -EBADF at start. */
+    submit(ex1, sqes, 1);
+    (void)settle(sim);
+    CHECK(reap(ex1, cqes, 2) == 2);
+    CHECK(cqes[0].result == -ENOTCONN && cqes[0].flags == VSR_IO_CQE_MORE);
+    CHECK(cqes[1].result == 0 && cqes[1].flags == VSR_IO_CQE_NOTIF);
+
+    /* user_data UINT64_MAX is reserved: the batch is refused whole. */
+    sqes[0] = make_sqe(VSR_IO_SQE_NOP, -1, 0xA1);
+    sqes[1] = make_sqe(VSR_IO_SQE_NOP, -1, UINT64_MAX);
+    CHECK(ex0.ops->submit_and_wait(ex0.ctx, sqes, 2, 0, 0, 0) == -EINVAL);
+    CHECK(reap(ex0, cqes, 2) == 0 && vsr_sim_inflight(sim, 0) == 0);
+
+    /* GETSOCKOPT serves SOL_SOCKET only; SETSOCKOPT takes TCP_NODELAY. */
+    option = 1;
+    sqes[0] = make_sqe(VSR_IO_SQE_SETSOCKOPT, client, 0xA2);
+    sqes[0].op_flags = (IPPROTO_TCP << 16) | TCP_NODELAY;
+    sqes[0].addr = &option;
+    sqes[0].length = sizeof(option);
+    CHECK(run(sim, ex0, &sqes[0]).result == 0);
+    sqes[0].op_flags = (SOL_SOCKET << 16) | SO_KEEPALIVE;
+    CHECK(run(sim, ex0, &sqes[0]).result == 0);
+    option = 0;
+    sqes[0].opcode = VSR_IO_SQE_GETSOCKOPT;
+    CHECK(run(sim, ex0, &sqes[0]).result == (int32_t)sizeof(option));
+    CHECK(option == 1);
+    sqes[0].op_flags = (IPPROTO_TCP << 16) | TCP_NODELAY;
+    CHECK(run(sim, ex0, &sqes[0]).result == -EOPNOTSUPP);
+    sqes[0].op_flags = (SOL_SOCKET << 16) | SO_REUSEADDR;
+    CHECK(run(sim, ex0, &sqes[0]).result == -ENOPROTOOPT);
+    sqes[0].opcode = VSR_IO_SQE_SETSOCKOPT;
+    CHECK(run(sim, ex0, &sqes[0]).result == -ENOPROTOOPT);
+    CHECK(close_fd(sim, ex0, client) == 0);
+    CHECK(close_fd(sim, ex1, server) == 0);
+
+    /* Registration errno values. */
+    CHECK(ex1.ops->register_files(ex1.ctx, 1) == 0);
+    CHECK(ex1.ops->register_files(ex1.ctx, 1) == -EBUSY);
+    CHECK(ex1.ops->register_buffers(ex1.ctx, 1) == 0);
+    CHECK(ex1.ops->register_buffers(ex1.ctx, 1) == -EBUSY);
+    CHECK(ex1.ops->provide(ex1.ctx, 9, NULL, 0) == -ENOENT);
+    CHECK(ex1.ops->buffer_ring(ex1.ctx, 9, 0, 0, NULL) == -ENOENT);
+
+    /* ACCEPT with DIRECT and no free slot: the connection is accepted and
+     * closed (the peer sees a reset), -ENFILE ends the multishot, and a
+     * later connection stays queued until a slot is free. Node 0 has no
+     * table at all, which is no free slot either. */
+    sqes[0] = make_sqe(VSR_IO_SQE_OPENAT, VSR_SIM_ROOT, 0xA3);
+    sqes[0].flags = VSR_IO_SQE_DIRECT;
+    sqes[0].fd2 = 0;
+    sqes[0].addr = "slot";
+    sqes[0].op_flags = O_CREAT | O_RDWR;
+    CHECK(run(sim, ex1, &sqes[0]).result == 0); /* Slot 0 is taken. */
+    sqes[0].fd2 = VSR_IO_SLOT_ALLOC;
+    CHECK(run(sim, ex1, &sqes[0]).result == -ENFILE);
+    CHECK(run(sim, ex0, &sqes[0]).result == -ENFILE);
+    sqes[0] = make_sqe(VSR_IO_SQE_ACCEPT, listener, 0xA4);
+    sqes[0].flags = VSR_IO_SQE_DIRECT;
+    sqes[0].fd2 = VSR_IO_SLOT_ALLOC;
+    sqes[0].op_flags = VSR_IO_ACCEPT_MULTISHOT;
+    submit(ex1, sqes, 1);
+    client = connect_to(sim, ex0, 1, PORT, &result);
+    CHECK(result == 0);
+    cqe = wait_one(sim, ex1);
+    CHECK(cqe.user_data == 0xA4 && cqe.result == -ENFILE && cqe.flags == 0);
+    CHECK(vsr_sim_inflight(sim, 1) == 0);
+    CHECK(recv_bytes(sim, ex0, client, bytes, sizeof(bytes)) == -ECONNRESET);
+    CHECK(close_fd(sim, ex0, client) == 0);
+    client = connect_to(sim, ex0, 1, PORT, &result);
+    CHECK(result == 0); /* Queued: nobody accepts yet. */
+    sqes[1] = make_sqe(VSR_IO_SQE_CLOSE, 0, 0xA5);
+    sqes[1].flags = VSR_IO_SQE_FIXED_FILE;
+    CHECK(run(sim, ex1, &sqes[1]).result == 0); /* Slot 0 is free. */
+    submit(ex1, sqes, 1);
+    cqe = wait_one(sim, ex1);
+    CHECK(cqe.user_data == 0xA4 && cqe.result == 0 &&
+          cqe.flags == VSR_IO_CQE_MORE);
+    CHECK(send_bytes(sim, ex0, client, "slot", 4) == 4);
+    sqes[1] = make_sqe(VSR_IO_SQE_RECV, 0, 0xA6);
+    sqes[1].flags = VSR_IO_SQE_FIXED_FILE;
+    sqes[1].addr = bytes;
+    sqes[1].length = sizeof(bytes);
+    CHECK(run(sim, ex1, &sqes[1]).result == 4 && memcmp(bytes, "slot", 4) == 0);
+    sqes[1] = make_sqe(VSR_IO_SQE_CANCEL, -1, 0xA7);
+    sqes[1].offset = 0xA4;
+    submit(ex1, &sqes[1], 1);
+    CHECK(reap(ex1, cqes, 2) == 2 && cqes[0].result == -ECANCELED);
+    sqes[1] = make_sqe(VSR_IO_SQE_CLOSE, 0, 0xA8);
+    sqes[1].flags = VSR_IO_SQE_FIXED_FILE;
+    CHECK(run(sim, ex1, &sqes[1]).result == 0);
+    CHECK(recv_bytes(sim, ex0, client, bytes, sizeof(bytes)) == 0);
+    CHECK(close_fd(sim, ex0, client) == 0);
+    CHECK(close_fd(sim, ex1, listener) == 0);
+
+    /* O_DIRECT: offset and length must be block multiples; a misaligned
+     * address is served. */
+    fd = open_at(sim, ex0, VSR_SIM_ROOT, "direct", O_CREAT | O_RDWR | O_DIRECT);
+    CHECK(fd >= 0);
+    fill(direct_buffer, sizeof(direct_buffer), 0x77);
+    CHECK(write_at(sim, ex0, fd, 0, direct_buffer + 1, (uint32_t)BLOCK) ==
+          (int32_t)BLOCK);
+    CHECK(write_at(sim, ex0, fd, BLOCK, direct_buffer, (uint32_t)BLOCK - 1) ==
+          -EINVAL);
+    CHECK(write_at(sim, ex0, fd, 1, direct_buffer, (uint32_t)BLOCK) == -EINVAL);
+    CHECK(read_at(sim, ex0, fd, 0, direct_buffer + 3, (uint32_t)BLOCK) ==
+          (int32_t)BLOCK);
+    CHECK(read_at(sim, ex0, fd, 0, direct_buffer, 100) == -EINVAL);
+    CHECK(read_at(sim, ex0, fd, 8, direct_buffer, (uint32_t)BLOCK) == -EINVAL);
+    CHECK(close_fd(sim, ex0, fd) == 0);
+    (void)settle(sim);
+    vsr_sim_destroy(sim);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1) {
@@ -2037,6 +2207,7 @@ int main(int argc, char **argv)
     test_close_holds();
     test_crash_model();
     test_directories();
+    test_contract_details();
     test_reproducibility();
     test_aborts();
     return 0;

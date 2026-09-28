@@ -607,13 +607,17 @@ static void serve_accept(struct vsr_sim_node *node, uint32_t index)
             return;
         }
         sqe = &vsr_sim_op(node, op)->sqe;
+        pending = listener->pending[0];
         error = vsr_sim_exec_install(node, sqe, 0, true);
         if (error != 0) {
-            /* The connection stays queued for the next accept. */
+            /* No slot for the descriptor: the connection has been accepted
+             * by then and is closed again, so its peer sees a reset; the
+             * error ends the record, and later connections stay queued
+             * (decision 65). */
+            reset_connection(sim, pending);
             vsr_sim_exec_complete(node, op, error, 0, 0);
             continue;
         }
-        pending = listener->pending[0];
         listener_remove(listener, pending);
         connection = connection_at(sim, pending);
         if (connection == NULL) {
@@ -1147,6 +1151,9 @@ static void start_send(struct vsr_sim_node *node, uint32_t op, uint32_t index)
     if ((record->sqe.op_flags &
          ~(uint32_t)(VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED)) != 0 ||
         (record->sqe.flags & VSR_IO_SQE_BUFFER_SELECT) != 0) {
+        /* Rejected at validation: one completion, no NOTIF (decision 62);
+         * every later failure of a zero-copy send still posts both. */
+        vsr_sim_op(node, op)->zero_copy = 0;
         error = -EINVAL;
     } else if (object->state != VSR_SIM_SOCKET_CONNECTED) {
         error = -ENOTCONN;
@@ -1213,6 +1220,13 @@ static void start_sockopt(struct vsr_sim_node *node, uint32_t op,
     uint32_t *value;
     int integer;
 
+    /* GETSOCKOPT serves level SOL_SOCKET only, as the ring does; any other
+     * level is -EOPNOTSUPP (decision 65). SETSOCKOPT takes TCP_NODELAY
+     * as well. */
+    if (record->sqe.opcode == VSR_IO_SQE_GETSOCKOPT && level != SOL_SOCKET) {
+        vsr_sim_exec_complete(node, op, -EOPNOTSUPP, 0, 0);
+        return;
+    }
     if (level == SOL_SOCKET && name == SO_KEEPALIVE) {
         value = &object->keepalive;
     } else if (level == IPPROTO_TCP && name == TCP_NODELAY) {
