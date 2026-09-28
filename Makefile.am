@@ -65,7 +65,8 @@ INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
   tests/integration/api_contract
 INTEGRATION_TESTS += tests/integration/failures tests/integration/view_change_edges \
   tests/integration/offers tests/integration/capture tests/integration/clients
-INTEGRATION_TESTS += tests/integration/uring_smoke
+INTEGRATION_TESTS += tests/integration/uring_smoke \
+  tests/integration/executor_conformance
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
   tests/regression/witness_prefix tests/regression/boundary_from_view_change \
@@ -119,6 +120,11 @@ tests_integration_uring_smoke_SOURCES = tests/integration/uring_smoke.c
 tests_integration_uring_smoke_LDADD = $(LIBVSR)
 tests_integration_uring_smoke_CFLAGS = $(AM_CFLAGS) -pthread
 tests_integration_uring_smoke_LDFLAGS = $(AM_LDFLAGS) -pthread
+tests_integration_executor_conformance_SOURCES = \
+  tests/integration/executor_conformance.c
+tests_integration_executor_conformance_LDADD = $(LIBVSR)
+tests_integration_executor_conformance_CFLAGS = $(AM_CFLAGS) -pthread
+tests_integration_executor_conformance_LDFLAGS = $(AM_LDFLAGS) -pthread
 tests_integration_replication_SOURCES = tests/integration/replication.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
