@@ -1018,9 +1018,17 @@ static bool routes_poll(struct vsr *v)
                 return true;
             break;
         case VSR_ROUTE_WAIT: {
+            /* The indexed store owns the payload once the append carrying
+             * it is stored. Its cache placement proves that early, but the
+             * placement can be evicted before the proposal is decided: a
+             * primary demoted with proposals in flight would otherwise pin
+             * every such payload through the view change and starve the
+             * transfer loads the minimum budget provisions. */
             const struct vsr_log_slot *slot = vsr_protocol_log_find(v, r->op);
-            if (r->lease != VSR_INDEX_NONE && r->op < p->written_end &&
-                slot != NULL && slot->sequence <= v->status.stored_sequence) {
+            bool stored = r->op < p->stable_end ||
+                          (r->op < p->written_end && slot != NULL &&
+                           slot->sequence <= v->status.stored_sequence);
+            if (r->lease != VSR_INDEX_NONE && stored) {
                 vsr_lease_release(v, r->lease);
                 r->lease = VSR_INDEX_NONE;
                 r->request.body = NULL;

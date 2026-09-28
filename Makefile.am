@@ -51,7 +51,7 @@ REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/api_init_out tests/regression/pressure_reload \
   tests/regression/anchor_behind_applied tests/regression/reply_restore \
   tests/regression/next_epoch_before_steady \
-  tests/regression/recovery_into_handoff
+  tests/regression/recovery_into_handoff tests/regression/view_change_minimum
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 # Reproductions of open safety bugs found in review go here; they turn into
 # XPASS once the core is fixed and then move to the ordinary regressions.
@@ -161,6 +161,11 @@ tests_regression_reply_restore_SOURCES = tests/regression/reply_restore.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_reply_restore_LDADD = src/libvsr.a
+tests_regression_view_change_minimum_SOURCES = \
+  tests/regression/view_change_minimum.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_view_change_minimum_LDADD = src/libvsr.a
 tests_regression_review_epoch_recovery_vote_SOURCES = \
   tests/regression/review_epoch_recovery_vote.c \
   tests/lib/memory.c tests/lib/memory.h \
