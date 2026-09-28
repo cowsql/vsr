@@ -176,6 +176,7 @@ static void reconfigure(struct mem_node *primary, uint64_t epoch,
 
 static void late_backup_commits_next_boundary(void)
 {
+    const struct vsr_reply *answer;
     struct mem_cluster *cluster = mem_cluster_create();
     struct mem_node *nodes[NODES];
     struct schedule schedule = {true, false};
@@ -201,8 +202,9 @@ static void late_backup_commits_next_boundary(void)
     reconfigure(nodes[PRIMARY], 2, 2);
     SETTLE(cluster, nodes, &schedule, &now,
            status(nodes[LATE]).epoch == 2 && status(nodes[PRIMARY]).epoch == 2);
-    CHECK(reply(nodes[PRIMARY], 2) != NULL);
-    CHECK(reply(nodes[PRIMARY], 2)->status == VSR_REPLY_OK);
+    answer = reply(nodes[PRIMARY], 2);
+    CHECK(answer != NULL);
+    CHECK(answer->status == VSR_REPLY_OK);
     CHECK(status(nodes[LATE]).committed == 2);
     CHECK(status(nodes[LATE]).failure.code == VSR_FAILURE_NONE);
 
