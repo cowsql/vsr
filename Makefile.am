@@ -50,7 +50,7 @@ REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/learner_follows tests/regression/epoch_announcement_recovery \
   tests/regression/api_init_out tests/regression/pressure_reload \
   tests/regression/anchor_behind_applied tests/regression/reply_restore \
-  tests/regression/next_epoch_before_steady
+  tests/regression/next_epoch_before_steady tests/regression/lagging_reload
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 # Reproductions of open safety bugs found in review go here; they turn into
 # XPASS once the core is fixed and then move to the ordinary regressions.
@@ -151,6 +151,10 @@ tests_regression_pressure_reload_SOURCES = tests/regression/pressure_reload.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_pressure_reload_LDADD = src/libvsr.a
+tests_regression_lagging_reload_SOURCES = tests/regression/lagging_reload.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_lagging_reload_LDADD = src/libvsr.a
 tests_regression_anchor_behind_applied_SOURCES = \
   tests/regression/anchor_behind_applied.c \
   tests/lib/memory.c tests/lib/memory.h \

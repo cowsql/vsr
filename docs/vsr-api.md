@@ -116,6 +116,12 @@ or capacity boundary, even if all input was accepted. `VSR_EINVAL` identifies an
 invalid event or argument; `VSR_ELIMIT` identifies a permanent size or capacity
 violation. An event error leaves that event unconsumed and preserves earlier
 accepted events and output. Neither a negative result nor `AGAIN` rolls back work.
+`MORE` promises progress: a drain either advances the protocol or returns
+without `MORE` once nothing runnable remains. It never spends its work undoing
+its own earlier work, such as releasing a cache entry it loaded for a peer
+before that peer is served, and retries are coalesced under timers rather than
+spun; a host that drains on `MORE` and services completions fairly reaches an
+idle return.
 
 Dispatch all returned operations before reusing the array. Queue immediate
 completions and feed them back after dispatch; do not call into the core

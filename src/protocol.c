@@ -147,6 +147,7 @@ void vsr_protocol_init(struct vsr *v, void *memory, size_t size)
     p->next_sequence = p->log_begin = p->readable_begin = p->log_end =
         p->written_end = p->stable_end = 1;
     p->results_lease = VSR_INDEX_NONE;
+    p->load_peer = VSR_INDEX_NONE;
     p->heartbeat_at = p->election_at = p->retry_at = p->append_at =
         VSR_NO_DEADLINE;
     for (uint32_t i = 0; i < v->options.limits.log_cache_entries; ++i)
@@ -1101,16 +1102,25 @@ static bool network_poll(struct vsr *v)
                     /* Serve this peer first once its entries arrive. A small
                      * cache cannot hold every lagging peer's next entry at
                      * once; rotating past it would evict the loaded entry
-                     * for another peer's load before it is ever sent. */
+                     * for another peer's load before it is ever sent. Polls
+                     * that run while the load is outstanding rotate past
+                     * this peer, so the completion restores the cursor. */
                     p->peer_cursor = i;
+                    p->load_peer = i;
                     return true;
                 }
                 continue;
             }
             struct vsr_operation *op = vsr_operation_acquire(
                 v, VSR_OP_SEND, peer->id, VSR_TAG_SEND, 0);
-            if (op == NULL)
+            if (op == NULL) {
+                /* Only an operation slot is missing. Keep the cursor here so
+                 * that a freed slot sends the cached entries rather than
+                 * loading another peer's, whose reservation would evict them
+                 * under pressure before they were ever sent. */
+                p->peer_cursor = i;
                 return false;
+            }
             uint32_t count = 0;
             uint64_t bytes = 0;
             while (first + count < p->stable_end &&
@@ -1149,8 +1159,10 @@ static bool network_poll(struct vsr *v)
         }
         if (peer->heartbeat || peer->commit_sent < p->stable_commit) {
             if (!vsr_protocol_send(v, peer->id, VSR_MSG_COMMIT,
-                                   p->stable_commit, NULL, VSR_INDEX_NONE))
+                                   p->stable_commit, NULL, VSR_INDEX_NONE)) {
+                p->peer_cursor = i;
                 return false;
+            }
             peer->heartbeat = false;
             peer->commit_sent = p->stable_commit;
             peer->sending = true;
@@ -1527,6 +1539,10 @@ void vsr_protocol_complete(struct vsr *v, struct vsr_operation *op,
         break;
     case VSR_TAG_LOG: {
         p->log_loading = false;
+        if (p->load_peer != VSR_INDEX_NONE) {
+            p->peer_cursor = p->load_peer;
+            p->load_peer = VSR_INDEX_NONE;
+        }
         if (event->status == VSR_IO_RETRY)
             break;
         if (event->status != VSR_IO_OK) {

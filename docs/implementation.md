@@ -97,6 +97,8 @@ Campaigns run on this tree, all passing:
 | `cluster 1 1 600 quiet 34 100` | 100 |
 | `cluster 1 1 2000 quiet 2 32` | 32 |
 | `cluster 1 1 600 quiet P 32` for `P` in 2, 3, 32, 127 | 32 each |
+| `cluster 1000 1 600 quiet P 1000` for `P` in 2, 3, 6, 7 | 1000 each |
+| `cluster 1 1 2000 quiet P 150` for `P` in 6, 7 | 150 each |
 
 Every replay command formerly listed in `tests/fuzzy/KNOWN_FAILURES.md` also
 passes. Flags `2` and `32` are exercised by these campaigns rather than by
@@ -137,7 +139,7 @@ action of every scheduler run and integration test.
 | Witness promotion and demotion | Covered | `epochs` `promotion` and `same_members` (the demoted member keeps its donor image and executes nothing as a witness); scheduler flag `32` role swap |
 | Demotion during disjoint handoff | Partially | Demotion and disjoint handoff are separate proposals in `epochs` and in the scheduler (one change kind per `RECONFIGURE`); no scenario demotes a surviving member in the proposal that replaces the rest of the group |
 | Duplicate CHECK_EPOCH requests across redirects | Covered | Scheduler flag `32` (`CHECK_EPOCH` resubmitted with the same identity through redirects, `certified`/`uncertified` oracle); `epochs` `same_members`; `clients` `routing` |
-| Cache eviction | Covered | `client_cache_entries = 1` in `replication`, `normal_contract`, `epochs`, `clients`, `capture`, `checkpoints`, `failures`; scheduler varies client and log cache sizes; `offers` `eviction`; regression `pressure_reload` |
+| Cache eviction | Covered | `client_cache_entries = 1` in `replication`, `normal_contract`, `epochs`, `clients`, `capture`, `checkpoints`, `failures`; scheduler varies client and log cache sizes; `offers` `eviction`; regressions `pressure_reload`, `lagging_reload` |
 | Maximum-size commands and manifests under completion backpressure | Covered | `clients` `payload_backpressure` (maximum commands with APPLY held); `audit` `exact_apply_reservation`; `capture` `manifest_at_limits`; scheduler flag `2` |
 | Maximum-size results | Partially | The planner reserves `batch_entries * result_bytes` (`api_contract`, `unit/layout`), but the host applications return short results: no test executes a result of exactly `result_bytes` |
 | Small capacities | Covered | `normal_contract` `minimum_capacity`, `lagging_peers_minimum_cache`; scheduler flag `2` (exact minimum lease and payload budgets), one to sixteen operations, `work_per_step` 1..16, output capacity 1..4 |
