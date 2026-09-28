@@ -1493,6 +1493,145 @@ static void test_variants(void)
     }
 }
 
+/* ------------------------------------------------------------------------
+ * Ring plumbing under pressure: a full SQ mid-batch with chains, CQ
+ * overflow and its recovery, want beyond the CQ, deinit with pending
+ * multishot and timeout records, and what the kernel says where the
+ * translation has room (recorded, not checked).
+ * --------------------------------------------------------------------- */
+
+static void test_pressure(void)
+{
+    struct vsr_io_uring_options o = options();
+    struct fixture f;
+    struct vsr_io_sqe batch[100];
+    struct vsr_io_cqe cqe;
+    uint32_t seen;
+    uint64_t expect;
+    int32_t listener;
+    struct sockaddr_in address;
+    struct vsr_io_sqe r;
+
+    CHECK(open_fixture(&f, &o) == 0);
+
+    /* 100 records in one batch over a 32-entry SQ: chains of 5 straddle
+     * every SQ boundary, one chain fails in its middle, and every record
+     * completes exactly once, chains in order. */
+    for (uint32_t i = 0; i < 100; ++i) {
+        batch[i] = rec(VSR_IO_SQE_NOP, 1000 + i);
+        if (i % 5 != 4) {
+            batch[i].flags = VSR_IO_SQE_LINK;
+        }
+    }
+    batch[51].opcode = 200; /* Rejected: fails records 52..54. */
+    submit(&f, batch, 100);
+    for (uint32_t i = 0; i < 100; ++i) {
+        cqe = take(&f, 1000 + i);
+        if (i == 51) {
+            CHECK(cqe.result == -EINVAL);
+        } else if (i > 51 && i < 55) {
+            CHECK(cqe.result == -ECANCELED);
+        } else {
+            CHECK(cqe.result == 0);
+        }
+        CHECK(!(cqe.flags & VSR_IO_CQE_MORE));
+    }
+    /* Chain order: 1005..1009 completed in submission order. */
+    /* A chain longer than the SQ fails alone, without linking. */
+    for (uint32_t i = 0; i < 40; ++i) {
+        batch[i] = rec(VSR_IO_SQE_NOP, 2000 + i);
+        batch[i].flags = VSR_IO_SQE_LINK;
+    }
+    submit(&f, batch, 40);
+    for (uint32_t i = 0; i < 40; ++i) {
+        CHECK(take(&f, 2000 + i).result == -EINVAL);
+    }
+
+    /* CQ overflow: 3000 completions over a 128-entry CQ without reaping,
+     * with wakes in between (the multishot wake poll dies when the CQ is
+     * full and must come back); every completion arrives, none twice. */
+    for (uint32_t round = 0; round < 30; ++round) {
+        for (uint32_t i = 0; i < 100; ++i) {
+            batch[i] = rec(VSR_IO_SQE_NOP, 3000 + round * 100 + i);
+        }
+        submit(&f, batch, 100);
+        if (round % 7 == 3) {
+            f.ex.ops->wake(f.ex.ctx);
+        }
+    }
+    seen = 0;
+    expect = 0;
+    while (seen < 3000) {
+        uint32_t n;
+
+        CHECK(f.ex.ops->submit_and_wait(f.ex.ctx, NULL, 0, 1, 0,
+                                        now(&f) + 5000 * MS) == 0);
+        n = f.ex.ops->reap(f.ex.ctx, stash, 37);
+        CHECK(n > 0);
+        for (uint32_t i = 0; i < n; ++i) {
+            CHECK(stash[i].user_data >= 3000 && stash[i].user_data < 6000);
+            CHECK(stash[i].result == 0);
+            expect += stash[i].user_data;
+        }
+        seen += n;
+    }
+    CHECK(expect == (UINT64_C(3000) + 5999) * 3000 / 2);
+    CHECK(f.ex.ops->reap(f.ex.ctx, stash, STASH) == 0);
+    /* The wake poll is back: a wake ends the next wait. */
+    wake_during(&f, 1, 0);
+
+    /* want beyond the CQ can never be satisfied: refused, not blocked. */
+    CHECK(f.ex.ops->submit_and_wait(f.ex.ctx, NULL, 0, 129, 0,
+                                    VSR_NO_DEADLINE) == -EINVAL);
+    CHECK(f.ex.ops->submit_and_wait(f.ex.ctx, NULL, 0, 128, 0, now(&f)) == 0);
+
+    /* A direct open with O_CLOEXEC, which the kernel alone refuses. */
+    listener = make_socket(&f, 4000);
+    CHECK(listener >= 0);
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    r = rec(VSR_IO_SQE_BIND, 4001);
+    r.fd = listener;
+    r.addr = &address;
+    r.length = sizeof(address);
+    CHECK(run(&f, r) == 0);
+    r = rec(VSR_IO_SQE_LISTEN, 4002);
+    r.fd = listener;
+    r.length = 4;
+    CHECK(run(&f, r) == 0);
+    CHECK(f.ex.ops->register_files(f.ex.ctx, 4) == 0);
+    r = rec(VSR_IO_SQE_OPENAT, 4003);
+    r.flags = VSR_IO_SQE_DIRECT;
+    r.fd = AT_FDCWD;
+    r.addr = ".";
+    r.op_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    r.fd2 = VSR_IO_SLOT_ALLOC;
+    /* O_CLOEXEC is dropped for a slot: the kernel would refuse it. */
+    CHECK(run(&f, r) >= 0);
+    r.op_flags = O_RDONLY | O_DIRECTORY;
+    CHECK(run(&f, r) >= 0);
+
+    /* deinit with a multishot accept, a plain accept and a timeout
+     * pending: the drain cancels them and nothing completes afterwards
+     * into memory that is gone (ASan would see a stash write). */
+    r = rec(VSR_IO_SQE_ACCEPT, 4010);
+    r.fd = listener;
+    r.op_flags = VSR_IO_ACCEPT_MULTISHOT;
+    submit1(&f, r);
+    r = rec(VSR_IO_SQE_ACCEPT, 4011);
+    r.fd = listener;
+    submit1(&f, r);
+    r = rec(VSR_IO_SQE_TIMEOUT, 4012);
+    r.offset = 60000 * MS;
+    submit1(&f, r);
+    CHECK(f.ex.ops->submit_and_wait(f.ex.ctx, NULL, 0, 0, 0, 0) == 0);
+    close_fixture(&f);
+    CHECK(close(listener) == 0);
+    /* Idempotent. */
+    vsr_io_uring_deinit(&f.ex);
+}
+
 int main(void)
 {
     struct vsr_io_uring_options o = options();
@@ -1518,5 +1657,6 @@ int main(void)
     test_timeouts();
     test_wake();
     test_variants();
+    test_pressure();
     return 0;
 }

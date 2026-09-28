@@ -237,6 +237,15 @@ static void test_files(void)
     r.fd2 = VSR_IO_SLOT_ALLOC;
     CHECK(tr(r, &sqe) == 0 && sqe.file_index == IORING_FILE_INDEX_ALLOC);
     CHECK(uring.directs_count == 0);
+    /* The kernel refuses O_CLOEXEC on a direct open: dropped, as the
+     * SOCK_CLOEXEC of a direct accept. */
+    r.op_flags = O_RDWR | O_CREAT | O_CLOEXEC;
+    CHECK(tr(r, &sqe) == 0 && sqe.open_flags == (O_RDWR | O_CREAT) &&
+          sqe.file_index == IORING_FILE_INDEX_ALLOC);
+    r.flags = 0;
+    CHECK(tr(r, &sqe) == 0 && sqe.open_flags == (O_RDWR | O_CREAT | O_CLOEXEC));
+    r.flags = VSR_IO_SQE_DIRECT;
+    r.op_flags = O_RDWR | O_CREAT;
     /* A named slot: the kernel completes with 0, so the executor keeps
      * (user_data, slot) to report the slot. */
     r.fd2 = 3;
