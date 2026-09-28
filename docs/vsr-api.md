@@ -237,6 +237,11 @@ no completed client record or successful duplicate reply before readiness. Since
 successive reconfigurations require the preceding handoff to complete, a target
 older than the current epoch is already safe. RECONFIGURE similarly preserves
 its target membership on retry; a fresh proposal must target routing epoch + 1.
+The adapter also owns the availability of what it proposes: a membership that
+tolerates fewer failures than the number of its members currently without
+recoverable state can never complete its handoff, because those members rejoin
+only through the new epoch's quorum recovery (docs/protocol.md "Epoch handoff
+and witnesses"); the core does not reject such a proposal.
 
 `READ` carries an applied minimum and an absolute deadline, or
 `VSR_NO_DEADLINE`. A zero deadline is already expired once time is established.

@@ -92,6 +92,23 @@ scenario function inside it; "scheduler flag" refers to the profile flags of
   `docs/protocol.md` "Restart and persistence". Tests:
   `regression/review_epoch_recovery_vote`,
   `regression/epoch_announcement_recovery`; scheduler flag `8`.
+- A reconfiguration must tolerate the members already without state. A
+  member of the new group that lost its state rejoins only through quorum
+  recovery there, with `q` responses from the other members, and readiness
+  needs `q` promises, so a membership naming more such members than its `f`
+  can never recover them or reach STEADY. This is a precondition on the
+  adapter that authorizes RECONFIGURE, not a core rule: the core cannot tell
+  a slow member from one without state. A tolerated lost-state member, even
+  the designated primary of the new epoch, recovers from the installed
+  members, which are NORMAL and change view around a silent primary. Why:
+  the seeded scheduler lowered `f` from 2 to 1 while two members were
+  crashed (`tests/fuzzy/cluster 1823 1 600 quiet 120` and `1536 1 600 quiet
+  127`), and both lost-state members waited forever for a fourth recovery
+  response from three NORMAL members while the handoff waited for their
+  promises. Where: `docs/protocol.md` "Epoch handoff and witnesses";
+  `docs/vsr-api.md` "Requests, replies, and reads". Tests:
+  `regression/recovery_into_handoff`; the scheduler proposes only
+  memberships that tolerate their unavailable members.
 
 ## Checkpoints and trim
 

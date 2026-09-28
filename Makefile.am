@@ -50,7 +50,8 @@ REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/learner_follows tests/regression/epoch_announcement_recovery \
   tests/regression/api_init_out tests/regression/pressure_reload \
   tests/regression/anchor_behind_applied tests/regression/reply_restore \
-  tests/regression/next_epoch_before_steady
+  tests/regression/next_epoch_before_steady \
+  tests/regression/recovery_into_handoff
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 # Reproductions of open safety bugs found in review go here; they turn into
 # XPASS once the core is fixed and then move to the ordinary regressions.
@@ -188,6 +189,11 @@ tests_regression_learner_follows_SOURCES = tests/regression/learner_follows.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_learner_follows_LDADD = src/libvsr.a
+tests_regression_recovery_into_handoff_SOURCES = \
+  tests/regression/recovery_into_handoff.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_recovery_into_handoff_LDADD = src/libvsr.a
 tests_regression_api_init_out_SOURCES = tests/regression/api_init_out.c
 tests_regression_api_init_out_LDADD = src/libvsr.a
 CLUSTER_SCENARIO = tests/fuzzy/scenario.c tests/fuzzy/scenario.h \

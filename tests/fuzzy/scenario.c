@@ -703,6 +703,28 @@ static bool group_valid(struct group *group)
     return true;
 }
 
+/* A membership is only proposed if it tolerates the members of it that are
+ * already unavailable. A member without recoverable state when the boundary
+ * commits (crashed, or restarted under replicated durability) rejoins the new
+ * epoch only through quorum recovery there, which needs q = n - f responses
+ * from that epoch's other members, and handoff readiness needs q promises
+ * (protocol.md "Authority and quorums", "Epoch handoff and witnesses"). With
+ * more such members than the new f, neither quorum can ever form: the
+ * configuration is born beyond its fault tolerance, an administrative error
+ * rather than a liveness bug. crash_allowed bounds later crashes by the
+ * proposed group as well, so this check closes the only gap. */
+static bool group_tolerates_unavailable(const struct simulation *s,
+                                        const struct group *group)
+{
+    uint32_t unavailable = 0;
+    for (uint32_t i = 0; i < group->count; ++i) {
+        uint32_t index = (uint32_t)group->members[i].id - 1;
+        if (!alive(s, index) || s->unrecovered[index])
+            ++unavailable;
+    }
+    return unavailable <= group->faults;
+}
+
 static void send_reconfigure(struct simulation *s, uint32_t index)
 {
     const struct vsr_membership membership = {
@@ -771,7 +793,7 @@ static void propose(struct simulation *s, uint32_t index)
         /* Same members, next epoch: a pure epoch bump. */
         break;
     }
-    if (!group_valid(&group))
+    if (!group_valid(&group) || !group_tolerates_unavailable(s, &group))
         return;
     s->proposed = group;
     s->proposing = true;
@@ -1071,6 +1093,9 @@ static void heal(struct simulation *s)
             "membership epoch=%" PRIu64 " count=%u faults=%u target=%" PRIu64
             "\n",
             s->known.epoch, s->known.count, s->known.faults, committed);
+    for (uint32_t i = 0; i < s->known.count; ++i)
+        fprintf(stderr, "member %" PRIu64 " role=%u\n", s->known.members[i].id,
+                s->known.members[i].role);
     CHECK(false);
 }
 

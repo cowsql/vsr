@@ -177,6 +177,20 @@ the next member, since a removed donor retires once the new group is ready
 and a crashed one may never return. A recovery keeps its highest-view primary
 as the sole authoritative source.
 
+These quorums bound what a reconfiguration may propose. A member of the new
+group without recoverable state when the boundary commits, because it crashed
+or restarted under replicated durability, rejoins only through quorum recovery
+in the new epoch, which needs `q` responses from that epoch's other members,
+and handoff readiness needs `q` promises. A new membership that tolerates
+fewer failures than the number of such members it names can therefore never
+recover them or reach STEADY. The adapter that authorizes RECONFIGURE must not
+propose a membership while more of its members than its `f` are unavailable;
+the core cannot tell a slow member from one that lost its state and does not
+reject such a proposal. A member without state whose group tolerates it, even
+the designated primary of the new epoch, recovers once the installed members,
+which are NORMAL, answer it; when it is that primary they change view first,
+since only the primary of the highest view supplies the offer.
+
 An authenticated peer already known in the receiver's current membership or
 seed may report a later committed epoch, including a jump over compacted
 intermediate epochs. This relies on the crash-only, non-Byzantine peer model;
