@@ -111,7 +111,7 @@ with `VSR_ELIMIT`:
 | Record limit | `vsr_io_codec_record_limit(limits)`; `<= slab_bytes - 2 * block_bytes` and `<= segment_bytes - header_bytes` | `store.c`, decision 37 |
 | Segment header bytes | `round_up(vsr_io_codec_segment_limit(limits), block_bytes)` | `store.c` |
 | Tail region | `cache_bytes + 2 * block_bytes`; `cache_bytes >= write_behind_bytes + pinned_payload_bytes + 2 * record limit` | `store.c`, decision 36 |
-| Slots | `vsr_io_slots_size`: `listeners + 4 * links + streams * (stream_window + 2) + replicas * (inflight_writes + 8) + 8` | `slots.c` |
+| Slots | `vsr_io_slots_size`: `listeners + 7 * links + streams * (stream_window + 2) + replicas * (inflight_writes + 8) + 8`; per link a receive, a shutdown, a connect and `VSR_IO_LINK_SENDS` (4) sends awaiting NOTIF | `slots.c` |
 | Deadlines | `links + nodes + 4 * replicas + streams` | `engine.c` |
 | Pool reserve | `replicas + 1` slabs never provided to the kernel | `pool.c` |
 | Minimum slabs | `links + streams * (stream_window + 1) + 2 * replicas + 4` | `vsr-io.h` |
