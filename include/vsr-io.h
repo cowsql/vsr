@@ -408,9 +408,10 @@ struct vsr_io_layout {
 int vsr_io_layout(const struct vsr_io_options *options,
                   struct vsr_io_layout *layout);
 /*
- * Copies options; registers the payload pool, the provided-buffer ring, and
- * the engine's file slots with the executor; queues the listener setup for
- * the first prepare. Regions must satisfy the layout and stay fixed until
+ * Copies options; registers the payload pool region at buffer_region_base
+ * and the provided-buffer ring at buffer_group with the executor (the file
+ * and buffer tables themselves are executor-wide and registered by whoever
+ * created the executor); queues the listener setup for the first prepare. Regions must satisfy the layout and stay fixed until
  * deinit. Returns OK, EINVAL, ELIMIT, or a negative errno from the
  * executor's registrations.
  */
