@@ -62,19 +62,21 @@ struct vsr_io_slots {
     uint64_t rejected; /* Completions dropped by resolve. */
 };
 
-/* Slots the engine needs for the limits: listeners, per link recv + send
- * + shutdown + connect, per stream its window plus two, per replica
- * inflight_writes + flush + superblock + load + four file operations + one
- * clients-file chunk, plus a small fixed spare (8). Checked arithmetic;
- * ELIMIT on overflow or beyond VSR_IO_SLOTS_MAX. *bytes is for an array of
- * *count struct vsr_io_slot, which init lays out at the start of memory. */
+/* Slots the engine needs for the limits: listeners, per link recv +
+ * shutdown + connect + VSR_IO_LINK_SENDS (4) sends, each held until its
+ * NOTIF, per stream its window plus two, per replica inflight_writes +
+ * flush + superblock + load + four file operations + one clients-file
+ * chunk, plus a small fixed spare (8). Checked arithmetic; ELIMIT on
+ * overflow or beyond VSR_IO_SLOTS_MAX. *bytes is for an array of *count
+ * struct vsr_io_slot, which init lays out at the start of memory. */
 int vsr_io_slots_size(const struct vsr_io_limits *limits, uint32_t listeners,
                       uint32_t inflight_writes, size_t *bytes, uint32_t *count);
 void vsr_io_slots_init(struct vsr_io_slots *table, void *memory, uint32_t count,
                        uint8_t owner);
 
 /* Allocates a slot expecting `completions` completions; INDEX_NONE when
- * the table is full, which prepare treats as "stop preparing". */
+ * the table is full, which prepare treats as "stop preparing". kind is not
+ * VSR_IO_SLOT_FREE. */
 uint32_t vsr_io_slots_alloc(struct vsr_io_slots *table, uint8_t kind,
                             uint8_t completions, uint32_t owner, uint32_t sub,
                             uint64_t cookie);
@@ -91,8 +93,17 @@ struct vsr_io_slot *vsr_io_slots_resolve(struct vsr_io_slots *table,
  * `expected` only while more than one is expected, so the caller passes the
  * record's MORE flag verbatim and both a multishot record (expected 1, MORE
  * on all but its last completion) and a zero-copy send (expected 2, MORE on
- * the result, none on the NOTIF) free on their final completion. A FREE
- * slot is left alone. */
+ * the result, none on the NOTIF) free on their final completion. A LINK
+ * chain sharing a slot expects one completion per record that completes on
+ * success (a SKIP_SUCCESS record counts none); after a failure the count
+ * may reach zero before the chain's -ECANCELED rest, which is then stale.
+ * The zero-copy count relies on the executor contract's order, result
+ * then NOTIF: a NOTIF first would leave the result's MORE looking like a
+ * multishot record's, and the slot live. A zero-copy result without MORE
+ * has no NOTIF to follow (a send refused before the kernel took it, such as
+ * -EINVAL for SKIP_SUCCESS); the table cannot tell it from the first of
+ * two counted completions, so the caller frees the slot with
+ * vsr_io_slots_free. A FREE slot is left alone. */
 void vsr_io_slots_consumed(struct vsr_io_slots *table, uint32_t index,
                            bool more);
 /* Frees the slot whatever it still expects (a record that was never

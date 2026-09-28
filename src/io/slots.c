@@ -14,8 +14,18 @@
 #define SLOT_INDEX_SHIFT 24
 #define SLOT_FIELD_MASK UINT32_C(0xFFFFFF)
 
-/* Fixed per-record counts of docs/io-implementation.md, "Slots". */
-#define SLOTS_PER_LINK 4u /* recv, send, shutdown, connect */
+/* Invariant checks in debug builds; a violation traps (see pool.c). */
+#ifdef NDEBUG
+#define SLOTS_ASSERT(condition) ((void)sizeof(condition))
+#else
+#define SLOTS_ASSERT(condition) ((condition) ? (void)0 : __builtin_trap())
+#endif
+
+/* Fixed per-record counts of docs/io-implementation.md, "Slots". A link
+ * holds a receive, a shutdown, a connect and up to VSR_IO_LINK_SENDS (4,
+ * src/io/link.h, a level above) sends, each until its NOTIF. */
+#define SLOTS_LINK_SENDS 4u
+#define SLOTS_PER_LINK (3u + SLOTS_LINK_SENDS)
 #define SLOTS_STREAM_EXTRA 2u
 #define SLOTS_REPLICA_EXTRA 8u
 #define SLOTS_SPARE 8u
@@ -45,6 +55,8 @@ int vsr_io_slots_size(const struct vsr_io_limits *limits, uint32_t listeners,
 void vsr_io_slots_init(struct vsr_io_slots *table, void *memory, uint32_t count,
                        uint8_t owner)
 {
+    /* A larger table would alias index bits in user_data. */
+    SLOTS_ASSERT(count <= VSR_IO_SLOTS_MAX);
     table->slots = memory;
     table->count = count;
     table->free_head = count > 0 ? 0 : SLOT_NONE;
@@ -72,6 +84,8 @@ uint32_t vsr_io_slots_alloc(struct vsr_io_slots *table, uint8_t kind,
     uint32_t index = table->free_head;
     struct vsr_io_slot *slot;
 
+    /* A FREE kind would drop the slot from the free list for good. */
+    SLOTS_ASSERT(kind != VSR_IO_SLOT_FREE);
     if (index == SLOT_NONE) {
         return SLOT_NONE;
     }
