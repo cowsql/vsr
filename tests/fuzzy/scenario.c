@@ -219,8 +219,9 @@ static void observe(struct simulation *s)
                 current.state == VSR_STATE_WARMING)
                 continue;
             s->unrecovered[i] = false;
-            /* Recovery, durable or from a quorum, must not forget commitment
-             * this member had already acknowledged as durable/replicated. */
+            /* A durable restart restores the persisted commitment; quorum
+             * recovery restores at least what f + 1 other members knew
+             * committed at the crash (see quorum_known). */
             if (group_member(&s->known, i + 1) != NULL &&
                 current.state != VSR_STATE_RETIRED)
                 CHECK(current.committed >= s->floor[i]);
@@ -472,6 +473,42 @@ static void restart(struct simulation *s, uint32_t index)
     record(s, "restart", index, s->incarnation[index]);
 }
 
+/* Commitment a replicated-mode restart of this member must not lose. Nothing
+ * local survives such a restart: quorum recovery installs the highest-view
+ * primary's history, whose commitment is the maximum a view-change or recovery
+ * quorum knows (protocol.md "Preparation and view change", "Restart and
+ * persistence"). A position only this member had learned committed (a primary
+ * commits first; a backup learns from a COMMIT the others may not have
+ * received) can lie outside every later quorum: the entries survive in the
+ * selected history and are re-proposed and re-committed in the next view, but
+ * the counter restarts below the pre-crash value. Every quorum intersects any
+ * f + 1 members, so the floor is the highest position that at least f + 1
+ * other members of the known group, alive and recovered, report committed.
+ * mem_cluster_check separately keeps the committed entries of every
+ * incarnation and compares them across nodes. */
+static uint64_t quorum_known(struct simulation *s, uint32_t index)
+{
+    uint64_t values[MAX_NODES];
+    uint32_t count = 0;
+    uint32_t needed = s->known.faults + 1;
+    for (uint32_t i = 0; i < s->count; ++i) {
+        if (i == index || !alive(s, i) || s->unrecovered[i] ||
+            group_member(&s->known, i + 1) == NULL)
+            continue;
+        values[count++] = state(s->nodes[i]).committed;
+    }
+    if (count < needed)
+        return 0;
+    /* Sort descending; the needed-th highest is known by needed members. */
+    for (uint32_t i = 1; i < count; ++i)
+        for (uint32_t j = i; j > 0 && values[j - 1] < values[j]; --j) {
+            uint64_t swap = values[j - 1];
+            values[j - 1] = values[j];
+            values[j] = swap;
+        }
+    return values[needed - 1];
+}
+
 static void crash(struct simulation *s, uint32_t index)
 {
     struct mem_node *node = s->nodes[index];
@@ -483,7 +520,7 @@ static void crash(struct simulation *s, uint32_t index)
         if (durable != NULL)
             floor = durable->hard.committed;
     } else if (!s->unrecovered[index]) {
-        floor = state(node).committed;
+        floor = quorum_known(s, index);
     }
     if (floor > s->floor[index])
         s->floor[index] = floor;
