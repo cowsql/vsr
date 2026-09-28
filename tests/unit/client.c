@@ -1181,6 +1181,7 @@ static void independent_lanes(void)
 struct model {
     bool open;
     bool outstanding;
+    bool stale; /* FAILED with STALE_REQUEST: begin is EINVAL until close. */
     struct vsr_request request; /* The first attempt of the pending one. */
     uint64_t last_number;
     uint64_t last_epoch;
@@ -1272,6 +1273,10 @@ static void check_outcome(struct world *w, uint32_t lane,
     case VSR_CLIENT_FAILED:
         CHECK(m->outstanding);
         m->outstanding = false;
+        if (o->action == VSR_CLIENT_FAILED &&
+            o->status == VSR_REPLY_STALE_REQUEST) {
+            m->stale = true;
+        }
         break;
     case VSR_CLIENT_WAIT:
         CHECK(m->outstanding && o->deadline_ns >= w->now);
@@ -1403,6 +1408,9 @@ static void deliver(struct world *w, uint32_t lane, const struct vsr_reply *r)
         CHECK(o.status == r->status);
         CHECK(r->status == VSR_REPLY_INVALID || r->status == VSR_REPLY_LIMIT ||
               r->status == VSR_REPLY_STALE_REQUEST);
+        if (r->status == VSR_REPLY_STALE_REQUEST) {
+            m->stale = true;
+        }
         break;
     case VSR_CLIENT_WAIT: {
         uint64_t delay = BACKOFF;
@@ -1571,6 +1579,7 @@ static void random_resolve(struct world *w, uint32_t lane)
     } else if (o.action == VSR_CLIENT_FAILED) {
         CHECK(q.request.number > m->request.id.number);
         CHECK(o.status == VSR_REPLY_STALE_REQUEST);
+        m->stale = true;
     } else {
         CHECK(o.action == VSR_CLIENT_IGNORE);
         CHECK(lane_status(c, lane).state == VSR_CLIENT_LANE_DETACHED);
@@ -1661,6 +1670,10 @@ static void random_step(struct world *w)
                                           w->now, &a);
             if (m->outstanding) {
                 CHECK(result == VSR_EBUSY);
+                break;
+            }
+            if (m->stale) {
+                CHECK(result == VSR_EINVAL);
                 break;
             }
             CHECK(result == VSR_OK && a.attempt == 1 && a.lane == lane);
@@ -1814,6 +1827,37 @@ static void stale_new_epoch(void)
  * vsr.h accepts, UINT64_MAX - 1; after it next_number reads UINT64_MAX and
  * begin is ELIMIT, changing nothing. The exhausted counter survives export
  * and import, with or without the last request pending. */
+/* Decision 64: after FAILED with STALE_REQUEST the outcome is unknown, so
+ * the lane refuses begin until closed; a fresh incarnation starts clean. */
+static void stale_request_lane(void)
+{
+    struct fixture f;
+    struct vsr_client_outcome o;
+    struct vsr_client_attempt a;
+    setup(&f, 3, 3);
+    struct vsr_client *c = f.client;
+    uint32_t lane = open_lane(c, 1, 5);
+    a = begin(c, lane, 0);
+    struct vsr_reply r = answer(&a, VSR_REPLY_STALE_REQUEST);
+    CHECK(reply(c, lane, &r, 1, &o) == VSR_CLIENT_FAILED);
+    CHECK(o.status == VSR_REPLY_STALE_REQUEST);
+    CHECK(lane_status(c, lane).state == VSR_CLIENT_LANE_IDLE);
+    CHECK(vsr_client_begin(c, lane, 0, &empty_command, 2, &a) == VSR_EINVAL);
+    CHECK(vsr_client_begin(c, lane, 0, &empty_command, 3, &a) == VSR_EINVAL);
+    CHECK(vsr_client_close(c, lane) == VSR_OK);
+    uint32_t fresh = open_lane(c, 2, 1);
+    a = begin(c, fresh, 4);
+    CHECK(a.request.id.number == 1);
+    r = answer(&a, VSR_REPLY_OK);
+    CHECK(reply(c, fresh, &r, 5, &o) == VSR_CLIENT_DONE);
+    /* The same lane index reopened with another incarnation is clean too. */
+    CHECK(vsr_client_close(c, fresh) == VSR_OK);
+    uint32_t again = open_lane(c, 3, 9);
+    a = begin(c, again, 6);
+    CHECK(a.request.id.number == 9);
+    teardown(&f);
+}
+
 static void counter_limits(void)
 {
     struct fixture f;
@@ -2157,6 +2201,7 @@ int main(int argc, char **argv)
     independent_lanes();
     stale_new_epoch();
     counter_limits();
+    stale_request_lane();
     image_checksum();
     image_rejections();
     for (uint64_t i = 0; i < 8; i++) {

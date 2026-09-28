@@ -166,7 +166,10 @@ enum vsr_client_action {
     VSR_CLIENT_FAILED  /* Terminal: status names the reply status. The lane
                           is IDLE again. After INVALID or LIMIT the request
                           will never execute; after STALE_REQUEST it will
-                          not execute again, but it may have executed. */
+                          not execute again, but it may have executed, so
+                          the caller must not resubmit it, and the lane
+                          refuses vsr_client_begin with EINVAL until it is
+                          closed and a fresh incarnation opened. */
 };
 
 struct vsr_client_outcome {

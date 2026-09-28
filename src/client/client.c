@@ -34,6 +34,8 @@ struct client_lane {
     uint32_t state;
     uint32_t attempts;
     uint32_t busy_streak;
+    uint32_t stale; /* 1 after FAILED with STALE_REQUEST: begin refused
+                       until the lane is closed (decision 64). */
 };
 
 struct vsr_client {
@@ -441,6 +443,9 @@ static void finish(struct vsr_client *client, uint32_t index, uint32_t action,
     lane->type = 0;
     lane->attempts = 0;
     lane->busy_streak = 0;
+    if (action == VSR_CLIENT_FAILED && status == VSR_REPLY_STALE_REQUEST) {
+        lane->stale = 1;
+    }
     ignore(outcome, index);
     outcome->action = action;
     outcome->status = status;
@@ -483,6 +488,9 @@ int vsr_client_begin(struct vsr_client *client, uint32_t lane, uint32_t type,
     }
     if (slot->state != VSR_CLIENT_LANE_IDLE) {
         return VSR_EBUSY;
+    }
+    if (slot->stale != 0) {
+        return VSR_EINVAL; /* Outcome unknown: close and open a fresh one. */
     }
     if (check_body(client, slot, type, body) != VSR_OK) {
         return VSR_EINVAL;
