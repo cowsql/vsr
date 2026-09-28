@@ -71,6 +71,8 @@ indexed storage and checkpoints, independently of the in-memory cache.
 - [Protocol contract](docs/protocol.md): quorums, message validation, recovery,
   reads, and membership transitions.
 - [Adapter reference](docs/vsr-api.md): driving, storage, snapshots, and failures.
+- [I/O layer design](docs/io-design.md): the io_uring host, its executor seam,
+  store, streams, client model, and the decision log behind them.
 - [Implementation status](docs/implementation.md): test layers, campaigns, and
   coverage of the validation matrix; [changes](docs/changes.md) lists every
   contract refinement since the review baseline.
