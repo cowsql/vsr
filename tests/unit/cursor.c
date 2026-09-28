@@ -73,6 +73,27 @@ static uint32_t piece_of(const struct layout *layout, size_t k)
     return 0;
 }
 
+/* The cursor's own invariant: piece and offset name the position, and a
+ * piece holding the next byte whenever one remains. */
+static void check_settled(const struct vsr_io_cursor *cursor,
+                          const struct layout *layout)
+{
+    const struct vsr_io_piece *piece;
+
+    CHECK(cursor->pieces == layout->pieces);
+    CHECK(cursor->count == layout->count);
+    CHECK(cursor->length == layout->length);
+    CHECK(cursor->position <= cursor->length);
+    CHECK(cursor->piece < cursor->count);
+    piece = &layout->pieces[cursor->piece];
+    CHECK(layout->start[cursor->piece] + cursor->offset == cursor->position);
+    if (cursor->position < cursor->length) {
+        CHECK(cursor->offset < piece->length);
+    } else {
+        CHECK(cursor->offset <= piece->length);
+    }
+}
+
 static void open_at(struct vsr_io_cursor *cursor, const struct layout *layout,
                     size_t position)
 {
@@ -82,12 +103,14 @@ static void open_at(struct vsr_io_cursor *cursor, const struct layout *layout,
     CHECK(vsr_io_cursor_skip(cursor, position));
     CHECK(cursor->position == position);
     CHECK(vsr_io_cursor_remaining(cursor) == layout->length - position);
+    check_settled(cursor, layout);
 }
 
 static bool same_cursor(const struct vsr_io_cursor *a,
                         const struct vsr_io_cursor *b)
 {
-    return a->pieces == b->pieces && a->count == b->count &&
+    return a->pieces == b->pieces && a->one.base == b->one.base &&
+           a->one.length == b->one.length && a->count == b->count &&
            a->piece == b->piece && a->offset == b->offset &&
            a->position == b->position && a->length == b->length;
 }
@@ -112,6 +135,7 @@ static void check_refusals(const struct vsr_io_cursor *cursor)
     uint32_t crc = 0x1234u;
     uint64_t u64 = 7;
     uint32_t u32 = 7;
+    uint16_t u16 = 7;
     int32_t i32 = 7;
 
     memset(out, 0x5A, sizeof(out));
@@ -124,6 +148,10 @@ static void check_refusals(const struct vsr_io_cursor *cursor)
     CHECK(vsr_io_cursor_span(&copy, SIZE_MAX, &contiguous) == NULL);
     CHECK(!vsr_io_cursor_crc(&copy, remaining + 1, &crc));
     CHECK(crc == 0x1234u);
+    if (remaining < 2) {
+        CHECK(!vsr_io_cursor_u16(&copy, &u16));
+        CHECK(u16 == 7);
+    }
     if (remaining < 4) {
         CHECK(!vsr_io_cursor_u32(&copy, &u32));
         CHECK(!vsr_io_cursor_i32(&copy, &i32));
@@ -188,11 +216,18 @@ static void check_reads(const struct layout *layout)
 
     /* Fixed-width little-endian reads starting at every position. */
     for (size_t k = 0; k <= length; ++k) {
+        uint16_t u16;
         uint32_t u32;
         uint64_t u64;
         int32_t i32;
 
         open_at(&cursor, layout, k);
+        if (length - k >= 2) {
+            CHECK(vsr_io_cursor_u16(&cursor, &u16));
+            CHECK(u16 == (uint16_t)little_endian(k, 2));
+            CHECK(cursor.position == k + 2);
+            open_at(&cursor, layout, k);
+        }
         if (length - k >= 4) {
             uint32_t expect = (uint32_t)little_endian(k, 4);
 
@@ -378,6 +413,21 @@ static void test_one_piece(void)
     check_refusals(&cursor);
 }
 
+/* u16 at the extremes, unaligned in the buffer: no sign extension of the
+ * high byte, no dependence on the host's byte order. */
+static void test_u16(void)
+{
+    static const unsigned char bytes[] = {0x00, 0xFF, 0xFF, 0x00, 0x80, 0x01};
+    struct vsr_io_cursor cursor;
+    uint16_t value;
+
+    vsr_io_cursor_init_one(&cursor, bytes + 1, sizeof(bytes) - 1);
+    CHECK(vsr_io_cursor_u16(&cursor, &value) && value == 0xFFFFu);
+    CHECK(vsr_io_cursor_u16(&cursor, &value) && value == 0x8000u);
+    CHECK(!vsr_io_cursor_u16(&cursor, &value) && value == 0x8000u);
+    CHECK(vsr_io_cursor_remaining(&cursor) == 1);
+}
+
 /* Sign handling of i32 at the extremes. */
 static void test_signed(void)
 {
@@ -398,6 +448,251 @@ static void test_signed(void)
     CHECK(!vsr_io_cursor_i32(&cursor, &value) && value == -2);
 }
 
+/* Every four-piece split of the short lengths, empty pieces anywhere
+ * (reads crossing three boundaries), and the empty sequence in every piece
+ * count, which test_splits does not reach. */
+static void test_four_pieces(void)
+{
+    size_t cuts[VSR_IO_CURSOR_PIECES - 1] = {0};
+
+    for (uint32_t count = 1; count <= VSR_IO_CURSOR_PIECES; ++count) {
+        check_layout(0, cuts, count, true);
+    }
+    for (size_t length = 1; length <= 12; ++length) {
+        for (size_t a = 0; a <= length; ++a) {
+            for (size_t b = a; b <= length; ++b) {
+                for (size_t c = b; c <= length; ++c) {
+                    cuts[0] = a;
+                    cuts[1] = b;
+                    cuts[2] = c;
+                    check_layout(length, cuts, 4, true);
+                }
+            }
+        }
+    }
+}
+
+/* Deterministic xorshift64: every run replays the same sequences. The left
+ * shifts drop the bits they would shift out first, so that nothing wraps
+ * under -fsanitize=integer. */
+static uint64_t random_state = 0x2545F4914F6CDD1Du;
+
+static size_t random_below(size_t bound)
+{
+    random_state ^= (random_state & (UINT64_MAX >> 13)) << 13;
+    random_state ^= random_state >> 7;
+    random_state ^= (random_state & (UINT64_MAX >> 17)) << 17;
+    return (size_t)(random_state >> 32) % bound;
+}
+
+/* One to four pieces of a random length, cut anywhere; an empty piece
+ * sometimes keeps a base, which the cursor must tolerate as well. */
+static void random_layout(struct layout *layout)
+{
+    size_t length = random_below(MAX_BYTES + 1);
+    uint32_t count = 1u + (uint32_t)random_below(VSR_IO_CURSOR_PIECES);
+    size_t cuts[VSR_IO_CURSOR_PIECES - 1] = {0};
+
+    if (random_below(2) == 0) {
+        length = random_below(17); /* Dense boundaries. */
+    }
+    for (uint32_t i = 0; i + 1 < count; ++i) {
+        size_t cut = random_below(length + 1);
+        uint32_t j = i;
+
+        for (; j > 0 && cuts[j - 1] > cut; --j) {
+            cuts[j] = cuts[j - 1];
+        }
+        cuts[j] = cut;
+    }
+    make_layout(layout, length, cuts, count);
+    layout->full = false;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (layout->pieces[i].length == 0 && random_below(2) == 0) {
+            layout->pieces[i].base = buffers[i];
+        }
+    }
+}
+
+/* Random sequences of every accessor over random layouts, against the flat
+ * sequence: values, position, contiguity, the settled invariant after every
+ * call, an unchanged cursor after every refusal, peek and checksum, and a span
+ * that leaves the cursor exactly where a read of the same size does. */
+static void test_mixed(void)
+{
+    for (unsigned round = 0; round < 20000; ++round) {
+        struct layout layout;
+        struct vsr_io_cursor cursor;
+
+        random_layout(&layout);
+        open_at(&cursor, &layout, 0);
+        for (unsigned step = 0; step < 24; ++step) {
+            struct vsr_io_cursor before = cursor;
+            struct vsr_io_cursor copy = cursor;
+            size_t k = cursor.position;
+            size_t remaining = layout.length - k;
+            size_t size = random_below(remaining + 3);
+            unsigned char out[MAX_BYTES + 2];
+            size_t need = size;
+            size_t advance = size;
+            bool ok = false;
+
+            switch (random_below(10)) {
+            case 0:
+                ok = vsr_io_cursor_read(&cursor, out, size);
+                CHECK(!ok || memcmp(out, data + k, size) == 0);
+                break;
+            case 1:
+                advance = 0;
+                ok = vsr_io_cursor_peek(&cursor, out, size);
+                CHECK(!ok || memcmp(out, data + k, size) == 0);
+                break;
+            case 2:
+                ok = vsr_io_cursor_skip(&cursor, size);
+                break;
+            case 3: {
+                size_t alignment = (size_t)1 << random_below(7);
+
+                need = (k + alignment - 1) / alignment * alignment - k;
+                advance = need;
+                ok = vsr_io_cursor_align(&cursor, alignment);
+                break;
+            }
+            case 4: {
+                bool contiguous = random_below(2) == 0;
+                bool was = contiguous;
+                const unsigned char *address =
+                    vsr_io_cursor_span(&cursor, size, &contiguous);
+
+                ok = address != NULL;
+                if (!ok) {
+                    CHECK(contiguous == was);
+                    break;
+                }
+                CHECK(vsr_io_cursor_read(&copy, out, size));
+                CHECK(memcmp(out, data + k, size) == 0);
+                CHECK(same_cursor(&copy, &cursor));
+                if (size == 0) {
+                    CHECK(contiguous);
+                    break;
+                }
+                {
+                    uint32_t first = piece_of(&layout, k);
+
+                    CHECK(contiguous ==
+                          (first == piece_of(&layout, k + size - 1)));
+                    CHECK(address == layout.pieces[first].base +
+                                         (k - layout.start[first]));
+                    CHECK(!contiguous || memcmp(address, data + k, size) == 0);
+                }
+                break;
+            }
+            case 5: {
+                uint32_t crc = (uint32_t)random_below(SIZE_MAX);
+                uint32_t seed = crc;
+
+                advance = 0;
+                ok = vsr_io_cursor_crc(&cursor, size, &crc);
+                CHECK(crc == (ok ? vsr_io_crc32c(seed, data + k, size) : seed));
+                break;
+            }
+            case 6: {
+                uint32_t value = 7;
+
+                need = advance = 4;
+                ok = vsr_io_cursor_u32(&cursor, &value);
+                CHECK(value == (ok ? (uint32_t)little_endian(k, 4) : 7));
+                break;
+            }
+            case 7: {
+                int32_t value = 7;
+
+                need = advance = 4;
+                ok = vsr_io_cursor_i32(&cursor, &value);
+                CHECK(ok ? (uint32_t)value == (uint32_t)little_endian(k, 4)
+                         : value == 7);
+                break;
+            }
+            case 8: {
+                uint16_t value = 7;
+
+                need = advance = 2;
+                ok = vsr_io_cursor_u16(&cursor, &value);
+                CHECK(value == (ok ? (uint16_t)little_endian(k, 2) : 7));
+                break;
+            }
+            default: {
+                uint64_t value = 7;
+
+                need = advance = 8;
+                ok = vsr_io_cursor_u64(&cursor, &value);
+                CHECK(value == (ok ? little_endian(k, 8) : 7));
+                break;
+            }
+            }
+            CHECK(ok == (need <= remaining));
+            if (ok && advance > 0) {
+                CHECK(cursor.position == k + advance);
+            } else {
+                CHECK(same_cursor(&cursor, &before));
+            }
+            check_settled(&cursor, &layout);
+        }
+    }
+}
+
+/* Pieces adjacent in memory remain separate pieces: a span across their
+ * boundary is not contiguous, whatever the addresses. */
+static void test_adjacent_pieces(void)
+{
+    for (size_t cut = 1; cut < MAX_BYTES; ++cut) {
+        struct vsr_io_piece pieces[2] = {{data, cut},
+                                         {data + cut, MAX_BYTES - cut}};
+        struct vsr_io_cursor cursor;
+        bool contiguous = true;
+
+        vsr_io_cursor_init(&cursor, pieces, 2);
+        CHECK(vsr_io_cursor_skip(&cursor, cut - 1));
+        CHECK(vsr_io_cursor_span(&cursor, 2, &contiguous) == data + cut - 1);
+        CHECK(!contiguous);
+    }
+}
+
+static struct vsr_io_cursor opened_one(size_t position)
+{
+    struct vsr_io_cursor cursor;
+
+    vsr_io_cursor_init_one(&cursor, data, MAX_BYTES);
+    CHECK(vsr_io_cursor_skip(&cursor, position));
+    return cursor;
+}
+
+/* init_one at every (position, size): a cursor returned by value outlives
+ * the original (ASan catches a use after return), a const cursor peeks and
+ * checksums, and every span is contiguous and points into the buffer. */
+static void test_one_spans(void)
+{
+    for (size_t k = 0; k <= MAX_BYTES; ++k) {
+        for (size_t size = 0; size <= MAX_BYTES - k; ++size) {
+            struct vsr_io_cursor cursor = opened_one(k);
+            const struct vsr_io_cursor fixed = opened_one(k);
+            unsigned char out[MAX_BYTES];
+            bool contiguous = false;
+            uint32_t crc = 0;
+
+            CHECK(vsr_io_cursor_remaining(&fixed) == MAX_BYTES - k);
+            CHECK(vsr_io_cursor_peek(&fixed, out, size));
+            CHECK(memcmp(out, data + k, size) == 0);
+            CHECK(vsr_io_cursor_crc(&fixed, size, &crc));
+            CHECK(crc == vsr_io_crc32c(0, data + k, size));
+            CHECK(vsr_io_cursor_span(&cursor, size, &contiguous) == data + k);
+            CHECK(contiguous);
+            CHECK(cursor.position == k + size);
+            CHECK(cursor.piece == 0 && cursor.offset == k + size);
+        }
+    }
+}
+
 int main(void)
 {
     fill_data();
@@ -405,6 +700,11 @@ int main(void)
     test_empty_pieces();
     test_one_piece();
     test_signed();
+    test_u16();
+    test_four_pieces();
+    test_mixed();
+    test_adjacent_pieces();
+    test_one_spans();
     printf("cursor ok\n");
     return 0;
 }

@@ -70,9 +70,10 @@ bool vsr_io_cursor_align(struct vsr_io_cursor *cursor, size_t alignment);
  * one piece, returns its address and sets *contiguous; a decoder then keeps
  * that pointer as the span of a blob, with no copy. When it crosses a piece
  * boundary, returns the address of its first byte with *contiguous false:
- * the caller copies it out through a second cursor or rejects the input,
- * whichever the module's contract says. size 0 returns a non-NULL address
- * and contiguous. NULL means too few bytes remain, nothing moved.
+ * the caller copies it out through a copy of the cursor taken before the
+ * call, or rejects the input, whichever the module's contract says. size 0
+ * returns a non-NULL address and contiguous. NULL means too few bytes
+ * remain, nothing moved.
  */
 const void *vsr_io_cursor_span(struct vsr_io_cursor *cursor, size_t size,
                                bool *contiguous);
@@ -86,6 +87,7 @@ bool vsr_io_cursor_crc(const struct vsr_io_cursor *cursor, size_t size,
 /* Little-endian fixed-width reads through the cursor: a decoder reads every
  * wire header field with these, never through a struct cast, so unaligned
  * and cross-piece headers are legal. false: too few bytes, nothing moved. */
+bool vsr_io_cursor_u16(struct vsr_io_cursor *cursor, uint16_t *value);
 bool vsr_io_cursor_u32(struct vsr_io_cursor *cursor, uint32_t *value);
 bool vsr_io_cursor_u64(struct vsr_io_cursor *cursor, uint64_t *value);
 bool vsr_io_cursor_i32(struct vsr_io_cursor *cursor, int32_t *value);

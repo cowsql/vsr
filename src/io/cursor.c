@@ -179,6 +179,17 @@ bool vsr_io_cursor_crc(const struct vsr_io_cursor *cursor, size_t size,
     return true;
 }
 
+bool vsr_io_cursor_u16(struct vsr_io_cursor *cursor, uint16_t *value)
+{
+    unsigned char bytes[2];
+
+    if (!vsr_io_cursor_read(cursor, bytes, sizeof(bytes))) {
+        return false;
+    }
+    *value = (uint16_t)(bytes[0] | bytes[1] << 8);
+    return true;
+}
+
 bool vsr_io_cursor_u32(struct vsr_io_cursor *cursor, uint32_t *value)
 {
     unsigned char bytes[4];
