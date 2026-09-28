@@ -73,10 +73,19 @@ static struct vsr_io_slab_entry *entry(struct vsr_io_pool *pool, uint32_t id)
     return &pool->entries[id];
 }
 
+/* Provision keeps this many slabs FREE: the reserve plus the part of the
+ * caller's share the caller does not hold (decision 54). reserve < slabs
+ * and caller_slabs <= slabs <= 32768, so the sum cannot wrap. */
+static uint32_t provision_floor(const struct vsr_io_pool *pool)
+{
+    return pool->reserve + (pool->caller_slabs - pool->caller_taken);
+}
+
 static void update_pending(struct vsr_io_pool *pool)
 {
-    pool->pending =
-        pool->free_count > pool->reserve ? pool->free_count - pool->reserve : 0;
+    uint32_t floor = provision_floor(pool);
+
+    pool->pending = pool->free_count > floor ? pool->free_count - floor : 0;
 }
 
 static void free_push(struct vsr_io_pool *pool, uint32_t id)
@@ -84,10 +93,12 @@ static void free_push(struct vsr_io_pool *pool, uint32_t id)
     struct vsr_io_slab_entry *slab = entry(pool, id);
 
     POOL_ASSERT(slab->refs == 0);
+    /* The caller's reference goes through caller_release, which clears the
+     * flag and returns the share first. */
+    POOL_ASSERT(slab->caller == 0);
     POOL_ASSERT(pool->free_count + pool->kernel_count < pool->slabs);
     slab->state = VSR_IO_SLAB_FREE;
     slab->consumed = 0;
-    slab->caller = 0;
     slab->next = pool->free_head;
     pool->free_head = id;
     pool->free_count++;
@@ -115,15 +126,20 @@ void vsr_io_pool_init(struct vsr_io_pool *pool, void *base, size_t size,
 {
     size_t ring = 0;
     size_t total = 0;
-    bool sized = pool_bytes(limits->slabs, &ring, &total);
-    void *entries = (unsigned char *)memory + ring;
+    bool sized;
+    void *entries;
 
-    POOL_ASSERT(sized && total <= memory_size);
+    /* The slab range first: ring_entries never ends beyond 2^31 slabs. */
     POOL_ASSERT(limits->slabs > 0 && limits->slabs <= POOL_MAX_SLABS);
+    POOL_ASSERT(limits->slab_bytes > 0);
     POOL_ASSERT(reserve < limits->slabs);
+    POOL_ASSERT(limits->caller_slabs <= limits->slabs);
     POOL_ASSERT((size_t)limits->slabs * limits->slab_bytes <= size);
+    sized = pool_bytes(limits->slabs, &ring, &total);
+    POOL_ASSERT(sized && total <= memory_size);
     (void)sized;
     (void)size;
+    entries = (unsigned char *)memory + ring;
     memset(memory, 0, total);
     memset(pool, 0, sizeof(*pool));
     pool->base = base;
@@ -132,6 +148,8 @@ void vsr_io_pool_init(struct vsr_io_pool *pool, void *base, size_t size,
     pool->slabs = limits->slabs;
     pool->free_head = VSR_IO_INDEX_NONE;
     pool->reserve = reserve;
+    pool->caller_slabs = limits->caller_slabs;
+    pool->caller_taken = 0;
     pool->region_index = region_index;
     pool->group = group;
     pool->ring_entries = (uint16_t)ring_entries(limits->slabs);
@@ -161,7 +179,8 @@ uint32_t vsr_io_pool_acquire(struct vsr_io_pool *pool, bool caller)
     struct vsr_io_slab_entry *slab;
 
     if (pool->free_count == 0 ||
-        (caller && pool->free_count <= pool->reserve)) {
+        (caller && (pool->caller_taken == pool->caller_slabs ||
+                    pool->free_count <= pool->reserve))) {
         return VSR_IO_INDEX_NONE;
     }
     id = free_pop(pool);
@@ -169,6 +188,10 @@ uint32_t vsr_io_pool_acquire(struct vsr_io_pool *pool, bool caller)
     slab->state = VSR_IO_SLAB_HELD;
     slab->refs = 1;
     slab->caller = caller ? 1 : 0;
+    if (caller) {
+        pool->caller_taken++;
+        update_pending(pool);
+    }
     return id;
 }
 
@@ -192,6 +215,23 @@ void vsr_io_pool_release(struct vsr_io_pool *pool, uint32_t id)
     if (slab->refs == 0 && slab->state == VSR_IO_SLAB_HELD) {
         free_push(pool, id);
     }
+}
+
+bool vsr_io_pool_caller_release(struct vsr_io_pool *pool, uint32_t id)
+{
+    struct vsr_io_slab_entry *slab;
+
+    if (id >= pool->slabs || pool->entries[id].caller == 0) {
+        return false;
+    }
+    slab = entry(pool, id);
+    POOL_ASSERT(slab->state == VSR_IO_SLAB_HELD);
+    POOL_ASSERT(pool->caller_taken > 0);
+    slab->caller = 0;
+    pool->caller_taken--;
+    update_pending(pool);
+    vsr_io_pool_release(pool, id);
+    return true;
 }
 
 uint32_t vsr_io_pool_recv_begin(struct vsr_io_pool *pool, uint16_t buffer_id,
@@ -238,7 +278,7 @@ uint32_t vsr_io_pool_provide(struct vsr_io_pool *pool,
     if (!pool->ring_registered) {
         return 0;
     }
-    while (count < capacity && pool->free_count > pool->reserve) {
+    while (count < capacity && pool->free_count > provision_floor(pool)) {
         uint32_t id = free_pop(pool);
         struct vsr_io_slab_entry *slab = entry(pool, id);
 
@@ -278,5 +318,4 @@ void vsr_io_pool_ring_lost(struct vsr_io_pool *pool)
     }
     POOL_ASSERT(pool->kernel_count == 0);
     pool->ring_registered = false;
-    pool->starved = false;
 }
