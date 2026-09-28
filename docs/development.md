@@ -75,6 +75,9 @@ make benchmark             # tests/benchmark/core; use --disable-sanitize
 
 `make check-unit`, `make check-integration`, `make check-regression` and
 `make check-fuzzy` run one test layer. The examples run as part of `make check`.
+A seeded fault campaign is `./tests/fuzzy/cluster SEED 1 STEPS quiet PROFILE
+SEEDS` from the build directory; profiles, flags, and replay are described in
+the [test layout](../tests/README.md).
 
 Run `compile-commands` and `analyze` sequentially: both clean the build.
 Regenerate `compile_commands.json` after changing flags or adding files.
@@ -83,13 +86,14 @@ LLVM tools are located through Clang so Debian's versioned packages work;
 commands can be overridden, e.g. `make tidy CLANG_TIDY=clang-tidy-21`.
 Older Valgrind versions may need `CFLAGS='-O1 -g -gdwarf-4'`.
 
-In a separate build configured with `--enable-fuzzing`, run `make fuzz`;
-`FUZZ_RUNS` and `FUZZ_ARGS` can be set in the environment or on the command
-line. See [test layers and replay](../tests/README.md). In a build configured
-with `--enable-coverage`, run `make coverage` for fresh profiles, a terminal
-report, `coverage/html/index.html` and `coverage/coverage.lcov`. LLVM tools must
-match the compiler's major. Coverage measures `src/` across every test program
-run by `make check`; test sources and system headers are excluded.
+In a separate build configured with `--enable-fuzzing`, run `make fuzz`, which
+drives the `checked`, `validation`, and `cluster_fuzz` harnesses under
+`tests/fuzzy/`; `FUZZ_RUNS` and `FUZZ_ARGS` can be set in the environment or on
+the command line. See [test layers and replay](../tests/README.md). In a build
+configured with `--enable-coverage`, run `make coverage` for fresh profiles, a
+terminal report, `coverage/html/index.html` and `coverage/coverage.lcov`. LLVM
+tools must match the compiler's major. Coverage measures `src/` across every
+test program run by `make check`; test sources and system headers are excluded.
 
 CI runs Clang, GCC, sanitizers, lint, static analysis, Valgrind, fuzzing, coverage
 and `distcheck` on native runners. Generated Autotools files are ignored in Git
