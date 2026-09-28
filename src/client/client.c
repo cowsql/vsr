@@ -3,6 +3,7 @@
 #include "vsr-client.h"
 
 #include "checked.h"
+#include "io/crc32c.h"
 #include "objects.h"
 #include "validate.h"
 
@@ -486,8 +487,8 @@ int vsr_client_begin(struct vsr_client *client, uint32_t lane, uint32_t type,
     if (check_body(client, slot, type, body) != VSR_OK) {
         return VSR_EINVAL;
     }
-    if (slot->next_number >= UINT64_MAX - 1) {
-        return VSR_ELIMIT; /* The lane's counter is exhausted. */
+    if (slot->next_number == UINT64_MAX) {
+        return VSR_ELIMIT; /* UINT64_MAX - 1 was the last request number. */
     }
     slot->pending_number = slot->next_number++;
     slot->type = type;
@@ -623,7 +624,10 @@ int vsr_client_reply(struct vsr_client *client, uint32_t lane,
         }
         break;
     case VSR_REPLY_NEW_EPOCH:
-        if (!pending) {
+        /* A replica in the attempt's routing epoch never answers it with
+         * NEW_EPOCH: this one answered an earlier attempt, late or twice. */
+        if (!pending || (reply->membership != NULL &&
+                         reply->membership->epoch == slot->epoch)) {
             return VSR_OK;
         }
         apply(client, reply, &next);
@@ -917,11 +921,12 @@ uint64_t vsr_client_min_op(const struct vsr_client *client)
  *     0  u32 lane index
  *     4  u32 flags: 1 a request is pending
  *     8  u64 incarnation.hi, 16 u64 incarnation.lo
- *    24  u64 next_number, 32 u64 pending_number (zero unless pending)
+ *    24  u64 next_number (UINT64_MAX once the counter is exhausted)
+ *    32  u64 pending_number (zero unless pending)
  *    40  u32 pending type (zero unless pending), 44 u32 attempts
  *   member records, 16 bytes each, in ID order
  *     0  u64 id, 8 u32 role, 12 u32 zero
- *   trailer: u32 CRC-32C (Castagnoli) of every preceding byte.
+ *   trailer: u32 vsr_io_crc32c (Castagnoli) of every preceding byte.
  *
  * Pending bodies are the caller's and are not included. A version other
  * than this one is rejected, as is any size, checksum or field mismatch.
@@ -966,18 +971,6 @@ static uint64_t get64(const unsigned char *p)
         value |= (uint64_t)p[i] << (8 * i);
     }
     return value;
-}
-
-static uint32_t crc32c(const unsigned char *bytes, size_t size)
-{
-    uint32_t crc = UINT32_MAX;
-    for (size_t i = 0; i < size; i++) {
-        crc ^= (uint32_t)bytes[i];
-        for (unsigned bit = 0; bit < 8; bit++) {
-            crc = (crc >> 1) ^ ((crc & 1u) != 0 ? UINT32_C(0x82F63B78) : 0u);
-        }
-    }
-    return crc ^ UINT32_MAX;
 }
 
 static bool image_size(uint32_t lanes, uint32_t members, size_t *size)
@@ -1057,7 +1050,7 @@ int vsr_client_export(const struct vsr_client *client, void *bytes, size_t size,
         put32(p + 12, 0);
         p += IMAGE_MEMBER;
     }
-    put32(p, crc32c(bytes, needed - IMAGE_TRAILER));
+    put32(p, vsr_io_crc32c(0, bytes, needed - IMAGE_TRAILER));
     return VSR_OK;
 }
 
@@ -1087,7 +1080,8 @@ static int parse_header(const unsigned char *p, size_t size,
     image->member_count = get32(p + 12);
     if (!image_size(image->lane_count, image->member_count, &expected) ||
         expected != size || get64(p + 16) != (uint64_t)size ||
-        get32(p + size - IMAGE_TRAILER) != crc32c(p, size - IMAGE_TRAILER)) {
+        get32(p + size - IMAGE_TRAILER) !=
+            vsr_io_crc32c(0, p, size - IMAGE_TRAILER)) {
         return VSR_EINVAL;
     }
     image->epoch = get64(p + 24);
@@ -1116,9 +1110,6 @@ static int check_image_topology(const struct vsr_client *client,
           (uint64_t)image->faults * 2 + 1 > image->member_count))) {
         return VSR_EINVAL;
     }
-    if (image->member_count > client->options.members) {
-        return VSR_ELIMIT;
-    }
     uint64_t previous = 0;
     uint32_t full = 0;
     for (uint32_t i = 0; i < image->member_count; i++) {
@@ -1132,7 +1123,10 @@ static int check_image_topology(const struct vsr_client *client,
         previous = id;
         full += role == VSR_MEMBER_FULL ? 1u : 0u;
     }
-    return known && full <= image->faults ? VSR_EINVAL : VSR_OK;
+    if (known && full <= image->faults) {
+        return VSR_EINVAL;
+    }
+    return image->member_count > client->options.members ? VSR_ELIMIT : VSR_OK;
 }
 
 static int check_image_lanes(const struct vsr_client *client,
@@ -1150,7 +1144,7 @@ static int check_image_lanes(const struct vsr_client *client,
         uint32_t attempts = get32(p + 44);
         if ((i != 0 && index <= get32(p - IMAGE_LANE)) ||
             (flags & ~IMAGE_PENDING) != 0 || !vsr_id_present(incarnation) ||
-            next == 0 || next == UINT64_MAX) {
+            next == 0) {
             return VSR_EINVAL;
         }
         if (flags == IMAGE_PENDING
