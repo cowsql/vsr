@@ -1613,6 +1613,8 @@ static void random_restart(struct world *w)
     teardown(&w->fixture);
     w->fixture = next;
     for (uint32_t i = 0; i < RANDOM_LANES; i++) {
+        /* The stale mark is in-memory only: an imported lane is clean. */
+        w->lanes[i].stale = false;
         w->lanes[i].target = VSR_NO_REPLICA;
         if (w->lanes[i].outstanding) {
             CHECK(lane_status(next.client, i).state ==

@@ -169,7 +169,9 @@ enum vsr_client_action {
                           not execute again, but it may have executed, so
                           the caller must not resubmit it, and the lane
                           refuses vsr_client_begin with EINVAL until it is
-                          closed and a fresh incarnation opened. */
+                          closed and a fresh incarnation opened; the mark
+                          is in-memory only, an exported image does not
+                          carry it, so close such a lane before exporting. */
 };
 
 struct vsr_client_outcome {
