@@ -57,7 +57,7 @@ UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/
 UNIT_TESTS += tests/unit/descriptors tests/unit/layout
 UNIT_TESTS += tests/unit/crc32c tests/unit/cursor tests/unit/pool \
   tests/unit/slots tests/unit/deadline tests/unit/client \
-  tests/unit/uring_translate
+  tests/unit/uring_translate tests/unit/sim_world
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
@@ -113,6 +113,8 @@ tests_unit_client_SOURCES = tests/unit/client.c tests/lib/random.c tests/lib/ran
 tests_unit_client_LDADD = $(LIBVSR)
 tests_unit_uring_translate_SOURCES = tests/unit/uring_translate.c
 tests_unit_uring_translate_LDADD = $(LIBVSR)
+tests_unit_sim_world_SOURCES = tests/unit/sim_world.c
+tests_unit_sim_world_LDADD = $(LIBVSR)
 tests_integration_uring_smoke_SOURCES = tests/integration/uring_smoke.c
 tests_integration_uring_smoke_LDADD = $(LIBVSR)
 tests_integration_uring_smoke_CFLAGS = $(AM_CFLAGS) -pthread
