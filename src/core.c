@@ -790,7 +790,6 @@ static int admit_event(struct vsr *v, const struct vsr_event *event,
                 validation.failure_code = VSR_FAILURE_INVARIANT;
                 invalid_effect = true;
             }
-            unreserve_operation(v, operation);
         } else {
             bool inactive = terminal(v) || v->stopping;
             bool control = event->type == VSR_EVENT_MESSAGE;
@@ -930,22 +929,6 @@ int vsr_step_many(struct vsr *v, const struct vsr_event *events, uint32_t count,
             emit_output(v, update);
             budget--;
             continue;
-        }
-        if (!v->started && !v->protocol_quiesced) {
-            budget--;
-            int start = vsr_protocol_start(v);
-            if (start == VSR_OK) {
-                v->started = true;
-                continue;
-            }
-            if (start != VSR_AGAIN) {
-                vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
-            }
-            if (budget == 0) {
-                exhausted = true;
-                result = VSR_AGAIN;
-                break;
-            }
         }
         if (!blocked && update->consumed < count) {
             budget--;

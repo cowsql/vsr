@@ -50,7 +50,6 @@ enum anchor_state { ANCHOR_UNKNOWN, ANCHOR_RETAINED, ANCHOR_MISSING };
 
 struct round_peer {
     struct vsr_nonce reply_nonce;
-    uint64_t response_view;
     bool svc;
     bool dvc;
     bool recovered;
@@ -1818,7 +1817,6 @@ static void receive_recovery_response(struct vsr *v,
         return;
     }
     t->peers[sender].recovered = true;
-    t->peers[sender].response_view = message->view;
     if (response->state != NULL)
         consider_offer(v, message->from, response->state, lease,
                        VSR_INDEX_NONE);

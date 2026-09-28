@@ -36,13 +36,7 @@ void vsr_protocol_init(struct vsr *v, void *memory, size_t size)
     v->status.configuration = &mock->epoch;
     v->status.role = VSR_MEMBER_FULL;
     v->status.primary = v->options.replica;
-}
-
-int vsr_protocol_start(struct vsr *v)
-{
     v->status.state = VSR_STATE_NORMAL;
-    vsr_changed(v);
-    return VSR_OK;
 }
 
 int vsr_protocol_event(struct vsr *v, const struct vsr_event *event,

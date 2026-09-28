@@ -65,7 +65,6 @@ struct vsr {
     uint32_t release_last;
     uint32_t reserved_leases;
     bool time_set;
-    bool started;
     bool initialized;
     bool stopping;
     bool protocol_quiesced;
@@ -79,8 +78,7 @@ struct vsr {
 int vsr_protocol_size(const struct vsr_options *options, size_t *size,
                       size_t *alignment);
 void vsr_protocol_init(struct vsr *v, void *memory, size_t size);
-/* start/event return AGAIN only before retaining/mutating the submitted input. */
-int vsr_protocol_start(struct vsr *v);
+/* event returns AGAIN only before retaining/mutating the submitted input. */
 int vsr_protocol_event(struct vsr *v, const struct vsr_event *event,
                        uint32_t lease);
 /* The completed operation and completion lease remain alive during this call.

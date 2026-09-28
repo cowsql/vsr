@@ -144,6 +144,7 @@ void vsr_protocol_init(struct vsr *v, void *memory, size_t size)
     p->batch = (void *)(b + a.batch);
     p->results = (void *)(b + a.results);
     p->transaction_capacity = v->options.limits.operations + 1u;
+    p->boot = BOOT_LOAD;
     p->next_sequence = p->log_begin = p->readable_begin = p->log_end =
         p->written_end = p->stable_end = 1;
     p->results_lease = VSR_INDEX_NONE;
@@ -406,13 +407,6 @@ void vsr_protocol_normal(struct vsr *v)
         p->peers[p->self].prepared = p->stable_end - 1;
     vsr_extension_normal(v);
     vsr_changed(v);
-}
-
-int vsr_protocol_start(struct vsr *v)
-{
-    struct vsr_protocol *p = vsr_protocol(v);
-    p->boot = BOOT_LOAD;
-    return VSR_OK;
 }
 
 static bool boot_poll(struct vsr *v)
