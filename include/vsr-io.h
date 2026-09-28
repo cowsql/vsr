@@ -324,7 +324,8 @@ struct vsr_io_replica;
 struct vsr_io_op;
 struct vsr_io_event;
 
-/* Positive fixed capacities. Memory is sized from them, never grown. */
+/* Fixed capacities, positive except caller_slabs. Memory is sized from them,
+ * never grown. */
 struct vsr_io_limits {
     uint32_t replicas;       /* Groups attachable to this engine. */
     uint32_t nodes;          /* Node table entries. */
@@ -338,6 +339,7 @@ struct vsr_io_limits {
     uint32_t batch;          /* Records per vsr_io_prepare. */
     uint32_t slabs;          /* Payload pool: slab count... */
     uint32_t slab_bytes;     /* ...and size, a multiple of the page size. */
+    uint32_t caller_slabs;   /* Slabs kept for vsr_io_slab_acquire; 0: none. */
     uint32_t file_slots; /* Registered file slots reserved for the engine. */
     uint32_t buffer_regions; /* Registered regions reserved for the engine. */
 };
@@ -350,9 +352,10 @@ struct vsr_io_limits {
  * plus two blocks of alignment, so a frame fits one slab, a straddling
  * frame is copied into a fresh one, and a cold LOAD reads its records into
  * one slab. slabs must be at least links + streams * (stream_window + 1) +
- * 2 * replicas + 4: every established link holds one slab for its frame
- * headers, streams hold their windows, and each replica needs one for cold
- * loads and one for capture staging, beyond what receives consume.
+ * 2 * replicas + 4 + caller_slabs: beyond what receives consume, every
+ * established link holds one slab for its frame headers, streams hold their
+ * windows, each replica needs one for cold loads and one for capture
+ * staging, and the caller's share stays out of the ring.
  * file_slots covers the listeners, every link, one per stream (the file a
  * served stream reads), and per replica the log plus one transient
  * clients file. buffer_regions covers one region for the payload pool plus
@@ -746,7 +749,13 @@ struct vsr_io_stream_write {
  * without FIXED_BUFFER, which pins the pages per send, when its bytes reach
  * zero_copy_bytes, and plain VECTORED SEND (kernel copy) below. Release a
  * slab only when no lease, op, or record of the caller still covers it.
- * acquire returns OK, ELIMIT when the pool is exhausted, or EINVAL.
+ * The caller holds at most limits.caller_slabs slabs at once, and the
+ * engine never hands the part of that share the caller does not hold to
+ * the kernel, which returns a provided slab only once it has filled it.
+ * acquire returns OK, ELIMIT once the caller holds caller_slabs slabs or
+ * the free slabs are down to the engine's reserve of replicas + 1 (its own
+ * cold loads, reassembly and staging may use the share meanwhile), or
+ * EINVAL.
  * ---------------------------------------------------------------------- */
 
 struct vsr_io_slab {

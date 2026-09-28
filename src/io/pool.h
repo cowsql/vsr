@@ -25,8 +25,11 @@
  * A KERNEL slab with incremental consumption also carries refs for the
  * frames already delivered from it; it becomes FREE only when the kernel
  * has left it AND refs are zero. A slab returns to the ring only from FREE,
- * and only while the free count exceeds the reserve, so that cold loads,
- * reassembly and staging can always obtain one eventually.
+ * and only while the free count exceeds the provision floor, reserve +
+ * caller_slabs - caller_taken (decision 54): the reserve lets cold loads,
+ * reassembly and staging always obtain one eventually, and the caller's
+ * untaken share stays FREE because the kernel returns a provided slab only
+ * once it has filled it.
  *
  * Ids are the provided-buffer ids (0..slabs-1) and double as slab indexes;
  * the pool region is registered as ONE region with the executor, so a
@@ -57,15 +60,18 @@ struct vsr_io_pool {
     uint32_t free_count;
     uint32_t kernel_count; /* Slabs currently in the ring. */
     uint32_t reserve;      /* Free slabs never provided. */
-    uint32_t pending;      /* FREE slabs above the reserve: what the next
-                              prepare provides. */
+    uint32_t caller_slabs; /* The caller's share (vsr_io_limits). */
+    uint32_t caller_taken; /* Slabs the caller holds, <= caller_slabs. */
+    uint32_t pending;      /* FREE slabs above the provision floor: what the
+                              next prepare provides. */
     uint32_t region_index; /* Executor buffer region of the pool. */
     uint16_t group;        /* Buffer group of the ring. */
     uint16_t ring_entries; /* Power of two >= slabs. */
     bool ring_registered;  /* Set by the engine once buffer_ring succeeded,
                               cleared by ring_lost; provide hands out
                               nothing while clear. */
-    bool starved;          /* A RECV ended with -ENOBUFS; see was_starved. */
+    bool starved;          /* A RECV ended with -ENOBUFS that was_starved
+                              has not reported yet. */
     struct vsr_io_slab_entry *entries; /* [slabs] */
     void *ring_memory;                 /* Provided-ring memory, page aligned:
                                            16 bytes per entry. */
@@ -81,7 +87,8 @@ struct vsr_io_pool {
 int vsr_io_pool_size(const struct vsr_io_limits *limits, size_t page_bytes,
                      size_t *bytes, size_t *alignment);
 /* base/size is the payload region; memory the bookkeeping region. reserve
- * slabs are never provided. Every slab starts FREE. */
+ * slabs are never provided, nor the caller's share of limits->caller_slabs
+ * while the caller does not hold it. Every slab starts FREE. */
 void vsr_io_pool_init(struct vsr_io_pool *pool, void *base, size_t size,
                       const struct vsr_io_limits *limits, uint32_t reserve,
                       uint32_t region_index, uint16_t group, void *memory,
@@ -95,24 +102,33 @@ static inline unsigned char *vsr_io_pool_slab(const struct vsr_io_pool *pool,
 
 /* Slab index of a pointer inside the pool, or INDEX_NONE. */
 uint32_t vsr_io_pool_locate(const struct vsr_io_pool *pool, const void *ptr);
+/* Compared as integers: ptr is usually outside the pool (tail buffers, the
+ * core arena, caller memory), where relational pointer comparison is
+ * undefined. */
 static inline bool vsr_io_pool_contains(const struct vsr_io_pool *pool,
                                         const void *ptr, size_t length)
 {
-    const unsigned char *p = ptr;
-    return p >= pool->base && length <= pool->size &&
-           p <= pool->base + pool->size - length;
+    uintptr_t p = (uintptr_t)ptr;
+    uintptr_t base = (uintptr_t)pool->base;
+
+    return p >= base && length <= pool->size && p - base <= pool->size - length;
 }
 
 /* Takes a FREE slab as HELD with one reference; INDEX_NONE when none is
  * free. `caller` marks a slab taken through vsr_io_slab_acquire, which never
- * takes the reserve: INDEX_NONE (ELIMIT) once free_count <= reserve, while
- * internal users (cold loads, reassembly, staging) may take the reserve.
- * The engine clears `caller` when the caller releases the slab. */
+ * takes the reserve nor more than the share: INDEX_NONE (ELIMIT) once
+ * caller_taken == caller_slabs or free_count <= reserve, while internal
+ * users (cold loads, reassembly, staging) may take every FREE slab. */
 uint32_t vsr_io_pool_acquire(struct vsr_io_pool *pool, bool caller);
 void vsr_io_pool_retain(struct vsr_io_pool *pool, uint32_t id);
 /* Drops one reference; a slab reaching zero outside the ring becomes FREE
- * and is queued for provision. */
+ * and is queued for provision. Never the caller's own reference. */
 void vsr_io_pool_release(struct vsr_io_pool *pool, uint32_t id);
+/* The caller's release (vsr_io_slab_release): false, changing nothing,
+ * unless id names a slab the caller holds; else clears `caller`, returns
+ * the share, and drops the caller's reference. Holders that retained the
+ * slab (a send in flight) keep it HELD until they release it. */
+bool vsr_io_pool_caller_release(struct vsr_io_pool *pool, uint32_t id);
 
 /*
  * Receive bookkeeping. A RECV completion with BUFFER set names buffer_id
@@ -128,9 +144,10 @@ void vsr_io_pool_recv_end(struct vsr_io_pool *pool, uint16_t buffer_id);
 
 /*
  * Provision planning for vsr_io_prepare: fills up to capacity buffers to
- * hand to the executor's provide(), moving them FREE -> KERNEL, respecting
- * the reserve. `starved` reports that a RECV completed with -ENOBUFS since
- * the last call, so the link module re-arms receives after providing.
+ * hand to the executor's provide(), moving them FREE -> KERNEL, never below
+ * the provision floor and nothing while the ring is not registered.
+ * `starved` records that a RECV completed with -ENOBUFS, so the link module
+ * re-arms receives once the ring holds a buffer again.
  */
 uint32_t vsr_io_pool_provide(struct vsr_io_pool *pool,
                              struct vsr_io_buffer *buffers, uint32_t capacity);
@@ -138,7 +155,9 @@ void vsr_io_pool_starved(struct vsr_io_pool *pool);
 /* True once per starvation, as soon as the ring holds a buffer again; it
  * clears the flag then, so receives are not re-armed into an empty ring. */
 bool vsr_io_pool_was_starved(struct vsr_io_pool *pool);
-/* Ring torn down (close or crash): every KERNEL slab is back to the pool. */
+/* Ring torn down (close or crash): every KERNEL slab is back to the pool.
+ * Starvation is kept: a receive that ended with -ENOBUFS is still to be
+ * re-armed if a ring is registered and provided again. */
 void vsr_io_pool_ring_lost(struct vsr_io_pool *pool);
 
 #endif /* VSR_IO_POOL_H */

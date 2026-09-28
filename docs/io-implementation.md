@@ -114,7 +114,7 @@ with `VSR_ELIMIT`:
 | Slots | `vsr_io_slots_size`: `listeners + 4 * links + streams * (stream_window + 2) + replicas * (inflight_writes + 8) + 8` | `slots.c` |
 | Deadlines | `links + nodes + 4 * replicas + streams` | `engine.c` |
 | Pool reserve | `replicas + 1` slabs never provided to the kernel | `pool.c` |
-| Minimum slabs | `links + streams * (stream_window + 1) + 2 * replicas + 4` | `vsr-io.h` |
+| Minimum slabs | `links + streams * (stream_window + 1) + 2 * replicas + 4 + caller_slabs` | `vsr-io.h`, decision 54 |
 | Send queue | `link_queue` entries per node | `link.c`, decision 38 |
 | Versions table | `max_entries` | `store.c` |
 | Client table | next power of two `>= 2 * max_clients` buckets | `store.c` |
@@ -185,15 +185,24 @@ the pool records what it provided and what completions returned.
   `BUFFER_MORE` is clear. A slab is FREE again only when the kernel left it
   (`recv_end`) and `refs` is zero.
 - Provision: `vsr_io_pool_provide` hands FREE slabs to the ring during
-  prepare while `free_count > reserve`; `starved` remembers `-ENOBUFS` so
-  receives are re-armed after the next provision.
+  prepare while `free_count > reserve + caller_slabs - caller_taken`
+  (decision 54: the part of the caller's share it does not hold stays
+  FREE); `starved` remembers `-ENOBUFS`, across a ring loss too, so
+  receives are re-armed once the ring holds a buffer again.
+- Caller slabs: `vsr_io_pool_acquire(pool, true)` fails once
+  `caller_taken == caller_slabs` or `free_count <= reserve`; internal
+  acquires may take every FREE slab. The caller's release goes through
+  `vsr_io_pool_caller_release`, which rejects an id the caller does not
+  hold (EINVAL for `vsr_io_slab_release`).
 - Invariants: `free_count + kernel_count + held == slabs`; a KERNEL slab is
   never handed to `acquire`; a slab in the ring is never written by the
-  engine.
+  engine; `caller_taken` counts the slabs flagged `caller`, all HELD.
 - Tests: `tests/unit/pool`: state transitions including incremental
-  consumption with many frames per slab, reserve enforcement, starvation
-  flag, ring loss, and a randomized holder model (every retain has a
-  release) checking the invariant after each step.
+  consumption with many frames per slab, reserve and caller-share
+  enforcement, starvation flag, ring loss, the largest ring of 32768 ids,
+  and a randomized holder model (every retain has a release, caller holds
+  released through `caller_release`) checking the invariant after each
+  step.
 
 ### Slots (`src/io/slots.h`)
 
@@ -1207,6 +1216,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | Store section: never-rewrite rule, held-STORE conditions (pinned floor, write-behind, RESTORE/PUBLISH base load), index overflow fails with FAILED; `cache_bytes` rule | 33, 36, 43 |
 | `vsr-io.h` | `vsr_io_detach` is EBUSY while write-behind writes or flushes are in flight | 49 |
 | `vsr-io.h` | Store section: the durable prefix below which a bad record is CORRUPT is the greatest durable sequence any persisted record, segment header or superblock carries; idle superblock write | 50 |
+| `vsr-io.h` | `vsr_io_limits.caller_slabs`, the caller's share of the pool; the minimum-slabs rule adds it; `vsr_io_slab_acquire` is ELIMIT once the caller holds the share or the free slabs are down to the reserve | 54 |
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | One `libvsr.a` with liburing; three headers installed (done by the build skeleton) | 32 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
