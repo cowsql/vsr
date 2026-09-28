@@ -508,6 +508,13 @@ void vsr_operation_abort(struct vsr *v, struct vsr_operation *operation)
     recycle_operation(v, operation);
 }
 
+uint64_t vsr_operation_last_id(const struct vsr *v)
+{
+    return v->operation_ready_last == VSR_INDEX_NONE
+               ? 0
+               : v->operations[v->operation_ready_last].output.id;
+}
+
 struct vsr_operation *vsr_operation_find(struct vsr *v, uint64_t id)
 {
     if (id == 0 || id == UINT64_MAX) {
@@ -783,7 +790,6 @@ static int admit_event(struct vsr *v, const struct vsr_event *event,
                 validation.failure_code = VSR_FAILURE_INVARIANT;
                 invalid_effect = true;
             }
-            unreserve_operation(v, operation);
         } else {
             bool inactive = terminal(v) || v->stopping;
             bool control = event->type == VSR_EVENT_MESSAGE;
@@ -923,22 +929,6 @@ int vsr_step_many(struct vsr *v, const struct vsr_event *events, uint32_t count,
             emit_output(v, update);
             budget--;
             continue;
-        }
-        if (!v->started && !v->protocol_quiesced) {
-            budget--;
-            int start = vsr_protocol_start(v);
-            if (start == VSR_OK) {
-                v->started = true;
-                continue;
-            }
-            if (start != VSR_AGAIN) {
-                vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
-            }
-            if (budget == 0) {
-                exhausted = true;
-                result = VSR_AGAIN;
-                break;
-            }
         }
         if (!blocked && update->consumed < count) {
             budget--;

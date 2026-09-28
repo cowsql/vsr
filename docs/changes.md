@@ -147,6 +147,16 @@ scenario function inside it; "scheduler flag" refers to the profile flags of
   "Indexed storage". Tests: `regression/trim_resend`,
   `integration/transfer_audit`.
 
+- Range fetches are batched. A `GET_LOG` or range `GET_STATE` asks for as
+  many entries as `batch_entries` and the requester's free payload budget
+  allow (`fetch_budget`), and a comparison load covers the whole overlap in
+  as many bounded loads as the budget takes; a local history load is sized
+  the same way. Why: every transfer fetched one entry per round trip, so a
+  backup missing fifty committed entries needed fifty `GET_LOG` exchanges.
+  Where: `docs/vsr-api.md` "Log and checkpoint transfer". Tests:
+  `integration/transitions` (`batched_log_transfer`, which counts the
+  fetches: fifty before, at most eight after).
+
 ## Resource minima
 
 - Capture hints defer under input pressure. A `CHECKPOINT` hint may be

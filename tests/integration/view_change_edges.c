@@ -25,7 +25,6 @@ struct group {
     struct mem_cluster *cluster;
     struct mem_node *nodes[MAX_NODES];
     struct vsr_member members[MAX_NODES];
-    struct vsr_membership membership;
     uint32_t count;
     uint64_t clock[MAX_NODES];
     filter_fn filter;
@@ -214,10 +213,12 @@ static struct group create(uint32_t count, uint32_t durability, bool timed,
     g.count_type = UINT32_MAX;
     for (uint32_t i = 0; i < count; i++)
         g.members[i] = (struct vsr_member){i + 1, VSR_MEMBER_FULL, 0};
-    g.membership =
-        (struct vsr_membership){0, g.members, count, (count - 1) / 2};
+    /* The group is returned by value, so it carries no pointer into itself:
+     * a caller that needs the membership builds it from the copy's array. */
+    const struct vsr_membership membership = {0, g.members, count,
+                                              (count - 1) / 2};
     for (uint32_t i = 0; i < count; i++) {
-        struct vsr_options options = mem_options(i + 1, &g.membership);
+        struct vsr_options options = mem_options(i + 1, &membership);
         options.durability = durability;
         if (tweak != NULL)
             tweak(&options);
@@ -865,7 +866,9 @@ static void learner_rotates_donor(void)
     CHECK(healthy(g.nodes[1]).view == 1 && healthy(g.nodes[1]).primary == 2);
     submit(g.nodes[1], 100, 1, 1);
     settle(&g, UINT32_MAX, all_applied_one);
-    struct vsr_options options = mem_options(4, &g.membership);
+    const struct vsr_membership membership = {0, g.members, g.count,
+                                              (g.count - 1) / 2};
+    struct vsr_options options = mem_options(4, &membership);
     options.start_mode = VSR_START_JOIN;
     options.join_role = VSR_MEMBER_FULL;
     g.nodes[3] = mem_cluster_add(g.cluster, &options);

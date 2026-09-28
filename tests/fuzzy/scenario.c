@@ -506,7 +506,10 @@ static uint64_t quorum_known(struct simulation *s, uint32_t index)
             values[j - 1] = values[j];
             values[j] = swap;
         }
-    return values[needed - 1];
+    for (uint32_t rank = 1; rank <= count; ++rank)
+        if (rank == needed)
+            return values[rank - 1];
+    return 0;
 }
 
 static void crash(struct simulation *s, uint32_t index)
@@ -1155,9 +1158,8 @@ void scenario_run(const struct scenario_options *options,
         s.role[i] = s.known.members[i].role;
         s.was_member[i] = true;
     }
-    const struct vsr_membership membership = {0, s.known.members, s.count,
-                                              faults};
-    remember_epoch(&s, &membership);
+    const struct vsr_membership initial = {0, s.known.members, s.count, faults};
+    remember_epoch(&s, &initial);
     snprintf(header, sizeof(header),
              "seed=%" PRIu64 " steps=%u nodes=%u f=%u witness=%u durability=%u "
              "operations=%u cache=%u profile=%u",
@@ -1183,7 +1185,7 @@ void scenario_run(const struct scenario_options *options,
         struct vsr_options node_options = s.base;
         node_options.replica = i + 1;
         node_options.incarnation = (struct vsr_id){i + 1, 1};
-        node_options.seed = &membership;
+        node_options.seed = &initial;
         node_options.limits.client_cache_entries = 1 + choose(&s, 4);
         node_options.limits.work_per_step = 1 + choose(&s, 16);
         s.nodes[i] = mem_cluster_add(s.cluster, &node_options);

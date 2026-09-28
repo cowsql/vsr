@@ -39,16 +39,15 @@ void vsr_protocol_init(struct vsr *v, void *memory, size_t size)
     v->status.primary = v->options.replica;
 }
 
-int vsr_protocol_start(struct vsr *v)
-{
-    v->status.state = VSR_STATE_NORMAL;
-    vsr_changed(v);
-    return VSR_OK;
-}
-
 int vsr_protocol_event(struct vsr *v, const struct vsr_event *event,
                        uint32_t lease)
 {
+    /* The model enters NORMAL on its first input, as the protocol's boot
+     * would, so a step that later refuses an event still reports the change. */
+    if (v->status.state == VSR_STATE_STARTING) {
+        v->status.state = VSR_STATE_NORMAL;
+        vsr_changed(v);
+    }
     if (event->type != VSR_EVENT_REQUEST) {
         return VSR_OK;
     }

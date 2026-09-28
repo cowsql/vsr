@@ -56,7 +56,7 @@ static int campaign(uint64_t seed, uint64_t seeds, uint32_t steps,
                     uint32_t profile)
 {
     struct sigaction action = {.sa_handler = on_abort};
-    uint64_t failures = 0;
+    volatile uint64_t failures = 0;
     sigemptyset(&action.sa_mask);
     CHECK(sigaction(SIGABRT, &action, NULL) == 0);
     for (uint64_t i = 0; i < seeds; ++i) {

@@ -65,7 +65,6 @@ struct vsr {
     uint32_t release_last;
     uint32_t reserved_leases;
     bool time_set;
-    bool started;
     bool initialized;
     bool stopping;
     bool protocol_quiesced;
@@ -79,8 +78,7 @@ struct vsr {
 int vsr_protocol_size(const struct vsr_options *options, size_t *size,
                       size_t *alignment);
 void vsr_protocol_init(struct vsr *v, void *memory, size_t size);
-/* start/event return AGAIN only before retaining/mutating the submitted input. */
-int vsr_protocol_start(struct vsr *v);
+/* event returns AGAIN only before retaining/mutating the submitted input. */
 int vsr_protocol_event(struct vsr *v, const struct vsr_event *event,
                        uint32_t lease);
 /* The completed operation and completion lease remain alive during this call.
@@ -115,9 +113,17 @@ bool vsr_operation_hold(struct vsr *v, struct vsr_operation *operation,
 void vsr_operation_publish(struct vsr *v, struct vsr_operation *operation);
 void vsr_operation_abort(struct vsr *v, struct vsr_operation *operation);
 struct vsr_operation *vsr_operation_find(struct vsr *v, uint64_t id);
+/* The id of the most recently published operation, or zero when none is
+ * queued: modules record it to match a completion to the intent it serves. */
+uint64_t vsr_operation_last_id(const struct vsr *v);
 
 /* Event callbacks borrow one reference. Retain anything needed after return.
- * Index NONE represents an event with no data and retain/release are no-ops. */
+ * Index NONE represents an event with no data and retain/release are no-ops.
+ * Retaining never fails for lack of capacity: a false result means the lease
+ * is not live or its reference count overflowed, an invariant failure that
+ * has already latched, failed the engine, and quiesced the protocol. Callers
+ * unwind without recording the lease; nothing is retried or lost, because
+ * no further work is admitted or issued after a failure. */
 bool vsr_lease_retain(struct vsr *v, uint32_t lease);
 void vsr_lease_release(struct vsr *v, uint32_t lease);
 uint64_t vsr_lease_id(const struct vsr *v, uint32_t lease);

@@ -214,8 +214,9 @@ static void announcement_must_not_preempt_recovery(void)
     for (uint64_t number = 1; number <= COMMANDS; number++) {
         submit(nodes[PRIMARY], number, number);
         drive(cluster, nodes);
-        CHECK(reply(nodes[PRIMARY], number) != NULL);
-        CHECK(reply(nodes[PRIMARY], number)->status == VSR_REPLY_OK);
+        const struct vsr_reply *result = reply(nodes[PRIMARY], number);
+        CHECK(result != NULL);
+        CHECK(result->status == VSR_REPLY_OK);
     }
     CHECK(status(nodes[PRIMARY]).primary == PRIMARY + 1);
     const uint64_t floor = status(nodes[LOST]).committed;

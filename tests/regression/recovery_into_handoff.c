@@ -188,8 +188,9 @@ static void commit(struct mem_cluster *cluster, struct mem_node **nodes,
     for (uint64_t number = first; number <= last; number++) {
         submit(leader, number, number);
         drive(cluster, nodes, schedule);
-        CHECK(reply(leader, number) != NULL);
-        CHECK(reply(leader, number)->status == VSR_REPLY_OK);
+        const struct vsr_reply *result = reply(leader, number);
+        CHECK(result != NULL);
+        CHECK(result->status == VSR_REPLY_OK);
     }
 }
 

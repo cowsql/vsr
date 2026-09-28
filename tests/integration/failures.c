@@ -291,8 +291,9 @@ static void recovery_absent_without_quorum(void)
     CHECK(find(node, (struct hold){VSR_OP_APPLY, UINT32_MAX}) == SIZE_MAX);
     submit(node, 700, 1, 1);
     drive(&f, none);
-    CHECK(reply_for(node, 1) != NULL);
-    CHECK(reply_for(node, 1)->status == VSR_REPLY_BUSY);
+    const struct vsr_reply *reply = reply_for(node, 1);
+    CHECK(reply != NULL);
+    CHECK(reply->status == VSR_REPLY_BUSY);
     time_all(&f, 500);
     drive(&f, none);
     CHECK(status(node).state == VSR_STATE_RECOVERING);

@@ -36,7 +36,6 @@ enum target_goal {
 };
 enum target_phase {
     TARGET_DRAIN,
-    TARGET_TRUNCATE,
     TARGET_SNAPSHOT,
     TARGET_FETCH,
     TARGET_COMPARE,
@@ -50,7 +49,6 @@ enum anchor_state { ANCHOR_UNKNOWN, ANCHOR_RETAINED, ANCHOR_MISSING };
 
 struct round_peer {
     struct vsr_nonce reply_nonce;
-    uint64_t response_view;
     bool svc;
     bool dvc;
     bool recovered;
@@ -310,9 +308,9 @@ static uint64_t applied_needed(const struct vsr *v)
     return p->stable_commit;
 }
 
-static bool send_control(struct vsr *v, uint64_t peer, uint32_t type,
-                         uint64_t number, const void *body,
-                         const uint32_t *leases, uint32_t count)
+static bool send_tagged(struct vsr *v, uint64_t peer, uint32_t type,
+                        uint64_t number, const void *body,
+                        const uint32_t *leases, uint32_t count, uint64_t tag)
 {
     struct vsr_message message = {v->options.cluster,
                                   v->status.epoch,
@@ -322,8 +320,15 @@ static bool send_control(struct vsr *v, uint64_t peer, uint32_t type,
                                   0,
                                   number,
                                   body};
-    return vsr_protocol_emit(v, VSR_OP_SEND, peer, TAG_CONTROL, &message,
-                             leases, count, 0);
+    return vsr_protocol_emit(v, VSR_OP_SEND, peer, tag, &message, leases, count,
+                             0);
+}
+
+static bool send_control(struct vsr *v, uint64_t peer, uint32_t type,
+                         uint64_t number, const void *body,
+                         const uint32_t *leases, uint32_t count)
+{
+    return send_tagged(v, peer, type, number, body, leases, count, TAG_CONTROL);
 }
 
 static void copy_membership(struct vsr_membership *target,
@@ -384,13 +389,17 @@ static void offer_unreference(struct vsr *v, uint32_t index)
 
 /* The output graph owns copied metadata, while the indexed revision and
  * snapshot image retain their separate pin until SEND completion. */
-static void pin_sent_offer(struct vsr *v, uint32_t index)
+static bool send_offer(struct vsr *v, uint64_t peer, uint32_t type,
+                       uint64_t number, const void *body,
+                       const uint32_t *leases, uint32_t count, uint32_t index)
 {
-    if (index == VSR_INDEX_NONE)
-        return;
+    uint64_t tag = index == VSR_INDEX_NONE
+                       ? TAG_CONTROL
+                       : TAG_OFFER_SEND | ((uint64_t)index << 32);
+    if (!send_tagged(v, peer, type, number, body, leases, count, tag))
+        return false;
     offer_reference(v, index);
-    v->operations[v->operation_ready_last].tag =
-        TAG_OFFER_SEND | ((uint64_t)index << 32);
+    return true;
 }
 
 static uint32_t offer_current(struct vsr *v)
@@ -453,6 +462,7 @@ static uint32_t offer_current(struct vsr *v)
                    (size_t)checkpoint->manifest.count * sizeof(*offer->spans));
             offer->checkpoint.manifest.spans = offer->spans;
         }
+        /* A failed retain has failed the engine; leave the slot unused. */
         if (!vsr_lease_retain(v, lease))
             return VSR_INDEX_NONE;
         offer->lease = lease;
@@ -610,6 +620,7 @@ static void consider_offer(struct vsr *v, uint64_t source,
          state->log_end == t->best.log_end && source < t->best_source);
     if (!better)
         return;
+    /* A failed retain has failed the engine; the previous best stays. */
     if (!vsr_lease_retain(v, lease))
         return;
     offer_reference(v, local_offer);
@@ -836,7 +847,7 @@ static bool server_poll(struct vsr *v)
             if (!vsr_protocol_emit(v, VSR_OP_LOAD, 0, tag, &read, NULL, 0,
                                    bytes))
                 continue;
-            server->load_id = v->operations[v->operation_ready_last].output.id;
+            server->load_id = vsr_operation_last_id(v);
             server->phase = SERVER_LOADING;
             return true;
         }
@@ -852,10 +863,10 @@ static bool server_poll(struct vsr *v)
             chunk.next = server->request.end;
         }
         uint32_t leases[2] = {offer->lease, server->lease};
-        if (!send_control(v, server->peer, server->response,
-                          offer->state.log_end - 1, &chunk, leases, 2))
+        if (!send_offer(v, server->peer, server->response,
+                        offer->state.log_end - 1, &chunk, leases, 2,
+                        server->offer))
             continue;
-        pin_sent_offer(v, server->offer);
         vsr_lease_release(v, server->lease);
         offer_unreference(v, server->offer);
         server->lease = server->offer = VSR_INDEX_NONE;
@@ -866,21 +877,52 @@ static bool server_poll(struct vsr *v)
     return false;
 }
 
-static bool target_load(struct vsr *v, uint64_t sequence, uint64_t first,
-                        uint64_t end, uint32_t tag, uint64_t *id)
+/* How many entries a range fetch may ask for, and the byte limit that goes
+ * with them: as many as batch_entries and the payload budget allow. A chunk
+ * is an input this replica must admit with its standing progress reserve
+ * intact, so the request is sized from the budget free now, never below the
+ * one entry every fetch may reserve and never above message_bytes. A chunk
+ * that no longer fits when it arrives is refused, and the retry timer
+ * fetches it again, sized to the budget free then. */
+static uint64_t fetch_budget(const struct vsr *v, uint32_t *entries)
 {
+    const struct vsr_limits *limits = &v->options.limits;
+    uint64_t budget = vsr_protocol_available_bytes(v);
+    budget = budget > v->progress_bytes ? budget - v->progress_bytes : 0;
+    uint64_t least = limits->command_bytes + limits->manifest_bytes;
+    if (budget < least)
+        budget = least;
+    if (budget > limits->message_bytes)
+        budget = limits->message_bytes;
+    uint64_t count = (budget - limits->manifest_bytes) / limits->command_bytes;
+    if (count > limits->batch_entries)
+        count = limits->batch_entries;
+    *entries = (uint32_t)count;
+    return limits->manifest_bytes + count * limits->command_bytes;
+}
+
+/* Load up to count entries of [first, end) from the named revision, fewer
+ * when the payload budget or message_bytes holds less; at least one. */
+static bool target_load(struct vsr *v, uint64_t sequence, uint64_t first,
+                        uint64_t end, uint32_t count, uint32_t tag,
+                        uint64_t *id)
+{
+    const struct vsr_limits *limits = &v->options.limits;
     uint64_t bytes = vsr_protocol_available_bytes(v);
-    if (bytes < v->options.limits.command_bytes)
+    if (bytes < limits->command_bytes)
         return false;
-    bytes = v->options.limits.command_bytes;
-    uint32_t count = 1;
+    if (bytes > limits->message_bytes)
+        bytes = limits->message_bytes;
     if (end - first < count)
         count = (uint32_t)(end - first);
+    if (bytes / limits->command_bytes < count)
+        count = (uint32_t)(bytes / limits->command_bytes);
+    bytes = (uint64_t)count * limits->command_bytes;
     struct vsr_store_read read = {sequence, first,        end,  {0, 0},
                                   bytes,    VSR_LOAD_LOG, count};
     if (!vsr_protocol_emit(v, VSR_OP_LOAD, 0, tag, &read, NULL, 0, bytes))
         return false;
-    *id = v->operations[v->operation_ready_last].output.id;
+    *id = vsr_operation_last_id(v);
     return true;
 }
 
@@ -921,6 +963,7 @@ static void take_chunk(struct vsr *v, const struct vsr_entry *entries,
                        uint32_t count, uint32_t lease)
 {
     struct selected_target *target = &transition(v)->target;
+    /* A failed retain has failed the engine; the chunk is not adopted. */
     if (!vsr_lease_retain(v, lease))
         return;
     vsr_lease_release(v, target->entries_lease);
@@ -945,35 +988,36 @@ static bool compare_chunk(struct vsr *v)
         target->phase = TARGET_APPEND;
         return true;
     }
-    bool cached = true;
-    for (uint32_t i = 0;
-         i < target->entry_count && target->entries[i].op < overlap_end; i++) {
-        struct vsr_log_slot *local =
-            vsr_protocol_log_find(v, target->entries[i].op);
-        if (local == NULL) {
-            cached = false;
+    /* append_offset counts the entries proven equal so far, from the cache
+     * or from earlier comparison loads; the divergence, if any, is the first
+     * entry past it. The overlap is bounded by the chunk, which is bounded
+     * by batch_entries, so the count below fits. */
+    uint32_t overlap = (uint32_t)(overlap_end - target->next);
+    while (target->append_offset < overlap) {
+        const struct vsr_entry *entry = &target->entries[target->append_offset];
+        struct vsr_log_slot *local = vsr_protocol_log_find(v, entry->op);
+        if (local == NULL)
             break;
-        }
-        if (!vsr_entry_equal(&local->entry, &target->entries[i])) {
-            if (target->entries[i].op <= p->stable_commit) {
+        if (!vsr_entry_equal(&local->entry, entry)) {
+            if (entry->op <= p->stable_commit) {
                 vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
                 return true;
             }
-            target->append_offset = i;
             target->phase = TARGET_APPEND;
             return true;
         }
-        target->append_offset = i + 1;
+        target->append_offset++;
     }
-    if (cached) {
+    if (target->append_offset == overlap) {
         target->phase = TARGET_APPEND;
         return true;
     }
-    target->append_offset = 0;
     if (target->compare_id != 0)
         return false;
-    return target_load(v, v->status.stored_sequence, target->next, overlap_end,
-                       TAG_COMPARE_LOAD, &target->compare_id);
+    return target_load(v, v->status.stored_sequence,
+                       target->next + target->append_offset, overlap_end,
+                       overlap - target->append_offset, TAG_COMPARE_LOAD,
+                       &target->compare_id);
 }
 
 static bool append_chunk(struct vsr *v)
@@ -1039,290 +1083,322 @@ static bool append_chunk(struct vsr *v)
     return true;
 }
 
-static bool target_poll(struct vsr *v)
+static bool drain_phase(struct vsr *v)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct selected_target *target = &transition(v)->target;
+    if (p->safe_sequence + 1 != p->next_sequence || p->application_busy ||
+        p->results_pending || p->log_loading)
+        return false;
+    if (p->log_end > p->written_end) {
+        /* Unissued old-view proposals were never endorsed and may go. */
+        reject_discarded_routes(v, p->written_end);
+        p->log_end = p->written_end;
+    }
+    /* No truncation happens here: the previous suffix is kept until the
+     * comparison proves a divergence. A transfer can be interrupted by
+     * another view, and truncating a matching quorum-endorsed prefix now
+     * would then advertise an incomplete log with its previous last normal
+     * view. The divergent uncommitted tail goes in two places instead:
+     * append_chunk replaces the suffix from the first differing uncommitted
+     * entry in one TRUNCATE+APPEND transaction, and fetch_phase truncates
+     * whatever extends past the selected log end once the fetch cursor
+     * reaches it. A RESTORE issued by snapshot_phase precedes both, so the
+     * suffix it retains is validated by that same comparison; the retained
+     * entries below the fetch cursor are committed or covered by an anchor
+     * this replica holds and are never divergent. */
+    target->phase = TARGET_SNAPSHOT;
+    return true;
+}
+
+static bool snapshot_phase(struct vsr *v)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct selected_target *target = &transition(v)->target;
+    if (!target->snapshot_started) {
+        uint32_t existing_lease;
+        const struct vsr_checkpoint *existing =
+            vsr_checkpoint_published(v, &existing_lease);
+        const struct vsr_checkpoint *checkpoint = target->state.checkpoint;
+        uint32_t role = v->status.role;
+        /* A handoff or a recovery in a handoff rebuilds the role the
+         * learned membership assigns: a promoted witness reconstructs
+         * application state before it can vote as a full member. */
+        if ((target->goal == TARGET_EPOCH || target->goal == TARGET_RECOVERY) &&
+            p->self != VSR_INDEX_NONE &&
+            p->current.members[p->self].role == VSR_MEMBER_FULL)
+            role = VSR_MEMBER_FULL;
+        bool adopt = target->rebuild ||
+                     (checkpoint != NULL &&
+                      (existing == NULL || checkpoint->op > existing->op));
+        /* A full member whose application already reached the selected
+         * checkpoint keeps its state: INSTALL establishes the application
+         * boundary before suffix replay, never behind entries a running
+         * application has applied. The fetch cursor still starts at the
+         * donor's retained log, which covers everything past its anchor. */
+        if (adopt && !target->rebuild && role == VSR_MEMBER_FULL &&
+            checkpoint->op <= v->status.applied)
+            adopt = false;
+        /* A witness keeps a prefix it can vouch for instead of copying
+         * the donor's newer anchor: a known-committed prefix, or one that
+         * ends in the very entry the anchor closes with. The donor cannot
+         * resend entries behind its anchor, so that check reads the local
+         * copy here rather than in the ordinary chunk comparison. */
+        if (adopt && role == VSR_MEMBER_WITNESS && !target->rebuild &&
+            checkpoint->op > p->stable_commit &&
+            checkpoint->op >= p->readable_begin &&
+            checkpoint->op < p->written_end &&
+            target->anchor == ANCHOR_UNKNOWN) {
+            const struct vsr_log_slot *slot =
+                vsr_protocol_log_find(v, checkpoint->op);
+            if (slot == NULL) {
+                if (target->anchor_id != 0)
+                    return false;
+                return target_load(v, v->status.stored_sequence, checkpoint->op,
+                                   checkpoint->op + 1, 1, TAG_ANCHOR_LOAD,
+                                   &target->anchor_id);
+            }
+            target->anchor = anchor_retained(v, &slot->entry, checkpoint)
+                                 ? ANCHOR_RETAINED
+                                 : ANCHOR_MISSING;
+            return true;
+        }
+        if (role == VSR_MEMBER_WITNESS &&
+            (checkpoint == NULL || checkpoint->op <= p->stable_commit ||
+             target->anchor == ANCHOR_RETAINED))
+            adopt = false;
+        if (adopt) {
+            /* A newer local anchor may cover an older selected checkpoint,
+             * but never beyond the selected committed floor. */
+            uint32_t lease = target->lease;
+            uint64_t peer = target->source;
+            if (existing != NULL && v->status.role == VSR_MEMBER_FULL &&
+                (checkpoint == NULL || existing->op > checkpoint->op) &&
+                existing->op <= target->state.committed) {
+                checkpoint = existing;
+                lease = existing_lease;
+                peer = v->options.replica;
+            }
+            int result = vsr_checkpoint_adopt(v, checkpoint, lease, peer, role);
+            if (result == VSR_AGAIN)
+                return false;
+            if (result != VSR_OK) {
+                restart_selection(v);
+                return true;
+            }
+            target->snapshot_adopted = true;
+        }
+        target->snapshot_started = true;
+        if (adopt)
+            return true;
+    }
+    if (vsr_checkpoint_busy(v))
+        return false;
+    if (target->snapshot_adopted &&
+        vsr_checkpoint_adoption_status(v) != VSR_OK) {
+        restart_selection(v);
+        return true;
+    }
+    target->next = p->log_begin > target->state.log_begin
+                       ? p->log_begin
+                       : target->state.log_begin;
+    uint32_t lease;
+    const struct vsr_checkpoint *checkpoint =
+        vsr_checkpoint_published(v, &lease);
+    if (checkpoint != NULL && target->next <= checkpoint->op)
+        target->next = checkpoint->op + 1;
+    /* A warmed learner already holds the committed prefix, which every
+     * offer shares; only its suffix can differ from the donor's. */
+    if (target->goal == TARGET_WARM && !target->rebuild &&
+        target->next <= p->stable_commit)
+        target->next = p->stable_commit + 1;
+    if (target->next > target->state.log_end) {
+        vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
+        return true;
+    }
+    target->phase = TARGET_FETCH;
+    return true;
+}
+
+static bool fetch_phase(struct vsr *v)
 {
     struct vsr_protocol *p = vsr_protocol(v);
     struct vsr_transition *t = transition(v);
     struct selected_target *target = &t->target;
-    if (!target->active)
+    if (target->sequence != 0 && p->safe_sequence < target->sequence)
         return false;
-    if (target->phase == TARGET_DRAIN) {
-        if (p->safe_sequence + 1 != p->next_sequence || p->application_busy ||
-            p->results_pending || p->log_loading)
-            return false;
-        if (p->log_end > p->written_end) {
-            /* Unissued old-view proposals were never endorsed and may go. */
-            reject_discarded_routes(v, p->written_end);
-            p->log_end = p->written_end;
-        }
-        /* Keep the previous suffix until comparison proves a divergence.
-         * A transfer can be interrupted by another view: truncating a matching
-         * quorum-endorsed prefix here would then advertise an incomplete log
-         * with its previous last-normal-view. Replacements below atomically
-         * truncate at the first differing uncommitted entry and append it. */
-        target->phase = TARGET_TRUNCATE;
-        return true;
-    }
-    if (target->phase == TARGET_TRUNCATE) {
-        if (target->sequence != 0 && p->safe_sequence < target->sequence)
-            return false;
-        target->sequence = 0;
-        target->phase = TARGET_SNAPSHOT;
-        return true;
-    }
-    if (target->phase == TARGET_SNAPSHOT) {
-        if (!target->snapshot_started) {
-            uint32_t existing_lease;
-            const struct vsr_checkpoint *existing =
-                vsr_checkpoint_published(v, &existing_lease);
-            const struct vsr_checkpoint *checkpoint = target->state.checkpoint;
-            uint32_t role = v->status.role;
-            /* A handoff or a recovery in a handoff rebuilds the role the
-             * learned membership assigns: a promoted witness reconstructs
-             * application state before it can vote as a full member. */
-            if ((target->goal == TARGET_EPOCH ||
-                 target->goal == TARGET_RECOVERY) &&
-                p->self != VSR_INDEX_NONE &&
-                p->current.members[p->self].role == VSR_MEMBER_FULL)
-                role = VSR_MEMBER_FULL;
-            bool adopt = target->rebuild ||
-                         (checkpoint != NULL &&
-                          (existing == NULL || checkpoint->op > existing->op));
-            /* A full member whose application already reached the selected
-             * checkpoint keeps its state: INSTALL establishes the application
-             * boundary before suffix replay, never behind entries a running
-             * application has applied. The fetch cursor still starts at the
-             * donor's retained log, which covers everything past its anchor. */
-            if (adopt && !target->rebuild && role == VSR_MEMBER_FULL &&
-                checkpoint->op <= v->status.applied)
-                adopt = false;
-            /* A witness keeps a prefix it can vouch for instead of copying
-             * the donor's newer anchor: a known-committed prefix, or one that
-             * ends in the very entry the anchor closes with. The donor cannot
-             * resend entries behind its anchor, so that check reads the local
-             * copy here rather than in the ordinary chunk comparison. */
-            if (adopt && role == VSR_MEMBER_WITNESS && !target->rebuild &&
-                checkpoint->op > p->stable_commit &&
-                checkpoint->op >= p->readable_begin &&
-                checkpoint->op < p->written_end &&
-                target->anchor == ANCHOR_UNKNOWN) {
-                const struct vsr_log_slot *slot =
-                    vsr_protocol_log_find(v, checkpoint->op);
-                if (slot == NULL) {
-                    if (target->anchor_id != 0)
-                        return false;
-                    return target_load(v, v->status.stored_sequence,
-                                       checkpoint->op, checkpoint->op + 1,
-                                       TAG_ANCHOR_LOAD, &target->anchor_id);
-                }
-                target->anchor = anchor_retained(v, &slot->entry, checkpoint)
-                                     ? ANCHOR_RETAINED
-                                     : ANCHOR_MISSING;
-                return true;
-            }
-            if (role == VSR_MEMBER_WITNESS &&
-                (checkpoint == NULL || checkpoint->op <= p->stable_commit ||
-                 target->anchor == ANCHOR_RETAINED))
-                adopt = false;
-            if (adopt) {
-                /* A newer local anchor may cover an older selected checkpoint,
-                 * but never beyond the selected committed floor. */
-                uint32_t lease = target->lease;
-                uint64_t peer = target->source;
-                if (existing != NULL && v->status.role == VSR_MEMBER_FULL &&
-                    (checkpoint == NULL || existing->op > checkpoint->op) &&
-                    existing->op <= target->state.committed) {
-                    checkpoint = existing;
-                    lease = existing_lease;
-                    peer = v->options.replica;
-                }
-                int result =
-                    vsr_checkpoint_adopt(v, checkpoint, lease, peer, role);
-                if (result == VSR_AGAIN)
-                    return false;
-                if (result != VSR_OK) {
-                    restart_selection(v);
-                    return true;
-                }
-                target->snapshot_adopted = true;
-            }
-            target->snapshot_started = true;
-            if (adopt)
-                return true;
-        }
-        if (vsr_checkpoint_busy(v))
-            return false;
-        if (target->snapshot_adopted &&
-            vsr_checkpoint_adoption_status(v) != VSR_OK) {
-            restart_selection(v);
+    target->sequence = 0;
+    if (target->next == target->state.log_end) {
+        if (p->written_end > target->state.log_end) {
+            struct vsr_hard_state hard;
+            vsr_protocol_hard(v, &hard);
+            hard.committed = target->state.committed;
+            if (hard.committed < t->committed_floor)
+                hard.committed = t->committed_floor;
+            vsr_transition_hard(v, &hard);
+            struct vsr_change changes[2] = {
+                {VSR_STORE_TRUNCATE, 0, target->state.log_end, NULL},
+                {VSR_STORE_HARD_STATE, 1, 0, &hard},
+            };
+            if (!vsr_protocol_store(v, changes, 2, NULL, 0,
+                                    target->state.log_end, hard.committed, 0,
+                                    &target->sequence))
+                return false;
+            reject_discarded_routes(v, target->state.log_end);
+            p->written_end = p->log_end = target->state.log_end;
+            p->desired_commit = hard.committed;
+            p->hard_sequence = target->sequence;
+            p->hard_dirty = false;
             return true;
         }
-        target->next = p->log_begin > target->state.log_begin
-                           ? p->log_begin
-                           : target->state.log_begin;
-        uint32_t lease;
-        const struct vsr_checkpoint *checkpoint =
-            vsr_checkpoint_published(v, &lease);
-        if (checkpoint != NULL && target->next <= checkpoint->op)
-            target->next = checkpoint->op + 1;
-        /* A warmed learner already holds the committed prefix, which every
-         * offer shares; only its suffix can differ from the donor's. */
-        if (target->goal == TARGET_WARM && !target->rebuild &&
-            target->next <= p->stable_commit)
-            target->next = p->stable_commit + 1;
-        if (target->next > target->state.log_end) {
+        if (p->written_end != target->state.log_end) {
             vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
             return true;
         }
-        target->phase = TARGET_FETCH;
+        uint64_t committed = target->state.committed;
+        if (committed < t->committed_floor)
+            committed = t->committed_floor;
+        p->desired_commit = committed;
+        if (p->stable_commit < committed)
+            p->hard_dirty = true;
+        p->replay = true;
+        target->phase = TARGET_REPLAY;
         return true;
     }
-    if (target->phase == TARGET_COMPARE)
-        return compare_chunk(v);
-    if (target->phase == TARGET_APPEND)
-        return append_chunk(v);
-    if (target->phase == TARGET_FETCH) {
-        if (target->sequence != 0 && p->safe_sequence < target->sequence)
-            return false;
-        target->sequence = 0;
-        if (target->next == target->state.log_end) {
-            if (p->written_end > target->state.log_end) {
-                struct vsr_hard_state hard;
-                vsr_protocol_hard(v, &hard);
-                hard.committed = target->state.committed;
-                if (hard.committed < t->committed_floor)
-                    hard.committed = t->committed_floor;
-                vsr_transition_hard(v, &hard);
-                struct vsr_change changes[2] = {
-                    {VSR_STORE_TRUNCATE, 0, target->state.log_end, NULL},
-                    {VSR_STORE_HARD_STATE, 1, 0, &hard},
-                };
-                if (!vsr_protocol_store(v, changes, 2, NULL, 0,
-                                        target->state.log_end, hard.committed,
-                                        0, &target->sequence))
-                    return false;
-                reject_discarded_routes(v, target->state.log_end);
-                p->written_end = p->log_end = target->state.log_end;
-                p->desired_commit = hard.committed;
-                p->hard_sequence = target->sequence;
-                p->hard_dirty = false;
-                return true;
-            }
-            if (p->written_end != target->state.log_end) {
-                vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
-                return true;
-            }
-            uint64_t committed = target->state.committed;
-            if (committed < t->committed_floor)
-                committed = t->committed_floor;
-            p->desired_commit = committed;
-            if (p->stable_commit < committed)
-                p->hard_dirty = true;
-            p->replay = true;
-            target->phase = TARGET_REPLAY;
+    if (target->load_id != 0)
+        return false;
+    if (target->waiting && !expired(v, target->retry_at))
+        return false;
+    if (target->waiting && target->source != v->options.replica &&
+        (target->goal == TARGET_EPOCH || target->goal == TARGET_WARM)) {
+        if (target->unanswered < TARGET_PATIENCE)
+            target->unanswered++;
+        if (target->unanswered >= TARGET_PATIENCE) {
+            restart_selection(v);
             return true;
         }
-        if (target->load_id != 0)
-            return false;
-        if (target->waiting && !expired(v, target->retry_at))
-            return false;
-        if (target->waiting && target->source != v->options.replica &&
-            (target->goal == TARGET_EPOCH || target->goal == TARGET_WARM)) {
-            if (target->unanswered < TARGET_PATIENCE)
-                target->unanswered++;
-            if (target->unanswered >= TARGET_PATIENCE) {
-                restart_selection(v);
-                return true;
-            }
-        }
-        if (target->source == v->options.replica) {
-            return target_load(v, target->state.revision.sequence, target->next,
-                               target->state.log_end, TAG_TARGET_LOAD,
-                               &target->load_id);
-        }
-        struct vsr_fetch request = {
-            .revision = target->state.revision,
-            .first = target->next,
-            .end = target->state.log_end,
-            .max_bytes = v->options.limits.command_bytes +
-                         v->options.limits.manifest_bytes,
-            .max_entries = 1,
-        };
-        if (!vsr_protocol_nonce(v, &request.nonce))
-            return true;
-        uint32_t type =
-            target->goal == TARGET_PRIMARY || target->goal == TARGET_BACKUP
-                ? VSR_MSG_GET_LOG
-                : VSR_MSG_GET_STATE;
-        if (!send_control(v, target->source, type, 0, &request, NULL, 0))
-            return false;
-        target->request = request;
-        target->waiting = true;
-        target->retry_at = vsr_after(v, v->options.retry_ns);
-        return true;
     }
-    if (target->phase == TARGET_REPLAY) {
-        if (!hard_safe(v) || p->stable_end != target->state.log_end ||
-            p->stable_commit < t->committed_floor || p->results_pending ||
-            p->application_busy || vsr_checkpoint_busy(v))
-            return false;
-        if (v->status.role == VSR_MEMBER_FULL &&
-            (v->status.applied < applied_needed(v) ||
-             p->clients_stored < applied_needed(v)))
-            return false;
-        bool handoff = target->goal == TARGET_EPOCH ||
-                       (target->goal == TARGET_RECOVERY &&
-                        p->epoch.phase == VSR_EPOCH_TRANSFERRING);
-        if (target->goal == TARGET_WARM || handoff) {
-            /* A quorum recovery run inside a handoff installed the highest
-             * view primary's complete history: the replica is now qualified
-             * to vote and hands the epoch module the installation, which
-             * persists NORMAL together with phase INSTALLED. */
-            if (target->goal == TARGET_RECOVERY)
-                t->quorum_recovery = false;
-            p->replay = false;
-            clear_target(v);
-            t->round = ROUND_NONE;
-            t->warmed = true;
-            v->status.state =
-                handoff ? VSR_STATE_TRANSITIONING : VSR_STATE_WARMING;
-            return true;
-        }
-        struct vsr_hard_state hard;
-        vsr_protocol_hard(v, &hard);
-        hard.state = VSR_HARD_NORMAL;
-        hard.last_normal_view = v->status.view;
-        hard.committed = p->stable_commit;
-        struct vsr_change change = {VSR_STORE_HARD_STATE, 1, 0, &hard};
-        if (!vsr_protocol_store(v, &change, 1, NULL, 0, p->written_end,
-                                p->stable_commit, 0, &target->sequence))
-            return false;
-        p->last_normal_view = v->status.view;
-        p->hard_sequence = target->sequence;
-        p->hard_dirty = false;
-        target->phase = TARGET_NORMAL;
-        return true;
+    uint32_t entries;
+    uint64_t bytes = fetch_budget(v, &entries);
+    if (target->source == v->options.replica) {
+        return target_load(v, target->state.revision.sequence, target->next,
+                           target->state.log_end, entries, TAG_TARGET_LOAD,
+                           &target->load_id);
     }
-    if (target->phase == TARGET_NORMAL) {
-        if (p->safe_sequence < target->sequence)
-            return false;
-        bool primary = target->goal == TARGET_PRIMARY;
+    struct vsr_fetch request = {
+        .revision = target->state.revision,
+        .first = target->next,
+        .end = target->state.log_end,
+        .max_bytes = bytes,
+        .max_entries = entries,
+    };
+    if (!vsr_protocol_nonce(v, &request.nonce))
+        return true;
+    uint32_t type =
+        target->goal == TARGET_PRIMARY || target->goal == TARGET_BACKUP
+            ? VSR_MSG_GET_LOG
+            : VSR_MSG_GET_STATE;
+    if (!send_control(v, target->source, type, 0, &request, NULL, 0))
+        return false;
+    target->request = request;
+    target->waiting = true;
+    target->retry_at = vsr_after(v, v->options.retry_ns);
+    return true;
+}
+
+static bool replay_phase(struct vsr *v)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    struct selected_target *target = &t->target;
+    if (!hard_safe(v) || p->stable_end != target->state.log_end ||
+        p->stable_commit < t->committed_floor || p->results_pending ||
+        p->application_busy || vsr_checkpoint_busy(v))
+        return false;
+    if (v->status.role == VSR_MEMBER_FULL &&
+        (v->status.applied < applied_needed(v) ||
+         p->clients_stored < applied_needed(v)))
+        return false;
+    bool handoff = target->goal == TARGET_EPOCH ||
+                   (target->goal == TARGET_RECOVERY &&
+                    p->epoch.phase == VSR_EPOCH_TRANSFERRING);
+    if (target->goal == TARGET_WARM || handoff) {
+        /* A quorum recovery run inside a handoff installed the highest
+         * view primary's complete history: the replica is now qualified
+         * to vote and hands the epoch module the installation, which
+         * persists NORMAL together with phase INSTALLED. */
         if (target->goal == TARGET_RECOVERY)
             t->quorum_recovery = false;
         p->replay = false;
         clear_target(v);
-        clear_best(v);
-        offer_unreference(v, t->local_offer);
-        t->local_offer = VSR_INDEX_NONE;
         t->round = ROUND_NONE;
-        t->start_pending = primary;
-        t->ack_pending = !primary;
-        for (uint32_t i = 0; i < p->current.count; i++)
-            t->peers[i].start_sent = false;
-        vsr_protocol_normal(v);
+        t->warmed = true;
+        v->status.state = handoff ? VSR_STATE_TRANSITIONING : VSR_STATE_WARMING;
         return true;
     }
-    return false;
+    struct vsr_hard_state hard;
+    vsr_protocol_hard(v, &hard);
+    hard.state = VSR_HARD_NORMAL;
+    hard.last_normal_view = v->status.view;
+    hard.committed = p->stable_commit;
+    struct vsr_change change = {VSR_STORE_HARD_STATE, 1, 0, &hard};
+    if (!vsr_protocol_store(v, &change, 1, NULL, 0, p->written_end,
+                            p->stable_commit, 0, &target->sequence))
+        return false;
+    p->last_normal_view = v->status.view;
+    p->hard_sequence = target->sequence;
+    p->hard_dirty = false;
+    target->phase = TARGET_NORMAL;
+    return true;
+}
+
+static bool normal_phase(struct vsr *v)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    struct selected_target *target = &t->target;
+    if (p->safe_sequence < target->sequence)
+        return false;
+    bool primary = target->goal == TARGET_PRIMARY;
+    if (target->goal == TARGET_RECOVERY)
+        t->quorum_recovery = false;
+    p->replay = false;
+    clear_target(v);
+    clear_best(v);
+    offer_unreference(v, t->local_offer);
+    t->local_offer = VSR_INDEX_NONE;
+    t->round = ROUND_NONE;
+    t->start_pending = primary;
+    t->ack_pending = !primary;
+    for (uint32_t i = 0; i < p->current.count; i++)
+        t->peers[i].start_sent = false;
+    vsr_protocol_normal(v);
+    return true;
+}
+
+static bool target_poll(struct vsr *v)
+{
+    struct selected_target *target = &transition(v)->target;
+    if (!target->active)
+        return false;
+    switch (target->phase) {
+    case TARGET_DRAIN:
+        return drain_phase(v);
+    case TARGET_SNAPSHOT:
+        return snapshot_phase(v);
+    case TARGET_COMPARE:
+        return compare_chunk(v);
+    case TARGET_APPEND:
+        return append_chunk(v);
+    case TARGET_FETCH:
+        return fetch_phase(v);
+    case TARGET_REPLAY:
+        return replay_phase(v);
+    case TARGET_NORMAL:
+        return normal_phase(v);
+    default:
+        return false;
+    }
 }
 
 static bool receive_chunk(struct vsr *v, const struct vsr_message *message,
@@ -1390,11 +1466,9 @@ static bool recover_response_poll(struct vsr *v)
             lease = t->offers[index].lease;
             number = recovery.state->log_end - 1;
         }
-        if (!send_control(v, p->current.members[i].id,
-                          VSR_MSG_RECOVERY_RESPONSE, number, &recovery, &lease,
-                          1))
+        if (!send_offer(v, p->current.members[i].id, VSR_MSG_RECOVERY_RESPONSE,
+                        number, &recovery, &lease, 1, index))
             return false;
-        pin_sent_offer(v, index);
         peer->reply_pending = false;
         return true;
     }
@@ -1460,11 +1534,10 @@ static bool view_poll(struct vsr *v)
             return true;
         }
     } else if (!t->dvc_sent) {
-        if (!send_control(v, v->status.primary, VSR_MSG_DO_VIEW_CHANGE,
-                          offer->state.log_end - 1, &offer->state,
-                          &offer->lease, 1))
+        if (!send_offer(v, v->status.primary, VSR_MSG_DO_VIEW_CHANGE,
+                        offer->state.log_end - 1, &offer->state, &offer->lease,
+                        1, t->local_offer))
             return false;
-        pin_sent_offer(v, t->local_offer);
         t->dvc_sent = true;
         return true;
     }
@@ -1583,11 +1656,10 @@ static bool start_view_poll(struct vsr *v)
         if (i == p->self || t->peers[i].start_sent)
             continue;
         const struct retained_offer *state = &t->offers[offer];
-        if (!send_control(v, p->current.members[i].id, VSR_MSG_START_VIEW,
-                          state->state.log_end - 1, &state->state,
-                          &state->lease, 1))
+        if (!send_offer(v, p->current.members[i].id, VSR_MSG_START_VIEW,
+                        state->state.log_end - 1, &state->state, &state->lease,
+                        1, offer))
             return false;
-        pin_sent_offer(v, offer);
         t->peers[i].start_sent = true;
         return true;
     }
@@ -1691,6 +1763,195 @@ bool vsr_transition_poll(struct vsr *v)
            server_poll(v);
 }
 
+/* A discovery reply that is not a chunk for a selected transfer: an offer
+ * from the peer this replica asked, in the view it is entering. */
+static void receive_discovery(struct vsr *v, const struct vsr_message *message,
+                              const struct vsr_state_chunk *chunk,
+                              uint32_t lease)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    if (!t->target.active && t->discovery_waiting &&
+        message->from == t->discovery_peer &&
+        message->type == VSR_MSG_NEW_STATE && chunk->first == 0 &&
+        chunk->next == 0 && chunk->state.entries.count == 0 &&
+        vsr_nonce_equal(chunk->nonce, t->discovery_nonce) &&
+        (t->uninitialized_hint
+             ? vsr_membership_equal(&p->current, chunk->state.epoch->current)
+             : compatible_offer(v, &chunk->state)) &&
+        chunk->state.committed >= t->committed_floor &&
+        chunk->state.view == message->view &&
+        chunk->state.last_normal_view == message->view) {
+        if (message->view < v->status.view)
+            return;
+        if (t->uninitialized_hint) {
+            bool recover = t->quorum_recovery;
+            vsr_protocol_configuration(v, chunk->state.epoch);
+            p->epoch.phase = VSR_EPOCH_TRANSFERRING;
+            t->uninitialized_hint = false;
+            p->identity_pending = true;
+            p->hard_dirty = true;
+            v->status.view = message->view;
+            p->last_normal_view = 0;
+            /* A replica absent from the discovered membership cannot
+             * recover from it; it resumes warm-up as a learner. */
+            if (recover && p->self != VSR_INDEX_NONE) {
+                begin_recovery(v);
+                return;
+            }
+        }
+        v->status.view = message->view;
+        v->status.primary = vsr_primary(&p->current, message->view);
+        if (message->from != v->status.primary && t->round != ROUND_WARM &&
+            t->round != ROUND_EPOCH)
+            return;
+        consider_offer(v, message->from, &chunk->state, lease, VSR_INDEX_NONE);
+        /* A learner rebuilds once per incarnation; later warm-ups only
+         * extend the state it already materialized. */
+        select_best(v,
+                    t->round == ROUND_EPOCH  ? TARGET_EPOCH
+                    : t->round == ROUND_WARM ? TARGET_WARM
+                                             : TARGET_CATCHUP,
+                    t->round == ROUND_EPOCH ||
+                        (t->round == ROUND_WARM && !t->warmed));
+        t->discovery_waiting = false;
+        if (t->round != ROUND_WARM)
+            p->hard_dirty = true;
+    }
+}
+
+static void receive_recovery_response(struct vsr *v,
+                                      const struct vsr_message *message,
+                                      uint32_t sender, uint32_t lease)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    const struct vsr_recovery *response = message->body;
+    if (t->round != ROUND_RECOVERY || t->target.active ||
+        !vsr_nonce_equal(response->nonce, t->recovery_nonce) ||
+        message->view < v->status.view)
+        return;
+    uint64_t primary = vsr_primary(&p->current, message->view);
+    if ((message->from == primary) != (response->state != NULL))
+        return;
+    if (response->state != NULL &&
+        (!compatible_offer(v, response->state) ||
+         response->state->view != message->view ||
+         response->state->last_normal_view != message->view))
+        return;
+    if (message->view > t->highest_view) {
+        v->status.view = message->view;
+        v->status.primary = primary;
+        begin_recovery(v);
+        return;
+    }
+    t->peers[sender].recovered = true;
+    if (response->state != NULL)
+        consider_offer(v, message->from, response->state, lease,
+                       VSR_INDEX_NONE);
+}
+
+static void receive_start_view_change(struct vsr *v,
+                                      const struct vsr_message *message,
+                                      uint32_t sender)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    if (v->status.state == VSR_STATE_RECOVERING ||
+        v->status.state == VSR_STATE_WARMING ||
+        p->epoch.phase == VSR_EPOCH_TRANSFERRING)
+        return;
+    if (message->view > v->status.view || t->round == ROUND_CATCHUP)
+        enter_view(v, message->view);
+    if (t->round == ROUND_VIEW && !t->target.active)
+        t->peers[sender].svc = true;
+}
+
+static void receive_do_view_change(struct vsr *v,
+                                   const struct vsr_message *message,
+                                   uint32_t sender, uint32_t lease)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    if (v->status.state == VSR_STATE_RECOVERING ||
+        v->status.state == VSR_STATE_WARMING ||
+        p->epoch.phase == VSR_EPOCH_TRANSFERRING ||
+        vsr_primary(&p->current, message->view) != v->options.replica)
+        return;
+    const struct vsr_log_state *state = message->body;
+    if (!compatible_offer(v, state) || state->view != message->view)
+        return;
+    if (message->view > v->status.view || t->round == ROUND_CATCHUP)
+        enter_view(v, message->view);
+    if (t->round == ROUND_VIEW && !t->target.active) {
+        t->peers[sender].dvc = true;
+        consider_offer(v, message->from, state, lease, VSR_INDEX_NONE);
+    }
+}
+
+static void receive_start_view(struct vsr *v, const struct vsr_message *message,
+                               uint32_t lease)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    const struct vsr_log_state *state = message->body;
+    if (t->round == ROUND_RECOVERY ||
+        p->epoch.phase == VSR_EPOCH_TRANSFERRING ||
+        !compatible_offer(v, state) || state->view != message->view ||
+        state->last_normal_view != message->view)
+        return;
+    if (message->view == v->status.view && vsr_protocol_ready(v) &&
+        state->log_end <= p->stable_end &&
+        state->committed <= p->stable_commit) {
+        t->ack_pending = true;
+        return;
+    }
+    if (message->view > v->status.view)
+        enter_view(v, message->view);
+    if (t->target.active)
+        return;
+    if (t->round != ROUND_VIEW)
+        enter_view(v, message->view);
+    consider_offer(v, message->from, state, lease, VSR_INDEX_NONE);
+    select_best(v, TARGET_BACKUP, false);
+}
+
+/* A PREPARE or COMMIT this replica cannot follow in place: a later view, a
+ * gap in its log, or a state that is not NORMAL starts a catch-up. True
+ * means the message was consumed here. */
+static bool receive_normal_gap(struct vsr *v, const struct vsr_message *message)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    if (t->round == ROUND_RECOVERY || t->target.active ||
+        v->status.state == VSR_STATE_WARMING ||
+        p->epoch.phase == VSR_EPOCH_TRANSFERRING) {
+        return true;
+    }
+    bool gap =
+        message->type == VSR_MSG_COMMIT
+            ? message->number >= p->log_end
+            : ((const struct vsr_prepare *)message->body)->batch.entries[0].op >
+                  p->log_end;
+    if (message->view > v->status.view || gap ||
+        v->status.state != VSR_STATE_NORMAL) {
+        bool new_round =
+            t->round != ROUND_CATCHUP || message->view > v->status.view;
+        v->status.view = message->view;
+        v->status.primary = message->from;
+        if (new_round)
+            begin_discovery(v, message->from, false);
+        uint64_t known =
+            message->type == VSR_MSG_COMMIT
+                ? message->number
+                : ((const struct vsr_prepare *)message->body)->committed;
+        if (known > t->committed_floor)
+            t->committed_floor = known;
+        return true;
+    }
+    return false;
+}
+
 int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
                          uint32_t lease, bool *handled)
 {
@@ -1740,57 +2001,8 @@ int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
         message->type == VSR_MSG_STATE_UNAVAILABLE) {
         *handled = true;
         const struct vsr_state_chunk *chunk = message->body;
-        if (receive_chunk(v, message, chunk, lease))
-            return VSR_OK;
-        if (!t->target.active && t->discovery_waiting &&
-            message->from == t->discovery_peer &&
-            message->type == VSR_MSG_NEW_STATE && chunk->first == 0 &&
-            chunk->next == 0 && chunk->state.entries.count == 0 &&
-            vsr_nonce_equal(chunk->nonce, t->discovery_nonce) &&
-            (t->uninitialized_hint
-                 ? vsr_membership_equal(&p->current,
-                                        chunk->state.epoch->current)
-                 : compatible_offer(v, &chunk->state)) &&
-            chunk->state.committed >= t->committed_floor &&
-            chunk->state.view == message->view &&
-            chunk->state.last_normal_view == message->view) {
-            if (message->view < v->status.view)
-                return VSR_OK;
-            if (t->uninitialized_hint) {
-                bool recover = t->quorum_recovery;
-                vsr_protocol_configuration(v, chunk->state.epoch);
-                p->epoch.phase = VSR_EPOCH_TRANSFERRING;
-                t->uninitialized_hint = false;
-                p->identity_pending = true;
-                p->hard_dirty = true;
-                v->status.view = message->view;
-                p->last_normal_view = 0;
-                /* A replica absent from the discovered membership cannot
-                 * recover from it; it resumes warm-up as a learner. */
-                if (recover && p->self != VSR_INDEX_NONE) {
-                    begin_recovery(v);
-                    return VSR_OK;
-                }
-            }
-            v->status.view = message->view;
-            v->status.primary = vsr_primary(&p->current, message->view);
-            if (message->from != v->status.primary && t->round != ROUND_WARM &&
-                t->round != ROUND_EPOCH)
-                return VSR_OK;
-            consider_offer(v, message->from, &chunk->state, lease,
-                           VSR_INDEX_NONE);
-            /* A learner rebuilds once per incarnation; later warm-ups only
-             * extend the state it already materialized. */
-            select_best(v,
-                        t->round == ROUND_EPOCH  ? TARGET_EPOCH
-                        : t->round == ROUND_WARM ? TARGET_WARM
-                                                 : TARGET_CATCHUP,
-                        t->round == ROUND_EPOCH ||
-                            (t->round == ROUND_WARM && !t->warmed));
-            t->discovery_waiting = false;
-            if (t->round != ROUND_WARM)
-                p->hard_dirty = true;
-        }
+        if (!receive_chunk(v, message, chunk, lease))
+            receive_discovery(v, message, chunk, lease);
         return VSR_OK;
     }
     if (sender == VSR_INDEX_NONE || message->from == v->options.replica) {
@@ -1808,30 +2020,7 @@ int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
     }
     if (message->type == VSR_MSG_RECOVERY_RESPONSE) {
         *handled = true;
-        const struct vsr_recovery *response = message->body;
-        if (t->round != ROUND_RECOVERY || t->target.active ||
-            !vsr_nonce_equal(response->nonce, t->recovery_nonce) ||
-            message->view < v->status.view)
-            return VSR_OK;
-        uint64_t primary = vsr_primary(&p->current, message->view);
-        if ((message->from == primary) != (response->state != NULL))
-            return VSR_OK;
-        if (response->state != NULL &&
-            (!compatible_offer(v, response->state) ||
-             response->state->view != message->view ||
-             response->state->last_normal_view != message->view))
-            return VSR_OK;
-        if (message->view > t->highest_view) {
-            v->status.view = message->view;
-            v->status.primary = primary;
-            begin_recovery(v);
-            return VSR_OK;
-        }
-        t->peers[sender].recovered = true;
-        t->peers[sender].response_view = message->view;
-        if (response->state != NULL)
-            consider_offer(v, message->from, response->state, lease,
-                           VSR_INDEX_NONE);
+        receive_recovery_response(v, message, sender, lease);
         return VSR_OK;
     }
     bool primary_message = message->type == VSR_MSG_PREPARE ||
@@ -1849,87 +2038,23 @@ int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
     }
     if (message->type == VSR_MSG_START_VIEW_CHANGE) {
         *handled = true;
-        if (v->status.state == VSR_STATE_RECOVERING ||
-            v->status.state == VSR_STATE_WARMING ||
-            p->epoch.phase == VSR_EPOCH_TRANSFERRING)
-            return VSR_OK;
-        if (message->view > v->status.view || t->round == ROUND_CATCHUP)
-            enter_view(v, message->view);
-        if (t->round == ROUND_VIEW && !t->target.active)
-            t->peers[sender].svc = true;
+        receive_start_view_change(v, message, sender);
         return VSR_OK;
     }
     if (message->type == VSR_MSG_DO_VIEW_CHANGE) {
         *handled = true;
-        if (v->status.state == VSR_STATE_RECOVERING ||
-            v->status.state == VSR_STATE_WARMING ||
-            p->epoch.phase == VSR_EPOCH_TRANSFERRING ||
-            vsr_primary(&p->current, message->view) != v->options.replica)
-            return VSR_OK;
-        const struct vsr_log_state *state = message->body;
-        if (!compatible_offer(v, state) || state->view != message->view)
-            return VSR_OK;
-        if (message->view > v->status.view || t->round == ROUND_CATCHUP)
-            enter_view(v, message->view);
-        if (t->round == ROUND_VIEW && !t->target.active) {
-            t->peers[sender].dvc = true;
-            consider_offer(v, message->from, state, lease, VSR_INDEX_NONE);
-        }
+        receive_do_view_change(v, message, sender, lease);
         return VSR_OK;
     }
     if (message->type == VSR_MSG_START_VIEW) {
         *handled = true;
-        const struct vsr_log_state *state = message->body;
-        if (t->round == ROUND_RECOVERY ||
-            p->epoch.phase == VSR_EPOCH_TRANSFERRING ||
-            !compatible_offer(v, state) || state->view != message->view ||
-            state->last_normal_view != message->view)
-            return VSR_OK;
-        if (message->view == v->status.view && vsr_protocol_ready(v) &&
-            state->log_end <= p->stable_end &&
-            state->committed <= p->stable_commit) {
-            t->ack_pending = true;
-            return VSR_OK;
-        }
-        if (message->view > v->status.view)
-            enter_view(v, message->view);
-        if (t->target.active)
-            return VSR_OK;
-        if (t->round != ROUND_VIEW)
-            enter_view(v, message->view);
-        consider_offer(v, message->from, state, lease, VSR_INDEX_NONE);
-        select_best(v, TARGET_BACKUP, false);
+        receive_start_view(v, message, lease);
         return VSR_OK;
     }
-    if (message->type == VSR_MSG_PREPARE || message->type == VSR_MSG_COMMIT) {
-        if (t->round == ROUND_RECOVERY || t->target.active ||
-            v->status.state == VSR_STATE_WARMING ||
-            p->epoch.phase == VSR_EPOCH_TRANSFERRING) {
-            *handled = true;
-            return VSR_OK;
-        }
-        bool gap = message->type == VSR_MSG_COMMIT
-                       ? message->number >= p->log_end
-                       : ((const struct vsr_prepare *)message->body)
-                                 ->batch.entries[0]
-                                 .op > p->log_end;
-        if (message->view > v->status.view || gap ||
-            v->status.state != VSR_STATE_NORMAL) {
-            *handled = true;
-            bool new_round =
-                t->round != ROUND_CATCHUP || message->view > v->status.view;
-            v->status.view = message->view;
-            v->status.primary = message->from;
-            if (new_round)
-                begin_discovery(v, message->from, false);
-            uint64_t known =
-                message->type == VSR_MSG_COMMIT
-                    ? message->number
-                    : ((const struct vsr_prepare *)message->body)->committed;
-            if (known > t->committed_floor)
-                t->committed_floor = known;
-            return VSR_OK;
-        }
+    if ((message->type == VSR_MSG_PREPARE || message->type == VSR_MSG_COMMIT) &&
+        receive_normal_gap(v, message)) {
+        *handled = true;
+        return VSR_OK;
     }
     if (message->view > v->status.view)
         *handled = true;
@@ -1963,6 +2088,7 @@ void vsr_transition_complete(struct vsr *v, struct vsr_operation *operation,
         } else if (event->status != VSR_IO_OK) {
             vsr_fail(v, VSR_FAILURE_STORAGE, operation, event->status);
         } else {
+            /* A failed retain has failed the engine; nothing is served. */
             if (!vsr_lease_retain(v, lease))
                 return;
             server->lease = lease;
@@ -2020,23 +2146,27 @@ void vsr_transition_complete(struct vsr *v, struct vsr_operation *operation,
         }
         const struct vsr_loaded *loaded = event->data;
         const struct vsr_entry *entries = loaded->items;
-        if (loaded->count == 0 || loaded->count > target->entry_count) {
+        uint32_t offset = target->append_offset;
+        if (loaded->count == 0 ||
+            loaded->count > target->entry_count - offset) {
             vsr_fail(v, VSR_FAILURE_STORAGE, operation, event->status);
             return;
         }
-        target->append_offset = loaded->count;
         for (uint32_t i = 0; i < loaded->count; i++) {
-            if (!vsr_entry_equal(&entries[i], &target->entries[i])) {
+            if (!vsr_entry_equal(&entries[i], &target->entries[offset + i])) {
                 if (entries[i].op <= vsr_protocol(v)->stable_commit) {
                     vsr_fail(v, VSR_FAILURE_INVARIANT, operation,
                              event->status);
                     return;
                 }
-                target->append_offset = i;
-                break;
+                target->append_offset = offset + i;
+                target->phase = TARGET_APPEND;
+                return;
             }
         }
-        target->phase = TARGET_APPEND;
+        /* A load bounded by the payload budget may cover only part of the
+         * overlap; the comparison resumes past the verified prefix. */
+        target->append_offset = offset + loaded->count;
     }
 }
 
