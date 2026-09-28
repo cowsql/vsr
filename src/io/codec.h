@@ -217,10 +217,14 @@ int vsr_io_codec_decode_message(struct vsr_io_cursor *cursor,
 int vsr_io_codec_record_bytes(const struct vsr_store *transaction,
                               const struct vsr_limits *limits, size_t *bytes);
 /* Copies the record into out, which holds at least record_bytes; every
- * payload span is copied. Returns OK or EINVAL for a malformed graph. */
+ * payload span is copied. generation and run stamp the header as the store
+ * requires; flushed is the durable sequence acknowledged to the core when
+ * the record is packed (decision 50). Returns OK or EINVAL for a malformed
+ * graph. */
 int vsr_io_codec_put_record(const struct vsr_store *transaction,
-                            uint64_t generation, unsigned char *out,
-                            size_t capacity, size_t *written);
+                            uint64_t generation, uint32_t run, uint64_t flushed,
+                            unsigned char *out, size_t capacity,
+                            size_t *written);
 void vsr_io_codec_put_pad(unsigned char *out, uint32_t length);
 
 /*

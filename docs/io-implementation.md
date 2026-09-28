@@ -3,7 +3,7 @@
 The acceptance target is the contract in `include/vsr-io.h`,
 `include/vsr-sim.h` and `include/vsr-client.h`, designed in
 [io-design.md](io-design.md) and refined by its decision log (decisions 32
-to 49 record the choices this document applies). This document is the
+to 51 record the choices this document applies). This document is the
 internal architecture that the implementation follows: the source layout,
 every module with its private header, the byte formats, the indexes, the
 engine's entry points, the executor contract that both executors satisfy,
@@ -376,7 +376,9 @@ and growth, freeing floor with each floor dominating in turn, SYNC in both
 modes with out-of-order write completion, LOAD hot and cold for every
 type at current and older revisions, versions after TRUNCATE, RECLAIM,
 recovery over synthesized files including every torn-tail case of section
-6.4, CORRUPT below the durable floor); `tests/fuzzy/recovery` (libFuzzer:
+6.4, CORRUPT below the durable floor, the idle superblock write after
+a flush with no later record, LOADs routed before the STOREs of one
+update, and RETRY for a CLIENT load naming an older sequence); `tests/fuzzy/recovery` (libFuzzer:
 bytes as a log file -> `vsr_io_store_open` must never crash, and the
 recovered prefix must satisfy the CRC, sequence and run invariants when
 re-scanned by an independent checker in the test).
@@ -622,7 +624,7 @@ replica, snapshot hi/lo}`.
  └──────────────┴──────────────┴─────────────────┴─────────────────┴─────┘
  slot:    [header: header_blocks blocks][data: records and pads ...]
  write:   |record|record|record|PAD..|   whole blocks, from a block boundary
- record:  |hdr 40|change[count] 24 each|payload ... pad to 8|
+ record:  |hdr 48|change[count] 24 each|payload ... pad to 8|
 ```
 
 ### 5.1 Superblock (`vsr_io_wire_superblock`, 104 bytes in one block)
@@ -650,11 +652,12 @@ block_bytes)` blocks; bytes after the CRC are zero. The header is packed
 into the ring and written as its own write; no record of the segment is
 written before the header's write completed.
 
-### 5.3 Record (`vsr_io_wire_record`, 40 bytes)
+### 5.3 Record (`vsr_io_wire_record`, 48 bytes)
 
-magic "REC1", length (total, multiple of 8), sequence, generation, count
-(descriptors), run, payload_crc (bytes 40..length), header_crc (bytes
-0..35). Then `count` descriptors `{u32 type, u32 count, u64 first, u32
+magic "REC1", length (total, multiple of 8), sequence, generation, flushed
+(the durable sequence acknowledged to the core when the record was packed,
+decision 50), count (descriptors), run, payload_crc (bytes 48..length),
+header_crc (bytes 0..43). Then `count` descriptors `{u32 type, u32 count, u64 first, u32
 offset, u32 length}` (offset from the record start), then payloads in
 descriptor order:
 
@@ -667,7 +670,7 @@ descriptor order:
 | HARD_STATE | `vsr_io_wire_hard_state` EPOCH |
 | PUBLISH_CHECKPOINT, RESTORE_CHECKPOINT | CHECKPOINT |
 
-`vsr_io_codec_record_limit` is the largest record: 40 + 8 × 24 + (APPEND:
+`vsr_io_codec_record_limit` is the largest record: 48 + 8 × 24 + (APPEND:
 `batch_entries × 56 + message_bytes` padded) + (CLIENTS: `batch_entries ×
 (40 + pad(result_bytes))`) + (HARD_STATE: 32 + 16 + 2 × (16 + members ×
 16)) + 2 × (PUBLISH/RESTORE: 32 + 16 + 2 × (16 + members × 16) + 8 +
@@ -753,6 +756,12 @@ DATASYNC` is issued once `written >= flush_target` and its completion sets
 `flushed = written at issue`, completing every SYNC with `sequence <=
 flushed`. `durable` is the largest sequence acknowledged to the core.
 
+Idle floor (decision 50): when `durable` passes `superblock_floor` and no
+record is packed within `flush_interval_ns` (100 ms when zero), a
+superblock write carrying `durable_floor = durable` is planned; a record
+packed meanwhile carries the floor in its `flushed` field instead and the
+write is skipped.
+
 ### 6.3 Indexes
 
 Op ring `ops[op % max_entries]` holds the current version of every op in
@@ -764,7 +773,7 @@ revision can still name its entries. Each change type:
 | --- | --- |
 | APPEND | for each entry: ring slot set (a nonempty slot with a different op means the ring is full: `FAILED`); `previous = clients[c].retained`, `clients[c].retained = op`, creating the entry if absent (counts against `max_clients`; over: `FAILED`) |
 | TRUNCATE | for op from `log_end - 1` down to `first`: move the version to `versions` with `truncated = sequence` (table full: `FAILED`), clear the slot, and if `clients[c].retained == op` set it to `previous` when `previous >= log_begin`, else 0; `log_end = first` |
-| CLIENTS | for each record: entry `current` replaced (previous kept) when `number` is greater; equal number with different op or result is `CORRUPT`; lower is ignored; `clients_sequence = sequence` |
+| CLIENTS | for each record: entry `current` replaced when `number` is greater; equal number with different op or result is `CORRUPT`; lower is ignored; `clients_sequence = sequence` |
 | HARD_STATE | copied into `hard` and `state_region` |
 | PUBLISH | `anchor` replaced; if `id == last_capture` then `base_set(id, last_capture_sequence)`; else if `id` differs from the current base and the role is FULL, the transaction waits (`base_wanted`) for `vsr_io_snapshots_load_base` |
 | RESTORE | entries `<= op` dropped from the ring as by TRIM to `op + 1`; `anchor` replaced; the table is rebuilt: the transaction waits for the base load of `id` at this sequence (WITNESS: emptied at once), then every client's `retained` is recomputed by walking `[log_begin, log_end)` |
@@ -772,7 +781,9 @@ revision can still name its entries. Each change type:
 | IDENTITY | `identity` set; only at sequence 1 |
 | RECLAIM(oldest) | `reclaim = oldest`; `retained_begin` = `log_begin` as of `oldest - 1` from `trims`; versions with `truncated <= oldest` deleted; then `vsr_io_store_free_segments` |
 
-LOAD at sequence `s`:
+LOAD at sequence `s` (the core always names its `stored_sequence`; the
+engine routes every LOAD of an update before its STOREs, so normally
+`readable == s`, decision 51):
 
 - RECOVERY: only from `open`; answered by recovery.
 - LOG `[first, end)`: for `op = first` while `op < end`, count and bytes
@@ -788,8 +799,8 @@ LOAD at sequence `s`:
   = first + count`, `next = end` when the range is complete; an empty
   result for a nonempty range is `NOT_FOUND`.
 - CLIENT: the entry's `current` when `current.sequence <= s`, else
-  `previous` when `previous.sequence <= s`, else `FAILED` (decision 47);
-  no entry or `number == 0` is count 0. The record is read hot or cold
+  `RETRY` (decision 51: the core resets the route and reloads at its newer
+  stored sequence, without fencing); no entry or `number == 0` is count 0. The record is read hot or cold
   from the log when `sequence > client_base`, else from the base file at
   `base_offset` (a cold read through the clients-file slot).
 - REQUEST: `retained` when the version's `sequence <= s`, else walk
@@ -831,16 +842,20 @@ completion advances `recovery.stage`:
    `CORRUPT`.
 4. Load the start segment's state into `identity`, `hard`, `anchor`,
    `log_begin`, `log_end`, `client_base`; `sequence = last_sequence`;
-   `durable_floor = max(superblock.durable_floor, header.durable_floor)`.
+   `F = max(superblock.durable_floor, header.durable_floor)`, raised by
+   every later segment header's floor and every valid record's `flushed`
+   as the scan proceeds (decision 50).
 5. Scan the segment's data in slab-sized `READ`s: for each record header
    (`vsr_io_codec_get_record`): PAD skips; END or a bad header, wrong
    generation, `sequence != last + 1` or `run < last run` ends the scan;
-   a header valid but payload CRC bad ends it too. A record that ends
-   the scan with `sequence <= durable_floor` is `CORRUPT`. A record that
+   a header valid but payload CRC bad ends it too. Before a range is
+   judged bad it is read once more (`retried`): a transient bit flip or
+   read error passes on the re-read and only a second failure ends the
+   scan. A record that ends the scan with `sequence <= F` is `CORRUPT`;
+   above `F` it is the torn tail. A record that
    straddles the chunk end is re-read from its start (a record fits a
    slab). Each valid record is applied to the indexes exactly as a STORE
-   is (section 6.3), through the same code; the durable floor is only
-   what the superblock and headers persisted, records never raise it.
+   is (section 6.3), through the same code.
    CLIENTS records with `sequence <= client_base` still update
    `current`; the base file load in step 7 then re-points entries at the
    file, which is consistent because every record after the base is in
@@ -866,7 +881,10 @@ Torn-tail cases the tests synthesize: a lost last block; a lost middle
 block of a multi-block write with the later block persisted; a persisted
 block from a torn write behind a block rewritten by a later run (rejected
 by the run rule); a stale header of a segment whose records were torn; a
-bad record at or below the durable floor (`CORRUPT`); both superblocks
+bad record at or below the durable floor (`CORRUPT`), including a floor
+that only a later valid record's `flushed` carries; a bad record above the
+floor followed by a valid later record (still the torn tail); a block that
+reads bad once and clean on the re-read (passes); both superblocks
 valid with different revisions; one superblock corrupt; the start slot
 holding another segment (`CORRUPT`).
 
@@ -898,8 +916,9 @@ completes.
            events[n++] = every queued internal COMPLETE, in queue order
                          (store completions, SEND completions, snapshot
                          completions, LOAD results with their leases)
-           events[n++] = every caller event in the events ring, in order
+           events[n++] = every caller COMPLETE and STOP, in order
            events[n++] = every MESSAGE in the messages ring, in order
+           events[n++] = every other caller event, in submission order
            events[n++] = TIME(now)
            r = vsr_step_many(core, events, n, &update{step_ops})
            consume the accepted prefix: internal completions are dropped,
@@ -921,12 +940,17 @@ completes.
        ring, OUTPUT_FULL when ops filled and the ring is not empty
 ```
 
-Event order per step is what the header promises (completions and STOP,
-then MESSAGEs, then REQUESTs and the other caller events in their
-submission order, TIME last): the caller ring preserves the caller's
-order among its own events; STOP and COMPLETE precede MESSAGEs because the
-engine sorts them to the front of the caller section when building the
-array. The core coalesces across the whole array in one `vsr_step_many`.
+Event order per step, the one order used everywhere: internal
+completions; the caller's COMPLETE and STOP events; MESSAGEs; the caller's
+other events (REQUEST, CLIENT_QUERY, READ, CHECKPOINT) in submission order;
+TIME last. Completions and STOP come first because the core reserves
+capacity for them and they release resources (vsr.h: they take priority in
+a driver's queue). TIME is last so that a message received in this batch,
+which may reset a timer (a heartbeat from the primary, for example), is
+seen before the time that would otherwise expire it. The caller's COMPLETE
+and STOP are taken out of the caller ring in order when the array is
+built; the remaining caller events keep their relative order. The core
+coalesces across the whole array in one `vsr_step_many`.
 
 `work_per_step` bounds a step; the loop drains MORE, so a poll performs
 bounded work only because the forwarded ring (`limits.ops`) and the
@@ -951,7 +975,9 @@ A replica in STOPPED refuses every CORE event with `EINVAL`.
 
 ### 7.3 Op routing
 
-For each op the core emits, by `op.type`:
+For each op the core emits, by `op.type`; within one update every LOAD is
+routed first, then every STORE, then SYNC and RECLAIM, then the other ops
+in emission order (decision 51):
 
 | Op | Route |
 | --- | --- |
@@ -1179,6 +1205,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | `VSR_IO_CQE_MORE` documented on the first completion of a zero-copy send; executor semantics referenced to this document; uring options comment corrected (no `buffer_ring_memory` field) | 45 |
 | `vsr-io.h` | Store section: never-rewrite rule, held-STORE conditions (pinned floor, write-behind, RESTORE/PUBLISH base load), index overflow fails with FAILED; `cache_bytes` rule | 33, 36, 43 |
 | `vsr-io.h` | `vsr_io_detach` is EBUSY while write-behind writes or flushes are in flight | 49 |
+| `vsr-io.h` | Store section: the durable prefix below which a bad record is CORRUPT is the greatest durable sequence any persisted record, segment header or superblock carries; idle superblock write | 50 |
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | One `libvsr.a` with liburing; three headers installed (done by the build skeleton) | 32 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
@@ -1187,10 +1214,6 @@ of `docs/io-design.md`:
 
 - The per-stream inactivity timeout reuses `handshake_timeout_ns`; a
   dedicated option may be wanted once real transfers are measured.
-- The conservative durable floor (superblock and segment headers) can
-  miss corruption of records synced after the last header write; an
-  exact floor would cost a superblock write per SYNC batch, which the
-  design rejects. Decide after measuring how often headers are written.
 - `versions` is sized like the op ring, which is conservative; a smaller
   bound tied to the core's uncommitted suffix needs a core-side statement
   of that bound.

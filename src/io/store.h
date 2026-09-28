@@ -32,7 +32,14 @@
  *     a LOAD lease, or not yet written) or when unwritten bytes exceed
  *     write_behind_bytes. The layout rule cache_bytes >= write_behind_bytes
  *     + pinned_payload_bytes + 2 * max_record_bytes, checked at attach,
- *     guarantees this wait always ends.
+ *     guarantees this wait always ends;
+ *   - every record carries `flushed`, the durable sequence acknowledged to
+ *     the core when it was packed, and every superblock its durable_floor;
+ *     recovery's floor F is the maximum over all of them and a scan that
+ *     ends at or below F is CORRUPT (decision 50). When `durable` passes
+ *     the floor of the newest superblock and no record is packed within
+ *     flush_interval_ns (100 ms when zero), an idle superblock write
+ *     records the new floor.
  *
  * Index rules:
  *   - the OP RING maps every op in [retained_begin, log_end) to its record;
@@ -42,10 +49,13 @@
  *   - a version removed by TRUNCATE moves to the VERSIONS table with its
  *     validity range [appended, truncated) until RECLAIM passes it;
  *   - the CLIENT TABLE holds one entry per incarnation the store knows:
- *     its latest completed record (current and the one it replaced), its
- *     latest retained entry, its offset in the current base file, and an
- *     in-flight flag for admitted requests not yet indexed; entries count
- *     against max_clients together;
+ *     its latest completed record, its latest retained entry, its offset
+ *     in the current base file, and an in-flight flag for admitted
+ *     requests not yet indexed; entries count against max_clients
+ *     together. One version suffices because the engine routes the LOADs
+ *     of a core update before its STOREs and never queues a LOAD behind a
+ *     held STORE, so a CLIENT or REQUEST load is processed with `readable`
+ *     equal to the sequence it names (decision 51);
  *   - the SEGMENT TABLE maps slots to segment numbers and sequence ranges;
  *     a slot is freed when its last sequence is below every floor: the
  *     record of the oldest retained entry, the RECLAIM revision, the client
@@ -121,9 +131,6 @@ struct vsr_io_client_version {
 struct vsr_io_client {
     struct vsr_id id; /* Zero: empty; VSR_IO_CLIENT_TOMBSTONE: deleted. */
     struct vsr_io_client_version current;
-    struct vsr_io_client_version previous; /* Replaced within the last poll:
-                                              answers a load at the core's
-                                              trailing stored sequence. */
     uint64_t base_offset;    /* Record offset in the current base file, or
                                 UINT64_MAX; valid when current.sequence is at
                                 or below the client base. */
@@ -199,17 +206,19 @@ struct vsr_io_trim_event {
 
 /* Recovery scan state: one step at a time through prepare/complete. */
 struct vsr_io_recovery {
-    uint32_t stage;    /* Private stage enumeration. */
-    uint32_t slot;     /* Slot being read. */
-    uint32_t slab;     /* Read buffer. */
-    uint32_t region;   /* Region of the recovered graph. */
-    uint64_t offset;   /* Next file offset to read. */
-    uint64_t chunk;    /* Bytes in the slab. */
-    uint64_t sequence; /* Last valid record replayed. */
-    uint32_t run;      /* Run of the last valid record. */
-    uint32_t reserved;
-    uint64_t durable_floor;
-    uint64_t load_op;                /* The RECOVERY load op to complete. */
+    uint32_t stage;         /* Private stage enumeration. */
+    uint32_t slot;          /* Slot being read. */
+    uint32_t slab;          /* Read buffer. */
+    uint32_t region;        /* Region of the recovered graph. */
+    uint64_t offset;        /* Next file offset to read. */
+    uint64_t chunk;         /* Bytes in the slab. */
+    uint64_t sequence;      /* Last valid record replayed. */
+    uint32_t run;           /* Run of the last valid record. */
+    uint32_t retried;       /* 1 while the one re-read of a bad range is out. */
+    uint64_t retry_offset;  /* File offset of the range being re-read. */
+    uint64_t durable_floor; /* F: max of the superblock's and headers'
+                               floors and every valid record's flushed. */
+    uint64_t load_op;       /* The RECOVERY load op to complete. */
     struct vsr_recovered *recovered; /* Being built in `region`. */
 };
 
@@ -277,12 +286,18 @@ struct vsr_io_store {
     struct vsr_io_write *writes; /* [inflight_writes], issue order ring. */
     uint32_t writes_head;
     uint32_t writes_count;
-    uint32_t flush_slot;     /* Outstanding fdatasync or NONE. */
-    uint32_t flush_pending;  /* 1 when a flush must be issued. */
-    uint64_t flush_target;   /* Sequence the pending flush must cover. */
-    uint64_t flush_deadline; /* sync_delay / flush_interval expiry. */
+    uint32_t flush_slot;       /* Outstanding fdatasync or NONE. */
+    uint32_t flush_pending;    /* 1 when a flush must be issued. */
+    uint64_t flush_target;     /* Sequence the pending flush must cover. */
+    uint64_t flush_deadline;   /* sync_delay / flush_interval expiry. */
+    uint64_t superblock_floor; /* durable_floor of the newest superblock. */
+    uint64_t idle_deadline;    /* Idle superblock write: armed on the FLUSH
+                                  deadline handle when durable passes
+                                  superblock_floor, for flush_interval_ns
+                                  (100 ms when zero); fires only if no
+                                  record was packed meanwhile. */
+    uint32_t packed_since_durable;
     int32_t error;
-    uint32_t reserved;
     /* Indexes. */
     struct vsr_io_op_ref *ops;       /* [max_entries] */
     struct vsr_io_version *versions; /* [max_entries] */
@@ -353,9 +368,12 @@ void vsr_io_store_init(struct vsr_io_store *store, void *metadata,
 void vsr_io_store_open(struct vsr_io_store *store, uint32_t start_mode,
                        uint64_t load_op, const struct vsr_store_read *read);
 
-/* Core ops, in emission order. Each returns OK when accepted; the
- * completion is queued later through next_completion. EINVAL for a
- * malformed op (a caller bug). */
+/* Core ops. Within one core update the engine calls load for every LOAD
+ * first, then store for every STORE, then sync and reclaim (decision 51);
+ * a LOAD is answered against the current indexes at once, never behind a
+ * held STORE. Each returns OK when accepted; the completion is queued
+ * later through next_completion. EINVAL for a malformed op (a caller
+ * bug). */
 int vsr_io_store_load(struct vsr_io_store *store, uint64_t op,
                       const struct vsr_store_read *read);
 int vsr_io_store_store(struct vsr_io_store *store, uint64_t op,

@@ -501,12 +501,18 @@ checkpoint.
   the last sequence before the segment (decision 34). The superblocks are a
   double-buffered pointer to the segment to start scanning from plus
   identity, geometry, the run counter and a durable floor; they are
-  rewritten only when the start segment changes or slots grow, never per
-  transaction. Hard-state changes travel inside transaction records.
+  rewritten only when the start segment changes, slots grow, or, when no
+  record follows a flush within the flush interval, to persist a newer
+  durable floor; never per transaction. Every record also carries the
+  durable sequence acknowledged when it was packed (decision 50). Hard-state changes travel inside transaction records.
 - Torn-tail rule: records must be contiguous by sequence, CRC-clean and
   non-decreasing in their run counter. The first record that is short,
   fails its CRC, does not carry the expected next sequence, or carries a
-  run below its predecessor's ends the log. A stale record from a recycled
+  run below its predecessor's ends the log. A range is read once more
+  before it is judged bad, since reads can fail transiently; a bad record
+  at or below the durable floor, the greatest acknowledged durable
+  sequence carried by any superblock, segment header or valid record, is
+  CORRUPT and fences the replica (decision 50). A stale record from a recycled
   slot can never match, because sequences never repeat; a persisted block
   of a torn write that survives behind a block rewritten by a later run is
   rejected by the run rule. A bad record at or below the acknowledged
@@ -589,10 +595,12 @@ All indexes are fixed-capacity arrays from the replica's metadata region.
   table with their validity range until RECLAIM passes it, which is how LOAD
   can name an older retained revision.
 - One open-addressing table over the 128-bit client IDs with capacity
-  `max_clients` holds, per incarnation, its latest completed record (and the
-  one it replaced, since the core loads at a stored sequence that trails by
-  at most one poll), its latest retained entry, its offset in the current
-  base file and an in-flight flag (decisions 35, 44 and 47). The contract
+  `max_clients` holds, per incarnation, its latest completed record (one
+  version: the engine routes the LOADs of a core update before its STOREs,
+  and a load that still names an older sequence than the client's record
+  completes with RETRY, which makes the core reload), its latest retained
+  entry, its offset in the current base file and an in-flight flag
+  (decisions 35, 44 and 51). The contract
   retains every client's latest record forever and provides no deletion, so
   the client set is unbounded by design while the arena is not.
   `max_clients` is therefore a deployment-wide limit, identical on every
@@ -919,9 +927,11 @@ In the order the decisions were taken.
 | 44 | `max_clients` admission tracks in-flight incarnations as a flag in the client table entry, cleared when the incarnation is indexed or replied to | No second structure; the count is the table's | A separate in-flight set |
 | 45 | Executor semantics are specified once in docs/io-implementation.md and checked by `tests/integration/executor_conformance` over both executors; the first completion of a zero-copy send carries `MORE`; `FIXED_BUFFER` addresses are validated against the region; listeners are set up asynchronously through the executor and a failure is fatal through `vsr_io_stats.failure` | Two implementations of one contract need the contract written down; init that blocks on the ring would steal the caller's completions | Probing semantics from the kernel; synchronous bind in init |
 | 46 | Test plan: unit tests per module, libFuzzer harnesses for the frame decoder and store recovery, engine contracts over the simulation, the conformance suite, and `tests/fuzzy/iocluster` with fault profiles and a seeded fault-injecting wrapper executor for real I/O | Mirrors the core's layers; every randomized failure replays from its seed | Real-I/O-only integration tests |
-| 47 | CLIENT and REQUEST loads answer from the current record and the one it replaced; a load older than both fails as an invariant | The core issues them at its stored sequence, which trails the readable one by at most one poll, and replaces a client's record at most once per poll | Full history per client |
+| 47 | Superseded by 51. CLIENT and REQUEST loads answer from the current record and the one it replaced; a load older than both fails as an invariant | The core issues them at its stored sequence, which trails the readable one by at most one poll, and replaces a client's record at most once per poll | Full history per client |
 | 48 | Recovery successor rule: after replaying a segment, continue in the segment with the greatest number among those whose header names the replayed sequence with a run at or above the current one; a header naming a lower sequence is stale and its slot is free; the durable floor is the maximum persisted floor | Stale headers of torn segments are distinguishable without rewriting them | Zeroing stale headers at recovery |
 | 49 | `vsr_io_detach` is EBUSY while write-behind writes or flushes are in flight; `vsr_io_close` cancels listeners and receives, closes links and streams, and reports `closed` when every slot is free | Nothing is torn down under an in-flight kernel operation | Synchronous teardown |
+| 50 | Exact durable floor: every record carries `flushed`, the durable sequence acknowledged to the core when it was packed; recovery's floor is the maximum over the superblock, the segment headers and every valid record; a scan that ends at or below it is CORRUPT; a bad range is re-read once before it is judged; when no record follows a flush within `flush_interval_ns` (100 ms when zero) an idle superblock write persists the new floor | In DURABLE mode a replica that silently drops an acknowledged transaction can vote twice after a restart, and a floor only as fresh as the last superblock would misread corrupted durable records as a torn tail. Flushed blocks survive a crash, so the residual case is media corruption of the last flushed records before a later record or the idle write persists their floor | A superblock write per SYNC batch; the floor of superblocks and headers only |
+| 51 | One completed-record version per client: within one core update the engine routes every LOAD before any STORE, so a CLIENT or REQUEST load is answered with `readable` equal to the sequence it names; a load that still names a sequence older than the client's current record (a STORE completion the core has not consumed yet) completes with RETRY | The core names its `stored_sequence` in these loads and on RETRY resets the route and reloads without fencing (`load_route` and `route_load_complete` in src/protocol.c) | Decision 47's second version per client; FAILED as an invariant |
 
 ## 11. Open items and implementation order
 

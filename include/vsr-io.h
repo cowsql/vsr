@@ -786,7 +786,12 @@ int vsr_io_slab_release(struct vsr_io *io, uint16_t id);
  * flushed every flush_interval_ns, and its only role is recovery and
  * catch-up. Recovery scans live segments from the newer superblock; a
  * record that is short, fails its CRC, or breaks the sequence ends the log;
- * a bad record below the acknowledged durable prefix is CORRUPT. NEW and
+ * a bad record below the acknowledged durable prefix is CORRUPT, the
+ * prefix being the greatest durable sequence any persisted record or
+ * superblock carries, so only the transactions acknowledged by the last
+ * flush before a crash, until a later record or the idle superblock write
+ * (within flush_interval_ns, 100 ms when zero) persists that sequence, can
+ * read as a torn tail instead. NEW and
  * JOIN create the store; RECOVER opens it and reports NOT_FOUND when the
  * directory has no log. An index overflow (more than max_entries ops
  * retained by unreclaimed revisions, or more than max_clients incarnations

@@ -360,7 +360,11 @@ struct vsr_io_wire_hard_state {
 /*
  * Record: one store transaction. length counts the header, the change
  * descriptors and the payload, padded to 8. header_crc covers bytes
- * [0, 36); payload_crc covers bytes [40, length). A PAD is a
+ * [0, 44); payload_crc covers bytes [48, length). flushed is the durable
+ * sequence acknowledged to the core when the record was packed: recovery
+ * takes the maximum of it over every valid record, with the superblock's
+ * and the segment headers' durable_floor, as the prefix that must be
+ * intact (docs/io-implementation.md, "Recovery"; decision 50). A PAD is a
  * vsr_io_wire_pad whose length runs to the next block boundary; when fewer
  * than 8 bytes remain in a block they are zero and the scanner skips to the
  * next block without a marker. The scanner stops at the first header whose
@@ -385,8 +389,9 @@ struct vsr_io_wire_record {
     uint32_t length; /* Total bytes, multiple of 8. */
     uint64_t sequence;
     uint64_t generation;
-    uint32_t count; /* Change descriptors following the header. */
-    uint32_t run;   /* Superblock run at the time of writing. */
+    uint64_t flushed; /* Durable sequence acknowledged when packed. */
+    uint32_t count;   /* Change descriptors following the header. */
+    uint32_t run;     /* Superblock run at the time of writing. */
     uint32_t payload_crc;
     uint32_t header_crc;
 };
@@ -486,7 +491,7 @@ _Static_assert(sizeof(struct vsr_io_wire_segment) == 80,
                "segment header is 80");
 _Static_assert(sizeof(struct vsr_io_wire_identity) == 32, "identity is 32");
 _Static_assert(sizeof(struct vsr_io_wire_hard_state) == 32, "hard state is 32");
-_Static_assert(sizeof(struct vsr_io_wire_record) == 40, "record header is 40");
+_Static_assert(sizeof(struct vsr_io_wire_record) == 48, "record header is 48");
 _Static_assert(sizeof(struct vsr_io_wire_pad) == 8, "pad is 8");
 _Static_assert(sizeof(struct vsr_io_wire_change) == 24, "change is 24");
 _Static_assert(sizeof(struct vsr_io_wire_client_record) == 40,
