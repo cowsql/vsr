@@ -739,7 +739,7 @@ descriptor order:
 | PUBLISH_CHECKPOINT, RESTORE_CHECKPOINT | CHECKPOINT |
 
 `vsr_io_codec_record_limit` is the largest record: 48 + 8 × 24 + (APPEND:
-`batch_entries × 56 + message_bytes` padded) + (CLIENTS: `batch_entries ×
+`batch_entries × (56 + max(15, 16 + 16 × members)) + message_bytes` padded, since every entry carries a blob header and a RECONFIGURE body holds a membership) + (CLIENTS: `batch_entries ×
 (40 + pad(result_bytes))`) + (HARD_STATE: 32 + 16 + 2 × (16 + members ×
 16)) + 2 × (PUBLISH/RESTORE: 32 + 16 + 2 × (16 + members × 16) + 8 +
 pad(manifest_bytes)) + 32, with checked arithmetic. A transaction larger
