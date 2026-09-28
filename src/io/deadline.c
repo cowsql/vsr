@@ -100,11 +100,14 @@ static void deadline_down(struct vsr_io_deadlines *set, uint32_t position)
     uint32_t handle = set->heap[position];
 
     for (;;) {
-        uint32_t child = 2 * position + 1;
+        uint32_t child;
 
-        if (child >= set->count) {
+        /* The left child exists iff position < count / 2; computing
+         * 2 * position + 1 first would wrap past 2^31 entries. */
+        if (position >= set->count / 2) {
             break;
         }
+        child = 2 * position + 1;
         if (child + 1 < set->count &&
             deadline_before(set, set->heap[child + 1], set->heap[child])) {
             child++;

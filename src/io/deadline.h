@@ -9,7 +9,7 @@
 
 /*
  * Deadline set (docs/io-implementation.md, "Deadlines"). The engine arms no
- * TIMEOUT record for itself (docs/io-design.md decision 39): every engine
+ * TIMEOUT record for itself (docs/io-design.md decision 40): every engine
  * deadline is an entry here, the earliest is what vsr_io_prepare reports in
  * *deadline_ns, and the loop's submit_and_wait returns by then. On the next
  * poll the engine asks which entries are due and dispatches them by kind.
@@ -28,7 +28,7 @@ enum vsr_io_deadline_kind {
     VSR_IO_DEADLINE_FLUSH,   /* Write-behind flush; index = replica. */
     VSR_IO_DEADLINE_SYNC,    /* sync_delay_ns hold; index = replica. */
     VSR_IO_DEADLINE_STREAM,  /* Stream inactivity; index = stream. */
-    VSR_IO_DEADLINE_CAPTURE, /* Retry of a failed clients-file step. */
+    VSR_IO_DEADLINE_CAPTURE, /* Clients-file step retry; index = replica. */
     VSR_IO_DEADLINE_KINDS
 };
 
@@ -48,8 +48,9 @@ struct vsr_io_deadlines {
     uint32_t count;
 };
 
-/* Bytes for capacity handles (entries, then heap); checked arithmetic,
- * ELIMIT on overflow or capacity UINT32_MAX (the NONE position). */
+/* Bytes for capacity handles (entries, then heap), in memory aligned for
+ * uint64_t; checked arithmetic, ELIMIT on overflow or capacity UINT32_MAX
+ * (the NONE position). */
 int vsr_io_deadlines_size(uint32_t capacity, size_t *bytes);
 /* Every handle starts disarmed and unbound. */
 void vsr_io_deadlines_init(struct vsr_io_deadlines *set, void *memory,
@@ -64,7 +65,8 @@ void vsr_io_deadlines_arm(struct vsr_io_deadlines *set, uint32_t handle,
 uint64_t vsr_io_deadlines_earliest(const struct vsr_io_deadlines *set);
 /* Pops the earliest entry due at or before now; false when none. Equal
  * deadlines pop in handle order. The entry is disarmed; a periodic owner
- * re-arms it. */
+ * re-arms it after now, since an entry armed at or before now is due at
+ * once and pops again in the same drain. */
 bool vsr_io_deadlines_pop(struct vsr_io_deadlines *set, uint64_t now,
                           uint16_t *kind, uint32_t *index);
 
