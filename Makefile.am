@@ -24,7 +24,8 @@ src_libvsr_a_SOURCES = \
 # planners, the engine, and the io_uring executor under src/io; the simulated
 # world under src/sim; the client bookkeeping under src/client.
 src_libvsr_a_SOURCES += src/io/crc32c.c src/io/crc32c.h src/io/cursor.c \
-  src/io/pool.c src/io/slots.c src/io/deadline.c src/client/client.c
+  src/io/pool.c src/io/slots.c src/io/deadline.c src/client/client.c \
+  src/io/uring.c
 # Private headers of the I/O layer: the interface specification every
 # module implements (docs/io-implementation.md); compiled by the header
 # check until their sources land.
@@ -55,7 +56,8 @@ UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/
   tests/unit/validate tests/unit/runtime tests/unit/reads tests/unit/memory_watch
 UNIT_TESTS += tests/unit/descriptors tests/unit/layout
 UNIT_TESTS += tests/unit/crc32c tests/unit/cursor tests/unit/pool \
-  tests/unit/slots tests/unit/deadline tests/unit/client
+  tests/unit/slots tests/unit/deadline tests/unit/client \
+  tests/unit/uring_translate
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
@@ -63,6 +65,7 @@ INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
   tests/integration/api_contract
 INTEGRATION_TESTS += tests/integration/failures tests/integration/view_change_edges \
   tests/integration/offers tests/integration/capture tests/integration/clients
+INTEGRATION_TESTS += tests/integration/uring_smoke
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
   tests/regression/witness_prefix tests/regression/boundary_from_view_change \
@@ -108,6 +111,12 @@ tests_unit_deadline_SOURCES = tests/unit/deadline.c tests/lib/random.c \
 tests_unit_deadline_LDADD = $(LIBVSR)
 tests_unit_client_SOURCES = tests/unit/client.c tests/lib/random.c tests/lib/random.h
 tests_unit_client_LDADD = $(LIBVSR)
+tests_unit_uring_translate_SOURCES = tests/unit/uring_translate.c
+tests_unit_uring_translate_LDADD = $(LIBVSR)
+tests_integration_uring_smoke_SOURCES = tests/integration/uring_smoke.c
+tests_integration_uring_smoke_LDADD = $(LIBVSR)
+tests_integration_uring_smoke_CFLAGS = $(AM_CFLAGS) -pthread
+tests_integration_uring_smoke_LDFLAGS = $(AM_LDFLAGS) -pthread
 tests_integration_replication_SOURCES = tests/integration/replication.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
