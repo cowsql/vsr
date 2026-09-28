@@ -24,8 +24,9 @@ src_libvsr_a_SOURCES = \
 # planners, the engine, and the io_uring executor under src/io; the simulated
 # world under src/sim; the client bookkeeping under src/client.
 src_libvsr_a_SOURCES += src/io/crc32c.c src/io/crc32c.h src/io/cursor.c \
-  src/io/pool.c src/io/slots.c src/io/deadline.c src/client/client.c \
-  src/io/uring.c src/sim/world.c src/sim/net.c src/sim/disk.c src/sim/exec.c
+  src/io/codec.c src/io/pool.c src/io/slots.c src/io/deadline.c \
+  src/client/client.c src/io/uring.c src/sim/world.c src/sim/net.c \
+  src/sim/disk.c src/sim/exec.c
 # Private headers of the I/O layer: the interface specification every
 # module implements (docs/io-implementation.md); compiled by the header
 # check until their sources land.
@@ -55,8 +56,8 @@ examples_witness_LDADD = $(LIBVSR)
 UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/memory \
   tests/unit/validate tests/unit/runtime tests/unit/reads tests/unit/memory_watch
 UNIT_TESTS += tests/unit/descriptors tests/unit/layout
-UNIT_TESTS += tests/unit/crc32c tests/unit/cursor tests/unit/pool \
-  tests/unit/slots tests/unit/deadline tests/unit/client \
+UNIT_TESTS += tests/unit/crc32c tests/unit/cursor tests/unit/codec \
+  tests/unit/pool tests/unit/slots tests/unit/deadline tests/unit/client \
   tests/unit/uring_translate tests/unit/sim_world
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
@@ -103,6 +104,8 @@ tests_unit_crc32c_SOURCES = tests/unit/crc32c.c tests/lib/random.c tests/lib/ran
 tests_unit_crc32c_LDADD = $(LIBVSR)
 tests_unit_cursor_SOURCES = tests/unit/cursor.c
 tests_unit_cursor_LDADD = $(LIBVSR)
+tests_unit_codec_SOURCES = tests/unit/codec.c tests/lib/random.c tests/lib/random.h
+tests_unit_codec_LDADD = $(LIBVSR)
 tests_unit_pool_SOURCES = tests/unit/pool.c tests/lib/random.c tests/lib/random.h
 tests_unit_pool_LDADD = $(LIBVSR)
 tests_unit_slots_SOURCES = tests/unit/slots.c
@@ -283,7 +286,8 @@ check_LIBRARIES = tests/integration/libheader.a
 tests_integration_libheader_a_SOURCES = tests/integration/header.c
 
 if FUZZING
-noinst_PROGRAMS += tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz
+noinst_PROGRAMS += tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz \
+  tests/fuzzy/frame
 tests_fuzzy_checked_SOURCES = tests/fuzzy/checked.c
 tests_fuzzy_checked_LDADD = $(LIBVSR)
 tests_fuzzy_checked_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
@@ -293,6 +297,9 @@ tests_fuzzy_validation_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 tests_fuzzy_cluster_fuzz_SOURCES = tests/fuzzy/cluster_fuzz.c $(CLUSTER_SCENARIO)
 tests_fuzzy_cluster_fuzz_LDADD = $(LIBVSR)
 tests_fuzzy_cluster_fuzz_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
+tests_fuzzy_frame_SOURCES = tests/fuzzy/frame.c
+tests_fuzzy_frame_LDADD = $(LIBVSR)
+tests_fuzzy_frame_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 endif
 
 EXTRA_DIST = \
@@ -398,15 +405,21 @@ coverage:
 endif
 
 if FUZZING
-fuzz: tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz
+# The codec unit test seeds the frame corpus with valid encodings of every
+# frame, record, superblock, segment header and clients file it builds.
+fuzz: tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz \
+  tests/fuzzy/frame tests/unit/codec
 	$(MKDIR_P) tests/fuzzy/corpus/checked tests/fuzzy/corpus/validation \
-	  tests/fuzzy/corpus/cluster tests/fuzzy/artifacts
+	  tests/fuzzy/corpus/cluster tests/fuzzy/corpus/frame tests/fuzzy/artifacts
+	VSR_CODEC_CORPUS=tests/fuzzy/corpus/frame ./tests/unit/codec
 	./tests/fuzzy/checked -runs=$(FUZZ_RUNS) -max_len=64 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/checked
 	./tests/fuzzy/validation -runs=$(FUZZ_RUNS) -max_len=256 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/validation
 	./tests/fuzzy/cluster_fuzz -runs=$(FUZZ_RUNS) -max_len=512 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/cluster
+	./tests/fuzzy/frame -runs=$(FUZZ_RUNS) -max_len=4096 \
+	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/frame
 else
 fuzz:
 	@echo 'Configure a separate build with --enable-fuzzing first.' >&2; exit 1
