@@ -1292,25 +1292,6 @@ static void test_complete_core(void)
  * MESSAGE delivery
  * ---------------------------------------------------------------------- */
 
-#ifndef ENGINE_TABLES_CODEC
-/* SKIP: src/io/codec.c is not in the library yet (branch wt/codec). This
- * stand-in rejects every body, so the rejection and no-region paths run
- * and the round trip below is skipped. Remove it and define
- * ENGINE_TABLES_CODEC once the codec lands. */
-int vsr_io_codec_decode_message(struct vsr_io_cursor *cursor,
-                                const struct vsr_limits *limits,
-                                struct vsr_io_bump *region,
-                                struct vsr_message **out)
-{
-    (void)cursor;
-    (void)limits;
-    (void)region;
-    *out = NULL;
-    return VSR_EINVAL;
-}
-#endif
-
-#ifdef ENGINE_TABLES_CODEC
 /* Encodes a body-less message (PREPARE_OK) into a slab as one frame:
  * header, then the envelope. Returns the body length. */
 static size_t encode_frame(struct vsr_io *io, uint32_t slab,
@@ -1343,7 +1324,6 @@ static size_t encode_frame(struct vsr_io *io, uint32_t slab,
     CHECK(used == VSR_IO_FRAME_HEADER_BYTES + length);
     return length;
 }
-#endif
 
 static void test_deliver(void)
 {
@@ -1371,7 +1351,6 @@ static void test_deliver(void)
     CHECK(replica->leases_free == REGIONS && replica->messages_count == 0);
     CHECK(io->pool.entries[slab].refs == 1);
     CHECK(leases[0].state == 0 && leases[0].region.used == 0);
-#ifdef ENGINE_TABLES_CODEC
     {
         struct vsr_message message;
         const struct vsr_io_queued_event *queued;
@@ -1447,10 +1426,6 @@ static void test_deliver(void)
         replica->messages_count = 0;
         CHECK(io->pool.entries[slab].refs == 1);
     }
-#else
-    printf("SKIP: deliver round trip needs src/io/codec.c (branch "
-           "wt/codec)\n");
-#endif
     vsr_io_pool_release(&io->pool, slab);
     CHECK(io->pool.free_count == SLABS);
     close_replica(replica);
