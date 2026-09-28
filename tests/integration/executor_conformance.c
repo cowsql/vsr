@@ -1492,6 +1492,16 @@ static void scenario_file_io(struct fixture *f)
 }
 
 /* Opens an O_DIRECT file holding one aligned block, or skips. */
+static bool all_bytes(const unsigned char *bytes, size_t size, unsigned char c)
+{
+    for (size_t i = 0; i < size; ++i) {
+        if (bytes[i] != c) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int32_t open_direct(struct fixture *f, unsigned char **page)
 {
     int32_t fd =
@@ -1535,19 +1545,26 @@ static void scenario_odirect_alignment(struct fixture *f)
     free(page);
 }
 
-/* O_DIRECT: the address must be block-aligned too. (The kernel's memory
- * rule is the device's DMA alignment, which may be smaller.) */
+/* O_DIRECT: only offset and length need block alignment; a misaligned
+ * address is served (decision 65). */
 static void scenario_odirect_address(struct fixture *f)
 {
     struct vsr_io_vec vecs[1];
     unsigned char *page;
     int32_t fd = open_direct(f, &page);
 
-    CHECK(io(f, VSR_IO_SQE_READ, fd, page + 1, 512, 0, UD(4)) == -EINVAL);
-    CHECK(io(f, VSR_IO_SQE_WRITE, fd, page + 1, 512, 0, UD(5)) == -EINVAL);
+    /* Only offset and length need block alignment; a misaligned address is
+     * served, bounced by the kernel where the device needs it (decision
+     * 65). The file holds ALIGNED bytes of 'd' from open_direct. */
+    memset(page + 1, 0, 512);
+    CHECK(io(f, VSR_IO_SQE_READ, fd, page + 1, 512, 0, UD(4)) == 512);
+    CHECK(all_bytes(page + 1, 512, 'd'));
+    CHECK(io(f, VSR_IO_SQE_WRITE, fd, page + 1, 512, 0, UD(5)) == 512);
     vecs[0].base = page + ALIGNED + 3;
     vecs[0].length = 512;
-    CHECK(io(f, VSR_IO_SQE_READV, fd, vecs, 1, 0, UD(6)) == -EINVAL);
+    memset(page + ALIGNED + 3, 0, 512);
+    CHECK(io(f, VSR_IO_SQE_READV, fd, vecs, 1, 0, UD(6)) == 512);
+    CHECK(all_bytes(page + ALIGNED + 3, 512, 'd'));
     CHECK(close_fd(f, fd, false) == 0);
     free(page);
 }
@@ -1673,6 +1690,7 @@ static void scenario_fixed_buffers(struct fixture *f)
     struct link l;
     unsigned char *page = page_alloc(8192);
     char buffer[64];
+    int rc;
     int32_t fd = open_at(f, f->dir, "fixed", O_CREAT | O_RDWR, UD(1));
 
     CHECK(fd >= 0);
@@ -1722,16 +1740,20 @@ static void scenario_fixed_buffers(struct fixture *f)
     CHECK(fixed_io(f, VSR_IO_SQE_READ, fd, page, 8, 0, 0, UD(14)) == 8);
     CHECK(close_fd(f, fd, false) == 0);
 
-    /* A region a pending record uses cannot be changed or cleared. */
+    /* Replacing a region a pending record uses is a caller error: the sim
+     * reports -EBUSY, the ring cannot tell and returns 0 while the kernel
+     * keeps the old registration alive (decision 65). */
     open_link(f, &l);
     r = recv_record(l.server, false, page, 64, UD(15));
     r.flags = VSR_IO_SQE_FIXED_BUFFER;
     r.buffer_index = 0;
     submit1(f, r);
-    CHECK(f->ex.ops->update_buffer(f->ex.ctx, 0, NULL) == -EBUSY);
+    rc = f->ex.ops->update_buffer(f->ex.ctx, 0, NULL);
+    CHECK(rc == -EBUSY || rc == 0);
     region.base = page + 4096;
     region.size = 4096;
-    CHECK(f->ex.ops->update_buffer(f->ex.ctx, 0, &region) == -EBUSY);
+    rc = f->ex.ops->update_buffer(f->ex.ctx, 0, &region);
+    CHECK(rc == -EBUSY || rc == 0);
     CHECK(cancel_user_data(f, UD(15)) == 0);
     CHECK(take(f, UD(15)).result == -ECANCELED);
     CHECK(f->ex.ops->update_buffer(f->ex.ctx, 0, NULL) == 0);
@@ -1854,9 +1876,13 @@ static void scenario_socket_setup(struct fixture *f)
     cqe = take(f, UD(4));
     CHECK(cqe.result >= 0 && cqe.flags == 0);
     server = cqe.result;
+    /* GETSOCKOPT serves SOL_SOCKET only; other levels complete
+     * -EOPNOTSUPP on both executors, while SETSOCKOPT serves every level
+     * (decision 65). */
     for (uint32_t option = 0; option < 2; ++option) {
         uint32_t level = option == 0 ? SOL_SOCKET : (uint32_t)IPPROTO_TCP;
         uint32_t name = option == 0 ? SO_KEEPALIVE : (uint32_t)TCP_NODELAY;
+        int32_t got = option == 0 ? (int32_t)sizeof(value) : -EOPNOTSUPP;
 
         value = 7;
         r = rec(VSR_IO_SQE_GETSOCKOPT, UD(10 + option));
@@ -1864,7 +1890,7 @@ static void scenario_socket_setup(struct fixture *f)
         r.op_flags = level << 16 | name;
         r.addr = &value;
         r.length = sizeof(value);
-        CHECK(run(f, r) == (int32_t)sizeof(value) && value == 0);
+        CHECK(run(f, r) == got && value == (option == 0 ? 0 : 7));
         value = 1;
         r = rec(VSR_IO_SQE_SETSOCKOPT, UD(20 + option));
         r.fd = server;
@@ -1878,7 +1904,7 @@ static void scenario_socket_setup(struct fixture *f)
         r.op_flags = level << 16 | name;
         r.addr = &value;
         r.length = sizeof(value);
-        CHECK(run(f, r) == (int32_t)sizeof(value) && value == 1);
+        CHECK(run(f, r) == got && value == (option == 0 ? 1 : 7));
     }
     CHECK(close_fd(f, server, false) == 0);
     CHECK(close_fd(f, listener, false) == 0);
@@ -2088,23 +2114,34 @@ static void scenario_accept_enfile_queued(struct fixture *f)
     char buffer[16];
     int32_t listener = open_listener(f, &dial);
     int peers[3];
+    int fresh;
+    int n;
 
     accept_until_enfile(f, listener, &dial, peers);
+    /* The connection that found no slot was accepted and closed, so its
+     * peer sees the end of the stream or a reset, and nothing stays queued
+     * for the next accept (decision 65). */
+    n = f->factory->peer_recv(f, peers[2], buffer, sizeof(buffer));
+    CHECK(n == 0 || n == -ECONNRESET);
     CHECK(close_fd(f, 0, true) == 0);
     r = rec(VSR_IO_SQE_ACCEPT, UD(2));
     r.fd = listener;
     r.flags = VSR_IO_SQE_DIRECT;
     r.fd2 = VSR_IO_SLOT_ALLOC;
     submit1(f, r);
+    CHECK(!arrives(f, UD(2), 100, &cqe));
+    fresh = f->factory->peer_connect(f, &dial);
+    CHECK(fresh >= 0);
     CHECK(arrives(f, UD(2), 500, &cqe));
     CHECK(cqe.result == 0 && cqe.flags == 0);
-    CHECK(f->factory->peer_send(f, peers[2], "queued", 6) == 0);
+    CHECK(f->factory->peer_send(f, fresh, "queued", 6) == 0);
     memset(buffer, 0, sizeof(buffer));
     CHECK(run(f, recv_record(0, true, buffer, sizeof(buffer), UD(3))) == 6);
     CHECK(memcmp(buffer, "queued", 6) == 0);
     for (uint32_t i = 0; i < 3; ++i) {
         CHECK(f->factory->peer_close(f, peers[i], false) == 0);
     }
+    CHECK(f->factory->peer_close(f, fresh, false) == 0);
     CHECK(close_fd(f, listener, false) == 0);
 }
 
