@@ -80,6 +80,12 @@ struct vsr_io_replica {
     struct vsr_io_snapshots snapshots;
     /* Event queues, in the order vsr_io_poll feeds them: internal
      * completions, then caller events, then MESSAGEs, then TIME. */
+    struct vsr_io_queued_event *completions; /* [core.limits.operations]
+                                                ring of internal COMPLETEs
+                                                (SEND, snapshot); the store
+                                                drains its own queue. */
+    uint32_t completions_head;
+    uint32_t completions_count;
     struct vsr_io_queued_event *events; /* [limits.events] caller ring */
     uint32_t events_head;
     uint32_t events_count;

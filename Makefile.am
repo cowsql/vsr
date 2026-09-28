@@ -24,8 +24,9 @@ src_libvsr_a_SOURCES = \
 # world under src/sim; the client bookkeeping under src/client.
 src_libvsr_a_SOURCES += src/io/crc32c.c src/io/crc32c.h src/io/cursor.c \
   src/io/codec.c src/io/pool.c src/io/slots.c src/io/deadline.c \
-  src/client/client.c src/io/uring.c src/sim/world.c src/sim/net.c \
-  src/sim/disk.c src/sim/exec.c
+  src/io/link.c src/io/stream.c src/io/engine.c src/client/client.c \
+  src/io/uring.c src/sim/world.c src/sim/net.c src/sim/disk.c \
+  src/sim/exec.c
 # Private headers of the I/O layer: the interface specification every
 # module implements (docs/io-implementation.md); compiled by the header
 # check until their sources land. src/io/uapi/io_uring.h is the kernel's
@@ -58,7 +59,7 @@ UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/
 UNIT_TESTS += tests/unit/descriptors tests/unit/layout
 UNIT_TESTS += tests/unit/crc32c tests/unit/cursor tests/unit/codec \
   tests/unit/pool tests/unit/slots tests/unit/deadline tests/unit/client \
-  tests/unit/uring_translate tests/unit/sim_world
+  tests/unit/uring_translate tests/unit/sim_world tests/unit/engine_tables
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
@@ -119,6 +120,8 @@ tests_unit_uring_translate_SOURCES = tests/unit/uring_translate.c
 tests_unit_uring_translate_LDADD = $(LIBVSR)
 tests_unit_sim_world_SOURCES = tests/unit/sim_world.c
 tests_unit_sim_world_LDADD = $(LIBVSR)
+tests_unit_engine_tables_SOURCES = tests/unit/engine_tables.c
+tests_unit_engine_tables_LDADD = $(LIBVSR)
 tests_integration_uring_smoke_SOURCES = tests/integration/uring_smoke.c
 tests_integration_uring_smoke_LDADD = $(LIBVSR)
 tests_integration_uring_smoke_CFLAGS = $(AM_CFLAGS) -pthread
