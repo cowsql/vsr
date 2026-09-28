@@ -99,7 +99,26 @@
  * executor remembers (user_data, slot) until the completion and reports
  * the slot; SEND always carries MSG_NOSIGNAL, and SEND and non-selecting
  * RECV carry MSG_WAITALL when LINK is set, so that a short transfer fails
- * the chain as the contract's LINK rule says.
+ * the chain as the contract's LINK rule says; a BUFFER_SELECT receive
+ * carries IORING_RECVSEND_POLL_FIRST, so the kernel selects its buffer at
+ * a delivery and an empty ring is -ENOBUFS then, never at arming
+ * (decision 65); GETSOCKOPT at a level other than SOL_SOCKET is refused
+ * at translation with -EOPNOTSUPP, the only level the kernel's socket
+ * command serves and the contract's rule for both executors (decision
+ * 65). A zero-copy record the translation rejects completes exactly once
+ * with the error and MORE clear, since the failure NOP has no
+ * notification (decision 62).
+ *
+ * Contract values the executor decides itself, before any kernel call: a
+ * record carrying the reserved user_data (below) makes submit_and_wait
+ * return -EINVAL before any SQE is written; a second register_files or
+ * register_buffers is -EBUSY; buffer_ring on a registered group -EEXIST;
+ * unregistering or providing to an unknown group -ENOENT; update_file and
+ * update_buffer with a slot or index outside the table, or before the
+ * table is registered, -EINVAL. update_buffer of a region a pending
+ * record uses is a caller error the ring cannot detect: it returns 0 and
+ * the kernel keeps the old registration alive until those records
+ * complete (decision 65).
  */
 
 /* One io_uring instance as the kernel shares it. The pointers address the

@@ -106,9 +106,18 @@ _Static_assert(offsetof(struct buf_ring_header, tail) ==
                    offsetof(struct io_uring_buf_ring, tail),
                "buffer ring tail must overlay the kernel's");
 
-static void *mutable(const void *pointer)
+/* The msghdr's iovec pointer is not const, though the vectors are never
+ * written; the conversion reads the pointer back through a union rather
+ * than a cast that drops the qualifier. */
+static struct iovec *vectors_of(const void *pointer)
 {
-    return (void *)(uintptr_t)pointer;
+    union {
+        const void *in;
+        struct iovec *out;
+    } convert;
+
+    convert.in = pointer;
+    return convert.out;
 }
 
 static uint64_t as_u64(const void *pointer)
@@ -511,8 +520,11 @@ static int translate_recv(const struct vsr_io_uring *uring,
     }
     sqe->msg_flags = msg_flags;
     if (select) {
+        /* POLL_FIRST: the buffer is selected at a delivery, so an empty
+         * ring is -ENOBUFS then and never at arming (decision 65). */
         *sqe_flags |= IOSQE_BUFFER_SELECT;
         sqe->buf_group = record->buffer_group;
+        sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
     }
     return 0;
 }
@@ -526,7 +538,6 @@ static int translate_send(struct vsr_io_uring *uring,
     bool vectored = (record->op_flags & VSR_IO_SEND_VECTORED) != 0;
     bool fixed = (record->flags & VSR_IO_SQE_FIXED_BUFFER) != 0;
     uint32_t msg_flags = MSG_NOSIGNAL;
-    int rc;
 
     if ((record->op_flags & ~known) != 0) {
         return -EINVAL;
@@ -552,7 +563,7 @@ static int translate_send(struct vsr_io_uring *uring,
                 return -EINVAL;
             }
             memset(msg, 0, sizeof(*msg));
-            msg->msg_iov = mutable(record->addr);
+            msg->msg_iov = vectors_of(record->addr);
             msg->msg_iovlen = record->length;
             fill(sqe, IORING_OP_SENDMSG_ZC, record->fd, msg, 1, 0);
             sqe->ioprio |= IORING_RECVSEND_FIXED_BUF;
@@ -572,8 +583,9 @@ static int translate_send(struct vsr_io_uring *uring,
         return 0;
     }
     if (fixed) {
-        rc = vectored ? check_vectors(uring, record)
-                      : check_region(uring, record);
+        int rc = vectored ? check_vectors(uring, record)
+                          : check_region(uring, record);
+
         if (rc != 0) {
             return rc;
         }
@@ -692,6 +704,13 @@ static int translate_sockopt(const struct vsr_io_sqe *record,
 {
     if (record->length > INT_MAX) {
         return -EINVAL;
+    }
+    /* The kernel's socket command serves GETSOCKOPT at SOL_SOCKET only;
+     * the contract makes every other level -EOPNOTSUPP on both executors
+     * (decision 65), so it is refused here rather than by the kernel. */
+    if (record->opcode == VSR_IO_SQE_GETSOCKOPT &&
+        (record->op_flags >> 16) != SOL_SOCKET) {
+        return -EOPNOTSUPP;
     }
     sqe->opcode = IORING_OP_URING_CMD;
     sqe->fd = record->fd;

@@ -503,7 +503,17 @@ publishes the ring tail with a release store. A vectored zero-copy send
 from a registered region is `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`
 and a `struct msghdr` naming the record's vectors, kept in a per-SQE-slot
 table like the timespec of a timeout (decision 53); the other sends are
-`SEND` and `SEND_ZC` with `IORING_SEND_VECTORIZED` where vectored.
+`SEND` and `SEND_ZC` with `IORING_SEND_VECTORIZED` where vectored. A
+`BUFFER_SELECT` receive carries `IORING_RECVSEND_POLL_FIRST`, so the
+kernel selects the buffer at a delivery and an empty ring is `-ENOBUFS`
+then, never at arming; `GETSOCKOPT` at a level other than `SOL_SOCKET` is
+refused at translation with `-EOPNOTSUPP` (decision 65); a zero-copy
+record rejected at translation completes once, with `MORE` clear and no
+`NOTIF` (decision 62); `update_buffer` of a region a pending record uses
+returns 0, the kernel keeping the old registration alive until those
+records complete. The errno values of the registration calls the
+contract fixes (`-EBUSY`, `-EEXIST`, `-ENOENT`, `-EINVAL`) are the
+executor's own checks before any kernel call.
 `vsr_io_uring_layout` sums `sizeof(struct vsr_io_uring)` and the tables.
 `vsr_io_uring_deinit` cancels every request still in flight
 (`IORING_REGISTER_SYNC_CANCEL` with `ANY | ALL`, in bounded rounds) and
