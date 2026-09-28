@@ -4,6 +4,7 @@ Checks: >-
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   bugprone-*,
   -bugprone-branch-clone,
+  -bugprone-casting-through-void,
   -bugprone-easily-swappable-parameters,
   -bugprone-multi-level-implicit-pointer-conversion,
   -bugprone-reserved-identifier,
@@ -17,3 +18,5 @@ FormatStyle: file
 # branch-clone: request routing chains repeat the same reply on purpose so
 # each rule reads on its own. multi-level-implicit-pointer-conversion: C
 # passes T ** to malloc/realloc/memcpy through void * by design.
+# casting-through-void: its advice is reinterpret_cast; in C the tests cast
+# an aligned byte buffer through void * on purpose to satisfy -Wcast-align.

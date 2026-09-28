@@ -324,9 +324,9 @@ static void check_epoch(struct mem_node *node, uint64_t client, uint64_t epoch,
                         uint64_t routing, uint64_t route)
 {
     const struct vsr_check_epoch body = {epoch};
-    const struct vsr_request request = {
+    const struct vsr_request input = {
         {{7, client}, 1}, routing, VSR_REQUEST_CHECK_EPOCH, 0, &body};
-    const struct vsr_event event = {VSR_EVENT_REQUEST, 0, route, &request, 1};
+    const struct vsr_event event = {VSR_EVENT_REQUEST, 0, route, &input, 1};
     CHECK(mem_node_event(node, &event).consumed == 1);
 }
 
@@ -337,9 +337,9 @@ static void reconfigure(struct mem_node *node, uint64_t client, uint64_t epoch,
                                          {2, VSR_MEMBER_FULL, 0},
                                          {3, VSR_MEMBER_FULL, 0}};
     const struct vsr_membership next = {epoch, members, 3, 1};
-    const struct vsr_request request = {
+    const struct vsr_request input = {
         {{7, client}, 1}, routing, VSR_REQUEST_RECONFIGURE, 0, &next};
-    const struct vsr_event event = {VSR_EVENT_REQUEST, 0, route, &request, 1};
+    const struct vsr_event event = {VSR_EVENT_REQUEST, 0, route, &input, 1};
     CHECK(mem_node_event(node, &event).consumed == 1);
 }
 
