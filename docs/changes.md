@@ -166,6 +166,17 @@ scenario function inside it; "scheduler flag" refers to the profile flags of
   the stalls found there were fixed without raising a minimum
   (`regression/pressure_reload`, `regression/anchor_behind_applied`,
   `regression/reply_restore`).
+- A drain never spends its progress undoing itself. A log entry loaded for a
+  lagging peer is sent to that peer before another peer's load can evict it:
+  the completion of the load resumes the send rotation at the peer it was
+  issued for, and a peer whose SEND lacks only an operation slot keeps the
+  rotation until a slot frees. Why: at the minimum payload budget with two
+  operation slots, one busy, a poll running while the load was outstanding
+  rotated past its peer, failed another pair's SEND, evicted that pair's
+  cached entry under the load's reservation, and reloaded it before the
+  loaded entry was sent, forever (`tests/fuzzy/cluster 1572 1 600 quiet 6`).
+  Where: `docs/vsr-api.md` "Driving the core". Tests:
+  `regression/lagging_reload`; scheduler profiles `2`, `3`, `6`, `7`.
 
 ## Reads
 

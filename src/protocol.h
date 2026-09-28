@@ -137,6 +137,9 @@ struct vsr_protocol {
     uint32_t results_count;
     uint32_t results_lease;
     uint32_t peer_cursor;
+    /* Peer whose next entries the outstanding log load fetches, served first
+     * once they arrive; VSR_INDEX_NONE when the load is not for a peer. */
+    uint32_t load_peer;
     uint32_t route_cursor;
     uint32_t boot;
     bool hard_dirty;
