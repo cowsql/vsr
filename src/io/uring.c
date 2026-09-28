@@ -826,6 +826,10 @@ int vsr_io_uring_translate(struct vsr_io_uring *uring,
              0);
         sqe->open_flags = record->op_flags;
         if (direct) {
+            /* A direct descriptor is close-on-exec by nature: the kernel
+             * refuses O_CLOEXEC with a slot (-EINVAL), as SOCK_CLOEXEC on
+             * a direct accept. */
+            sqe->open_flags &= ~(uint32_t)O_CLOEXEC;
             fill_direct(sqe, slot);
         }
         break;
