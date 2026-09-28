@@ -34,9 +34,11 @@
  * path: memory regions come from the caller, sized by the layout functions,
  * and are registered with the executor where the kernel benefits.
  *
- * Platform: Linux >= 7.2 with liburing >= 2.15. Required features are used
- * directly, without probing or fallbacks; initialization fails on an older
- * kernel. See docs/io-design.md for the design and the rationale behind it.
+ * Platform: Linux >= 6.18, driven through the io_uring syscalls directly
+ * (no liburing; the library depends on libc alone). Required features are
+ * used without fallbacks; vsr_io_uring_init probes the kernel once and fails
+ * with -ENOSYS on an older one. See docs/io-design.md for the design and
+ * the rationale behind it.
  */
 
 #define VSR_IO_API_VERSION 1u  /* Source API of this header. */
@@ -242,9 +244,10 @@ struct vsr_io_executor {
 
 /*
  * Production executor over one io_uring instance. The ring is created with
- * SINGLE_ISSUER and DEFER_TASKRUN, user-provided ring memory, a registered
- * ring descriptor, and the CQ size below. wake uses an eventfd polled by the
- * ring. sqpoll_idle_ms > 0 selects SQPOLL; napi_busy_poll_us > 0 registers
+ * SINGLE_ISSUER and DEFER_TASKRUN, a registered ring descriptor, and the CQ
+ * size below; its rings are the kernel's pages, mapped by init and unmapped
+ * by deinit. wake uses an eventfd polled by the ring. sqpoll_idle_ms > 0
+ * selects SQPOLL; napi_busy_poll_us > 0 registers
  * NAPI busy polling. IOPOLL rings cannot serve sockets and are not created
  * here. file_slots and buffer_regions size the sparse registered tables;
  * the memory of a provided-buffer ring is the caller's, handed to
@@ -266,14 +269,19 @@ struct vsr_io_need {
     size_t alignment;
 };
 
-/* Ring memory plus executor state, one region. Returns OK/EINVAL/ELIMIT. */
+/* Executor state, one page-aligned region. Returns OK/EINVAL/ELIMIT. */
 int vsr_io_uring_layout(const struct vsr_io_uring_options *options,
                         struct vsr_io_need *need);
 /* memory must satisfy the layout; returns OK or a negative errno. */
 int vsr_io_uring_init(void *memory, size_t size,
                       const struct vsr_io_uring_options *options,
                       struct vsr_io_executor *out);
-/* Every registered resource is released; the memory is the caller's. */
+/* Cancels every record still in flight and discards its completion, then
+ * closes the ring: every registered resource is released and the memory
+ * is the caller's. A record the kernel cannot cancel (a zero-copy send
+ * awaiting its NOTIF, an operation in progress in a kernel worker) still
+ * completes during the kernel's asynchronous teardown, into the record's
+ * buffers: see such records complete before calling this. */
 void vsr_io_uring_deinit(struct vsr_io_executor *executor);
 /* The ring descriptor, readable when completions are pending, for callers
  * that embed the loop in epoll or another ring's EPOLL_WAIT. */

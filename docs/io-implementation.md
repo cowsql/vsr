@@ -39,7 +39,8 @@ simulation and `vsr_client_` in the client.
                                   recovery
    snapshot.h        snapshot.c   clients files and the joint snapshot ops
    engine.h          engine.c     struct vsr_io, replicas, entry points
-   uring.h           uring.c      vsr_io_uring_* over liburing
+   uring.h           uring.c      vsr_io_uring_* over the io_uring syscalls
+   uapi/io_uring.h                the kernel's UAPI header, vendored
  src/sim/           the simulated world
    sim.h             world.c net.c disk.c exec.c
  src/client/        the client bookkeeping
@@ -59,11 +60,12 @@ modules take `struct vsr *`:
 | 3 | `link`, `stream`, `store` | levels 0 to 2 |
 | 4 | `snapshot` | `store`, `stream` |
 | 5 | `engine` | everything above; the only module that calls the executor |
-| 6 | `uring` | `vsr-io.h`; liburing; the kernel |
+| 6 | `uring` | `vsr-io.h`; `uapi/io_uring.h`; the kernel |
 | 6 | `sim` | `vsr-io.h`, `vsr-sim.h`; libc |
 | 6 | `client` | `vsr.h`, `vsr-client.h`, `crc32c` |
 
-Two modules touch the kernel: `uring.c` (through liburing, `getrandom`,
+Two modules touch the kernel: `uring.c` (through the `io_uring_setup`,
+`io_uring_enter` and `io_uring_register` syscalls, `getrandom`,
 `clock_gettime`, `eventfd`) and the simulation (`malloc` only). Every other
 module is a pure planner over records: it consumes ops, events and
 completion records and produces submission records, events and
@@ -461,25 +463,81 @@ Section 7.
 
 ### Executor: io_uring (`src/io/uring.h`)
 
-Section 8 is the contract; `uring.c` realizes it with liburing 2.15 on
-Linux 7.2 (design section 2). Specifics: the ring memory and `struct
-io_uring` live in the caller's region (`io_uring_queue_init_mem`);
-`IORING_SETUP_SINGLE_ISSUER | DEFER_TASKRUN | SUBMIT_ALL | COOP_TASKRUN |
-NO_MMAP | REGISTERED_FD_ONLY`; `cq_entries` from the options, checked at
-init to be at least `2 * sq_entries` so the CQ never overflows under the
-engine's slot count (every slot expects at most two completions);
-`submit_and_wait` uses `io_uring_submit_and_wait_min_timeout` with a
-registered wait argument (`IORING_FEAT_MIN_TIMEOUT`) for `want`,
-`min_wait_ns` and the absolute deadline converted to a relative timeout;
-`reap` copies CQEs with `io_uring_for_each_cqe` and advances the CQ once;
-the eventfd wake is a multishot `POLL_ADD` whose completions are consumed
-in `reap`. `vsr_io_uring_layout` sums `sizeof(struct vsr_io_uring)`, the
-tables, and `io_uring_memory_size_params`.
+Section 8 is the contract; `uring.c` realizes it on Linux >= 6.18 (design
+section 2) through the raw `io_uring_setup`, `io_uring_enter` and
+`io_uring_register` syscalls over the vendored UAPI header
+`src/io/uapi/io_uring.h` (decision 52); there is no liburing and no other
+library. Specifics: the executor state and its tables live in the caller's
+page-aligned region; the rings and the SQE array are the kernel's pages,
+mapped from the ring descriptor by init (one mapping for both rings,
+`IORING_FEAT_SINGLE_MMAP`, one for the SQEs) and unmapped by deinit before
+the descriptor is closed, not caller memory through `NO_MMAP`, because the
+kernel finishes a closed ring asynchronously and still writes its ring
+words then (it commits the CQ tail and clears the SQ flags while it
+cancels), which would land in memory the caller had already been given
+back; the head, tail and flag words are addressed through the offsets
+setup returns and accessed with C11 atomics, acquire loads for the words
+the kernel writes (SQ head, CQ tail, SQ flags) and release stores for the
+words this side writes (SQ tail, CQ head, the provided-buffer ring tail).
+`IORING_SETUP_SINGLE_ISSUER | DEFER_TASKRUN | COOP_TASKRUN | TASKRUN_FLAG |
+SUBMIT_ALL | NO_SQARRAY | CQSIZE` (`SQPOLL` in place of the three
+task-work flags when `sqpoll_idle_ms > 0`); the ring descriptor is
+registered (`IORING_REGISTER_RING_FDS`) and every later enter and register
+call goes through the registered index. `cq_entries` from the options,
+checked at init to be at least `2 * sq_entries` so the CQ never overflows
+under the engine's slot count (every slot expects at most two
+completions). Init checks once that the feature bits it relies on
+(`SINGLE_MMAP`, `NODROP`, `EXT_ARG`, `MIN_TIMEOUT`, `REG_REG_RING`,
+`RSRC_TAGS`, `CQE_SKIP`, `LINKED_FILE`) are set and that `IORING_REGISTER_PROBE` reports
+every opcode the translation table emits, and fails with `-ENOSYS`
+otherwise (decision 53); nothing is probed after that and there is no
+fallback. `submit_and_wait` translates the records into the SQ (a full SQ
+is drained by an enter, under `SQPOLL` by `SQ_WAIT`), publishes the tail
+and enters once with `GETEVENTS` and no minimum so completions already due
+are posted, then waits with `GETEVENTS | EXT_ARG` and a
+`struct io_uring_getevents_arg` on the stack carrying `min_wait_usec`
+(from `min_wait_ns`, `IORING_FEAT_MIN_TIMEOUT` semantics) and the relative
+timeout derived from the absolute deadline; registered wait regions are
+not needed. `reap` enters with `GETEVENTS` and no minimum when the SQ
+flags carry `IORING_SQ_TASKRUN` or `IORING_SQ_CQ_OVERFLOW`, so deferred
+task work and overflowed completions are posted without blocking, then
+copies the CQEs between head and tail and advances the head once; the
+eventfd wake is a multishot `POLL_ADD` whose completions are consumed in
+`reap`. Registration: `REGISTER_FILES2` sparse and `FILES_UPDATE`,
+`REGISTER_BUFFERS2` sparse and `BUFFERS_UPDATE` with tags,
+`REGISTER_PBUF_RING`/`UNREGISTER_PBUF_RING` with `IOU_PBUF_RING_INC` for
+incremental rings and `PBUF_STATUS` for the kernel's head, `REGISTER_NAPI`
+when requested; `provide` writes `struct io_uring_buf` entries then
+publishes the ring tail with a release store. A vectored zero-copy send
+from a registered region is `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`
+and a `struct msghdr` naming the record's vectors, kept in a per-SQE-slot
+table like the timespec of a timeout (decision 53); the other sends are
+`SEND` and `SEND_ZC` with `IORING_SEND_VECTORIZED` where vectored. A
+`BUFFER_SELECT` receive carries `IORING_RECVSEND_POLL_FIRST`, so the
+kernel selects the buffer at a delivery and an empty ring is `-ENOBUFS`
+then, never at arming; `GETSOCKOPT` at a level other than `SOL_SOCKET` is
+refused at translation with `-EOPNOTSUPP` (decision 65); a zero-copy
+record rejected at translation completes once, with `MORE` clear and no
+`NOTIF` (decision 62); `update_buffer` of a region a pending record uses
+returns 0, the kernel keeping the old registration alive until those
+records complete. The errno values of the registration calls the
+contract fixes (`-EBUSY`, `-EEXIST`, `-ENOENT`, `-EINVAL`) are the
+executor's own checks before any kernel call.
+`vsr_io_uring_layout` sums `sizeof(struct vsr_io_uring)` and the tables.
+`vsr_io_uring_deinit` cancels every request still in flight
+(`IORING_REGISTER_SYNC_CANCEL` with `ANY | ALL`, in bounded rounds) and
+discards the completions before unmapping and closing the ring, so that
+as little as possible completes into the caller's buffers during the
+kernel's asynchronous teardown; a request the cancel cannot reach (a
+zero-copy send awaiting its NOTIF, an operation in progress in a kernel
+worker) still completes then, so the caller sees such records complete
+before deinit.
 
 Tests: `tests/integration/executor_conformance` (section 8) run over this
 executor; `tests/unit/uring_translate` for the record-to-SQE table with a
 fake SQE buffer (every opcode and flag combination, rejection of
-out-of-region fixed buffers).
+out-of-region fixed buffers); `tests/integration/uring_smoke` for the ring
+against the kernel.
 
 ### Simulation (`src/sim/sim.h`)
 
@@ -1218,6 +1276,8 @@ of `docs/io-design.md`:
 | `vsr-io.h` | Store section: the durable prefix below which a bad record is CORRUPT is the greatest durable sequence any persisted record, segment header or superblock carries; idle superblock write | 50 |
 | `vsr-io.h` | `vsr_io_limits.caller_slabs`, the caller's share of the pool; the minimum-slabs rule adds it; `vsr_io_slab_acquire` is ELIMIT once the caller holds the share or the free slabs are down to the reserve | 54 |
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | One `libvsr.a` with liburing; three headers installed (done by the build skeleton) | 32 |
+| `vsr-io.h` | Platform note: Linux >= 6.18 through the io_uring syscalls, no liburing; `vsr_io_uring_init` probes once and fails with `-ENOSYS` on an older kernel | 52, 53 |
+| `Makefile.am`, `vsr.pc.in`, `configure.ac` | liburing dropped: no pkg-config check, no `Requires.private`; the kernel's UAPI header vendored under `src/io/uapi` | 52 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

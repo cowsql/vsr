@@ -2,9 +2,14 @@
 
 Public headers go in `include/`, private C code in `src/`, runnable examples in
 `examples/`, and all tests in `tests/`. The library builds into `src/libvsr.a`,
-which `make install` installs with `include/vsr.h` and `vsr.pc`. It depends on
-nothing beyond `memcpy`, `memmove`, `memset`, `memcmp`/`bcmp` and the stack
-protector; check with `nm -u src/libvsr.a` in a `--disable-sanitize` build.
+which `make install` installs with `include/vsr.h` and `vsr.pc`. The core
+depends on nothing beyond `memcpy`, `memmove`, `memset`, `memcmp`/`bcmp` and
+the stack protector; check with `nm -u src/libvsr.a` in a `--disable-sanitize`
+build. The I/O layer in the same archive depends on libc alone: it drives
+io_uring through the raw syscalls over the kernel header vendored in
+`src/io/uapi`, so no io_uring library is needed to build, and it needs Linux
+>= 6.18 at run time (`vsr_io_uring_init` fails with `-ENOSYS` on an older
+kernel).
 
 ## Build
 

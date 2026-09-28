@@ -5,7 +5,9 @@
  * links, cancellation, timeouts and a wake from another thread. The shared
  * sim-and-ring contract suite is tests/integration/executor_conformance;
  * this file checks the ring alone and records what the kernel does where
- * the contract leaves room. Exits 77 (skip) when no ring can be created. */
+ * the contract leaves room. Exits 77 (skip) only when the kernel has no
+ * io_uring (setup fails with ENOSYS or EPERM) or is too old for the
+ * executor (init's probe reports -ENOSYS); any other init failure fails. */
 #define _GNU_SOURCE
 #include "config.h"
 
@@ -388,6 +390,8 @@ static int32_t fixed_io(struct fixture *f, uint8_t opcode, int fd,
 
 static void test_files(void)
 {
+    static char abc[] = "abc";
+    static char defgh[] = "defgh";
     struct vsr_io_uring_options o = options();
     struct fixture f;
     struct directory dir;
@@ -434,9 +438,9 @@ static void test_files(void)
     CHECK(stx.stx_size == 8192 && S_ISREG(stx.stx_mode));
 
     /* Vectors. */
-    vecs[0].base = (void *)(uintptr_t)"abc";
+    vecs[0].base = abc;
     vecs[0].length = 3;
-    vecs[1].base = (void *)(uintptr_t)"defgh";
+    vecs[1].base = defgh;
     vecs[1].length = 5;
     r = rec(VSR_IO_SQE_WRITEV, 17);
     r.fd = fd;
@@ -802,6 +806,8 @@ static struct zero_copy zc_send(struct fixture *f, struct vsr_io_sqe r)
 
 static void test_network(void)
 {
+    static char vec[] = "vec";
+    static char tored[] = "tored";
     struct vsr_io_uring_options o = options();
     struct fixture f;
     struct vsr_io_sqe r;
@@ -922,7 +928,7 @@ static void test_network(void)
     CHECK(f.ex.ops->buffer_ring(f.ex.ctx, 7, 8, VSR_IO_BUFFER_RING_INCREMENTAL,
                                 &memory) == -EEXIST);
     for (uint16_t i = 0; i < 8; ++i) {
-        buffers[i].base = pool + 64u * i;
+        buffers[i].base = pool + (size_t)64 * i;
         buffers[i].length = 64;
         buffers[i].id = (uint16_t)(10 + i);
         buffers[i].reserved = 0;
@@ -1002,9 +1008,9 @@ static void test_network(void)
     CHECK(run(&f, r) == 3 && memcmp(buffer, "xyz", 3) == 0);
 
     /* Plain vectored send. */
-    vecs[0].base = (void *)(uintptr_t)"vec";
+    vecs[0].base = vec;
     vecs[0].length = 3;
-    vecs[1].base = (void *)(uintptr_t)"tored";
+    vecs[1].base = tored;
     vecs[1].length = 5;
     r = send_record(server, true, vecs, 2, 233);
     r.op_flags = VSR_IO_SEND_VECTORED;
@@ -1460,13 +1466,14 @@ static void test_variants(void)
 {
     struct vsr_io_uring_options o = options();
     struct fixture f;
-    struct vsr_io_sqe r;
     int rc;
 
     o.sqpoll_idle_ms = 10;
     rc = open_fixture(&f, &o);
     printf("SQPOLL ring: %d\n", rc);
     if (rc == 0) {
+        struct vsr_io_sqe r;
+
         submit1(&f, rec(VSR_IO_SQE_NOP, 400));
         CHECK(take(&f, 400).result == 0);
         r = rec(VSR_IO_SQE_TIMEOUT, 401);
@@ -1494,10 +1501,14 @@ int main(void)
 
     setvbuf(stdout, NULL, _IONBF, 0);
     rc = open_fixture(&f, &o);
-    if (rc != 0) {
-        printf("skip: no io_uring ring (%s)\n", strerror(-rc));
+    if (rc == -ENOSYS || rc == -EPERM) {
+        printf("skip: no usable io_uring (%s)\n", strerror(-rc));
         return 77;
     }
+    if (rc != 0) {
+        printf("init failed: %s\n", strerror(-rc));
+    }
+    CHECK(rc == 0);
     close_fixture(&f);
 
     test_layout();

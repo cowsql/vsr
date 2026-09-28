@@ -18,7 +18,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <liburing.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <string.h>
@@ -31,7 +30,8 @@ static unsigned char region_memory[REGION_BYTES];
 static unsigned char outside[64];
 static struct vsr_io_uring_region regions[3];
 static struct vsr_io_uring_direct directs[4];
-static struct vsr_io_uring_timespec timespecs[1];
+static struct __kernel_timespec timespecs[1];
+static struct msghdr msghdrs[1];
 static struct vsr_io_uring uring;
 
 static void reset(void)
@@ -50,7 +50,8 @@ static void reset(void)
     uring.directs = directs;
     uring.directs_capacity = sizeof(directs) / sizeof(directs[0]);
     uring.timespecs = timespecs;
-    uring.timespecs_count = 1;
+    uring.msghdrs = msghdrs;
+    uring.table_entries = 1;
     uring.wake_fd = -1;
 }
 
@@ -375,8 +376,12 @@ static void test_sockets(void)
           sqe.cmd_op == SOCKET_URING_OP_SETSOCKOPT && sqe.fd == 6 &&
           sqe.level == IPPROTO_TCP && sqe.optname == 1 &&
           sqe.optval == ptr(&value) && sqe.optlen == sizeof(value));
+    /* GETSOCKOPT serves SOL_SOCKET only (decision 65). */
     r.opcode = VSR_IO_SQE_GETSOCKOPT;
-    CHECK(tr(r, &sqe) == 0 && sqe.cmd_op == SOCKET_URING_OP_GETSOCKOPT);
+    CHECK(rejected(r) == -EOPNOTSUPP);
+    r.op_flags = (uint32_t)SOL_SOCKET << 16 | SO_KEEPALIVE;
+    CHECK(tr(r, &sqe) == 0 && sqe.cmd_op == SOCKET_URING_OP_GETSOCKOPT &&
+          sqe.level == SOL_SOCKET && sqe.optname == SO_KEEPALIVE);
 }
 
 static void test_recv(void)
@@ -413,7 +418,8 @@ static void test_recv(void)
     r.addr = outside;
     CHECK(rejected(r) == -EFAULT);
 
-    /* Provided buffers, single and multishot. */
+    /* Provided buffers, single and multishot: selected at a delivery
+     * (POLL_FIRST), so an empty ring never fails the arming. */
     r = rec(VSR_IO_SQE_RECV);
     r.flags = VSR_IO_SQE_BUFFER_SELECT;
     r.fd = 8;
@@ -421,11 +427,12 @@ static void test_recv(void)
     CHECK(tr(r, &sqe) == 0);
     CHECK(sqe.opcode == IORING_OP_RECV && sqe.addr == 0 &&
           sqe.flags == IOSQE_BUFFER_SELECT && sqe.buf_group == 7 &&
-          sqe.ioprio == 0);
+          sqe.ioprio == IORING_RECVSEND_POLL_FIRST);
     r.op_flags = VSR_IO_RECV_MULTISHOT | VSR_IO_RECV_PEEK;
     CHECK(tr(r, &sqe) == 0);
-    CHECK((sqe.ioprio & IORING_RECV_MULTISHOT) && sqe.buf_group == 7 &&
-          sqe.flags == IOSQE_BUFFER_SELECT && sqe.msg_flags == MSG_PEEK);
+    CHECK(sqe.ioprio == (IORING_RECV_MULTISHOT | IORING_RECVSEND_POLL_FIRST) &&
+          sqe.buf_group == 7 && sqe.flags == IOSQE_BUFFER_SELECT &&
+          sqe.msg_flags == MSG_PEEK);
     r.flags |= VSR_IO_SQE_FIXED_FILE | VSR_IO_SQE_LINK;
     CHECK(tr(r, &sqe) == 0);
     CHECK(sqe.flags ==
@@ -503,16 +510,40 @@ static void test_send(void)
           sqe.flags == IOSQE_FIXED_FILE);
     r.addr = outside; /* Left to the kernel: -EFAULT, then NOTIF. */
     CHECK(tr(r, &sqe) == 0 && sqe.addr == ptr(outside));
+    /* Vectored, not fixed: SEND_ZC with the vectorized flag. */
+    r.flags = 0;
     r.addr = vecs;
     r.length = 2;
-    r.buffer_index = 0;
     r.op_flags = VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED;
     CHECK(tr(r, &sqe) == 0);
     CHECK(sqe.opcode == IORING_OP_SEND_ZC &&
-          sqe.ioprio == (IORING_RECVSEND_FIXED_BUF | IORING_SEND_VECTORIZED) &&
-          sqe.addr == ptr(vecs) && sqe.len == 2 && sqe.buf_index == 0);
+          sqe.ioprio == IORING_SEND_VECTORIZED && sqe.addr == ptr(vecs) &&
+          sqe.len == 2 && sqe.buf_index == 0 && sqe.msg_flags == MSG_NOSIGNAL);
+    /* Vectored from a registered region: SENDMSG_ZC with a fixed buffer
+     * and a msghdr from the per-slot table naming the vectors. */
+    r.flags = VSR_IO_SQE_FIXED_BUFFER | VSR_IO_SQE_FIXED_FILE;
+    r.buffer_index = 1;
+    memset(msghdrs, 0xa5, sizeof(msghdrs));
+    CHECK(tr(r, &sqe) == 0);
+    CHECK(sqe.opcode == IORING_OP_SENDMSG_ZC &&
+          sqe.ioprio == IORING_RECVSEND_FIXED_BUF &&
+          sqe.addr == ptr(&msghdrs[0]) && sqe.len == 1 && sqe.off == 0 &&
+          sqe.buf_index == 1 && sqe.msg_flags == MSG_NOSIGNAL &&
+          sqe.flags == IOSQE_FIXED_FILE);
+    CHECK(msghdrs[0].msg_iov == (struct iovec *)vecs &&
+          msghdrs[0].msg_iovlen == 2 && msghdrs[0].msg_name == NULL &&
+          msghdrs[0].msg_namelen == 0 && msghdrs[0].msg_control == NULL &&
+          msghdrs[0].msg_controllen == 0 && msghdrs[0].msg_flags == 0);
+    r.flags |= VSR_IO_SQE_LINK;
+    CHECK(tr(r, &sqe) == 0 && sqe.msg_flags == (MSG_NOSIGNAL | MSG_WAITALL) &&
+          sqe.flags == (IOSQE_FIXED_FILE | IOSQE_IO_LINK));
     r.flags |= VSR_IO_SQE_SKIP_SUCCESS;
     CHECK(rejected(r) == -EINVAL);
+    /* Without msghdr storage the vectored fixed send cannot be issued. */
+    r.flags = VSR_IO_SQE_FIXED_BUFFER;
+    uring.msghdrs = NULL;
+    CHECK(rejected(r) == -EINVAL);
+    reset();
 }
 
 static void test_timeouts(void)
@@ -610,6 +641,11 @@ static struct vsr_io_sqe sweep_record(uint8_t opcode)
         r.length = AF_INET;
         r.op_flags = SOCK_STREAM;
         break;
+    case VSR_IO_SQE_GETSOCKOPT: /* SOL_SOCKET is the only level served. */
+        r.op_flags = (uint32_t)SOL_SOCKET << 16 | SO_KEEPALIVE;
+        r.addr = region_memory;
+        r.length = 8;
+        break;
     case VSR_IO_SQE_NOP:
     case VSR_IO_SQE_READ:
     case VSR_IO_SQE_WRITE:
@@ -629,7 +665,6 @@ static struct vsr_io_sqe sweep_record(uint8_t opcode)
     case VSR_IO_SQE_SEND:
     case VSR_IO_SQE_SHUTDOWN:
     case VSR_IO_SQE_SETSOCKOPT:
-    case VSR_IO_SQE_GETSOCKOPT:
     case VSR_IO_SQE_TIMEOUT:
     case VSR_IO_SQE_CANCEL:
     default:
@@ -659,19 +694,19 @@ static void test_sweep(void)
                                      VSR_IO_SQE_ACCEPT};
     uint32_t accepted = 0;
 
-    for (uint8_t opcode = 0; opcode <= VSR_IO_SQE_CANCEL + 1; ++opcode) {
+    for (uint32_t opcode = 0; opcode <= VSR_IO_SQE_CANCEL + 1; ++opcode) {
         for (uint32_t flags = 0; flags < 128; ++flags) {
-            struct vsr_io_sqe r = sweep_record(opcode);
+            struct vsr_io_sqe r = sweep_record((uint8_t)opcode);
             struct io_uring_sqe sqe;
             bool fixed = (flags & VSR_IO_SQE_FIXED_BUFFER) != 0;
             bool select = (flags & VSR_IO_SQE_BUFFER_SELECT) != 0;
             bool invalid = opcode > VSR_IO_SQE_CANCEL || flags >= 64 ||
                            (select && opcode != VSR_IO_SQE_RECV) ||
-                           (fixed && !one_of(opcode, fixed_buffer,
+                           (fixed && !one_of((uint8_t)opcode, fixed_buffer,
                                              sizeof(fixed_buffer))) ||
                            (fixed && select) ||
                            ((flags & VSR_IO_SQE_DIRECT) &&
-                            !one_of(opcode, direct, sizeof(direct)));
+                            !one_of((uint8_t)opcode, direct, sizeof(direct)));
             uint8_t expected = 0;
             int rc;
 
