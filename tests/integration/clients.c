@@ -542,7 +542,7 @@ static void payload_backpressure(void)
     const struct vsr_options template = minimum_template();
     struct fixture f = create(1, false, &template);
     struct mem_node *node = f.nodes[0];
-    const size_t bytes = (size_t)template.limits.command_bytes;
+    const size_t bytes = (size_t) template.limits.command_bytes;
     struct mem_step step = request(node, 1, 1, 0, 'X', bytes + 1, 1);
     CHECK(step.result == VSR_ELIMIT && step.consumed == 0);
     CHECK(mem_node_leases(node) == 0);
