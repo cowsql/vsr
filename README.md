@@ -71,6 +71,9 @@ indexed storage and checkpoints, independently of the in-memory cache.
 - [Protocol contract](docs/protocol.md): quorums, message validation, recovery,
   reads, and membership transitions.
 - [Adapter reference](docs/vsr-api.md): driving, storage, snapshots, and failures.
+- [Implementation status](docs/implementation.md): test layers, campaigns, and
+  coverage of the validation matrix; [changes](docs/changes.md) lists every
+  contract refinement since the review baseline.
 
 Build from Git and run the tests with Clang, ASan and UBSan:
 
@@ -83,10 +86,15 @@ make -j"$(nproc)" check
 ```
 
 The build produces `src/libvsr.a` and six runnable [in-memory examples](examples/README.md)
-in `examples/`. `make check` runs unit tests, public protocol/adapter scenarios,
-deterministic seeded fault simulations, and the examples. The simulator checks
-agreement, storage prerequisites, buffer immutability, and eventual progress
-after faults stop. Seeds and optional action traces make failures replayable.
+in `examples/`, each a narrated walkthrough of one feature over a small
+key-value store application. `make check` runs every layer: unit tests, public
+protocol/adapter contract scenarios, an independent conformance suite for the
+driver-facing API, regression reproducers of fixed bugs (`tests/regression`),
+two deterministic seeded fault simulations, and the examples. The simulator
+checks agreement, storage prerequisites, buffer immutability, read fences, and
+eventual progress after faults stop. Seeds, profiles, and optional action
+traces make failures replayable; a campaign mode runs many seeds in one
+process and prints the replay command of each failure.
 
 For an uninstrumented installation, configure a separate build with
 `CFLAGS='-O2 -g' ../../configure --disable-sanitize --prefix=/your/prefix`, then

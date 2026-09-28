@@ -196,8 +196,9 @@ CLUSTER_SCENARIO = tests/fuzzy/scenario.c tests/fuzzy/scenario.h \
 tests_fuzzy_cluster_SOURCES = tests/fuzzy/cluster.c $(CLUSTER_SCENARIO) \
   tests/lib/random.c tests/lib/random.h
 tests_fuzzy_cluster_LDADD = src/libvsr.a
-# The same scheduler with the widest passing flag union by default: 16 seeds
-# of 1+4+8+16+64 (flag 32 hits known core failures, see tests/fuzzy/KNOWN_FAILURES.md).
+# The same scheduler with a wider default flag union: 16 seeds of
+# 1+4+8+16+64. Flags 2 and 32 run in the campaigns listed in
+# docs/implementation.md rather than on every check, to bound its time.
 tests_fuzzy_cluster_extended_SOURCES = $(tests_fuzzy_cluster_SOURCES)
 tests_fuzzy_cluster_extended_CPPFLAGS = $(AM_CPPFLAGS) \
   -DCLUSTER_DEFAULT_COUNT=16 -DCLUSTER_DEFAULT_PROFILE=93
@@ -232,8 +233,9 @@ EXTRA_DIST = \
   bootstrap vsr.pc.in .clang-format .clang-tidy .editorconfig .gitignore \
   .github/workflows/ci.yml \
   README.md DESIGN.md docs/protocol.md docs/vsr-api.md docs/development.md \
-  docs/implementation.md examples/README.md \
-  tests/README.md tests/regression/README.md tests/benchmark/README.md
+  docs/implementation.md docs/changes.md examples/README.md \
+  tests/README.md tests/regression/README.md tests/benchmark/README.md \
+  tests/fuzzy/KNOWN_FAILURES.md
 
 # Ask Clang for matching tools, including Debian's versioned installations.
 # Override with e.g. make format-check CLANG_FORMAT=clang-format-18.

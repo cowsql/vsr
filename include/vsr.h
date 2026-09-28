@@ -584,6 +584,8 @@ enum vsr_op_type {
  *        is execution progress, not durable application progress. Replay MUST
  *        execute the suffix after the installed checkpoint, even if cached
  *        client results already exist; ordinary dedup must not skip rebuilding.
+ *        A result count differing from the batch is an inconsistent application
+ *        result: consumed, and fenced with VSR_FAILURE_APPLICATION.
  * READ_READY: capture/read an application snapshot at fence.applied, then
  *        complete with NULL. The core holds APPLY/INSTALL until capture ends;
  *        expensive read evaluation may continue on that snapshot afterwards.
@@ -616,9 +618,10 @@ enum vsr_op_type {
  * an event, not a failed vsr_step call. No partial APPLY/STORE successes.
  * Every non-OK STORE/SYNC/APPLY/INSTALL/SNAPSHOT_SYNC completion fences the
  * replica, even RETRY/CANCELLED. SEND failures retry protocol work; REPLY/READ
- * delivery failures abandon that local route. LOAD corruption/unexpected
- * absence is fatal; FETCH unavailability restarts discovery. CAPTURE/cleanup
- * failures may retry. CORRUPT from LOAD/RECLAIM fences storage; from any
+ * delivery failures abandon that local route. LOAD corruption, unexpected
+ * absence, FAILED, and CANCELLED all fence storage; only RETRY and expected
+ * NOT_FOUND do not. FETCH unavailability restarts discovery. CAPTURE/cleanup
+ * failures may retry. CORRUPT from RECLAIM fences storage; from any
  * snapshot operation it latches VSR_FAILURE_SNAPSHOT (including INSTALL).
  * STOPPING consumes completions without starting retries.
  */
@@ -687,6 +690,7 @@ struct vsr_limits {
         pinned_payload_bytes; /* Includes reserved LOAD/APPLY/snapshot results. */
 };
 
+/* Every *_ns option must be below UINT64_MAX; EINVAL otherwise. */
 struct vsr_options {
     struct vsr_id cluster;
     struct vsr_id
@@ -750,8 +754,11 @@ struct vsr_status {
     uint32_t role;  /* Materialized role; membership governs voting. */
     uint32_t outstanding_ops;
     uint32_t outstanding_leases;
-    const struct vsr_epoch
-        *configuration; /* NULL until known; borrowed to next step. */
+    const struct vsr_epoch *configuration; /* Never NULL once initialized:
+                                              the seed as a STEADY epoch until
+                                              a recovered or learned descriptor
+                                              replaces it; borrowed to next
+                                              step. */
     struct vsr_failure failure;
 };
 
@@ -778,7 +785,8 @@ int vsr_layout(const struct vsr_options *options, struct vsr_layout *layout);
  * LOAD_RECOVERY; missing store returns NOT_FOUND, not an invented recovered row.
  * Cluster/incarnation/replica IDs are nonzero. Options/seed are borrowed only
  * during this call. Supply at least layout.size bytes at layout.alignment.
- * Returns OK, EINVAL, or ELIMIT; *out=NULL on error when out is valid. The arena
+ * Returns OK, EINVAL, or ELIMIT. On error *out is set to NULL, except that an
+ * out lying inside memory returns EINVAL without being written. The arena
  * has no valid instance after failure. A live instance must not be reinitialized.
  * NULL arguments/misalignment return EINVAL; insufficient size returns ELIMIT.
  * memory must not overlap options, seed metadata, or out.
@@ -818,8 +826,9 @@ int vsr_step(struct vsr *v, const struct vsr_event *event,
  * is not a promise of commitment: clients retry an uncertain outcome with the
  * same identity. Membership changes/redirects/rejections are ordinary replies.
  * TIME/STOP/COMPLETE take priority in a driver's queue. STOP is idempotent;
- * after STOP, only those events and zero-input drains are accepted. FAILED and
- * RETIRED also consume other well-formed events without admitting new work.
+ * after STOP, only those events and zero-input drains are accepted: any other
+ * event returns EINVAL unconsumed. FAILED and RETIRED (until STOP) instead
+ * consume other well-formed events without admitting new work.
  * A valid completion is eventually admissible through the reserved capacity;
  * a full output array or exhausted work budget may still require drain calls.
  * Null v/update, inaccessible memory, and unsynchronized/reentrant calls are

@@ -6,11 +6,11 @@ seeded fault simulation share one directory.
 
 | Directory | Purpose | Current state |
 | --- | --- | --- |
-| `unit/` | Small deterministic tests of private modules | Arithmetic, equality, RNG, runtime, graph validation, reads, host storage |
-| `integration/` | Public API and host adapter contracts | Replication, resource minima, reads, checkpoints, epoch handoff |
-| `fuzzy/` | Coverage-guided fuzzing and seeded cluster/fault simulation | Arithmetic, graph, and cluster-scenario libFuzzer harnesses; seeded cluster scheduler |
-| `regression/` | Minimal reproducers for fixed bugs and crashes | Trimmed-prefix resend to a lagging peer (`trim_resend`); witness anchor adoption during recovery and transfer (`recovery_coverage`, `transfer_anchor`, `witness_prefix`); learner restart and continuous warm-up (`learner_restart`, `learner_follows`); input-pressure relief around a pin the next poll reloads (`pressure_reload`); checkpoint adoption behind the applied position and executed replies across a restoration (`anchor_behind_applied`, `reply_restore`); add with each bug fix |
-| `benchmark/` | Repeatable latency, throughput, allocation and copy measurements | Reserved; implementation required |
+| `unit/` | Small deterministic tests of private modules | Checked arithmetic (`checked`), logical equality (`objects`), PCG (`random`), in-memory store (`memory`, `memory_watch`), graph validation (`validate`), runtime ownership and scheduling against a protocol double (`runtime`), read rounds (`reads`), descriptor copies (`descriptors`), arena planner (`layout`) |
+| `integration/` | Public API and host adapter contracts | Replication, normal-path minima and lagging peers (`normal_contract`), reads, checkpoints, epoch handoff (`epochs`), stop/failure/crash lifecycle (`lifecycle`), transfer and recovery transitions (`transitions`), effect prerequisites (`audit`, `transfer_audit`), failure handling (`failures`), view change edges (`view_change_edges`), log offers (`offers`), capture scheduling (`capture`), client contract (`clients`), the independent driver-facing API conformance suite (`api_contract`), and the compile-only header check (`libheader.a`) |
+| `fuzzy/` | Coverage-guided fuzzing and seeded cluster/fault simulation | libFuzzer harnesses for checked arithmetic (`checked`), graph validation (`validation`), and the cluster scenario (`cluster_fuzz`); seeded cluster scheduler (`cluster`, `cluster_extended`); `KNOWN_FAILURES.md` for open campaign findings |
+| `regression/` | Minimal reproducers for fixed bugs and crashes | Fourteen reproducers, each with its origin in `regression/README.md`: trimmed-prefix resend (`trim_resend`); witness anchor adoption during recovery and transfer (`recovery_coverage`, `transfer_anchor`, `witness_prefix`); boundaries learned in view change or before STEADY (`boundary_from_view_change`, `next_epoch_before_steady`); lost-state members rejoining only through quorum recovery (`review_epoch_recovery_vote`, `epoch_announcement_recovery`); learner restart and continuous warm-up (`learner_restart`, `learner_follows`); input-pressure relief (`pressure_reload`); checkpoint adoption behind the applied position and replies across a restoration (`anchor_behind_applied`, `reply_restore`); `vsr_init` output clearing (`api_init_out`); add with each bug fix |
+| `benchmark/` | Repeatable latency, throughput, allocation and copy measurements | `core`: arena bytes and `vsr_step` timings over a small configuration matrix, run by `make benchmark` outside `TESTS`; copying and cache behavior are not measured |
 | `lib/` | Shared test-only assertions and fixtures | In-memory immutable storage validating each transaction's shape at issuance; cluster host with always-active oracles for fence exclusion, read-fence bounds, a cluster-wide client execution/reply table, offer-versus-store equality, LOAD/RECLAIM/DROP retention rules, lease release, and STOPPED accounting; seeded RNG |
 
 `make check` builds the contract archives and runs executable tests using
@@ -40,9 +40,9 @@ See [development workflows](../docs/development.md) for tools and commands.
 `make fuzz` uses libFuzzer with ASan/UBSan and defaults to 10,000 executions.
 Use `FUZZ_RUNS=0 FUZZ_ARGS='-max_total_time=60'` for a time budget. Corpora and
 crashes live in the build tree under `tests/fuzzy/corpus/` and
-`tests/fuzzy/artifacts/`, and survive `make clean`. Replay with
-`./tests/fuzzy/checked PATH_TO_ARTIFACT`; keep useful minimized inputs in source
-control and list them in `EXTRA_DIST`.
+`tests/fuzzy/artifacts/`, and survive `make clean`. Replay with the harness that
+produced the artifact, e.g. `./tests/fuzzy/validation PATH_TO_ARTIFACT`; keep
+useful minimized inputs in source control and list them in `EXTRA_DIST`.
 
 ## Seeded cluster scheduler
 
@@ -50,7 +50,8 @@ The scenario engine lives in `fuzzy/scenario.c`. Every nondeterministic decision
 is one bounded choice taken from a pluggable source: `fuzzy/cluster` draws them
 from the seeded PCG generator, `fuzzy/cluster_fuzz` from a libFuzzer byte stream.
 The scheduler accepts `SEED COUNT STEPS [trace|quiet] [PROFILE] [SEEDS]`
-(defaults: `1 32 600 quiet 0`). For example, from a build directory:
+(defaults: seed 1, 32 seeds, 600 steps, header without trace, profile 0). For
+example, from a build directory:
 
 ```sh
 ./tests/fuzzy/cluster 1 1000 2000
@@ -96,8 +97,9 @@ records the profile as part of the scenario.
 
 Profile `127` enables everything; `tests/fuzzy/cluster_extended` is the same
 program with defaults `1 16 600 quiet 93` (every flag except `2` and `32`,
-whose known core failures are listed in `fuzzy/KNOWN_FAILURES.md`) and runs
-under `make check` next to the profile `0` run.
+which the campaigns listed in `docs/implementation.md` exercise instead, to
+bound `make check` time) and runs under `make check` next to the profile `0`
+run.
 
 Failure budget. At most `f` members of every configuration that may still need
 them can be unavailable at once, where unavailable means crashed or restarted
@@ -127,5 +129,6 @@ the seed label, the second the profile, and every later byte or byte pair
 selects the next action or parameter; an exhausted input keeps choosing zero.
 Replay an artifact with `./tests/fuzzy/cluster_fuzz PATH_TO_ARTIFACT`, with
 `VSR_CLUSTER_TRACE=1` in the environment for the action trace.
-Known failures of the current core found by campaigns are listed with their
-mechanism and replay command in `fuzzy/KNOWN_FAILURES.md`.
+Failures found by campaigns that no regression test fixes yet are listed with
+their mechanism and replay command in `fuzzy/KNOWN_FAILURES.md`; the list is
+empty on a tree where the campaigns in `docs/implementation.md` pass.

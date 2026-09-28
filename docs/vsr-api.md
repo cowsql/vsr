@@ -13,6 +13,13 @@ alignment. Other values must be powers of two; the returned arena alignment also
 satisfies the alignment of every internal type. `vsr_layout` validates options,
 checks size arithmetic, and includes progress reserves in its result. `vsr_init`
 requires at least that size and alignment and copies all option/seed metadata.
+Every `*_ns` option must be below `UINT64_MAX`; both calls return `VSR_EINVAL`
+otherwise. `vsr_init` clears `*out` on every error except when `out` lies
+inside the arena, which returns `VSR_EINVAL` without writing through it. From
+`vsr_init` on, `vsr_status.configuration` is never NULL: it describes the seed
+as a STEADY epoch with no predecessor and a zero boundary, the genesis
+configuration under `NEW` and a discovery hint under `RECOVER` and `JOIN`,
+until a recovered or learned descriptor replaces it.
 
 Cluster, replica, and process-incarnation IDs must be nonzero. Incarnations must
 be unique across all starts in the cluster, including starts after storage loss.
@@ -434,6 +441,10 @@ snapshot objects after adapter readers drain, never another replica's anchor.
 
 APPLY contains one nonempty consecutive committed batch. Execute all entries in
 order and return exactly one `vsr_value` per entry, each within `result_bytes`.
+A `vsr_applied` whose `count` differs from the batch is a structurally valid but
+inconsistent result: the completion is consumed and the replica fences with
+`VSR_FAILURE_APPLICATION`. A count above `batch_entries` is instead rejected
+unconsumed with `VSR_ELIMIT`.
 Control entries are application no-ops with empty results. `through` is the last
 entry's op. At most one APPLY is active; execution does not overlap read/capture
 fences or INSTALL. Application result codes are deterministic data, including
@@ -450,7 +461,7 @@ obligation; independent adapter readers can delay physical reclamation.
 | --- | --- |
 | SEND | Retry/coalesce protocol work |
 | REPLY / READ_READY | Abandon local delivery; client may retry |
-| LOAD | Retry transient unavailability; expected absence follows load rules; corruption, unexpected absence, or permanent failure fences storage |
+| LOAD | Retry transient unavailability; expected absence follows load rules; corruption, unexpected absence, `FAILED`, and `CANCELLED` all fence storage |
 | STORE / SYNC | Fence storage on every non-success, including cancellation/retry |
 | APPLY / INSTALL | Fence application on every non-success; INSTALL corruption latches snapshot failure |
 | CAPTURE | Retry ordinary failures; corruption fences snapshot state; no partial object is adopted |
@@ -467,11 +478,13 @@ storage/application results fence the instance. Diagnostic information remains
 available through STOPPED.
 
 STOP is idempotent, disables deadlines, stops new protocol work, and abandons
-unissued requests. Only TIME, COMPLETE, STOP, and drain calls are then accepted.
-Finish or cancel every emitted operation and continue draining RELEASE outputs;
-STOPPING starts no retries. FAILED and RETIRED also permit draining and STOP;
-other well-formed inputs are consumed without new protocol work. Recovery
-metadata retains its protocol state, not the transient runtime failure/stop state.
+unissued requests. Only TIME, COMPLETE, STOP, and drain calls are then accepted;
+any other event returns `VSR_EINVAL` and stays unconsumed, in STOPPING and in
+STOPPED alike. Finish or cancel every emitted operation and continue draining
+RELEASE outputs; STOPPING starts no retries. FAILED and RETIRED also permit
+draining and STOP but, until STOP, consume other well-formed inputs without new
+protocol work. Recovery metadata retains its protocol state, not the transient
+runtime failure/stop state.
 
 STOPPED means no outstanding operations, pins, or queued releases remain.
 `vsr_deinit` then succeeds without freeing the caller's arena; otherwise it
