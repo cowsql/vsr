@@ -371,6 +371,57 @@ static int fetch(struct vsr_validation *v, const struct vsr_fetch *request,
                : VSR_EINVAL;
 }
 
+static int recovery_message(struct vsr_validation *v,
+                            const struct vsr_message *message)
+{
+    const struct vsr_recovery *recovery = message->body;
+    TRY(OBJECT(v, recovery, struct vsr_recovery));
+    TRY(nonce(recovery->nonce));
+    if (message->type == VSR_MSG_RECOVERY) {
+        if (recovery->state != NULL || message->number != 0) {
+            return VSR_EINVAL;
+        }
+    } else if (recovery->state == NULL) {
+        if (message->number != 0) {
+            return VSR_EINVAL;
+        }
+    } else {
+        TRY(log_state(v, recovery->state));
+        if (message->number != recovery->state->log_end - 1) {
+            return VSR_EINVAL;
+        }
+    }
+    return VSR_OK;
+}
+
+/* NEW_STATE, LOG, and STATE_UNAVAILABLE share the chunk shape: a discovery
+ * reply or an unavailable range carries no entries and an empty range. */
+static int chunk_message(struct vsr_validation *v,
+                         const struct vsr_message *message)
+{
+    const struct vsr_state_chunk *chunk = message->body;
+    TRY(OBJECT(v, chunk, struct vsr_state_chunk));
+    TRY(nonce(chunk->nonce));
+    TRY(log_state(v, &chunk->state));
+    if (message->number != chunk->state.log_end - 1 || !counter(chunk->first) ||
+        chunk->first > chunk->next) {
+        return VSR_EINVAL;
+    }
+    if (message->type == VSR_MSG_STATE_UNAVAILABLE || chunk->first == 0) {
+        if (chunk->first != chunk->next || chunk->state.entries.count != 0 ||
+            (chunk->first == 0 && message->type == VSR_MSG_LOG)) {
+            return VSR_EINVAL;
+        }
+    } else if (chunk->first < chunk->state.log_begin ||
+               chunk->next > chunk->state.log_end ||
+               chunk->next - chunk->first != chunk->state.entries.count ||
+               (chunk->state.entries.count != 0 &&
+                chunk->state.entries.entries[0].op != chunk->first)) {
+        return VSR_EINVAL;
+    }
+    return VSR_OK;
+}
+
 int vsr_validate_message(struct vsr_validation *v,
                          const struct vsr_message *message)
 {
@@ -416,26 +467,9 @@ int vsr_validate_message(struct vsr_validation *v,
         break;
     }
     case VSR_MSG_RECOVERY:
-    case VSR_MSG_RECOVERY_RESPONSE: {
-        const struct vsr_recovery *recovery = message->body;
-        TRY(OBJECT(v, recovery, struct vsr_recovery));
-        TRY(nonce(recovery->nonce));
-        if (message->type == VSR_MSG_RECOVERY) {
-            if (recovery->state != NULL || message->number != 0) {
-                return VSR_EINVAL;
-            }
-        } else if (recovery->state == NULL) {
-            if (message->number != 0) {
-                return VSR_EINVAL;
-            }
-        } else {
-            TRY(log_state(v, recovery->state));
-            if (message->number != recovery->state->log_end - 1) {
-                return VSR_EINVAL;
-            }
-        }
+    case VSR_MSG_RECOVERY_RESPONSE:
+        TRY(recovery_message(v, message));
         break;
-    }
     case VSR_MSG_GET_STATE:
     case VSR_MSG_GET_LOG:
         if (message->number != 0) {
@@ -445,30 +479,9 @@ int vsr_validate_message(struct vsr_validation *v,
         break;
     case VSR_MSG_NEW_STATE:
     case VSR_MSG_LOG:
-    case VSR_MSG_STATE_UNAVAILABLE: {
-        const struct vsr_state_chunk *chunk = message->body;
-        TRY(OBJECT(v, chunk, struct vsr_state_chunk));
-        TRY(nonce(chunk->nonce));
-        TRY(log_state(v, &chunk->state));
-        if (message->number != chunk->state.log_end - 1 ||
-            !counter(chunk->first) || chunk->first > chunk->next) {
-            return VSR_EINVAL;
-        }
-        if (message->type == VSR_MSG_STATE_UNAVAILABLE || chunk->first == 0) {
-            if (chunk->first != chunk->next ||
-                chunk->state.entries.count != 0 ||
-                (chunk->first == 0 && message->type == VSR_MSG_LOG)) {
-                return VSR_EINVAL;
-            }
-        } else if (chunk->first < chunk->state.log_begin ||
-                   chunk->next > chunk->state.log_end ||
-                   chunk->next - chunk->first != chunk->state.entries.count ||
-                   (chunk->state.entries.count != 0 &&
-                    chunk->state.entries.entries[0].op != chunk->first)) {
-            return VSR_EINVAL;
-        }
+    case VSR_MSG_STATE_UNAVAILABLE:
+        TRY(chunk_message(v, message));
         break;
-    }
     case VSR_MSG_START_EPOCH:
     case VSR_MSG_NEW_EPOCH: {
         const struct vsr_epoch *epoch = message->body;

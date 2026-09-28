@@ -508,6 +508,13 @@ void vsr_operation_abort(struct vsr *v, struct vsr_operation *operation)
     recycle_operation(v, operation);
 }
 
+uint64_t vsr_operation_last_id(const struct vsr *v)
+{
+    return v->operation_ready_last == VSR_INDEX_NONE
+               ? 0
+               : v->operations[v->operation_ready_last].output.id;
+}
+
 struct vsr_operation *vsr_operation_find(struct vsr *v, uint64_t id)
 {
     if (id == 0 || id == UINT64_MAX) {

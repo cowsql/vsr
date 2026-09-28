@@ -115,6 +115,9 @@ bool vsr_operation_hold(struct vsr *v, struct vsr_operation *operation,
 void vsr_operation_publish(struct vsr *v, struct vsr_operation *operation);
 void vsr_operation_abort(struct vsr *v, struct vsr_operation *operation);
 struct vsr_operation *vsr_operation_find(struct vsr *v, uint64_t id);
+/* The id of the most recently published operation, or zero when none is
+ * queued: modules record it to match a completion to the intent it serves. */
+uint64_t vsr_operation_last_id(const struct vsr *v);
 
 /* Event callbacks borrow one reference. Retain anything needed after return.
  * Index NONE represents an event with no data and retain/release are no-ops. */
