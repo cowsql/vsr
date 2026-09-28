@@ -2465,6 +2465,357 @@ static void test_malformed(void)
     }
 }
 
+/* -------------------------------------------------------------------------
+ * Review additions: differential round trips, region bounds at every
+ * shape, over-limit refusals by digest and decoder alike
+ * ---------------------------------------------------------------------- */
+
+/* decode(encode(x)) == x and encode(decode(bytes)) == bytes for random
+ * valid graphs of every message type, into a region of exactly the computed
+ * size at every misalignment of its base. */
+static void test_differential(void)
+{
+    const uint64_t seed = 0x9e3779b97f4a7c15ull;
+
+    printf("codec: differential seed %llx\n", (unsigned long long)seed);
+    test_random_seed(&rng, seed, 11);
+    for (size_t set = 0; set < LIMIT_SETS; ++set) {
+        const struct vsr_limits *limits = &limit_sets[set];
+        size_t region_bytes;
+
+        CHECK(vsr_io_codec_message_region(limits, &region_bytes) == VSR_OK);
+        for (uint32_t type = 0; type <= VSR_MSG_READ_ACK; ++type) {
+            for (unsigned round = 0; round < 4; ++round) {
+                struct builder b;
+                struct vsr_message *message;
+                struct vsr_message *decoded = NULL;
+                struct vsr_io_bump region;
+                struct vsr_io_cursor cursor;
+                uint32_t length;
+                uint32_t crc;
+                uint32_t length2;
+                uint32_t crc2;
+                size_t total;
+                size_t skew = round % 8;
+
+                arena_reset();
+                builder_init(&b, limits, 2, -1);
+                message = build_message(&b, type);
+                CHECK(vsr_io_codec_message_digest(message, limits, &length,
+                                                  &crc) == VSR_OK);
+                total = encode_reference(message, length, crc, reference_frame);
+                /* Exact region, base skewed by round bytes. */
+                vsr_io_bump_init(&region, region_memory + skew, region_bytes);
+                vsr_io_cursor_init_one(&cursor, reference_frame + 24, length);
+                CHECK(vsr_io_codec_decode_message(&cursor, limits, &region,
+                                                  &decoded) == VSR_OK);
+                CHECK(same_message(message, decoded));
+                /* The decoded graph digests and encodes to the same bytes. */
+                CHECK(vsr_io_codec_message_digest(decoded, limits, &length2,
+                                                  &crc2) == VSR_OK);
+                CHECK(length2 == length && crc2 == crc);
+                CHECK(encode_reference(decoded, length2, crc2, random_frame) ==
+                      total);
+                CHECK(memcmp(random_frame, reference_frame, total) == 0);
+            }
+        }
+    }
+}
+
+/* Maximal counts with minimal bodies: the region bound holds for shapes the
+ * random builder rarely produces (empty commands, one-member memberships,
+ * empty manifests, every entry type at batch_entries). */
+static void test_region_shapes(void)
+{
+    for (size_t set = 0; set < LIMIT_SETS; ++set) {
+        const struct vsr_limits *limits = &limit_sets[set];
+        size_t region_bytes;
+
+        CHECK(vsr_io_codec_message_region(limits, &region_bytes) == VSR_OK);
+        for (int entry_type = 0; entry_type <= VSR_REQUEST_NOOP; ++entry_type) {
+            for (unsigned variant = 0; variant < 3; ++variant) {
+                struct builder b;
+                struct vsr_message *message;
+                struct vsr_message *decoded = NULL;
+                struct vsr_io_bump region;
+                struct vsr_io_cursor cursor;
+                uint32_t length;
+                uint32_t crc;
+
+                arena_reset();
+                /* mode 1 fills every count to its limit; mode 0 empties
+                 * every body; variant 2 mixes maximal counts with empty
+                 * bodies by building maximal then shrinking blobs. */
+                builder_init(&b, limits, variant == 0 ? 1 : 0, entry_type);
+                if (variant != 2) {
+                    message = build_message(&b, VSR_MSG_NEW_STATE);
+                } else {
+                    struct vsr_prepare *prepare = NEW(struct vsr_prepare);
+                    struct vsr_entry *entries =
+                        build_entry_array(&b, limits->batch_entries);
+
+                    b.mode = 1;
+                    message = build_message(&b, VSR_MSG_PREPARE);
+                    for (uint32_t i = 0; i < limits->batch_entries; ++i) {
+                        if (entries[i].type == VSR_REQUEST_COMMAND) {
+                            struct vsr_blob *blob = NEW(struct vsr_blob);
+
+                            blob->spans = NULL;
+                            blob->size = 0;
+                            blob->count = 0;
+                            blob->reserved = 0;
+                            entries[i].body = blob;
+                        }
+                    }
+                    prepare->batch.entries = entries;
+                    prepare->batch.count = limits->batch_entries;
+                    prepare->batch.reserved = 0;
+                    prepare->committed = 1;
+                    message->body = prepare;
+                }
+                CHECK(vsr_io_codec_message_digest(message, limits, &length,
+                                                  &crc) == VSR_OK);
+                encode_reference(message, length, crc, reference_frame);
+                vsr_io_bump_init(&region, region_memory + 7, region_bytes);
+                vsr_io_cursor_init_one(&cursor, reference_frame + 24, length);
+                CHECK(vsr_io_codec_decode_message(&cursor, limits, &region,
+                                                  &decoded) == VSR_OK);
+                CHECK(same_message(message, decoded));
+            }
+        }
+    }
+}
+
+/* Just over each limit: refused by the digest, by record_bytes and by the
+ * decoders, for the aggregate and the per-object limits the earlier sizing
+ * test does not exercise on their own. */
+static void test_over_limits(void)
+{
+    const struct vsr_limits *limits = &limit_sets[3];
+    struct vsr_limits larger = *limits;
+    struct builder b;
+    struct vsr_io_bump region;
+    struct vsr_io_cursor cursor;
+    uint32_t length;
+    uint32_t crc;
+    size_t bytes;
+
+    CHECK(limits->command_bytes * limits->batch_entries >
+          limits->message_bytes);
+    /* Aggregate: every command within command_bytes, the sum one over. */
+    {
+        struct vsr_message *message;
+        struct vsr_message *decoded;
+        const struct vsr_prepare *prepare;
+        uint64_t sum = 0;
+
+        larger.message_bytes = limits->message_bytes + 1;
+        arena_reset();
+        builder_init(&b, &larger, 1, VSR_REQUEST_COMMAND);
+        message = build_message(&b, VSR_MSG_PREPARE);
+        prepare = message->body;
+        for (uint32_t i = 0; i < prepare->batch.count; ++i) {
+            const struct vsr_blob *blob = prepare->batch.entries[i].body;
+
+            CHECK(blob->size <= limits->command_bytes);
+            sum += blob->size;
+        }
+        CHECK(sum == limits->message_bytes + 1);
+        CHECK(vsr_io_codec_message_digest(message, limits, &length, &crc) ==
+              VSR_ELIMIT);
+        CHECK(vsr_io_codec_message_digest(message, &larger, &length, &crc) ==
+              VSR_OK);
+        encode_reference(message, length, crc, reference_frame);
+        vsr_io_bump_init(&region, region_memory, REGION_BYTES);
+        vsr_io_cursor_init_one(&cursor, reference_frame + 24, length);
+        CHECK(vsr_io_codec_decode_message(&cursor, limits, &region, &decoded) ==
+              VSR_ELIMIT);
+        /* The same entries as an APPEND: record_bytes and get_entries. */
+        {
+            struct vsr_change change = {VSR_STORE_APPEND, prepare->batch.count,
+                                        1, prepare->batch.entries};
+            struct vsr_store store = {1, &change, 1, 0};
+            struct vsr_entry *entries = NULL;
+            size_t written;
+
+            CHECK(vsr_io_codec_record_bytes(&store, limits, &bytes) ==
+                  VSR_ELIMIT);
+            CHECK(vsr_io_codec_record_bytes(&store, &larger, &bytes) == VSR_OK);
+            CHECK(vsr_io_codec_put_record(&store, 1, 1, 0, random_frame,
+                                          sizeof(random_frame),
+                                          &written) == VSR_OK);
+            vsr_io_bump_init(&region, region_memory, REGION_BYTES);
+            vsr_io_cursor_init_one(&cursor, random_frame + 72, written - 72);
+            CHECK(vsr_io_codec_get_entries(&cursor, change.count, limits,
+                                           &region, &entries) == VSR_ELIMIT);
+        }
+    }
+    /* Members: a HARD_STATE record with members + 1. */
+    {
+        struct vsr_hard_state *hard;
+        struct vsr_hard_state decoded;
+        struct vsr_change change;
+        struct vsr_store store = {1, &change, 1, 0};
+        size_t written;
+
+        larger = *limits;
+        larger.members++;
+        arena_reset();
+        builder_init(&b, &larger, 1, -1);
+        hard = build_hard_state(&b);
+        CHECK(hard->epoch->current->count == larger.members);
+        change = (struct vsr_change){VSR_STORE_HARD_STATE, 1, 0, hard};
+        CHECK(vsr_io_codec_record_bytes(&store, limits, &bytes) == VSR_ELIMIT);
+        CHECK(vsr_io_codec_record_bytes(&store, &larger, &bytes) == VSR_OK);
+        CHECK(vsr_io_codec_put_record(&store, 1, 1, 0, random_frame,
+                                      sizeof(random_frame),
+                                      &written) == VSR_OK);
+        vsr_io_bump_init(&region, region_memory, REGION_BYTES);
+        vsr_io_cursor_init_one(&cursor, random_frame + 72, written - 72);
+        CHECK(vsr_io_codec_get_hard_state(&cursor, limits, &region, &decoded) ==
+              VSR_ELIMIT);
+    }
+    /* Batch: an APPEND of batch_entries + 1 NOOPs. */
+    {
+        struct vsr_entry *entries;
+        struct vsr_entry *decoded = NULL;
+        struct vsr_change change;
+        struct vsr_store store = {1, &change, 1, 0};
+        size_t written;
+
+        larger = *limits;
+        larger.batch_entries++;
+        arena_reset();
+        builder_init(&b, &larger, 0, VSR_REQUEST_NOOP);
+        entries = build_entry_array(&b, larger.batch_entries);
+        change = (struct vsr_change){VSR_STORE_APPEND, larger.batch_entries, 1,
+                                     entries};
+        CHECK(vsr_io_codec_record_bytes(&store, limits, &bytes) == VSR_ELIMIT);
+        CHECK(vsr_io_codec_put_record(&store, 1, 1, 0, random_frame,
+                                      sizeof(random_frame),
+                                      &written) == VSR_OK);
+        vsr_io_bump_init(&region, region_memory, REGION_BYTES);
+        vsr_io_cursor_init_one(&cursor, random_frame + 72, written - 72);
+        CHECK(vsr_io_codec_get_entries(&cursor, change.count, limits, &region,
+                                       &decoded) == VSR_ELIMIT);
+        /* get_entry_at reaches the last one regardless of the batch rule,
+         * and fails one past it without moving out of the payload. */
+        vsr_io_cursor_init_one(&cursor, random_frame + 72, written - 72);
+        CHECK(vsr_io_codec_get_entry_at(
+                  &cursor, larger.batch_entries - 1, limits, &region,
+                  decoded == NULL ? &entries[0] : decoded) == VSR_OK);
+        CHECK(vsr_io_cursor_remaining(&cursor) == 0);
+        vsr_io_cursor_init_one(&cursor, random_frame + 72, written - 72);
+        CHECK(vsr_io_codec_get_entry_at(&cursor, larger.batch_entries, limits,
+                                        &region, &entries[0]) == VSR_EINVAL);
+        /* A hostile body_length in a skipped entry: not a multiple of 8,
+         * or beyond the payload. */
+        vsr_io_put_u32(random_frame + 72 + 52, 4);
+        vsr_io_cursor_init_one(&cursor, random_frame + 72, written - 72);
+        CHECK(vsr_io_codec_get_entry_at(&cursor, 1, limits, &region,
+                                        &entries[0]) == VSR_EINVAL);
+        vsr_io_put_u32(random_frame + 72 + 52, UINT32_MAX - 7);
+        vsr_io_cursor_init_one(&cursor, random_frame + 72, written - 72);
+        CHECK(vsr_io_codec_get_entry_at(&cursor, 1, limits, &region,
+                                        &entries[0]) == VSR_EINVAL);
+    }
+    /* Result: a CLIENTS record with result_bytes + 1. */
+    {
+        struct vsr_client_record record;
+        struct vsr_client_record decoded;
+        struct vsr_change change;
+        struct vsr_store store = {1, &change, 1, 0};
+        size_t written;
+
+        larger = *limits;
+        larger.result_bytes++;
+        arena_reset();
+        builder_init(&b, &larger, 1, -1);
+        build_client_record(&b, &record);
+        CHECK(record.result.data.size == larger.result_bytes);
+        change = (struct vsr_change){VSR_STORE_CLIENTS, 1, 0, &record};
+        CHECK(vsr_io_codec_record_bytes(&store, limits, &bytes) == VSR_ELIMIT);
+        CHECK(vsr_io_codec_record_bytes(&store, &larger, &bytes) == VSR_OK);
+        CHECK(vsr_io_codec_put_record(&store, 1, 1, 0, random_frame,
+                                      sizeof(random_frame),
+                                      &written) == VSR_OK);
+        vsr_io_bump_init(&region, region_memory, REGION_BYTES);
+        vsr_io_cursor_init_one(&cursor, random_frame + 72, written - 72);
+        CHECK(vsr_io_codec_get_client_record(&cursor, limits, &region,
+                                             &decoded) == VSR_ELIMIT);
+    }
+}
+
+/* The vectored encoder never references bytes that move: every vector lies
+ * in the writer or in a payload span, and only spans of at least
+ * VSR_IO_INLINE_BYTES are referenced. */
+static void test_vector_origins(void)
+{
+    const struct vsr_limits *limits = &limit_sets[3];
+    struct builder b;
+    struct vsr_message *message;
+    const struct vsr_prepare *prepare;
+    struct vsr_io_encoder encoder;
+    uint32_t length;
+    uint32_t crc;
+    bool done = false;
+    unsigned referenced = 0;
+
+    arena_reset();
+    builder_init(&b, limits, 1, VSR_REQUEST_COMMAND);
+    message = build_message(&b, VSR_MSG_PREPARE);
+    prepare = message->body;
+    CHECK(vsr_io_codec_message_digest(message, limits, &length, &crc) ==
+          VSR_OK);
+    vsr_io_encoder_begin(&encoder, message, length, crc);
+    while (!done) {
+        struct vsr_io_writer writer = {writer_memory, 100, 0};
+        uint32_t count = 0;
+
+        CHECK(vsr_io_encoder_emit(&encoder, &writer, vectors, 3, &count,
+                                  UINT64_MAX, &done) == VSR_OK);
+        for (uint32_t i = 0; i < count; ++i) {
+            const unsigned char *base = vectors[i].base;
+            bool in_writer =
+                base >= writer_memory &&
+                base + vectors[i].length <= writer_memory + writer.used;
+            bool in_span = false;
+
+            /* The builder lays a blob's spans out contiguously, so a
+             * vector may cover several adjacent referenced spans; it must
+             * never cover a span below the inline threshold. */
+            for (uint32_t e = 0; e < prepare->batch.count && !in_span; ++e) {
+                const struct vsr_blob *blob = prepare->batch.entries[e].body;
+                const unsigned char *first;
+                const unsigned char *end;
+
+                if (blob->count == 0) {
+                    continue;
+                }
+                first = blob->spans[0].data;
+                end = (const unsigned char *)blob->spans[blob->count - 1].data +
+                      blob->spans[blob->count - 1].size;
+                if (base < first || base + vectors[i].length > end) {
+                    continue;
+                }
+                in_span = true;
+                for (uint32_t s = 0; s < blob->count; ++s) {
+                    const unsigned char *data = blob->spans[s].data;
+
+                    if (blob->spans[s].size < VSR_IO_INLINE_BYTES &&
+                        base < data + blob->spans[s].size &&
+                        data < base + vectors[i].length) {
+                        in_span = false;
+                    }
+                }
+            }
+            CHECK(in_writer || in_span);
+            referenced += in_span;
+        }
+    }
+    CHECK(referenced > 0);
+}
+
 static void test_bump(void)
 {
     struct vsr_io_bump bump;
@@ -2499,6 +2850,10 @@ int main(void)
     test_superblock();
     test_segments();
     test_clients_file();
+    test_differential();
+    test_region_shapes();
+    test_over_limits();
+    test_vector_origins();
     printf("codec: ok\n");
     return 0;
 }
