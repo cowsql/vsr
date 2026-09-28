@@ -118,7 +118,12 @@ struct vsr_operation *vsr_operation_find(struct vsr *v, uint64_t id);
 uint64_t vsr_operation_last_id(const struct vsr *v);
 
 /* Event callbacks borrow one reference. Retain anything needed after return.
- * Index NONE represents an event with no data and retain/release are no-ops. */
+ * Index NONE represents an event with no data and retain/release are no-ops.
+ * Retaining never fails for lack of capacity: a false result means the lease
+ * is not live or its reference count overflowed, an invariant failure that
+ * has already latched, failed the engine, and quiesced the protocol. Callers
+ * unwind without recording the lease; nothing is retried or lost, because
+ * no further work is admitted or issued after a failure. */
 bool vsr_lease_retain(struct vsr *v, uint32_t lease);
 void vsr_lease_release(struct vsr *v, uint32_t lease);
 uint64_t vsr_lease_id(const struct vsr *v, uint32_t lease);

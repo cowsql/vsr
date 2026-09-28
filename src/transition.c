@@ -36,7 +36,6 @@ enum target_goal {
 };
 enum target_phase {
     TARGET_DRAIN,
-    TARGET_TRUNCATE,
     TARGET_SNAPSHOT,
     TARGET_FETCH,
     TARGET_COMPARE,
@@ -463,6 +462,7 @@ static uint32_t offer_current(struct vsr *v)
                    (size_t)checkpoint->manifest.count * sizeof(*offer->spans));
             offer->checkpoint.manifest.spans = offer->spans;
         }
+        /* A failed retain has failed the engine; leave the slot unused. */
         if (!vsr_lease_retain(v, lease))
             return VSR_INDEX_NONE;
         offer->lease = lease;
@@ -620,6 +620,7 @@ static void consider_offer(struct vsr *v, uint64_t source,
          state->log_end == t->best.log_end && source < t->best_source);
     if (!better)
         return;
+    /* A failed retain has failed the engine; the previous best stays. */
     if (!vsr_lease_retain(v, lease))
         return;
     offer_reference(v, local_offer);
@@ -931,6 +932,7 @@ static void take_chunk(struct vsr *v, const struct vsr_entry *entries,
                        uint32_t count, uint32_t lease)
 {
     struct selected_target *target = &transition(v)->target;
+    /* A failed retain has failed the engine; the chunk is not adopted. */
     if (!vsr_lease_retain(v, lease))
         return;
     vsr_lease_release(v, target->entries_lease);
@@ -1061,22 +1063,18 @@ static bool drain_phase(struct vsr *v)
         reject_discarded_routes(v, p->written_end);
         p->log_end = p->written_end;
     }
-    /* Keep the previous suffix until comparison proves a divergence.
-     * A transfer can be interrupted by another view: truncating a matching
-     * quorum-endorsed prefix here would then advertise an incomplete log
-     * with its previous last-normal-view. Replacements below atomically
-     * truncate at the first differing uncommitted entry and append it. */
-    target->phase = TARGET_TRUNCATE;
-    return true;
-}
-
-static bool truncate_phase(struct vsr *v)
-{
-    struct vsr_protocol *p = vsr_protocol(v);
-    struct selected_target *target = &transition(v)->target;
-    if (target->sequence != 0 && p->safe_sequence < target->sequence)
-        return false;
-    target->sequence = 0;
+    /* No truncation happens here: the previous suffix is kept until the
+     * comparison proves a divergence. A transfer can be interrupted by
+     * another view, and truncating a matching quorum-endorsed prefix now
+     * would then advertise an incomplete log with its previous last normal
+     * view. The divergent uncommitted tail goes in two places instead:
+     * append_chunk replaces the suffix from the first differing uncommitted
+     * entry in one TRUNCATE+APPEND transaction, and fetch_phase truncates
+     * whatever extends past the selected log end once the fetch cursor
+     * reaches it. A RESTORE issued by snapshot_phase precedes both, so the
+     * suffix it retains is validated by that same comparison; the retained
+     * entries below the fetch cursor are committed or covered by an anchor
+     * this replica holds and are never divergent. */
     target->phase = TARGET_SNAPSHOT;
     return true;
 }
@@ -1353,8 +1351,6 @@ static bool target_poll(struct vsr *v)
     switch (target->phase) {
     case TARGET_DRAIN:
         return drain_phase(v);
-    case TARGET_TRUNCATE:
-        return truncate_phase(v);
     case TARGET_SNAPSHOT:
         return snapshot_phase(v);
     case TARGET_COMPARE:
@@ -2059,6 +2055,7 @@ void vsr_transition_complete(struct vsr *v, struct vsr_operation *operation,
         } else if (event->status != VSR_IO_OK) {
             vsr_fail(v, VSR_FAILURE_STORAGE, operation, event->status);
         } else {
+            /* A failed retain has failed the engine; nothing is served. */
             if (!vsr_lease_retain(v, lease))
                 return;
             server->lease = lease;

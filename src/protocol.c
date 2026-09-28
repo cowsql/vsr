@@ -814,10 +814,11 @@ static int request_event(struct vsr *v, const struct vsr_event *event,
             ? ((const struct vsr_check_epoch *)request->body)->epoch
             : 0;
     r->lease = r->result_lease = VSR_INDEX_NONE;
-    if (!query) {
-        vsr_lease_retain(v, lease);
+    /* A failed retain has failed the engine; the route stays free. */
+    if (!query && !vsr_lease_retain(v, lease))
+        return VSR_OK;
+    if (!query)
         r->lease = lease;
-    }
     r->state = VSR_ROUTE_CLIENT;
     if (immediate_reply != UINT32_MAX)
         route_reply(r, immediate_reply);
@@ -1444,7 +1445,9 @@ static void route_load_complete(struct vsr *v, struct vsr_operation *op,
             }
             remember(v, record->request, record->op, true);
             if (r->query || record->request.number == r->request.id.number) {
-                vsr_lease_retain(v, lease);
+                /* A failed retain has failed the engine; keep no result. */
+                if (!vsr_lease_retain(v, lease))
+                    return;
                 r->result_lease = lease;
             } else
                 memset(&r->completed.result, 0, sizeof(r->completed.result));
@@ -1558,7 +1561,9 @@ void vsr_protocol_complete(struct vsr *v, struct vsr_operation *op,
         p->results_through = apply->through;
         p->results_sequence = 0;
         p->results_pending = true;
-        vsr_lease_retain(v, lease);
+        /* A failed retain has failed the engine; the results are dropped. */
+        if (!vsr_lease_retain(v, lease))
+            break;
         p->results_lease = lease;
         for (uint32_t i = 0; i < apply->batch.count; ++i) {
             const struct vsr_entry *entry = &apply->batch.entries[i];
