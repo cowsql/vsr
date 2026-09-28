@@ -51,7 +51,7 @@ struct example_cluster {
 };
 
 /* Narration: one line of plain text on stdout. */
-void say(const char *format, ...);
+__attribute__((format(printf, 1, 2))) void say(const char *format, ...);
 const char *example_state_name(uint32_t state);
 const char *example_role_name(uint32_t role);
 const char *example_reply_status_name(uint32_t status);
