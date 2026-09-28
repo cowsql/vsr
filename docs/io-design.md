@@ -60,8 +60,7 @@ vectorized zero-copy send from registered buffers (`SEND_ZC` with
 `IORING_SEND_VECTORIZED` and `IORING_RECVSEND_FIXED_BUF`), vectored
 fixed-buffer disk reads and writes, registered wait arguments with
 minimum-timeout batching, bind and listen as ring operations, direct
-descriptors, `MSG_RING` for cross-engine wakeups, and splice with a pipe for
-file-range sends. Zero-copy receive (`RECV_ZC`) requires NIC support for
+descriptors, peek receives, and splice with a pipe for file-range sends. Zero-copy receive (`RECV_ZC`) requires NIC support for
 header and data split and is deferred.
 
 Machine facts that informed defaults: 8 logical CPUs, an NVMe device
@@ -191,8 +190,9 @@ executor the seam removed the question: every form is one of the three above.
 
 One engine per thread, with its own executor and ring. A group lives on
 exactly one engine. Scaling out is N engines on N cores that share nothing;
-cross-engine traffic is a `MSG_RING` wakeup plus an application-level queue,
-never a lock on the hot path. Each engine holds its own links to each peer
+cross-engine traffic is an executor wake plus an application-level queue,
+never a lock on the hot path; `MSG_RING` is a possible later executor
+operation for the same purpose. Each engine holds its own links to each peer
 node, so two engines on one machine hold two connections to the same peer.
 
 ### Multi-group scope
@@ -246,7 +246,7 @@ its completion. The engine adds three things.
  │ groups {A, C, E}               │   │ groups {B, D}                  │
  │ own links to nodes 2 and 3     │   │ own links to nodes 2 and 3     │
  └──────────────▲─────────┬───────┘   └───────▲─────────┬──────────────┘
-                │         └── MSG_RING wakeup ┘         │
+                │         └── executor wake ──┘         │
                 └────────── + application queue ────────┘
  a group lives on exactly one engine; engines share nothing
 ```
@@ -292,6 +292,18 @@ plus incremental consumption make that rare. When the pool is exhausted the
 engine stops providing buffers and receiving pauses, which is the correct
 backpressure toward peers: TCP flow control does the rest.
 
+A frame therefore fits one slab, and `slab_bytes` less framing is the
+cluster's largest message and, through the core's `message_bytes`, its
+largest command. The first application replicates page diffs or B-tree
+changes rather than whole pages, so a cap of a few megabytes is a policy
+rather than an obstacle, and a pool of a few slabs of that size with
+incremental consumption costs little memory. Letting a body span slabs,
+delivered as one span per slab through the core's scatter-gather blobs, would
+remove the coupling and the reassembly copy at the price of slab chains,
+multi-slab leases and an exhaustion rule for half-received frames. It is
+deferred; the decoder reads through a boundary-aware cursor from the start so
+that adding it later changes no contract.
+
 ### Send path
 
 Each link has a bounded queue of pending core SEND ops
@@ -301,7 +313,14 @@ with the frame headers in engine memory and the bodies referenced from their
 slabs. Sends at or above `zero_copy_bytes` use `SEND_ZERO_COPY`, whose second
 completion, the `NOTIF`, is exactly the moment the core's SEND completion rule
 asks for: buffers no longer read. Smaller sends copy in the kernel and
-complete on their single completion. A full queue completes the oldest SEND
+complete on their single completion. Bodies in registered memory, that is
+pool slabs, tail buffers and slabs the caller has taken from the pool, go as
+fixed-buffer sends; caller bytes outside registered memory go zero-copy
+without registration at or above the same threshold, which pins their pages
+per send, and are copied by the kernel below it. An application whose
+request bodies are hot, such as a database submitting its own pages, places
+them in pool slabs it takes through `vsr_io_slab_acquire`, so the primary's
+hottest send is a fixed-buffer one. A full queue completes the oldest SEND
 with `RETRY`; the core already coalesces retries under its retry timer, so
 this is bounded and never silent. Changing a node's address or revoking its
 authorization closes its links and retries their queued sends the same way.
@@ -319,6 +338,26 @@ link's node is rejected. Learners and discovery peers are entries the
 application adds before they connect, which is exactly the administrative
 authorization the protocol contract asks the adapter for. Links are keyed by
 node and shared by every replica on the engine.
+
+Addresses are raw socket addresses as the kernel takes them, `AF_INET`,
+`AF_INET6` or `AF_UNIX` including abstract names, rather than a library
+structure: the executor is a virtual io_uring and its connect and bind
+records carry what the real ones carry, and the first application listens on
+abstract Unix sockets.
+
+Two arrangements the first application needs are covered without a second
+listener mechanism. A caller that owns the listener for its own clients can
+serve peers on the same port: every peer or stream connection begins with
+`VSR_IO_WIRE_MAGIC`, so the caller peeks the first eight bytes with a `PEEK`
+receive and, for a peer, adopts the socket with `VSR_IO_ADOPT_HANDSHAKE`,
+which runs the configured handshake on the untouched stream. A caller that
+must dial peers itself, through a proxy or its own authenticated channel,
+records the node with a NULL address: the engine emits `LINK_WANTED` on its
+backoff schedule instead of connecting, and the caller dials and adopts with
+`HANDSHAKE | OUTBOUND`. `vsr_io_node_status` reports the link state toward a
+node, when it was established, when a frame was last accepted from it and
+the next dial deadline, which is what role management and cluster status
+answers need; polling peers through the application protocol is unnecessary.
 
 ### Handshake modes and threat model
 
@@ -365,8 +404,9 @@ sans-IO state machine per link with the authenticator as a pluggable step.
 whatever it likes without blocking the loop and completes the op with the
 node identity, which is how TLS or any custom scheme plugs in; `vsr_io_adopt`
 takes a connection the application dialed and authenticated entirely by
-itself; `VSR_IO_HANDSHAKE_KEYED` is reserved for the built-in secret and not
-implemented. The library takes no crypto dependency. Randomness for nonces
+itself or, with its `HANDSHAKE` flag, a raw connection on which the engine
+runs the configured mode; `VSR_IO_HANDSHAKE_KEYED` is reserved for the
+built-in secret and not implemented. The library takes no crypto dependency. Randomness for nonces
 comes from the executor, next to the clock, so the handshake replays under
 simulation. The mode is a cluster-wide policy and a peer proposing another is
 refused.
@@ -518,9 +558,18 @@ All indexes are fixed-capacity arrays from the replica's metadata region.
   can name an older retained revision.
 - Client to latest completed record and client to latest retained entry are
   two open-addressing tables over the 128-bit IDs with capacity
-  `max_clients`. Exceeding it fences: the contract retains every client's
-  latest record forever and provides no deletion, so the client set is
-  unbounded by design while the arena is not.
+  `max_clients`. The contract retains every client's latest record forever
+  and provides no deletion, so the client set is unbounded by design while
+  the arena is not. `max_clients` is therefore a deployment-wide limit,
+  identical on every replica, enforced where new incarnations enter:
+  `vsr_io_submit` leaves a REQUEST from an incarnation the store does not
+  know unconsumed with `ELIMIT` when the table, counting incarnations in
+  flight, is full, and the application answers `LIMIT`. Only the primary
+  admits requests and every replica holds the same set, so no backup ever
+  overflows; an overflow reached any other way still fences, as an invariant
+  rather than a policy. A logged request that retires an incarnation on a
+  clean client disconnect would bound growth further and is a core
+  follow-up.
 - A segment slot is freed only when every record in it is below both the trim
   point and the reclaim floor.
 - LOAD reads the covering byte range into pool slabs with a fixed-buffer
@@ -627,10 +676,15 @@ API directly, with the harness adding latency if a scenario wants it.
 
 ### Helpers
 
-Slab allocation from the registered pool for the application's own file I/O,
-a CRC32C routine, and an atomic-publish sequence (write a temporary file,
-fsync, rename, fsync the directory) were considered and deferred until a need
-appears.
+Slab allocation from the registered pool is provided: `vsr_io_slab_acquire`
+hands the caller a slab for its own request bodies and file I/O, which the
+engine then sends and writes with fixed-buffer operations, and
+`vsr_io_slab_release` returns it once nothing of the caller's covers it. The
+first application's request bodies are its own database pages, so this is
+the difference between registered and unregistered zero-copy on the
+primary's hottest send. A CRC32C routine and an atomic-publish sequence
+(write a temporary file, fsync, rename, fsync the directory) remain deferred
+until a need appears.
 
 ## 8. Client
 
@@ -747,8 +801,10 @@ allocation inside its core.
   torn tails and quorum recovery in replicated mode are exercised for real.
 - Fault model: for disks, torn writes at block granularity on crash, bit rot,
   latency, transient errors and ENOSPC; for the network, partitions, delay,
-  silent drops that stall a connection until it resets, explicit resets and
-  byte corruption. Duplication and reordering within a connection are not
+  silent drops that stall a connection until it resets, explicit resets,
+  byte corruption, and segments split across receive completions at random
+  boundaries so that frame reassembly across completions and slabs is
+  exercised. Duplication and reordering within a connection are not
   modeled because sockets are ordered byte streams; reordering between
   connections falls out of their independent delays. The clock is per node,
   monotonic, with a per-node offset and late-only timer jitter.
@@ -796,6 +852,14 @@ In the order the decisions were taken.
 | 21 | `vsr-client.h` is bookkeeping only | The application's protocol carries the fields; submission is always local to a node | A networked VSR client library |
 | 22 | Topology-aware clients, no internal forwarding | No extra hop in steady state; rediscovery is a small, rare hit | Forwarding requests from backups to the primary |
 | 23 | Deferred: store IOPOLL ring, RECV_ZC, keyed handshake, index records, block devices, TLS helpers | Each is an addition behind an existing seam; none is needed for the first version | Including them now |
+| 24 | A frame fits one slab; `slab_bytes` caps message and command size; the decoder reads through a boundary-aware cursor | The first application replicates diffs, so a cap of a few megabytes is policy; multi-slab bodies cost slab chains, multi-slab leases and an exhaustion rule; the cursor keeps that a later, contract-free change | Multi-slab bodies in the first version |
+| 25 | Executor addresses are raw socket addresses, Unix sockets included | The executor mirrors io_uring; the first application listens on abstract Unix sockets | A library address structure limited to INET |
+| 26 | Caller-owned listeners and dialers: a wire magic, `PEEK`, adopt with `HANDSHAKE`, and `LINK_WANTED` for address-less nodes | One port for peers and clients, and dialing through the application's own channel, are both existing deployments | A second listener mechanism; passing consumed prefix bytes into adopt |
+| 27 | `max_clients` is a deployment-wide limit enforced at `vsr_io_submit` with `ELIMIT`; the fence stays as an invariant | Fencing a replica when a table fills is a time bomb under connection churn; admission at the primary keeps every replica within the limit | Fence as the only handling; admission control inside the core |
+| 28 | Per-node link status query | Role management and cluster status answers need link state, not polling through the application protocol | Aggregate statistics only |
+| 29 | Sends from registered memory use fixed buffers, other caller memory is zero-copy without registration; pool slabs are lendable to the caller | The primary's hottest send is its own request bodies, which live in application memory | Leaving caller-memory sends unspecified; deferring the slab helper |
+| 30 | Cross-engine wakeup is the executor's wake plus an application queue; socket options are two operations | No engine needs `MSG_RING` yet; get and set have different result semantics | `MSG_RING` in the first executor; one ambiguous SOCKOPT |
+| 31 | The simulation splits segments across receive completions | Real stacks do; reassembly across completions and slabs is the path most likely to hide bugs | Whole-segment delivery only |
 
 ## 11. Open items and implementation order
 
@@ -811,12 +875,20 @@ Open items, each behind an existing seam:
 - Helpers: slab allocation for application I/O, CRC32C, atomic publish.
 - The bounded-lane client alternative, if an application with short-lived
   clients ever needs it.
+- Multi-slab frame bodies, delivered as one span per slab, once a
+  transaction cap is no longer acceptable.
+- `MSG_RING` as an executor operation for cross-engine completions.
+- Core follow-ups agreed for the first application: a planned primary
+  handoff event, so a primary about to stop starts the view change itself
+  instead of waiting out the view timeout; and a logged request that retires
+  a client incarnation on a clean disconnect.
 - Application-specific tuning for the replicated SQLite database, taken up
   after the generic layer exists.
 
 Implementation order, each milestone with its own deterministic tests:
 
-1. Codec and framing: wire structs, CRC32C, in-place decoding, fuzzed.
+1. Codec and framing: wire structs, CRC32C, in-place decoding through a
+   boundary-aware cursor, fuzzed.
 2. Link state machine: dial, accept, TRUSTED and EXTERNAL handshakes, backoff,
    send coalescing and queue backpressure, receive reassembly.
 3. Store layout and recovery: records, superblocks, indexes, torn-tail

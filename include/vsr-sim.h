@@ -13,11 +13,12 @@
  * node, a seeded generator, and a fault model. Every node obtains a
  * struct vsr_io_executor whose operations have exactly the semantics that
  * vsr-io.h documents for the production executor: multishot accept and recv,
- * provided-buffer rings with incremental consumption, zero-copy sends with a
- * second NOTIF completion, linked records, cancellation, absolute and
- * relative timeouts, registered files and buffer regions, and wake. Engine
- * and application code therefore run byte-identical over the simulation and
- * over io_uring; the only difference is who advances time.
+ * provided-buffer rings with incremental consumption, peek receives,
+ * zero-copy sends with a second NOTIF completion, linked records,
+ * cancellation, absolute and relative timeouts, registered files and buffer
+ * regions, and wake. Engine and application code therefore run
+ * byte-identical over the simulation and over io_uring; the only difference
+ * is who advances time.
  *
  * Nothing here blocks. submit_and_wait records the node's want, min_wait_ns
  * and deadline_ns and returns; the harness runs each node's loop iteration
@@ -56,13 +57,16 @@ struct vsr_sim;
  * between two nodes, and connections already open across it stall then
  * reset. A node with no route to a peer sees CONNECT complete with
  * -EHOSTUNREACH after connect_timeout_ns, or -ECONNREFUSED at once when the
- * peer is up but nothing listens.
+ * peer is up but nothing listens. split delivers a segment across two or
+ * more receive completions at boundaries drawn at random, as a real stack
+ * may, so that frame reassembly across completions and provided buffers is
+ * exercised; it is not a fault, since the bytes and their order are intact.
  */
 struct vsr_sim_network_faults {
     uint32_t drop_ppm;
     uint32_t corrupt_ppm;
     uint32_t reset_ppm;
-    uint32_t reserved;
+    uint32_t split_ppm;
     uint64_t delay_min_ns;
     uint64_t delay_max_ns;
     uint64_t stall_reset_ns;
@@ -191,9 +195,13 @@ uint64_t vsr_sim_now(const struct vsr_sim *sim); /* World clock, ns. */
 uint32_t vsr_sim_inflight(const struct vsr_sim *sim, uint32_t node);
 
 /*
- * Addresses. Every node owns one canonical INET address; binding to it, or
- * to the unspecified address, on a port registers the node as the listener
- * for (address, port). vsr_sim_address is the address a peer dials.
+ * Addresses are raw socket addresses as in vsr-io.h. Every node owns one
+ * canonical AF_INET address; binding to it, or to the unspecified address,
+ * on a port registers the node as the listener for (address, port), and
+ * vsr_sim_address is what a peer dials. AF_UNIX names, pathname or abstract,
+ * live in a namespace private to each node, as on a real host: a connection
+ * to one reaches only a listener on the same node. Other families complete
+ * with -EAFNOSUPPORT.
  */
 struct vsr_io_address vsr_sim_address(const struct vsr_sim *sim, uint32_t node,
                                       uint16_t port);

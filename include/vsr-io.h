@@ -5,6 +5,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 /*
  * VSR-IO: Linux io_uring host for the VSR core.
@@ -42,6 +43,10 @@
 #define VSR_IO_WIRE_VERSION 1u /* Frame and handshake format between nodes. */
 #define VSR_IO_STORE_FORMAT 1u /* On-disk log format. */
 #define VSR_IO_NO_NODE UINT64_C(0)
+/* "VSRIO" little-endian: the first eight bytes a dialing engine sends on
+ * every peer or stream connection, so a caller-owned listener can tell peers
+ * from its own clients (see vsr_io_adopt). */
+#define VSR_IO_WIRE_MAGIC UINT64_C(0x0000004F49525356)
 
 /* -------------------------------------------------------------------------
  * Executor: a virtual io_uring
@@ -83,23 +88,25 @@ enum vsr_io_sqe_opcode {
     VSR_IO_SQE_MKDIRAT,   /* fd: dir; addr: path; length: mode */
     VSR_IO_SQE_STATX,     /* fd: dir; addr: path; addr2: struct statx; op_flags:
                             AT_* flags; length: STATX_* mask */
-    VSR_IO_SQE_SOCKET,    /* length: domain; op_flags: type; DIRECT: fd2 slot */
-    VSR_IO_SQE_CONNECT,   /* addr: vsr_io_address */
-    VSR_IO_SQE_BIND,      /* addr: vsr_io_address */
+    VSR_IO_SQE_SOCKET,    /* length: domain; op_flags: type; offset: protocol;
+                            DIRECT: fd2 slot */
+    VSR_IO_SQE_CONNECT,   /* addr: struct sockaddr; length: its size */
+    VSR_IO_SQE_BIND,      /* addr: struct sockaddr; length: its size */
     VSR_IO_SQE_LISTEN,    /* length: backlog */
     VSR_IO_SQE_ACCEPT,    /* op_flags: MULTISHOT; DIRECT allocates slots; result
                             is the descriptor or slot */
-    VSR_IO_SQE_RECV,      /* op_flags: MULTISHOT; BUFFER_SELECT from
+    VSR_IO_SQE_RECV,      /* op_flags: MULTISHOT, PEEK; BUFFER_SELECT from
                             buffer_group, else addr/length */
     VSR_IO_SQE_SEND,      /* op_flags: ZERO_COPY, VECTORED (addr: vecs,
                             length: count); FIXED_BUFFER: buffer_index */
     VSR_IO_SQE_SHUTDOWN,  /* length: SHUT_* how */
-    VSR_IO_SQE_SOCKOPT,   /* op_flags: level << 16 | name; addr/length: value */
-    VSR_IO_SQE_PIPE,      /* addr: int[2] or, with DIRECT, two slots from fd2 */
-    VSR_IO_SQE_SPLICE,    /* fd/offset: source; fd2: destination; length; a
-                            pipe must be one end; op_flags: SPLICE_F_* */
-    VSR_IO_SQE_TIMEOUT,   /* offset: ns, ABSOLUTE in the executor clock or
-                            relative; completes with -ETIME when it fires */
+    VSR_IO_SQE_SETSOCKOPT, /* op_flags: level << 16 | name; addr/length: value */
+    VSR_IO_SQE_GETSOCKOPT, /* same fields; result is the value's length */
+    VSR_IO_SQE_PIPE,    /* addr: int[2] or, with DIRECT, two slots from fd2 */
+    VSR_IO_SQE_SPLICE,  /* fd/offset: source; fd2: destination; length; a
+                           pipe must be one end; op_flags: SPLICE_F_* */
+    VSR_IO_SQE_TIMEOUT, /* offset: ns, ABSOLUTE in the executor clock or
+                           relative; completes with -ETIME when it fires */
     VSR_IO_SQE_TIMEOUT_UPDATE, /* addr2: target user_data as uint64; offset */
     VSR_IO_SQE_CANCEL          /* offset: target user_data; op_flags: BY_FD (all
                             operations on fd), ALL (every match) */
@@ -120,6 +127,7 @@ enum vsr_io_sqe_op_flags {
     VSR_IO_FSYNC_DATASYNC = 1u << 0,
     VSR_IO_ACCEPT_MULTISHOT = 1u << 0,
     VSR_IO_RECV_MULTISHOT = 1u << 0,
+    VSR_IO_RECV_PEEK = 1u << 1,      /* Return bytes without consuming them. */
     VSR_IO_SEND_ZERO_COPY = 1u << 0, /* Two completions: result, then NOTIF. */
     VSR_IO_SEND_VECTORED = 1u << 1,
     VSR_IO_TIMEOUT_ABSOLUTE = 1u << 0,
@@ -274,13 +282,12 @@ int vsr_io_uring_fd(const struct vsr_io_executor *executor);
  * requires for members, learners, and discovery peers.
  * ---------------------------------------------------------------------- */
 
-enum vsr_io_family { VSR_IO_INET = 1, VSR_IO_INET6 = 2 };
-
+/* A socket address as the kernel takes it: AF_INET, AF_INET6, or AF_UNIX,
+ * pathname or abstract. length is the number of bytes of sockaddr in use. */
 struct vsr_io_address {
-    uint16_t family;   /* enum vsr_io_family */
-    uint16_t port;     /* Host byte order. */
-    uint32_t scope;    /* INET6 scope ID, else zero. */
-    uint8_t bytes[16]; /* Network byte order; INET uses the first four. */
+    uint32_t length;
+    uint32_t reserved;
+    struct sockaddr_storage sockaddr;
 };
 
 /*
@@ -389,20 +396,63 @@ int vsr_io_deinit(struct vsr_io *io); /* EBUSY until closed. */
 /* Thread-safe. Wakes the owner's loop; the next poll sees nothing new. */
 void vsr_io_wake(struct vsr_io *io);
 
-/* Node table and authorization. Changing a node's address or revoking an
+/*
+ * Node table and authorization. Changing a node's address or revoking an
  * authorization closes affected links; a SEND queued on them completes with
- * RETRY. authorize with node = VSR_IO_NO_NODE revokes. */
+ * RETRY. authorize with node = VSR_IO_NO_NODE revokes. A NULL address
+ * records a CALLER-DIALED node: the engine never connects to it and instead
+ * emits a LINK_WANTED op, on its redial backoff schedule, whenever it needs a
+ * link and has none; the caller connects however it likes and adopts the
+ * socket.
+ */
 int vsr_io_node_set(struct vsr_io *io, uint64_t node,
                     const struct vsr_io_address *address);
 int vsr_io_node_clear(struct vsr_io *io, uint64_t node);
 int vsr_io_authorize(struct vsr_io *io, struct vsr_id cluster, uint64_t replica,
                      uint64_t node);
+
 /*
- * Adopt a connected socket the caller established and authenticated itself,
- * as a link to node. The engine owns the descriptor from now on. flags must
- * be zero. Returns OK, ELIMIT when no link slot is free, or EINVAL.
+ * Adopt a connected socket as a link; the engine owns the descriptor from
+ * now on. With flags zero the caller has already run the cluster's handshake
+ * or its own authentication, and node is the authenticated peer. HANDSHAKE
+ * instead runs the configured handshake mode on the socket, as an inbound
+ * link (node = VSR_IO_NO_NODE, identity from the handshake) or, with
+ * OUTBOUND, as a dialed link to the expected node: this is how a
+ * caller-owned listener hands over the peer connections it demultiplexes
+ * and how a caller-dialed node gets its link. Every peer or stream
+ * connection starts with VSR_IO_WIRE_MAGIC, so a caller-owned listener can
+ * tell a peer from one of its own clients with a PEEK receive and adopt the
+ * socket with its stream untouched. Returns OK, ELIMIT when no link slot is
+ * free, or EINVAL.
  */
+enum vsr_io_adopt_flags {
+    VSR_IO_ADOPT_HANDSHAKE = 1u << 0,
+    VSR_IO_ADOPT_OUTBOUND = 1u << 1 /* Only with HANDSHAKE. */
+};
+
 int vsr_io_adopt(struct vsr_io *io, int fd, uint64_t node, uint32_t flags);
+
+/* Link state toward one node, for role and health decisions. */
+enum vsr_io_node_state {
+    VSR_IO_NODE_UNLINKED, /* No link and none in progress. */
+    VSR_IO_NODE_PENDING,  /* Dialing, waiting for the caller, or handshaking. */
+    VSR_IO_NODE_LINKED    /* At least one established link. */
+};
+
+struct vsr_io_node_status {
+    uint32_t state;            /* enum vsr_io_node_state */
+    uint32_t links;            /* Established links of every kind. */
+    uint64_t linked_since_ns;  /* Executor clock; 0 while unlinked. */
+    uint64_t last_received_ns; /* Last frame accepted from the node; 0 never. */
+    uint64_t next_dial_ns;     /* Backoff deadline while UNLINKED, else
+                                  VSR_NO_DEADLINE. */
+    int32_t last_error;        /* Negative errno of the last failure, or 0. */
+    uint32_t reserved;
+};
+
+/* EINVAL for an unknown node. */
+int vsr_io_node_status(const struct vsr_io *io, uint64_t node,
+                       struct vsr_io_node_status *status);
 
 /* -------------------------------------------------------------------------
  * Loop entry points
@@ -438,7 +488,11 @@ int vsr_io_complete(struct vsr_io *io, const struct vsr_io_cqe *cqes,
 int vsr_io_poll(struct vsr_io *io, uint64_t now_ns, struct vsr_io_op *ops,
                 uint32_t capacity, uint32_t *count, uint32_t *flags);
 /* Accepts a prefix of events in order; unconsumed events are resubmitted
- * after the next poll. Reasons for stopping mirror vsr_step_many. */
+ * after the next poll. Reasons for stopping mirror vsr_step_many, plus one of
+ * the engine's own: a REQUEST from a client incarnation the store does not
+ * know, while its client table (counting incarnations in flight) is full, is
+ * left unconsumed with ELIMIT, and the caller answers LIMIT itself. With the
+ * same max_clients on every replica, backups therefore never exceed theirs. */
 int vsr_io_submit(struct vsr_io *io, const struct vsr_io_event *events,
                   uint32_t count, uint32_t *consumed);
 /* Fills at most capacity records; *deadline_ns is the earliest engine
@@ -495,9 +549,11 @@ enum vsr_io_op_kind {
     VSR_IO_OP_STREAM_WRITTEN, /* data: vsr_io_stream_written; informational:
                                  that write's buffers or file range are no
                                  longer read. */
-    VSR_IO_OP_STATUS          /* data: vsr_status of replica, borrowed until
+    VSR_IO_OP_STATUS,         /* data: vsr_status of replica, borrowed until
                                the next poll; informational. Emitted when
                                STATE_CHANGED, and once at STOPPED. */
+    VSR_IO_OP_LINK_WANTED     /* data: vsr_io_link_wanted; informational: a
+                               caller-dialed node needs a link. */
 };
 
 /* 48 bytes on common 64-bit ABIs. */
@@ -525,6 +581,17 @@ struct vsr_io_handshake {
 
 struct vsr_io_handshake_done {
     uint64_t node; /* Authenticated identity; must match for OUTBOUND. */
+};
+
+/*
+ * A caller-dialed node (vsr_io_node_set with a NULL address) has no link.
+ * Connect and vsr_io_adopt with HANDSHAKE | OUTBOUND; the op repeats on the
+ * redial backoff schedule until a link exists.
+ */
+struct vsr_io_link_wanted {
+    uint64_t node;
+    uint32_t attempt; /* Consecutive emissions without a link, from 1. */
+    uint32_t reserved;
 };
 
 /*
@@ -622,6 +689,31 @@ struct vsr_io_stream_write {
  * stream, FAILED for a permanent error, CANCELLED when the engine closes. */
 
 /* -------------------------------------------------------------------------
+ * Payload pool for the caller
+ *
+ * The caller may take slabs of the registered payload pool for its own
+ * bytes: request bodies it will submit, file I/O it issues itself. A taken
+ * slab is the caller's until released, and the engine does not provide it
+ * to the kernel meanwhile. Bytes in any registered region, the pool
+ * included, are sent and written by the engine with fixed-buffer
+ * operations; caller bytes outside registered memory are sent zero-copy
+ * without registration at or above zero_copy_bytes, which pins their pages
+ * per send, and copied by the kernel below it. Release a slab only when no
+ * lease, op, or record of the caller still covers it. acquire returns OK,
+ * ELIMIT when the pool is exhausted, or EINVAL.
+ * ---------------------------------------------------------------------- */
+
+struct vsr_io_slab {
+    void *base;
+    uint32_t length; /* slab_bytes */
+    uint16_t id;     /* Provided-buffer id, for release. */
+    uint16_t region; /* Registered region index, for FIXED_BUFFER records. */
+};
+
+int vsr_io_slab_acquire(struct vsr_io *io, struct vsr_io_slab *slab);
+int vsr_io_slab_release(struct vsr_io *io, uint16_t id);
+
+/* -------------------------------------------------------------------------
  * Replicas and the store
  *
  * A replica binds one core instance to one directory holding its store: the
@@ -661,8 +753,12 @@ struct vsr_io_store_options {
     uint32_t segments;           /* Slots allocated at creation. */
     uint32_t max_segments;       /* Growth bound; equal to segments: fixed. */
     uint32_t max_entries;        /* Retained log entries the index can hold. */
-    uint32_t max_clients;        /* Distinct client incarnations; exceeding it
-                               fences, since the contract never forgets one. */
+    uint32_t max_clients;        /* Distinct client incarnations the table
+                                    holds: a deployment-wide limit, identical
+                                    on every replica and enforced at
+                                    vsr_io_submit; an overflow reached any
+                                    other way fences, since the contract never
+                                    forgets one. */
     uint32_t inflight_writes;    /* Concurrent record writes; default 2. */
     uint64_t segment_bytes;      /* Multiple of block_bytes; default 64 MiB. */
     uint64_t sync_delay_ns;      /* Hold a flush to batch SYNCs; default 0. */
