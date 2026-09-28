@@ -35,10 +35,13 @@ examples_witness_LDADD = src/libvsr.a
 
 UNIT_TESTS = tests/unit/checked tests/unit/objects tests/unit/random tests/unit/memory \
   tests/unit/validate tests/unit/runtime tests/unit/reads tests/unit/memory_watch
+UNIT_TESTS += tests/unit/descriptors tests/unit/layout
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
   tests/integration/audit tests/integration/transfer_audit
+INTEGRATION_TESTS += tests/integration/failures tests/integration/view_change_edges \
+  tests/integration/offers tests/integration/capture tests/integration/clients
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
   tests/regression/witness_prefix tests/regression/boundary_from_view_change \
@@ -65,6 +68,10 @@ tests_unit_runtime_SOURCES = tests/unit/runtime.c
 tests_unit_runtime_LDADD = src/libvsr.a
 tests_unit_reads_SOURCES = tests/unit/reads.c
 tests_unit_reads_LDADD = src/libvsr.a
+tests_unit_descriptors_SOURCES = tests/unit/descriptors.c
+tests_unit_descriptors_LDADD = src/libvsr.a
+tests_unit_layout_SOURCES = tests/unit/layout.c
+tests_unit_layout_LDADD = src/libvsr.a
 tests_integration_replication_SOURCES = tests/integration/replication.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
@@ -101,6 +108,26 @@ tests_integration_transfer_audit_SOURCES = tests/integration/transfer_audit.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_integration_transfer_audit_LDADD = src/libvsr.a
+tests_integration_failures_SOURCES = tests/integration/failures.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_failures_LDADD = src/libvsr.a
+tests_integration_view_change_edges_SOURCES = tests/integration/view_change_edges.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_view_change_edges_LDADD = src/libvsr.a
+tests_integration_offers_SOURCES = tests/integration/offers.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_offers_LDADD = src/libvsr.a
+tests_integration_capture_SOURCES = tests/integration/capture.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_capture_LDADD = src/libvsr.a
+tests_integration_clients_SOURCES = tests/integration/clients.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_integration_clients_LDADD = src/libvsr.a
 tests_regression_trim_resend_SOURCES = tests/regression/trim_resend.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
