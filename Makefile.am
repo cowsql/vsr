@@ -49,18 +49,12 @@ REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/review_epoch_recovery_vote tests/regression/learner_restart \
   tests/regression/learner_follows tests/regression/epoch_announcement_recovery \
   tests/regression/api_init_out tests/regression/pressure_reload \
-  tests/regression/anchor_behind_applied tests/regression/reply_restore
+  tests/regression/anchor_behind_applied tests/regression/reply_restore \
+  tests/regression/next_epoch_before_steady
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
-# Reproductions of open safety bugs found in review; they turn into XPASS
-# once the core is fixed and should then move to the ordinary regressions.
-# review_epoch_recovery_vote: a member that lost its store rejoins as a voter
-# through a NEW_EPOCH redirect and a single-donor epoch transfer without the
-# recovery quorum, so a later view change replaces acknowledged commands.
-# epoch_announcement_recovery: the same handoff path entered from RECOVERING
-# by a START_EPOCH announcement abandons an in-progress recovery quorum and
-# reports a committed position below the one acknowledged before the crash.
-XFAIL_TESTS = tests/regression/review_epoch_recovery_vote \
-  tests/regression/epoch_announcement_recovery
+# Reproductions of open safety bugs found in review go here; they turn into
+# XPASS once the core is fixed and then move to the ordinary regressions.
+XFAIL_TESTS =
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
 tests_unit_checked_LDADD = src/libvsr.a
@@ -176,6 +170,11 @@ tests_regression_epoch_announcement_recovery_SOURCES = \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_epoch_announcement_recovery_LDADD = src/libvsr.a
+tests_regression_next_epoch_before_steady_SOURCES = \
+  tests/regression/next_epoch_before_steady.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_next_epoch_before_steady_LDADD = src/libvsr.a
 tests_regression_boundary_from_view_change_SOURCES = \
   tests/regression/boundary_from_view_change.c \
   tests/lib/memory.c tests/lib/memory.h \

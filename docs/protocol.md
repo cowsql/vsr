@@ -102,9 +102,13 @@ not belong to and never persists a role its own validation rejects.
 
 Replicated-mode restarts that can participate enter RECOVERING, even when a
 plausible local checkpoint exists; a retained removal tombstone remains RETIRED.
-A recovering replica does not vote, lead, acknowledge reads, or
-answer recovery requests. Recovery responses come only from NORMAL current
-members and echo a fresh nonce. Non-primary responses have `state=NULL` and
+A recovering replica does not vote, lead, acknowledge reads, answer recovery
+requests, or offer its history for discovery: its view and last normal view
+are unvalidated pre-crash metadata, and a discovery offer would let a peer
+install them as a NORMAL history. It still serves range fetches of a revision
+it published before recovering, whose metadata and contents are fixed.
+Recovery responses come only from NORMAL current members and echo a fresh
+nonce. Non-primary responses have `state=NULL` and
 `number=0`; the highest-view primary supplies the authoritative complete log
 offer. Responses from different epochs are never combined. A newly learned
 view or epoch invalidates incompatible responses and restarts validation.
@@ -151,6 +155,28 @@ acknowledgment carries over. A replica that already holds the complete history
 through the boundary installs directly, exactly as it would from NORMAL, and
 is TRANSFERRING only while history is actually missing.
 
+Learning a later epoch never substitutes for quorum recovery. A replica whose
+local state does not qualify it to vote, because it is recovering from missing
+or replicated-mode state or restarted from a RECOVERING record, restarts
+quorum recovery in the learned epoch, against that epoch's membership and
+quorum, instead of installing one donor's history; each further epoch learned
+meanwhile restarts it again. The single-donor transfer is reserved for a
+replica whose own state is authoritative through its committed prefix and
+that cast no vote in the learned epoch: a member of the old epoch learning the
+boundary, a durable restart of an unfinished installation, or a learner, which
+never votes. A removed member that lost its state needs only the history
+through the boundary in order to retire. In a learned epoch with `f = 0` the
+recovery quorum of `n` responses from `n - 1` peers can never form, and every
+quorum of that epoch is its whole membership: any NORMAL member took part in
+every decision the recovering replica could have voted in, so one such
+member's history is authoritative and the single-donor transfer applies.
+An epoch installation or warm-up may fetch from any NORMAL full member of
+either group: it is not bound to the peer that announced the epoch, and after
+a bounded number of unanswered chunk fetches it reselects its history from
+the next member, since a removed donor retires once the new group is ready
+and a crashed one may never return. A recovery keeps its highest-view primary
+as the sole authoritative source.
+
 An authenticated peer already known in the receiver's current membership or
 seed may report a later committed epoch, including a jump over compacted
 intermediate epochs. This relies on the crash-only, non-Byzantine peer model;
@@ -177,7 +203,11 @@ sent merely because a replica knows the membership.
 
 Each replica, including a learner, establishes STEADY after collecting the
 required distinct EPOCH_STARTED promises or learning a later committed epoch
-that necessarily follows that handoff. A local durable STEADY record survives
+that necessarily follows that handoff. The next epoch's boundary committing
+in the current epoch is such evidence, because its primary admitted it only
+after its own STEADY: a member or learner that commits it before collecting
+its promises finishes the handoff locally and enters the next epoch, and a
+removed donor retires through it. A local durable STEADY record survives
 restart. A peer's phase alone does not establish the receiver's installation or
 retirement. Readiness collection is independent of current view so view changes
 cannot erase the obligation. Until STEADY, the next RECONFIGURE is rejected

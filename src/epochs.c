@@ -42,6 +42,9 @@ struct vsr_epochs {
     bool announce;
     bool promise;
     bool guard;
+    /* The next epoch's boundary committed in this one: evidence that this
+     * handoff completed, standing in for promises still outstanding. */
+    bool successor;
 };
 
 static struct vsr_epochs *epochs(struct vsr *v)
@@ -190,6 +193,10 @@ static void arm(struct vsr *v)
     e->cursor = 0;
     e->peer = donor(v);
     e->stage = EPOCH_FENCE;
+    e->successor = false;
+    /* A descriptor still waiting for its fence describes at most this
+     * epoch; a later one is learned again from the peers' redirects. */
+    e->pending = NULL;
     e->retry_at = vsr_after(v, v->options.retry_ns);
     protect(v);
 }
@@ -226,10 +233,30 @@ void vsr_epochs_committed(struct vsr *v, const struct vsr_entry *entry)
         entry->epoch != p->current.epoch)
         return;
     const struct vsr_membership *next = entry->body;
-    if (next->epoch != p->current.epoch + 1 ||
-        p->epoch.phase != VSR_EPOCH_STEADY) {
+    if (next->epoch != p->current.epoch + 1) {
         vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
         return;
+    }
+    if (p->epoch.phase != VSR_EPOCH_STEADY) {
+        /* The primary admitted this boundary only after its own STEADY, so
+         * the handoff into the current epoch necessarily completed: a later
+         * committed epoch establishes STEADY without the promises still
+         * outstanding here. A backup commits it before collecting them
+         * because promise collection is independent of the view, and a
+         * transfer can copy it from a donor whose notification lags. A
+         * member or learner finishes the handoff locally and enters the
+         * next epoch; a removed donor retires through this evidence rather
+         * than following a group it does not belong to. */
+        if (p->self == VSR_INDEX_NONE && !learner(v)) {
+            epochs(v)->successor = true;
+            return;
+        }
+        uint32_t role = member_role(&p->current, v->options.replica);
+        if (role != VSR_MEMBER_NONE) {
+            v->status.role = role;
+            if (role == VSR_MEMBER_WITNESS)
+                v->status.applied = 0;
+        }
     }
     /* Configuration copying must preserve the old current array before it is
      * overwritten. The caller's entry graph remains pinned through this hook. */
@@ -531,6 +558,15 @@ bool vsr_epochs_poll(struct vsr *v)
         return true;
     }
     if (e->stage == EPOCH_FENCE) {
+        /* Missing state requires quorum recovery, and a membership learned
+         * meanwhile does not change that: the recovery restarts in this
+         * epoch, whatever history is locally present, and hands over the
+         * installation like the single-donor transfer below. */
+        if (vsr_transition_epoch_recover(v)) {
+            e->transferring = true;
+            e->stage = EPOCH_CATCHUP;
+            return true;
+        }
         if (p->stable_commit < p->epoch.boundary ||
             p->stable_end <= p->epoch.boundary ||
             (member_role(&p->current, v->options.replica) == VSR_MEMBER_FULL &&
@@ -565,7 +601,7 @@ bool vsr_epochs_poll(struct vsr *v)
         vsr_changed(v);
         return true;
     }
-    if (e->stage == EPOCH_INSTALLED && quorum_ready(v) &&
+    if (e->stage == EPOCH_INSTALLED && (quorum_ready(v) || e->successor) &&
         stable_configuration(v)) {
         if (persist_phase(v, true))
             return true;

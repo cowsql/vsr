@@ -107,12 +107,19 @@ struct selected_target {
     uint32_t goal;
     uint32_t phase;
     uint32_t anchor;
+    uint32_t unanswered; /* Consecutive chunk fetches without a reply. */
     bool active;
     bool waiting;
     bool snapshot_started;
     bool snapshot_adopted;
     bool rebuild;
 };
+
+/* Unanswered chunk fetches after which a transfer that may choose its donor
+ * gives the source up: a removed donor retires once the new group is ready,
+ * and a crashed one may never return, while every NORMAL full member of
+ * either group can serve the same committed history. */
+enum { TARGET_PATIENCE = 3 };
 
 struct vsr_transition {
     struct round_peer *peers;
@@ -131,6 +138,7 @@ struct vsr_transition {
     uint64_t redirect_peer;
     uint64_t warm_at;
     uint32_t warm_cursor;
+    uint32_t epoch_cursor;
     uint32_t best_lease;
     uint32_t best_offer;
     uint32_t local_offer;
@@ -151,7 +159,12 @@ struct vsr_transition {
     bool boot_snapshot_started;
     bool enabled;
     bool uninitialized_hint;
-    bool hint_recover;
+    /* The local state does not qualify this replica to vote: its store was
+     * missing or restarted under replicated durability, or a RECOVERING
+     * record was restored. Only a completed quorum recovery clears it; a
+     * later epoch learned meanwhile restarts that recovery in the learned
+     * epoch instead of installing one donor's history. */
+    bool quorum_recovery;
     bool redirect_pending;
     bool warmed;
 };
@@ -270,6 +283,31 @@ static bool hard_safe(const struct vsr *v)
     const struct vsr_protocol *p = vsr_protocol_const(v);
     return p->hard_sequence != 0 && !p->hard_dirty &&
            p->safe_sequence >= p->hard_sequence;
+}
+
+/* The committed position a full replica must have applied before a transfer
+ * or restart completes. Application beyond the boundary belongs to the new
+ * epoch's full members: a removed or demoted member stops there (the epoch
+ * module refuses later entries), and a donor from the new group may offer a
+ * committed position past it. */
+static uint64_t applied_needed(const struct vsr *v)
+{
+    const struct vsr_protocol *p = vsr_protocol_const(v);
+    uint32_t role = p->self == VSR_INDEX_NONE
+                        ? VSR_MEMBER_NONE
+                        : p->current.members[p->self].role;
+    uint32_t previous = VSR_MEMBER_NONE;
+    if (p->epoch.previous != NULL) {
+        uint32_t index =
+            vsr_member_index(p->epoch.previous, v->options.replica);
+        if (index != VSR_INDEX_NONE)
+            previous = p->epoch.previous->members[index].role;
+    }
+    if (role != VSR_MEMBER_FULL &&
+        (role == VSR_MEMBER_WITNESS || previous == VSR_MEMBER_FULL) &&
+        p->epoch.boundary < p->stable_commit)
+        return p->epoch.boundary;
+    return p->stable_commit;
 }
 
 static bool send_control(struct vsr *v, uint64_t peer, uint32_t type,
@@ -615,6 +653,7 @@ static void begin_recovery(struct vsr *v)
         return;
     t->enabled = true;
     t->round = ROUND_RECOVERY;
+    t->quorum_recovery = true;
     t->highest_view = v->status.view;
     v->status.state = VSR_STATE_RECOVERING;
     p->hard_dirty = true;
@@ -640,6 +679,31 @@ static uint64_t warm_peer(struct vsr *v)
         }
     }
     return v->status.primary;
+}
+
+/* An epoch installation accepts any NORMAL full member of either group as
+ * its donor, so it is not bound to the one that announced the epoch: a
+ * donor that retired, crashed, or is itself still transferring never
+ * answers, and the next retry moves on to another member. */
+static uint64_t epoch_peer(struct vsr *v)
+{
+    struct vsr_protocol *p = vsr_protocol(v);
+    struct vsr_transition *t = transition(v);
+    uint32_t previous = p->epoch.previous == NULL ? 0 : p->previous.count;
+    uint32_t total = p->current.count + previous;
+    for (uint32_t i = 0; i < total; i++) {
+        uint32_t index = (t->epoch_cursor + i) % total;
+        const struct vsr_member *member =
+            index < p->current.count
+                ? &p->current.members[index]
+                : &p->previous.members[index - p->current.count];
+        if (member->role == VSR_MEMBER_FULL &&
+            member->id != v->options.replica) {
+            t->epoch_cursor = index + 1;
+            return member->id;
+        }
+    }
+    return t->discovery_peer;
 }
 
 static void begin_discovery(struct vsr *v, uint64_t peer, bool warming)
@@ -670,9 +734,8 @@ static void restart_selection(struct vsr *v)
     struct vsr_transition *t = transition(v);
     uint32_t goal = t->target.goal;
     if (goal == TARGET_EPOCH) {
-        uint64_t peer = t->target.source;
         uint64_t boundary = t->epoch_boundary;
-        (void)vsr_transition_epoch(v, peer, boundary);
+        (void)vsr_transition_epoch(v, epoch_peer(v), boundary);
     } else if (goal == TARGET_PRIMARY) {
         (void)next_view(v);
     } else if (goal == TARGET_RECOVERY) {
@@ -698,6 +761,18 @@ static int receive_fetch(struct vsr *v, const struct vsr_message *message)
     if (slot == VSR_INDEX_NONE)
         return VSR_AGAIN;
     bool discovery = request->revision.sequence == 0;
+    /* A discovery offer endorses the sender's history as a NORMAL one in the
+     * offered view: a catch-up, warm-up, or epoch transfer installs it and
+     * enters that view. A recovering replica's view and last normal view
+     * are pre-crash metadata it has not validated with a quorum, so it does
+     * not offer them, just as it answers no recovery request. A range fetch
+     * names a revision this incarnation already published; that revision's
+     * metadata and contents are fixed, so serving it endorses nothing new.
+     * Liveness is unaffected: discovery targets a NORMAL primary (catch-up),
+     * the NEW_EPOCH sender or a full member of the old group (handoff), or
+     * the seed primary (warm-up), and the requester retries on its timer. */
+    if (discovery && v->status.state == VSR_STATE_RECOVERING)
+        return VSR_OK;
     uint32_t offer =
         discovery ? offer_current(v) : offer_find(v, request->revision);
     bool unavailable = offer == VSR_INDEX_NONE;
@@ -854,6 +929,7 @@ static void take_chunk(struct vsr *v, const struct vsr_entry *entries,
     target->entries_lease = lease;
     target->append_offset = 0;
     target->waiting = false;
+    target->unanswered = 0;
     target->load_id = 0;
     target->phase = TARGET_COMPARE;
 }
@@ -1001,7 +1077,12 @@ static bool target_poll(struct vsr *v)
                 vsr_checkpoint_published(v, &existing_lease);
             const struct vsr_checkpoint *checkpoint = target->state.checkpoint;
             uint32_t role = v->status.role;
-            if (target->goal == TARGET_EPOCH && p->self != VSR_INDEX_NONE &&
+            /* A handoff or a recovery in a handoff rebuilds the role the
+             * learned membership assigns: a promoted witness reconstructs
+             * application state before it can vote as a full member. */
+            if ((target->goal == TARGET_EPOCH ||
+                 target->goal == TARGET_RECOVERY) &&
+                p->self != VSR_INDEX_NONE &&
                 p->current.members[p->self].role == VSR_MEMBER_FULL)
                 role = VSR_MEMBER_FULL;
             bool adopt = target->rebuild ||
@@ -1145,6 +1226,15 @@ static bool target_poll(struct vsr *v)
             return false;
         if (target->waiting && !expired(v, target->retry_at))
             return false;
+        if (target->waiting && target->source != v->options.replica &&
+            (target->goal == TARGET_EPOCH || target->goal == TARGET_WARM)) {
+            if (target->unanswered < TARGET_PATIENCE)
+                target->unanswered++;
+            if (target->unanswered >= TARGET_PATIENCE) {
+                restart_selection(v);
+                return true;
+            }
+        }
         if (target->source == v->options.replica) {
             return target_load(v, target->state.revision.sequence, target->next,
                                target->state.log_end, TAG_TARGET_LOAD,
@@ -1177,17 +1267,25 @@ static bool target_poll(struct vsr *v)
             p->application_busy || vsr_checkpoint_busy(v))
             return false;
         if (v->status.role == VSR_MEMBER_FULL &&
-            (v->status.applied < p->stable_commit ||
-             p->clients_stored < p->stable_commit))
+            (v->status.applied < applied_needed(v) ||
+             p->clients_stored < applied_needed(v)))
             return false;
-        if (target->goal == TARGET_WARM || target->goal == TARGET_EPOCH) {
-            bool epoch = target->goal == TARGET_EPOCH;
+        bool handoff = target->goal == TARGET_EPOCH ||
+                       (target->goal == TARGET_RECOVERY &&
+                        p->epoch.phase == VSR_EPOCH_TRANSFERRING);
+        if (target->goal == TARGET_WARM || handoff) {
+            /* A quorum recovery run inside a handoff installed the highest
+             * view primary's complete history: the replica is now qualified
+             * to vote and hands the epoch module the installation, which
+             * persists NORMAL together with phase INSTALLED. */
+            if (target->goal == TARGET_RECOVERY)
+                t->quorum_recovery = false;
             p->replay = false;
             clear_target(v);
             t->round = ROUND_NONE;
             t->warmed = true;
             v->status.state =
-                epoch ? VSR_STATE_TRANSITIONING : VSR_STATE_WARMING;
+                handoff ? VSR_STATE_TRANSITIONING : VSR_STATE_WARMING;
             return true;
         }
         struct vsr_hard_state hard;
@@ -1209,6 +1307,8 @@ static bool target_poll(struct vsr *v)
         if (p->safe_sequence < target->sequence)
             return false;
         bool primary = target->goal == TARGET_PRIMARY;
+        if (target->goal == TARGET_RECOVERY)
+            t->quorum_recovery = false;
         p->replay = false;
         clear_target(v);
         clear_best(v);
@@ -1422,6 +1522,8 @@ static bool discovery_poll(struct vsr *v)
         return false;
     if (t->discovery_waiting && t->round == ROUND_WARM)
         t->discovery_peer = warm_peer(v);
+    if (t->discovery_waiting && t->round == ROUND_EPOCH)
+        t->discovery_peer = epoch_peer(v);
     struct vsr_fetch request = {
         .max_bytes =
             v->options.limits.command_bytes + v->options.limits.manifest_bytes,
@@ -1512,8 +1614,8 @@ static bool boot_restore_poll(struct vsr *v)
     if (vsr_checkpoint_adoption_status(v) != VSR_OK)
         return false;
     if (v->status.role == VSR_MEMBER_FULL &&
-        (v->status.applied < p->stable_commit ||
-         p->clients_stored < p->stable_commit))
+        (v->status.applied < applied_needed(v) ||
+         p->clients_stored < applied_needed(v)))
         return false;
     /* A durable restart preserves an uncommitted suffix. Its final entry can
      * fence all later proposals even though committed replay never loads it.
@@ -1655,7 +1757,7 @@ int vsr_transition_event(struct vsr *v, const struct vsr_event *event,
             if (message->view < v->status.view)
                 return VSR_OK;
             if (t->uninitialized_hint) {
-                bool recover = t->hint_recover;
+                bool recover = t->quorum_recovery;
                 vsr_protocol_configuration(v, chunk->state.epoch);
                 p->epoch.phase = VSR_EPOCH_TRANSFERRING;
                 t->uninitialized_hint = false;
@@ -2036,7 +2138,7 @@ bool vsr_transition_boot_missing(struct vsr *v)
         begin_discovery(v, v->status.primary, true);
         struct vsr_transition *t = transition(v);
         t->uninitialized_hint = true;
-        t->hint_recover = v->options.start_mode == VSR_START_RECOVER;
+        t->quorum_recovery = v->options.start_mode == VSR_START_RECOVER;
         p->identity_pending = false;
         p->hard_dirty = false;
     } else if (v->options.start_mode == VSR_START_JOIN ||
@@ -2147,13 +2249,56 @@ void vsr_transition_epoch_entered(struct vsr *v)
     t->highest_view = 0;
     t->retry_at = VSR_NO_DEADLINE;
     t->election_at = VSR_NO_DEADLINE;
+    /* The fence that preceded this entry, if any, is consumed: a later
+     * handoff must establish its own rather than reuse a completed one. */
+    t->epoch_fence_sequence = 0;
+}
+
+bool vsr_transition_epoch_recover(struct vsr *v)
+{
+    struct vsr_transition *t = transition(v);
+    struct vsr_protocol *p = vsr_protocol(v);
+    /* Membership knowledge never establishes voting readiness. A replica
+     * that owes a quorum recovery, and would vote in the learned epoch,
+     * restarts that recovery there: responses now come from NORMAL members
+     * of the learned membership, its quorum applies, and the highest-view
+     * primary's complete history replaces whatever one donor could offer.
+     * Every further epoch learned meanwhile restarts it the same way. The
+     * single-donor transfer stays reserved for a replica whose own state is
+     * authoritative through its committed prefix and that cast no vote in
+     * the learned epoch: an old-epoch member learning the boundary, an
+     * unfinished durable installation, or a learner, which never votes. A
+     * removed member that lost its state cannot vote either way and only
+     * needs the history through the boundary in order to retire.
+     *
+     * With f = 0 the quorum of n responses from n - 1 peers can never form,
+     * and every quorum of the learned epoch is its whole membership: any
+     * NORMAL member took part in every decision this replica could have
+     * voted in, so one such member's history is authoritative and the
+     * single-donor transfer is the recovery. */
+    if (!t->quorum_recovery || p->self == VSR_INDEX_NONE ||
+        p->current.faults == 0)
+        return false;
+    t->epoch_boundary = p->epoch.boundary;
+    if (p->next_sequence == 1 && v->status.stored_sequence == 0)
+        p->identity_pending = true;
+    p->replay = false;
+    begin_recovery(v);
+    if (t->committed_floor < p->epoch.boundary)
+        t->committed_floor = p->epoch.boundary;
+    return true;
 }
 
 void vsr_transition_hard(struct vsr *v, struct vsr_hard_state *hard)
 {
-    (void)v;
     /* A known later boundary is explicit nonvoting metadata until its history
-     * arrives. Never downgrade the persisted epoch to make local bounds fit. */
+     * arrives. Never downgrade the persisted epoch to make local bounds fit.
+     * A quorum recovery in progress keeps its RECOVERING record, which the
+     * validator accepts with such a boundary, so a durable restart resumes
+     * the recovery rather than an installation it never qualified for. */
+    if (hard->state == VSR_HARD_RECOVERING &&
+        v->status.state == VSR_STATE_RECOVERING)
+        return;
     if (hard->epoch->boundary > hard->committed &&
         hard->epoch->phase == VSR_EPOCH_TRANSFERRING)
         hard->state = VSR_HARD_TRANSITIONING;
