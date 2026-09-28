@@ -9,9 +9,10 @@ struct group {
     struct mem_cluster *cluster;
     struct mem_node *nodes[5];
     uint32_t count;
+    uint32_t fetches; /* GET_LOG and range GET_STATE messages delivered. */
 };
 
-enum schedule { FAIR, NO_ACKS, GAP, ONE_COPY, HOLD_LOG };
+enum schedule { FAIR, NO_ACKS, GAP, ONE_COPY, HOLD_LOG, LAG };
 
 static struct vsr_status status(struct mem_node *node)
 {
@@ -58,10 +59,18 @@ static void drive(struct group *group, enum schedule schedule)
                     ((to >= 4 && message->type == VSR_MSG_PREPARE) ||
                      message->type == VSR_MSG_GET_STATE ||
                      message->type == VSR_MSG_NEW_STATE);
+            drop |= schedule == LAG && to == 3 &&
+                    (message->type == VSR_MSG_PREPARE ||
+                     message->type == VSR_MSG_COMMIT);
+            bool fetch =
+                message->type == VSR_MSG_GET_LOG ||
+                (message->type == VSR_MSG_GET_STATE &&
+                 ((const struct vsr_fetch *)message->body)->first != 0);
             if (drop) {
                 mem_cluster_drop(group->cluster, 0);
                 progress = true;
             } else if (mem_cluster_deliver(group->cluster, 0)) {
+                group->fetches += fetch ? 1 : 0;
                 progress = true;
             }
         }
@@ -73,7 +82,7 @@ static void drive(struct group *group, enum schedule schedule)
 }
 
 static struct group create(uint32_t count, uint32_t durability,
-                           uint32_t operations, bool minimum)
+                           uint32_t operations, bool minimum, uint32_t batch)
 {
     struct group result = {.cluster = mem_cluster_create(), .count = count};
     struct vsr_member members[5];
@@ -93,8 +102,8 @@ static struct group create(uint32_t count, uint32_t durability,
             options.limits.message_bytes = 40;
             options.limits.pinned_payload_bytes = 154;
         }
-        options.limits.log_cache_entries = 1;
-        options.limits.batch_entries = 1;
+        options.limits.log_cache_entries = batch;
+        options.limits.batch_entries = batch;
         result.nodes[i] = mem_cluster_add(result.cluster, &options);
         mem_node_output_capacity(result.nodes[i], 1);
         CHECK(mem_node_time(result.nodes[i], 0).consumed == 1);
@@ -146,7 +155,7 @@ static void converge(struct group *group, uint64_t first, uint64_t committed)
 static void inherited_suffix(uint32_t durability, uint32_t operations,
                              bool minimum)
 {
-    struct group group = create(3, durability, operations, minimum);
+    struct group group = create(3, durability, operations, minimum, 1);
     command(group.nodes[0], 1);
     drive(&group, NO_ACKS);
     CHECK(status(group.nodes[0]).committed == 0);
@@ -168,7 +177,7 @@ static void inherited_suffix(uint32_t durability, uint32_t operations,
 
 static void intact_gap_keeps_vote(void)
 {
-    struct group group = create(5, VSR_REPLICATED, 2, false);
+    struct group group = create(5, VSR_REPLICATED, 2, false, 1);
     command(group.nodes[0], 1);
     drive(&group, GAP);
     time_all(&group, 10);
@@ -189,7 +198,7 @@ static void intact_gap_keeps_vote(void)
 
 static void interrupted_transfer_preserves_suffix(void)
 {
-    struct group group = create(3, VSR_DURABLE, 4, false);
+    struct group group = create(3, VSR_DURABLE, 4, false, 1);
     command(group.nodes[0], 1);
     drive(&group, ONE_COPY);
     mem_node_crash(group.nodes[0]);
@@ -210,7 +219,7 @@ static void interrupted_transfer_preserves_suffix(void)
 
 static void recovered_reconfiguration_fence(void)
 {
-    struct group group = create(3, VSR_DURABLE, 4, false);
+    struct group group = create(3, VSR_DURABLE, 4, false, 1);
     const struct vsr_member members[] = {{1, VSR_MEMBER_FULL, 0},
                                          {2, VSR_MEMBER_FULL, 0},
                                          {3, VSR_MEMBER_FULL, 0}};
@@ -242,6 +251,28 @@ static void recovered_reconfiguration_fence(void)
     mem_cluster_destroy(group.cluster);
 }
 
+/* "A range fetch asks for as many entries as its byte budget and
+ * batch_entries allow." A backup that missed fifty committed entries
+ * installs the new primary's log through GET_LOG in batches, not one entry
+ * per round trip. */
+static void batched_log_transfer(void)
+{
+    struct group group = create(3, VSR_DURABLE, 8, false, 8);
+    for (uint64_t number = 1; number <= 50; number++) {
+        command(group.nodes[0], number);
+        drive(&group, LAG);
+    }
+    CHECK(status(group.nodes[0]).committed == 50);
+    CHECK(status(group.nodes[2]).committed == 0);
+    mem_node_crash(group.nodes[0]);
+    group.fetches = 0;
+    converge(&group, 55, 50);
+    CHECK(status(group.nodes[2]).primary == 2);
+    CHECK(mem_node_history(group.nodes[2], 50)->request.client.lo == 50);
+    CHECK(group.fetches >= 1 && group.fetches <= 8);
+    mem_cluster_destroy(group.cluster);
+}
+
 int main(void)
 {
     inherited_suffix(VSR_DURABLE, 1, false);
@@ -253,5 +284,6 @@ int main(void)
     intact_gap_keeps_vote();
     interrupted_transfer_preserves_suffix();
     recovered_reconfiguration_fence();
+    batched_log_transfer();
     return 0;
 }

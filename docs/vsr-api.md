@@ -359,7 +359,11 @@ fixed for that revision even if the sender's current envelope view advances.
 All responses are checked against the outstanding request and protocol context.
 `max_bytes` bounds every blob in the response, including its checkpoint manifest,
 and `max_entries` bounds its entry array. Every fetch reserves at least
-`command_bytes + manifest_bytes` and at most `message_bytes`. A nonempty range
+`command_bytes + manifest_bytes` and at most `message_bytes`. A range fetch
+asks for as many entries as `batch_entries` and the requester's free payload
+budget allow, so a transfer moves a batch per round trip; a chunk the requester
+can no longer admit when it arrives is refetched, smaller, on its retry timer.
+A nonempty range
 must return at least one entry on success; an empty range returns `next=first=end`. Discovery
 has no entries. STATE_UNAVAILABLE also obeys the byte limit. Responding to a
 fetch never changes the source revision's commitment or epoch metadata.

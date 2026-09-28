@@ -877,16 +877,47 @@ static bool server_poll(struct vsr *v)
     return false;
 }
 
-static bool target_load(struct vsr *v, uint64_t sequence, uint64_t first,
-                        uint64_t end, uint32_t tag, uint64_t *id)
+/* How many entries a range fetch may ask for, and the byte limit that goes
+ * with them: as many as batch_entries and the payload budget allow. A chunk
+ * is an input this replica must admit with its standing progress reserve
+ * intact, so the request is sized from the budget free now, never below the
+ * one entry every fetch may reserve and never above message_bytes. A chunk
+ * that no longer fits when it arrives is refused, and the retry timer
+ * fetches it again, sized to the budget free then. */
+static uint64_t fetch_budget(const struct vsr *v, uint32_t *entries)
 {
+    const struct vsr_limits *limits = &v->options.limits;
+    uint64_t budget = vsr_protocol_available_bytes(v);
+    budget = budget > v->progress_bytes ? budget - v->progress_bytes : 0;
+    uint64_t least = limits->command_bytes + limits->manifest_bytes;
+    if (budget < least)
+        budget = least;
+    if (budget > limits->message_bytes)
+        budget = limits->message_bytes;
+    uint64_t count = (budget - limits->manifest_bytes) / limits->command_bytes;
+    if (count > limits->batch_entries)
+        count = limits->batch_entries;
+    *entries = (uint32_t)count;
+    return limits->manifest_bytes + count * limits->command_bytes;
+}
+
+/* Load up to count entries of [first, end) from the named revision, fewer
+ * when the payload budget or message_bytes holds less; at least one. */
+static bool target_load(struct vsr *v, uint64_t sequence, uint64_t first,
+                        uint64_t end, uint32_t count, uint32_t tag,
+                        uint64_t *id)
+{
+    const struct vsr_limits *limits = &v->options.limits;
     uint64_t bytes = vsr_protocol_available_bytes(v);
-    if (bytes < v->options.limits.command_bytes)
+    if (bytes < limits->command_bytes)
         return false;
-    bytes = v->options.limits.command_bytes;
-    uint32_t count = 1;
+    if (bytes > limits->message_bytes)
+        bytes = limits->message_bytes;
     if (end - first < count)
         count = (uint32_t)(end - first);
+    if (bytes / limits->command_bytes < count)
+        count = (uint32_t)(bytes / limits->command_bytes);
+    bytes = (uint64_t)count * limits->command_bytes;
     struct vsr_store_read read = {sequence, first,        end,  {0, 0},
                                   bytes,    VSR_LOAD_LOG, count};
     if (!vsr_protocol_emit(v, VSR_OP_LOAD, 0, tag, &read, NULL, 0, bytes))
@@ -957,35 +988,36 @@ static bool compare_chunk(struct vsr *v)
         target->phase = TARGET_APPEND;
         return true;
     }
-    bool cached = true;
-    for (uint32_t i = 0;
-         i < target->entry_count && target->entries[i].op < overlap_end; i++) {
-        struct vsr_log_slot *local =
-            vsr_protocol_log_find(v, target->entries[i].op);
-        if (local == NULL) {
-            cached = false;
+    /* append_offset counts the entries proven equal so far, from the cache
+     * or from earlier comparison loads; the divergence, if any, is the first
+     * entry past it. The overlap is bounded by the chunk, which is bounded
+     * by batch_entries, so the count below fits. */
+    uint32_t overlap = (uint32_t)(overlap_end - target->next);
+    while (target->append_offset < overlap) {
+        const struct vsr_entry *entry = &target->entries[target->append_offset];
+        struct vsr_log_slot *local = vsr_protocol_log_find(v, entry->op);
+        if (local == NULL)
             break;
-        }
-        if (!vsr_entry_equal(&local->entry, &target->entries[i])) {
-            if (target->entries[i].op <= p->stable_commit) {
+        if (!vsr_entry_equal(&local->entry, entry)) {
+            if (entry->op <= p->stable_commit) {
                 vsr_fail(v, VSR_FAILURE_INVARIANT, NULL, VSR_IO_OK);
                 return true;
             }
-            target->append_offset = i;
             target->phase = TARGET_APPEND;
             return true;
         }
-        target->append_offset = i + 1;
+        target->append_offset++;
     }
-    if (cached) {
+    if (target->append_offset == overlap) {
         target->phase = TARGET_APPEND;
         return true;
     }
-    target->append_offset = 0;
     if (target->compare_id != 0)
         return false;
-    return target_load(v, v->status.stored_sequence, target->next, overlap_end,
-                       TAG_COMPARE_LOAD, &target->compare_id);
+    return target_load(v, v->status.stored_sequence,
+                       target->next + target->append_offset, overlap_end,
+                       overlap - target->append_offset, TAG_COMPARE_LOAD,
+                       &target->compare_id);
 }
 
 static bool append_chunk(struct vsr *v)
@@ -1123,7 +1155,7 @@ static bool snapshot_phase(struct vsr *v)
                 if (target->anchor_id != 0)
                     return false;
                 return target_load(v, v->status.stored_sequence, checkpoint->op,
-                                   checkpoint->op + 1, TAG_ANCHOR_LOAD,
+                                   checkpoint->op + 1, 1, TAG_ANCHOR_LOAD,
                                    &target->anchor_id);
             }
             target->anchor = anchor_retained(v, &slot->entry, checkpoint)
@@ -1246,18 +1278,19 @@ static bool fetch_phase(struct vsr *v)
             return true;
         }
     }
+    uint32_t entries;
+    uint64_t bytes = fetch_budget(v, &entries);
     if (target->source == v->options.replica) {
         return target_load(v, target->state.revision.sequence, target->next,
-                           target->state.log_end, TAG_TARGET_LOAD,
+                           target->state.log_end, entries, TAG_TARGET_LOAD,
                            &target->load_id);
     }
     struct vsr_fetch request = {
         .revision = target->state.revision,
         .first = target->next,
         .end = target->state.log_end,
-        .max_bytes =
-            v->options.limits.command_bytes + v->options.limits.manifest_bytes,
-        .max_entries = 1,
+        .max_bytes = bytes,
+        .max_entries = entries,
     };
     if (!vsr_protocol_nonce(v, &request.nonce))
         return true;
@@ -2113,23 +2146,27 @@ void vsr_transition_complete(struct vsr *v, struct vsr_operation *operation,
         }
         const struct vsr_loaded *loaded = event->data;
         const struct vsr_entry *entries = loaded->items;
-        if (loaded->count == 0 || loaded->count > target->entry_count) {
+        uint32_t offset = target->append_offset;
+        if (loaded->count == 0 ||
+            loaded->count > target->entry_count - offset) {
             vsr_fail(v, VSR_FAILURE_STORAGE, operation, event->status);
             return;
         }
-        target->append_offset = loaded->count;
         for (uint32_t i = 0; i < loaded->count; i++) {
-            if (!vsr_entry_equal(&entries[i], &target->entries[i])) {
+            if (!vsr_entry_equal(&entries[i], &target->entries[offset + i])) {
                 if (entries[i].op <= vsr_protocol(v)->stable_commit) {
                     vsr_fail(v, VSR_FAILURE_INVARIANT, operation,
                              event->status);
                     return;
                 }
-                target->append_offset = i;
-                break;
+                target->append_offset = offset + i;
+                target->phase = TARGET_APPEND;
+                return;
             }
         }
-        target->phase = TARGET_APPEND;
+        /* A load bounded by the payload budget may cover only part of the
+         * overlap; the comparison resumes past the verified prefix. */
+        target->append_offset = offset + loaded->count;
     }
 }
 
