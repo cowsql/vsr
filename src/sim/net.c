@@ -20,8 +20,7 @@
 static struct vsr_sim_connection *connection_at(const struct vsr_sim *sim,
                                                 uint32_t index)
 {
-    if (index >= sim->connections_count ||
-        !sim->connections[index]->used) {
+    if (index >= sim->connections_count || !sim->connections[index]->used) {
         return NULL;
     }
     return sim->connections[index];
@@ -33,13 +32,12 @@ static uint32_t connection_new(struct vsr_sim *sim)
     struct vsr_sim_connection *connection;
     uint32_t generation;
 
-    while (index < sim->connections_count &&
-           sim->connections[index]->used) {
+    while (index < sim->connections_count && sim->connections[index]->used) {
         ++index;
     }
     if (index == sim->connections_count) {
-        sim->connections = vsr_sim_grow(sim->connections, (size_t)index + 1,
-                                        sizeof(*sim->connections));
+        sim->connections =
+            vsr_sim_grow_table(sim->connections, (size_t)index + 1);
         sim->connections[index] =
             vsr_sim_alloc(sizeof(struct vsr_sim_connection));
         ++sim->connections_count;
@@ -122,8 +120,7 @@ static uint32_t listener_new(struct vsr_sim *sim)
         ++index;
     }
     if (index == sim->listeners_count) {
-        sim->listeners = vsr_sim_grow(sim->listeners, (size_t)index + 1,
-                                      sizeof(*sim->listeners));
+        sim->listeners = vsr_sim_grow_table(sim->listeners, (size_t)index + 1);
         sim->listeners[index] = vsr_sim_alloc(sizeof(struct vsr_sim_listener));
         ++sim->listeners_count;
     }
@@ -224,19 +221,21 @@ static void stall(struct vsr_sim *sim, uint32_t index)
     connection->stalled = 1;
     vsr_sim_schedule(
         sim, vsr_sim_add(sim->now_ns, sim->faults.network.stall_reset_ns),
-        VSR_SIM_EVENT_STALL, VSR_SIM_NO_NODE, index, 0,
-        connection->generation);
+        VSR_SIM_EVENT_STALL, VSR_SIM_NO_NODE, index, 0, connection->generation);
 }
 
-bool vsr_sim_net_stall(struct vsr_sim *sim, uint32_t index,
-                       uint32_t generation)
+bool vsr_sim_net_stall_live(const struct vsr_sim *sim, uint32_t index,
+                            uint32_t generation)
 {
-    struct vsr_sim_connection *connection = connection_at(sim, index);
+    const struct vsr_sim_connection *connection = connection_at(sim, index);
 
-    if (connection == NULL || connection->generation != generation) {
-        return false;
-    }
-    if (connection->ends[0].reset && connection->ends[1].reset) {
+    return connection != NULL && connection->generation == generation &&
+           !(connection->ends[0].reset && connection->ends[1].reset);
+}
+
+bool vsr_sim_net_stall(struct vsr_sim *sim, uint32_t index, uint32_t generation)
+{
+    if (!vsr_sim_net_stall_live(sim, index, generation)) {
         return false;
     }
     reset_connection(sim, index);
@@ -259,9 +258,8 @@ static void append(struct vsr_sim_end *end, struct vsr_sim_segment *segment)
     end->queued += segment->length;
 }
 
-static struct vsr_sim_segment *segment_new(unsigned char *bytes,
-                                           uint32_t length, uint64_t due,
-                                           bool fin)
+static struct vsr_sim_segment *
+segment_new(unsigned char *bytes, uint32_t length, uint64_t due, bool fin)
 {
     struct vsr_sim_segment *segment = vsr_sim_alloc(sizeof(*segment));
 
@@ -282,15 +280,22 @@ static uint64_t transmit(struct vsr_sim *sim, uint32_t index, uint32_t from,
                          bool *reset)
 {
     struct vsr_sim_connection *connection = connection_at(sim, index);
-    struct vsr_sim_end *source = &connection->ends[from];
-    struct vsr_sim_end *target = &connection->ends[1 - from];
+    struct vsr_sim_end *source;
+    struct vsr_sim_end *target;
     const struct vsr_sim_network_faults *faults = &sim->faults.network;
-    bool cross = source->node != target->node;
-    bool blocked = connection->stalled != 0;
+    bool cross;
+    bool blocked;
     bool corrupted = false;
     uint64_t due;
 
     *reset = false;
+    if (connection == NULL) {
+        vsr_sim_fatal("transmit on a freed connection", VSR_SIM_NO_NODE, index);
+    }
+    source = &connection->ends[from];
+    target = &connection->ends[1 - from];
+    cross = source->node != target->node;
+    blocked = connection->stalled != 0;
     if (!blocked && cross &&
         vsr_sim_partitioned(sim, source->node, target->node)) {
         blocked = true;
@@ -324,16 +329,15 @@ static uint64_t transmit(struct vsr_sim *sim, uint32_t index, uint32_t from,
             bytes[at] = (unsigned char)(bytes[at] ^ (1u << bit));
         }
     }
-    due = vsr_sim_add(sim->now_ns,
-                      cross ? vsr_sim_range(sim, faults->delay_min_ns,
-                                            faults->delay_max_ns)
-                            : 0);
+    due = vsr_sim_add(
+        sim->now_ns,
+        cross ? vsr_sim_range(sim, faults->delay_min_ns, faults->delay_max_ns)
+              : 0);
     if (due < target->last_due_ns) {
         due = target->last_due_ns;
     }
     target->last_due_ns = due;
-    if (cross && !fin && length > 1 &&
-        vsr_sim_chance(sim, faults->split_ppm)) {
+    if (cross && !fin && length > 1 && vsr_sim_chance(sim, faults->split_ppm)) {
         uint64_t pieces = 2 + vsr_sim_pcg_below(&sim->random, 3);
         uint32_t offset = 0;
 
@@ -362,8 +366,7 @@ static uint64_t transmit(struct vsr_sim *sim, uint32_t index, uint32_t from,
         }
         free(bytes);
     } else {
-        struct vsr_sim_segment *segment =
-            segment_new(bytes, length, due, fin);
+        struct vsr_sim_segment *segment = segment_new(bytes, length, due, fin);
 
         segment->corrupted = corrupted;
         append(target, segment);
@@ -372,6 +375,28 @@ static uint64_t transmit(struct vsr_sim *sim, uint32_t index, uint32_t from,
     vsr_sim_schedule(sim, due, VSR_SIM_EVENT_SEGMENT, VSR_SIM_NO_NODE, index,
                      1 - from, connection->generation);
     return due;
+}
+
+/* A segment event is live while a segment of that end has not arrived and
+ * is due by the event's time; a partition moved the due time to NEVER, a
+ * reset freed the queue, and an earlier event at the same time may already
+ * have delivered it. */
+bool vsr_sim_net_segment_live(const struct vsr_sim *sim, uint32_t index,
+                              uint32_t end, uint32_t generation,
+                              uint64_t due_ns)
+{
+    const struct vsr_sim_connection *connection = connection_at(sim, index);
+
+    if (connection == NULL || connection->generation != generation || end > 1) {
+        return false;
+    }
+    for (const struct vsr_sim_segment *segment = connection->ends[end].head;
+         segment != NULL; segment = segment->next) {
+        if (!segment->arrived) {
+            return segment->due_ns <= due_ns;
+        }
+    }
+    return false;
 }
 
 bool vsr_sim_net_segment(struct vsr_sim *sim, uint32_t index, uint32_t end,
@@ -383,8 +408,7 @@ bool vsr_sim_net_segment(struct vsr_sim *sim, uint32_t index, uint32_t end,
     bool any = false;
     bool data = false;
 
-    if (connection == NULL || connection->generation != generation ||
-        end > 1) {
+    if (connection == NULL || connection->generation != generation || end > 1) {
         return false;
     }
     target = &connection->ends[end];
@@ -447,9 +471,8 @@ static void ephemeral(struct vsr_sim_node *node, struct vsr_sim_key *key)
     key->family = AF_INET;
     for (;;) {
         key->port = node->next_port;
-        node->next_port =
-            node->next_port >= 65535u ? VSR_SIM_EPHEMERAL_PORT
-                                      : node->next_port + 1;
+        node->next_port = node->next_port >= 65535u ? VSR_SIM_EPHEMERAL_PORT
+                                                    : node->next_port + 1;
         if (!key_in_use(node, key)) {
             return;
         }
@@ -536,8 +559,8 @@ static size_t take(struct vsr_sim_end *end, unsigned char *destination,
     while (segment != NULL && segment->arrived && !segment->fin &&
            taken < space) {
         size_t available = segment->length - segment->offset;
-        size_t size = available < space - taken ? available : space - taken;
-        bool whole = size == available;
+        bool whole = available <= space - taken;
+        size_t size = whole ? available : space - taken;
         bool boundary = segment->boundary != 0;
         struct vsr_sim_segment *next = segment->next;
 
@@ -593,6 +616,10 @@ static void serve_accept(struct vsr_sim_node *node, uint32_t index)
         pending = listener->pending[0];
         listener_remove(listener, pending);
         connection = connection_at(sim, pending);
+        if (connection == NULL) {
+            vsr_sim_fatal("accept queue names a freed connection", node->index,
+                          pending);
+        }
         connection->listener = VSR_SIM_NONE;
         accepted = vsr_sim_object_new(node, VSR_SIM_OBJECT_SOCKET);
         {
@@ -604,7 +631,6 @@ static void serve_accept(struct vsr_sim_node *node, uint32_t index)
             socket->end = 1;
         }
         connection->ends[1].object = accepted;
-        connection->ends[1].attached = 1;
         result = vsr_sim_exec_install(node, sqe, accepted, false);
         if (vsr_sim_op(node, op)->multishot) {
             vsr_sim_exec_post(node, op, result, 0, 0);
@@ -687,9 +713,9 @@ static void serve_recv(struct vsr_sim_node *node, uint32_t index)
             taken = take(end, (unsigned char *)buffer->buffer.base + offset,
                          space, peek);
             id = buffer->buffer.id;
-            flags = (uint16_t)(VSR_IO_CQE_BUFFER |
-                               vsr_sim_ring_consume(node, ring,
-                                                    (uint32_t)taken));
+            flags =
+                (uint16_t)(VSR_IO_CQE_BUFFER |
+                           vsr_sim_ring_consume(node, ring, (uint32_t)taken));
             if (!record->multishot) {
                 record->requested = space;
             }
@@ -698,7 +724,7 @@ static void serve_recv(struct vsr_sim_node *node, uint32_t index)
                 vsr_sim_exec_complete(node, op, 0, 0, 0);
                 continue;
             }
-            taken = take(end, (unsigned char *)(uintptr_t)record->sqe.addr,
+            taken = take(end, vsr_sim_mutable(record->sqe.addr),
                          record->sqe.length, peek);
         }
         connection_index = object->connection;
@@ -820,9 +846,11 @@ void vsr_sim_net_serve(struct vsr_sim_node *node, uint32_t index)
  * Record starts
  * --------------------------------------------------------------------- */
 
+/* A parked record holds the socket, so closing the descriptor neither ends
+ * the record nor the socket (decision 58). */
 static void park(struct vsr_sim_node *node, uint32_t op, uint32_t object)
 {
-    vsr_sim_op(node, op)->object = object;
+    vsr_sim_exec_hold(node, op, object);
     vsr_sim_exec_arm(node, op, node->world->now_ns, VSR_SIM_ACTION_SOCKET);
     vsr_sim_net_serve(node, object);
 }
@@ -860,12 +888,10 @@ static void start_socket(struct vsr_sim_node *node, uint32_t op)
     object = vsr_sim_object_new(node, VSR_SIM_OBJECT_SOCKET);
     vsr_sim_object(node, object)->domain = domain;
     vsr_sim_exec_complete(node, op,
-                          vsr_sim_exec_install(node, sqe, object, false), 0,
-                          0);
+                          vsr_sim_exec_install(node, sqe, object, false), 0, 0);
 }
 
-static void start_bind(struct vsr_sim_node *node, uint32_t op,
-                       uint32_t index)
+static void start_bind(struct vsr_sim_node *node, uint32_t op, uint32_t index)
 {
     struct vsr_sim_object *object = vsr_sim_object(node, index);
     struct vsr_sim_key key;
@@ -891,8 +917,7 @@ static void start_bind(struct vsr_sim_node *node, uint32_t op,
     vsr_sim_exec_complete(node, op, error, 0, 0);
 }
 
-static void start_listen(struct vsr_sim_node *node, uint32_t op,
-                         uint32_t index)
+static void start_listen(struct vsr_sim_node *node, uint32_t op, uint32_t index)
 {
     struct vsr_sim *sim = node->world;
     struct vsr_sim_object *object = vsr_sim_object(node, index);
@@ -901,7 +926,13 @@ static void start_listen(struct vsr_sim_node *node, uint32_t op,
     uint32_t created;
 
     if (object->state == VSR_SIM_SOCKET_LISTENING) {
-        listener_at(sim, object->listener)->backlog = backlog;
+        listener = listener_at(sim, object->listener);
+        if (listener == NULL) {
+            vsr_sim_fatal("listening socket without a listener", node->index,
+                          index);
+        }
+        /* Recorded, never enforced (decision 59). */
+        listener->backlog = backlog;
         vsr_sim_exec_complete(node, op, 0, 0, 0);
         return;
     }
@@ -931,8 +962,7 @@ static void start_listen(struct vsr_sim_node *node, uint32_t op,
 
 static void restore_unconnected(struct vsr_sim_object *object)
 {
-    object->state =
-        object->bound ? VSR_SIM_SOCKET_BOUND : VSR_SIM_SOCKET_NEW;
+    object->state = object->bound ? VSR_SIM_SOCKET_BOUND : VSR_SIM_SOCKET_NEW;
 }
 
 static void start_connect(struct vsr_sim_node *node, uint32_t op,
@@ -956,14 +986,14 @@ static void start_connect(struct vsr_sim_node *node, uint32_t op,
         vsr_sim_exec_complete(node, op, -EINVAL, 0, 0);
         return;
     }
-    error = parse_address(node, record, object->domain, false, &record->key,
-                          &peer);
+    error =
+        parse_address(node, record, object->domain, false, &record->key, &peer);
     if (error != 0) {
         vsr_sim_exec_complete(node, op, error, 0, 0);
         return;
     }
     record->peer = peer;
-    record->object = index;
+    vsr_sim_exec_hold(node, op, index);
     if (peer == VSR_SIM_NONE || !sim->nodes[peer].alive ||
         vsr_sim_partitioned(sim, node->index, peer)) {
         object->state = VSR_SIM_SOCKET_CONNECTING;
@@ -1007,11 +1037,10 @@ void vsr_sim_net_action(struct vsr_sim_node *node, uint32_t op)
     }
     if (!sim->nodes[peer].alive ||
         vsr_sim_partitioned(sim, node->index, peer)) {
-        vsr_sim_exec_arm(
-            node, op,
-            vsr_sim_add(record->started_ns,
-                        sim->faults.network.connect_timeout_ns),
-            VSR_SIM_ACTION_UNREACHABLE);
+        vsr_sim_exec_arm(node, op,
+                         vsr_sim_add(record->started_ns,
+                                     sim->faults.network.connect_timeout_ns),
+                         VSR_SIM_ACTION_UNREACHABLE);
         return;
     }
     listener_index = listener_find(sim, peer, &record->key);
@@ -1024,7 +1053,6 @@ void vsr_sim_net_action(struct vsr_sim_node *node, uint32_t op)
     connection = sim->connections[created];
     connection->ends[0].node = node->index;
     connection->ends[0].object = index;
-    connection->ends[0].attached = 1;
     connection->ends[1].node = peer;
     connection->listener = listener_index;
     listener = sim->listeners[listener_index];
@@ -1082,8 +1110,7 @@ static int check_memory(struct vsr_sim_node *node, const struct vsr_sim_op *op)
     return sqe->addr == NULL && sqe->length > 0 ? -EFAULT : 0;
 }
 
-static void start_recv(struct vsr_sim_node *node, uint32_t op,
-                       uint32_t index)
+static void start_recv(struct vsr_sim_node *node, uint32_t op, uint32_t index)
 {
     const struct vsr_sim_object *object = vsr_sim_object(node, index);
     const struct vsr_sim_op *record = vsr_sim_op(node, op);
@@ -1091,26 +1118,19 @@ static void start_recv(struct vsr_sim_node *node, uint32_t op,
     bool select = (sqe->flags & VSR_IO_SQE_BUFFER_SELECT) != 0;
     int error = 0;
 
-    if ((sqe->op_flags & ~(uint32_t)(VSR_IO_RECV_MULTISHOT |
-                                     VSR_IO_RECV_PEEK)) != 0 ||
+    if ((sqe->op_flags &
+         ~(uint32_t)(VSR_IO_RECV_MULTISHOT | VSR_IO_RECV_PEEK)) != 0 ||
         (record->multishot && !select) ||
-        (record->multishot &&
-         (sqe->op_flags & VSR_IO_RECV_PEEK) != 0) ||
+        (record->multishot && (sqe->op_flags & VSR_IO_RECV_PEEK) != 0) ||
         (select && (sqe->flags & VSR_IO_SQE_FIXED_BUFFER) != 0)) {
         error = -EINVAL;
     } else if (object->state != VSR_SIM_SOCKET_CONNECTED) {
         error = -ENOTCONN;
-    } else if (select) {
-        const struct vsr_sim_ring *ring =
-            vsr_sim_exec_ring(node, sqe->buffer_group);
-
-        /* Buffer selection happens at every attempt, the first included. */
-        if (ring == NULL || ring->count == 0) {
-            error = -ENOBUFS;
-        }
-    } else {
+    } else if (!select) {
         error = check_memory(node, record);
     }
+    /* With BUFFER_SELECT the ring is consulted at each delivery; an empty
+     * or unregistered ring then terminates the receive with -ENOBUFS. */
     if (error != 0) {
         vsr_sim_exec_complete(node, op, error, 0, 0);
         return;
@@ -1118,15 +1138,14 @@ static void start_recv(struct vsr_sim_node *node, uint32_t op,
     park(node, op, index);
 }
 
-static void start_send(struct vsr_sim_node *node, uint32_t op,
-                       uint32_t index)
+static void start_send(struct vsr_sim_node *node, uint32_t op, uint32_t index)
 {
     const struct vsr_sim_object *object = vsr_sim_object(node, index);
     const struct vsr_sim_op *record = vsr_sim_op(node, op);
     int error = 0;
 
-    if ((record->sqe.op_flags & ~(uint32_t)(VSR_IO_SEND_ZERO_COPY |
-                                            VSR_IO_SEND_VECTORED)) != 0 ||
+    if ((record->sqe.op_flags &
+         ~(uint32_t)(VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED)) != 0 ||
         (record->sqe.flags & VSR_IO_SQE_BUFFER_SELECT) != 0) {
         error = -EINVAL;
     } else if (object->state != VSR_SIM_SOCKET_CONNECTED) {
@@ -1225,7 +1244,7 @@ static void start_sockopt(struct vsr_sim_node *node, uint32_t op,
         return;
     }
     integer = *value != 0;
-    memcpy((void *)(uintptr_t)record->sqe.addr, &integer, sizeof(integer));
+    memcpy(vsr_sim_mutable(record->sqe.addr), &integer, sizeof(integer));
     vsr_sim_exec_complete(node, op, (int32_t)sizeof(integer), 0, 0);
 }
 
@@ -1262,10 +1281,8 @@ void vsr_sim_net_start(struct vsr_sim_node *node, uint32_t op)
     case VSR_IO_SQE_ACCEPT: {
         const struct vsr_sim_op *record = vsr_sim_op(node, op);
 
-        if (vsr_sim_object(node, index)->state !=
-                VSR_SIM_SOCKET_LISTENING ||
-            (record->sqe.op_flags & ~(uint32_t)VSR_IO_ACCEPT_MULTISHOT) !=
-                0 ||
+        if (vsr_sim_object(node, index)->state != VSR_SIM_SOCKET_LISTENING ||
+            (record->sqe.op_flags & ~(uint32_t)VSR_IO_ACCEPT_MULTISHOT) != 0 ||
             (record->multishot &&
              (record->sqe.flags & VSR_IO_SQE_DIRECT) != 0 &&
              record->sqe.fd2 != VSR_IO_SLOT_ALLOC)) {
@@ -1297,27 +1314,6 @@ void vsr_sim_net_start(struct vsr_sim_node *node, uint32_t op)
 /* ------------------------------------------------------------------------
  * Close, crash, partitions
  * --------------------------------------------------------------------- */
-
-static uint32_t any_waiter(const struct vsr_sim_node *node, uint32_t object)
-{
-    uint32_t found = VSR_SIM_NONE;
-    uint64_t sequence = UINT64_MAX;
-
-    for (uint32_t i = 0; i < node->ops_count; ++i) {
-        const struct vsr_sim_op *op = node->ops[i];
-
-        if (op->state == VSR_SIM_OP_WAITING && op->object == object &&
-            !op->holds &&
-            (op->action == VSR_SIM_ACTION_SOCKET ||
-             op->action == VSR_SIM_ACTION_CONNECT ||
-             op->action == VSR_SIM_ACTION_UNREACHABLE) &&
-            op->sequence < sequence) {
-            found = i;
-            sequence = op->sequence;
-        }
-    }
-    return found;
-}
 
 static void drop_listener(struct vsr_sim *sim, uint32_t index)
 {
@@ -1357,20 +1353,15 @@ static void detach(struct vsr_sim *sim, uint32_t connection_index,
     connection_maybe_free(sim, connection_index);
 }
 
+/* Reached only when no descriptor, slot or parked record refers to the
+ * socket any more: every parked record holds a reference, so the socket
+ * outlives a CLOSE of its descriptor until they complete or are cancelled
+ * (decision 58), and the FIN goes out at that point. */
 void vsr_sim_net_close(struct vsr_sim_node *node, uint32_t index)
 {
     struct vsr_sim *sim = node->world;
-    struct vsr_sim_object *object;
+    struct vsr_sim_object *object = vsr_sim_object(node, index);
 
-    for (;;) {
-        uint32_t op = any_waiter(node, index);
-
-        if (op == VSR_SIM_NONE) {
-            break;
-        }
-        vsr_sim_exec_complete(node, op, -ECANCELED, 0, 0);
-    }
-    object = vsr_sim_object(node, index);
     if (object->state == VSR_SIM_SOCKET_LISTENING) {
         drop_listener(sim, object->listener);
     } else if (object->state == VSR_SIM_SOCKET_CONNECTED) {

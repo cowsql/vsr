@@ -52,8 +52,7 @@ uint32_t vsr_sim_object_new(struct vsr_sim_node *node, uint32_t kind)
         ++index;
     }
     if (index == node->objects_count) {
-        node->objects = vsr_sim_grow(node->objects, (size_t)index + 1,
-                                     sizeof(*node->objects));
+        node->objects = vsr_sim_grow_table(node->objects, (size_t)index + 1);
         node->objects[index] = vsr_sim_alloc(sizeof(struct vsr_sim_object));
         ++node->objects_count;
     }
@@ -115,8 +114,9 @@ int vsr_sim_exec_resolve(struct vsr_sim_node *node, int32_t fd, bool fixed,
     return 0;
 }
 
-int vsr_sim_exec_install(struct vsr_sim_node *node, const struct vsr_io_sqe *sqe,
-                         uint32_t object, bool check)
+int vsr_sim_exec_install(struct vsr_sim_node *node,
+                         const struct vsr_io_sqe *sqe, uint32_t object,
+                         bool check)
 {
     struct vsr_sim_object *target = vsr_sim_object(node, object);
 
@@ -180,7 +180,7 @@ int vsr_sim_exec_region(const struct vsr_sim_node *node,
                         size_t length)
 {
     const struct vsr_io_region *region;
-    uintptr_t start;
+    uintptr_t first;
     uintptr_t at;
 
     if (sqe->buffer_index >= node->regions_count) {
@@ -190,10 +190,10 @@ int vsr_sim_exec_region(const struct vsr_sim_node *node,
     if (region->base == NULL || base == NULL) {
         return -EFAULT;
     }
-    start = (uintptr_t)region->base;
+    first = (uintptr_t)region->base;
     at = (uintptr_t)base;
-    if (at < start || at - start > region->size ||
-        length > region->size - (at - start)) {
+    if (at < first || at - first > region->size ||
+        length > region->size - (at - first)) {
         return -EFAULT;
     }
     return 0;
@@ -242,8 +242,8 @@ static bool op_source_checksum(const struct vsr_sim_op *op, uint64_t *sum)
             if (op->vecs[i].base == NULL && op->vecs[i].length > 0) {
                 return false;
             }
-            value = vsr_sim_checksum(op->vecs[i].base, op->vecs[i].length,
-                                     value);
+            value =
+                vsr_sim_checksum(op->vecs[i].base, op->vecs[i].length, value);
         }
         *sum = value;
         return true;
@@ -286,6 +286,36 @@ static void verify_op(const struct vsr_sim_node *node,
                       "executor released them (ownership violation)",
                       node->index, op->sqe.user_data);
     }
+}
+
+static bool overlaps(const void *a, size_t a_length, const void *b,
+                     size_t b_length)
+{
+    uintptr_t a0 = (uintptr_t)a;
+    uintptr_t b0 = (uintptr_t)b;
+
+    return a_length > 0 && b_length > 0 && a0 < b0 + b_length &&
+           b0 < a0 + a_length;
+}
+
+/* Whether [base, base + length) meets bytes a record still reads: the
+ * source of an in-flight WRITE, WRITEV or SEND, including a zero-copy send
+ * whose NOTIF has not been posted. */
+static bool op_source_overlaps(const struct vsr_sim_op *op, const void *base,
+                               size_t length)
+{
+    if (op->state == VSR_SIM_OP_FREE || !op->checked) {
+        return false;
+    }
+    if (op->vecs != NULL) {
+        for (uint32_t i = 0; i < op->vec_count; ++i) {
+            if (overlaps(base, length, op->vecs[i].base, op->vecs[i].length)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return overlaps(base, length, op->sqe.addr, op->sqe.length);
 }
 
 /* ------------------------------------------------------------------------
@@ -331,8 +361,7 @@ static uint32_t op_alloc(struct vsr_sim_node *node)
         ++index;
     }
     if (index == node->ops_count) {
-        node->ops = vsr_sim_grow(node->ops, (size_t)index + 1,
-                                 sizeof(*node->ops));
+        node->ops = vsr_sim_grow_table(node->ops, (size_t)index + 1);
         node->ops[index] = vsr_sim_alloc(sizeof(struct vsr_sim_op));
         ++node->ops_count;
     }
@@ -374,16 +403,15 @@ static void post(struct vsr_sim_node *node, uint64_t user_data, int32_t result,
             vsr_sim_alloc(sizeof(*grown) * (size_t)capacity);
 
         for (uint32_t i = 0; i < node->cqes_count; ++i) {
-            grown[i] =
-                node->cqes[(node->cqes_head + i) % node->cqes_capacity];
+            grown[i] = node->cqes[(node->cqes_head + i) % node->cqes_capacity];
         }
         free(node->cqes);
         node->cqes = grown;
         node->cqes_head = 0;
         node->cqes_capacity = capacity;
     }
-    cqe = &node->cqes[(node->cqes_head + node->cqes_count) %
-                      node->cqes_capacity];
+    cqe =
+        &node->cqes[(node->cqes_head + node->cqes_count) % node->cqes_capacity];
     cqe->user_data = user_data;
     cqe->result = result;
     cqe->flags = flags;
@@ -453,8 +481,7 @@ void vsr_sim_exec_complete(struct vsr_sim_node *node, uint32_t index,
     }
     if ((op->sqe.flags & VSR_IO_SQE_SKIP_SUCCESS) == 0 || result < 0) {
         post(node, op->sqe.user_data, result,
-             (uint16_t)(flags | (zero_copy ? VSR_IO_CQE_MORE : 0)),
-             buffer_id);
+             (uint16_t)(flags | (zero_copy ? VSR_IO_CQE_MORE : 0)), buffer_id);
     }
     op->link_next = VSR_SIM_NONE;
     if (op->holds) {
@@ -504,6 +531,21 @@ uint32_t vsr_sim_exec_waiter(const struct vsr_sim_node *node, uint32_t object,
     return found;
 }
 
+void vsr_sim_exec_hold(struct vsr_sim_node *node, uint32_t index,
+                       uint32_t object)
+{
+    struct vsr_sim_op *op = node->ops[index];
+    struct vsr_sim_object *target = vsr_sim_object(node, object);
+
+    if (op->holds || target == NULL) {
+        vsr_sim_fatal("record holds two objects or none", node->index,
+                      op->sqe.user_data);
+    }
+    op->object = object;
+    op->holds = 1;
+    ++target->refs;
+}
+
 /* ------------------------------------------------------------------------
  * Timers, TIMEOUT_UPDATE and CANCEL
  * --------------------------------------------------------------------- */
@@ -514,9 +556,8 @@ static uint64_t timer_due(struct vsr_sim_node *node, uint64_t offset,
     struct vsr_sim *sim = node->world;
     uint64_t deadline =
         absolute ? offset : vsr_sim_add(vsr_sim_node_now(node), offset);
-    uint64_t due = deadline > node->clock_offset_ns
-                       ? deadline - node->clock_offset_ns
-                       : 0;
+    uint64_t due =
+        deadline > node->clock_offset_ns ? deadline - node->clock_offset_ns : 0;
 
     if (due < sim->now_ns) {
         due = sim->now_ns;
@@ -528,9 +569,8 @@ static uint64_t timer_due(struct vsr_sim_node *node, uint64_t offset,
 static void start_timeout(struct vsr_sim_node *node, uint32_t index)
 {
     struct vsr_sim_op *op = node->ops[index];
-    uint64_t due =
-        timer_due(node, op->sqe.offset,
-                  (op->sqe.op_flags & VSR_IO_TIMEOUT_ABSOLUTE) != 0);
+    uint64_t due = timer_due(node, op->sqe.offset,
+                             (op->sqe.op_flags & VSR_IO_TIMEOUT_ABSOLUTE) != 0);
 
     vsr_sim_exec_arm(node, index, due, VSR_SIM_ACTION_TIMEOUT);
 }
@@ -563,18 +603,19 @@ static void start_timeout_update(struct vsr_sim_node *node, uint32_t index)
     vsr_sim_exec_complete(node, index, 0, 0, 0);
 }
 
-static bool cancel_matches(const struct vsr_sim_node *node,
-                           const struct vsr_sim_op *cancel,
-                           const struct vsr_sim_op *op)
+/* BY_FD matches the object the descriptor names now, as io_uring compares
+ * the file a request holds with the one the cancel's fd resolves to; a
+ * record parked on an object whose descriptor was closed and reused is
+ * not on the new descriptor. by_object is that object, or NONE to match
+ * on user_data. */
+static bool cancel_matches(const struct vsr_sim_op *cancel,
+                           const struct vsr_sim_op *op, uint32_t by_object)
 {
-    (void)node;
     if (op == cancel || op->state != VSR_SIM_OP_WAITING) {
         return false;
     }
     if ((cancel->sqe.op_flags & VSR_IO_CANCEL_BY_FD) != 0) {
-        return op->object != VSR_SIM_NONE && op->sqe.fd == cancel->sqe.fd &&
-               (op->sqe.flags & VSR_IO_SQE_FIXED_FILE) ==
-                   (cancel->sqe.flags & VSR_IO_SQE_FIXED_FILE);
+        return op->object == by_object;
     }
     return op->sqe.user_data == cancel->sqe.offset;
 }
@@ -600,19 +641,30 @@ static void start_cancel(struct vsr_sim_node *node, uint32_t index)
 {
     const struct vsr_sim_op *cancel = node->ops[index];
     bool all = (cancel->sqe.op_flags & VSR_IO_CANCEL_ALL) != 0;
+    uint32_t by_object = VSR_SIM_NONE;
     uint32_t *matches;
     uint32_t count = 0;
     int32_t cancelled = 0;
     int32_t busy = 0;
 
-    if ((cancel->sqe.op_flags & ~(uint32_t)(VSR_IO_CANCEL_BY_FD |
-                                            VSR_IO_CANCEL_ALL)) != 0) {
+    if ((cancel->sqe.op_flags &
+         ~(uint32_t)(VSR_IO_CANCEL_BY_FD | VSR_IO_CANCEL_ALL)) != 0) {
         vsr_sim_exec_complete(node, index, -EINVAL, 0, 0);
         return;
     }
+    if ((cancel->sqe.op_flags & VSR_IO_CANCEL_BY_FD) != 0) {
+        int error = vsr_sim_exec_resolve(
+            node, cancel->sqe.fd,
+            (cancel->sqe.flags & VSR_IO_SQE_FIXED_FILE) != 0, &by_object);
+
+        if (error != 0) {
+            vsr_sim_exec_complete(node, index, error, 0, 0);
+            return;
+        }
+    }
     matches = vsr_sim_alloc(sizeof(*matches) * ((size_t)node->ops_count + 1));
     for (uint32_t i = 0; i < node->ops_count; ++i) {
-        if (cancel_matches(node, cancel, node->ops[i])) {
+        if (cancel_matches(cancel, node->ops[i], by_object)) {
             uint32_t at = count++;
 
             /* Insertion in submission order. */
@@ -817,8 +869,8 @@ static void prepare(struct vsr_sim_node *node, struct vsr_sim_op *op)
                         readable = false;
                     }
                 }
-            } else if (vsr_sim_exec_region(node, sqe, sqe->addr,
-                                           sqe->length) != 0) {
+            } else if (vsr_sim_exec_region(node, sqe, sqe->addr, sqe->length) !=
+                       0) {
                 readable = false;
             }
         }
@@ -904,12 +956,10 @@ static void start(struct vsr_sim_node *node, uint32_t index)
     }
 }
 
-void vsr_sim_exec_event(struct vsr_sim_node *node, uint32_t index,
-                        uint32_t generation)
+void vsr_sim_exec_event(struct vsr_sim_node *node, uint32_t index)
 {
     struct vsr_sim_op *op = node->ops[index];
 
-    (void)generation;
     switch (op->action) {
     case VSR_SIM_ACTION_DISK:
         op->action = VSR_SIM_ACTION_NONE;
@@ -1035,8 +1085,7 @@ bool vsr_sim_exec_ready(const struct vsr_sim_node *node)
 {
     uint64_t clock = vsr_sim_node_now(node);
 
-    if (!node->waited || node->wake_pending ||
-        node->cqes_count >= node->want) {
+    if (!node->waited || node->wake_pending || node->cqes_count >= node->want) {
         return true;
     }
     if (node->deadline_ns != VSR_NO_DEADLINE && clock >= node->deadline_ns) {
@@ -1060,9 +1109,8 @@ uint64_t vsr_sim_exec_wake_at(const struct vsr_sim_node *node)
     if (node->min_wait_ns > 0 && node->cqes_count > 0) {
         uint64_t end = vsr_sim_add(node->wait_started_ns, node->min_wait_ns);
 
-        candidate = end > node->clock_offset_ns
-                        ? end - node->clock_offset_ns
-                        : 0;
+        candidate =
+            end > node->clock_offset_ns ? end - node->clock_offset_ns : 0;
         at = candidate < at ? candidate : at;
     }
     if (at != VSR_SIM_NEVER && at <= node->world->now_ns) {
@@ -1101,9 +1149,7 @@ static int update_file(void *ctx, uint32_t slot, int fd)
     uint32_t object;
     int error;
 
-    if (node->slots_count == 0) {
-        return -ENXIO;
-    }
+    /* No table yet, or a slot past it: -EINVAL (decision 58). */
     if (slot >= node->slots_count) {
         return -EINVAL;
     }
@@ -1154,9 +1200,7 @@ static int update_buffer(void *ctx, uint32_t index,
 {
     struct vsr_sim_node *node = handle_node(ctx);
 
-    if (node->regions_count == 0) {
-        return -ENXIO;
-    }
+    /* No table yet, or an index past it: -EINVAL (decision 58). */
     if (index >= node->regions_count) {
         return -EINVAL;
     }
@@ -1194,6 +1238,9 @@ static void free_ring(struct vsr_sim_ring *ring)
     memset(ring, 0, sizeof(*ring));
 }
 
+static void verify_ring(const struct vsr_sim_node *node,
+                        const struct vsr_sim_ring *ring);
+
 static int buffer_ring(void *ctx, uint16_t group, uint32_t entries,
                        uint32_t flags, const struct vsr_io_region *memory)
 {
@@ -1205,16 +1252,11 @@ static int buffer_ring(void *ctx, uint16_t group, uint32_t entries,
         if (ring == NULL) {
             return -ENOENT;
         }
-        for (uint32_t i = 0; i < node->ops_count; ++i) {
-            const struct vsr_sim_op *op = node->ops[i];
-
-            if (op->state != VSR_SIM_OP_FREE &&
-                op->sqe.opcode == VSR_IO_SQE_RECV &&
-                (op->sqe.flags & VSR_IO_SQE_BUFFER_SELECT) != 0 &&
-                op->sqe.buffer_group == group) {
-                return -EBUSY;
-            }
-        }
+        /* Receives pending on the group stay parked and terminate with
+         * -ENOBUFS at their next delivery (decision 58). The buffers go
+         * back to the caller now, so this is the last chance to see that
+         * nobody touched them. */
+        verify_ring(node, ring);
         free_ring(ring);
         return 0;
     }
@@ -1234,8 +1276,8 @@ static int buffer_ring(void *ctx, uint16_t group, uint32_t entries,
         ++index;
     }
     if (index == node->rings_count) {
-        node->rings = vsr_sim_grow(node->rings, (size_t)index + 1,
-                                   sizeof(*node->rings));
+        node->rings =
+            vsr_sim_grow(node->rings, (size_t)index + 1, sizeof(*node->rings));
         ++node->rings_count;
     }
     ring = &node->rings[index];
@@ -1256,13 +1298,39 @@ static uint64_t remaining_checksum(const struct vsr_sim_provided *provided)
                             provided->buffer.length - provided->consumed, 7);
 }
 
-static bool overlaps(const unsigned char *a, size_t a_length,
-                     const unsigned char *b, size_t b_length)
+static const struct vsr_sim_provided *ring_slot(const struct vsr_sim_ring *ring,
+                                                uint32_t position)
 {
-    uintptr_t a0 = (uintptr_t)a;
-    uintptr_t b0 = (uintptr_t)b;
+    return &ring->slots[(ring->head + position) % ring->entries];
+}
 
-    return a0 < b0 + b_length && b0 < a0 + a_length;
+/* The bytes of a provided buffer the kernel still owns: the whole buffer,
+ * or what an INCREMENTAL ring has not yet delivered from it. */
+static bool provided_overlaps(const struct vsr_sim_provided *held,
+                              const void *base, size_t length)
+{
+    const unsigned char *held_base = held->buffer.base;
+
+    return overlaps(base, length, held_base + held->consumed,
+                    held->buffer.length - held->consumed);
+}
+
+static void verify_provided(const struct vsr_sim_node *node,
+                            const struct vsr_sim_provided *provided)
+{
+    if (remaining_checksum(provided) != provided->checksum) {
+        vsr_sim_fatal("a provided buffer changed while the kernel owned it "
+                      "(ownership violation)",
+                      node->index, provided->buffer.id);
+    }
+}
+
+static void verify_ring(const struct vsr_sim_node *node,
+                        const struct vsr_sim_ring *ring)
+{
+    for (uint32_t i = 0; i < ring->count; ++i) {
+        verify_provided(node, ring_slot(ring, i));
+    }
 }
 
 static int provide(void *ctx, uint16_t group,
@@ -1285,24 +1353,35 @@ static int provide(void *ctx, uint16_t group,
             return -EINVAL;
         }
     }
+    /* A buffer handed to the kernel must not be one it already owns
+     * through any ring, nor one a submitted record still reads. */
     for (uint32_t i = 0; i < count; ++i) {
-        const unsigned char *base = buffers[i].base;
+        const void *base = buffers[i].base;
+        size_t length = buffers[i].length;
 
-        for (uint32_t j = 0; j < ring->count; ++j) {
-            const struct vsr_sim_provided *held =
-                &ring->slots[(ring->head + j) % ring->entries];
-            const unsigned char *held_base = held->buffer.base;
+        for (uint32_t r = 0; r < node->rings_count; ++r) {
+            const struct vsr_sim_ring *other = &node->rings[r];
 
-            if (overlaps(base, buffers[i].length, held_base + held->consumed,
-                         held->buffer.length - held->consumed)) {
-                vsr_sim_fatal("provided buffer overlaps one the kernel still "
-                              "owns (ownership violation)",
-                              node->index, buffers[i].id);
+            if (!other->used) {
+                continue;
+            }
+            for (uint32_t j = 0; j < other->count; ++j) {
+                if (provided_overlaps(ring_slot(other, j), base, length)) {
+                    vsr_sim_fatal("provided buffer overlaps one the kernel "
+                                  "still owns (ownership violation)",
+                                  node->index, buffers[i].id);
+                }
+            }
+        }
+        for (uint32_t j = 0; j < node->ops_count; ++j) {
+            if (op_source_overlaps(node->ops[j], base, length)) {
+                vsr_sim_fatal("provided buffer overlaps the source of a "
+                              "record in flight (ownership violation)",
+                              node->index, node->ops[j]->sqe.user_data);
             }
         }
         for (uint32_t j = 0; j < i; ++j) {
-            if (overlaps(base, buffers[i].length, buffers[j].base,
-                         buffers[j].length)) {
+            if (overlaps(base, length, buffers[j].base, buffers[j].length)) {
                 vsr_sim_fatal("provided buffers overlap each other",
                               node->index, buffers[i].id);
             }
@@ -1323,13 +1402,7 @@ static int provide(void *ctx, uint16_t group,
 void vsr_sim_ring_verify(const struct vsr_sim_node *node,
                          const struct vsr_sim_ring *ring)
 {
-    const struct vsr_sim_provided *head = &ring->slots[ring->head];
-
-    if (remaining_checksum(head) != head->checksum) {
-        vsr_sim_fatal("a provided buffer changed while the kernel owned it "
-                      "(ownership violation)",
-                      node->index, head->buffer.id);
-    }
+    verify_provided(node, &ring->slots[ring->head]);
 }
 
 uint16_t vsr_sim_ring_consume(struct vsr_sim_node *node,
@@ -1394,6 +1467,19 @@ static void drop_state(struct vsr_sim_node *node)
 
 void vsr_sim_exec_crash(struct vsr_sim_node *node)
 {
+    /* Up to this instant the kernel could still read every in-flight
+     * source and write every provided buffer; a change before the crash is
+     * a violation whether or not the crash then hides it. */
+    for (uint32_t i = 0; i < node->ops_count; ++i) {
+        if (node->ops[i]->state != VSR_SIM_OP_FREE) {
+            verify_op(node, node->ops[i]);
+        }
+    }
+    for (uint32_t i = 0; i < node->rings_count; ++i) {
+        if (node->rings[i].used) {
+            verify_ring(node, &node->rings[i]);
+        }
+    }
     drop_state(node);
     node->waited = 0;
     node->wake_pending = 0;

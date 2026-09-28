@@ -34,6 +34,26 @@
  * receive no callbacks. The world composes no cluster: which nodes exist,
  * what runs on them, and which invariants hold are the harness's, because
  * the application core is application-specific.
+ *
+ * Errors: every int function returns 0 on success or a negative errno:
+ * -EINVAL for a bad node index or argument, -ENOENT for a missing path,
+ * -ENOTDIR and -EISDIR for a path of the wrong kind, -ENOMEM from
+ * vsr_sim_create. The world never returns VSR_EINVAL (which is -EPERM as
+ * an errno). Once created, the world treats memory exhaustion as fatal:
+ * it prints a diagnostic and aborts, as a harness bug would.
+ *
+ * Ownership enforcement: the executor checksums the bytes a record reads
+ * (WRITE, WRITEV, SEND sources) at submission and verifies them when the
+ * record completes (at the NOTIF for a zero-copy send), and checksums a
+ * provided buffer when it is provided and verifies it when it leaves the
+ * ring, when the ring is unregistered, and when the node crashes; it also
+ * refuses to provide a buffer that overlaps one the kernel still owns or
+ * the source of a record in flight. A violation aborts the process with a
+ * diagnostic naming the node and the record's user_data: it is a bug in
+ * the code under test, never a scenario. Because vsr_sim_crash verifies
+ * what the node's executor still references, the memory of a node's
+ * in-flight records and provided buffers must be valid when the harness
+ * crashes it; tear the engine down after the crash, as a process would.
  */
 
 #define VSR_SIM_API_VERSION 1u
@@ -61,6 +81,10 @@ struct vsr_sim;
  * more receive completions at boundaries drawn at random, as a real stack
  * may, so that frame reassembly across completions and provided buffers is
  * exercised; it is not a fault, since the bytes and their order are intact.
+ * Simplifications a caller may not rely on: LISTEN records its backlog but
+ * never enforces it, so a connection attempt is queued however many wait
+ * for an accept; and the SENDs parked on one socket complete in submission
+ * order, which the contract permits but does not promise.
  */
 struct vsr_sim_network_faults {
     uint32_t drop_ppm;
@@ -84,6 +108,12 @@ struct vsr_sim_network_faults {
  * covers persists independently with probability unsynced_keep_ppm
  * (1000000 keeps all, 0 keeps none); blocks that fsync covered always
  * persist; nothing else changes. Block granularity is options.block_bytes.
+ * Two consequences of "nothing else changes": the file size is not rolled
+ * back, so a torn append leaves the discarded blocks reading as zeros
+ * inside the file rather than shortening it (a recovery must therefore
+ * validate what it reads, not trust the size), and a WRITE whose latency
+ * had not elapsed at the crash never reached the disk, so it is lost
+ * entirely rather than torn.
  */
 struct vsr_sim_disk_faults {
     uint64_t latency_min_ns;
@@ -157,7 +187,7 @@ struct vsr_sim_trace {
     void (*event)(void *ctx, const struct vsr_sim_trace_event *event);
 };
 
-/* Allocates the world. Returns OK, EINVAL, or a negative errno. */
+/* Allocates the world. Returns 0, -EINVAL for bad options, or -ENOMEM. */
 int vsr_sim_create(const struct vsr_sim_options *options, struct vsr_sim **out);
 /* Frees everything, including every executor handle ever returned. */
 void vsr_sim_destroy(struct vsr_sim *sim);
@@ -171,7 +201,13 @@ void vsr_sim_set_faults(struct vsr_sim *sim,
  * The node's current executor handle. Its now is the node's skewed clock;
  * its random draws from the world generator. Valid until the node crashes.
  * Calling any operation through a handle invalidated by a crash aborts the
- * process: that is a harness bug, never a scenario.
+ * process: that is a harness bug, never a scenario. A bad node index gives
+ * a handle with NULL ops. The executor implements the contract of
+ * docs/io-implementation.md section 8 exactly; in particular a CLOSE never
+ * completes the records pending on the descriptor, which keep the socket
+ * or file alive until they complete or are cancelled, and unregistering a
+ * buffer ring under a pending receive terminates it with -ENOBUFS at its
+ * next delivery.
  */
 struct vsr_io_executor vsr_sim_executor(struct vsr_sim *sim, uint32_t node);
 
@@ -184,6 +220,9 @@ struct vsr_io_executor vsr_sim_executor(struct vsr_sim *sim, uint32_t node);
  * is due anywhere it moves the clock to the earliest pending event or node
  * deadline and returns 0; when there is no pending event and no deadline it
  * returns -1, meaning only a harness action or a wake can make progress.
+ * A cancelled timer, a timer superseded by TIMEOUT_UPDATE, a segment a
+ * partition holds, and the events of a crashed node are not pending: they
+ * neither count nor move the clock.
  * The harness pattern is: run every ready node's iteration, then advance.
  * A node that is ready is run before the clock moves, so a node never
  * misses its own deadline by more than the clock jitter it configured.
@@ -214,14 +253,16 @@ void vsr_sim_isolate(struct vsr_sim *sim, uint32_t node, int cut);
 void vsr_sim_reset(struct vsr_sim *sim, uint32_t a, uint32_t b);
 
 /*
- * Crash and restart. Crash ends every in-flight operation of the node as if
- * cancelled, delivers nothing more to it, closes its sockets so peers see
- * resets, drops its registered files, buffers, and rings, applies the
- * unsynced-write model to its disk, and invalidates its executor handle.
- * The disk contents that survive are the node's until vsr_sim_destroy.
- * Restart draws a fresh clock offset and returns a fresh handle over that
- * disk. Restarting a node that has not crashed is EINVAL; crashing a crashed
- * node is a no-op.
+ * Crash and restart. Crash verifies the ownership of every buffer the
+ * node's executor still references (see above), then ends every in-flight
+ * operation of the node as if cancelled, delivers nothing more to it,
+ * closes its sockets so peers see resets, drops its registered files,
+ * buffers, and rings, applies the unsynced-write model to its disk, and
+ * invalidates its executor handle. The disk contents that survive are the
+ * node's until vsr_sim_destroy. Restart draws a fresh clock offset and
+ * returns a fresh handle over that disk. Restarting a node that has not
+ * crashed, or a bad node index, returns a handle with NULL ops and changes
+ * nothing; crashing a crashed node or a bad index is a no-op.
  */
 void vsr_sim_crash(struct vsr_sim *sim, uint32_t node);
 struct vsr_io_executor vsr_sim_restart(struct vsr_sim *sim, uint32_t node);
@@ -232,8 +273,11 @@ int vsr_sim_alive(const struct vsr_sim *sim, uint32_t node);
  * as the engine and application name them. Reads return the bytes that a
  * read through the executor would return now, including unsynced writes,
  * without faults. corrupt flips bytes in place and does not wait for a
- * crash. Directory listing is by index; a name buffer of at least
- * VSR_SIM_NAME_BYTES receives the entry name, NUL-terminated.
+ * crash. Directory listing is by index, in name order; a name buffer of at
+ * least VSR_SIM_NAME_BYTES receives the entry name, NUL-terminated, and a
+ * smaller one that cannot hold it is -EINVAL; an index past the last entry
+ * is -ENOENT. A file function on a directory is -EISDIR, a directory
+ * function on a file -ENOTDIR.
  */
 #define VSR_SIM_NAME_BYTES 256u
 

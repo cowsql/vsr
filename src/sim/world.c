@@ -43,6 +43,11 @@ void *vsr_sim_grow(void *memory, size_t count, size_t size)
     return grown;
 }
 
+void *vsr_sim_grow_table(void *table, size_t count)
+{
+    return vsr_sim_grow(table, count, sizeof(void *));
+}
+
 _Noreturn void vsr_sim_fatal(const char *message, uint32_t node,
                              uint64_t user_data)
 {
@@ -314,7 +319,7 @@ static bool dispatch(struct vsr_sim *sim, const struct vsr_sim_event *event)
              op->state != VSR_SIM_OP_NOTIF)) {
             return false;
         }
-        vsr_sim_exec_event(node, event->index, event->generation);
+        vsr_sim_exec_event(node, event->index);
         return true;
     }
     case VSR_SIM_EVENT_SEGMENT:
@@ -322,6 +327,38 @@ static bool dispatch(struct vsr_sim *sim, const struct vsr_sim_event *event)
                                    event->generation);
     case VSR_SIM_EVENT_STALL:
         return vsr_sim_net_stall(sim, event->index, event->generation);
+    default:
+        return false;
+    }
+}
+
+/* Whether dispatching the event would do anything. A cancelled op, a
+ * superseded timer (TIMEOUT_UPDATE bumps the generation), a crashed node,
+ * a freed connection, or a segment that a partition stalled leave their
+ * events in the heap; they are not pending work, so advance must not move
+ * the clock to them (decision 59). */
+static bool event_live(const struct vsr_sim *sim,
+                       const struct vsr_sim_event *event)
+{
+    switch (event->kind) {
+    case VSR_SIM_EVENT_OP: {
+        const struct vsr_sim_node *node = &sim->nodes[event->node];
+        const struct vsr_sim_op *op;
+
+        if (!node->alive || node->incarnation != event->incarnation ||
+            event->index >= node->ops_count) {
+            return false;
+        }
+        op = node->ops[event->index];
+        return op != NULL && op->generation == event->generation &&
+               (op->state == VSR_SIM_OP_WAITING ||
+                op->state == VSR_SIM_OP_NOTIF);
+    }
+    case VSR_SIM_EVENT_SEGMENT:
+        return vsr_sim_net_segment_live(sim, event->index, event->peer,
+                                        event->generation, event->due_ns);
+    case VSR_SIM_EVENT_STALL:
+        return vsr_sim_net_stall_live(sim, event->index, event->generation);
     default:
         return false;
     }
@@ -372,6 +409,11 @@ int vsr_sim_advance(struct vsr_sim *sim)
     if (count > 0) {
         return count > INT_MAX ? INT_MAX : (int)count;
     }
+    /* Prune stale events off the top so that the earliest real one, if
+     * any, decides where the clock goes. */
+    while (sim->events_count > 0 && !event_live(sim, &sim->events[0])) {
+        (void)pop_event(sim);
+    }
     if (sim->events_count > 0) {
         next = sim->events[0].due_ns;
     }
@@ -392,8 +434,8 @@ int vsr_sim_advance(struct vsr_sim *sim)
     }
     if (next > sim->now_ns) {
         sim->now_ns = next;
-        vsr_sim_emit(sim, VSR_SIM_TRACE_CLOCK, VSR_SIM_NO_NODE,
-                     VSR_SIM_NO_NODE, next);
+        vsr_sim_emit(sim, VSR_SIM_TRACE_CLOCK, VSR_SIM_NO_NODE, VSR_SIM_NO_NODE,
+                     next);
     }
     return 0;
 }
@@ -538,39 +580,53 @@ static bool valid_options(const struct vsr_sim_options *options)
     return true;
 }
 
+/* The world, its node table, the partition matrix and the disk roots are
+ * the allocations create reports as -ENOMEM; everything the world allocates
+ * later aborts with a diagnostic instead, as test infrastructure may. */
 int vsr_sim_create(const struct vsr_sim_options *options, struct vsr_sim **out)
 {
     struct vsr_sim *sim;
 
     if (out == NULL) {
-        return VSR_EINVAL;
+        return -EINVAL;
     }
     *out = NULL;
     if (options == NULL || !valid_options(options)) {
-        return VSR_EINVAL;
+        return -EINVAL;
     }
-    sim = vsr_sim_alloc(sizeof(*sim));
+    sim = calloc(1, sizeof(*sim));
+    if (sim == NULL) {
+        return -ENOMEM;
+    }
     sim->options = *options;
     if (sim->options.block_bytes == 0) {
         sim->options.block_bytes = 4096;
     }
     sim->faults = options->faults;
     pcg_seed(&sim->random, options->seed, UINT64_C(0x5653522d53494d));
+    sim->nodes = calloc(options->nodes, sizeof(*sim->nodes));
+    sim->partitions = calloc((size_t)options->nodes, (size_t)options->nodes);
+    if (sim->nodes == NULL || sim->partitions == NULL) {
+        vsr_sim_destroy(sim);
+        return -ENOMEM;
+    }
     sim->nodes_count = options->nodes;
-    sim->nodes = vsr_sim_alloc(sizeof(*sim->nodes) * options->nodes);
-    sim->partitions =
-        vsr_sim_alloc((size_t)options->nodes * (size_t)options->nodes);
     for (uint32_t i = 0; i < options->nodes; ++i) {
         struct vsr_sim_node *node = &sim->nodes[i];
 
         node->world = sim;
         node->index = i;
         node->address = node_address(i, 0);
-        vsr_sim_disk_init(&node->disk, sim->options.block_bytes);
-        boot_node(sim, node);
+        if (vsr_sim_disk_init(&node->disk, sim->options.block_bytes) != 0) {
+            vsr_sim_destroy(sim);
+            return -ENOMEM;
+        }
+    }
+    for (uint32_t i = 0; i < options->nodes; ++i) {
+        boot_node(sim, &sim->nodes[i]);
     }
     *out = sim;
-    return VSR_OK;
+    return 0;
 }
 
 void vsr_sim_destroy(struct vsr_sim *sim)
@@ -578,7 +634,8 @@ void vsr_sim_destroy(struct vsr_sim *sim)
     if (sim == NULL) {
         return;
     }
-    for (uint32_t i = 0; i < sim->nodes_count; ++i) {
+    /* A create that failed early has no node table (and nodes_count 0). */
+    for (uint32_t i = 0; sim->nodes != NULL && i < sim->nodes_count; ++i) {
         struct vsr_sim_node *node = &sim->nodes[i];
         struct vsr_sim_handle *handle = node->handles;
 

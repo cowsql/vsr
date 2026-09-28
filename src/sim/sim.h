@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /*
  * Simulated world internals (docs/io-implementation.md, "Simulation").
@@ -39,7 +40,7 @@
 #define VSR_SIM_PATH_BYTES 4096u
 /* Bytes one direction of a connection holds (in flight plus unread) before
  * a SEND waits for space; a SEND takes what fits, so results are short. */
-#define VSR_SIM_SOCKET_BUFFER (256u * 1024u)
+#define VSR_SIM_SOCKET_BUFFER (UINT64_C(256) * 1024)
 #define VSR_SIM_FIRST_FD 3
 #define VSR_SIM_EPHEMERAL_PORT 40000u
 
@@ -221,11 +222,11 @@ struct vsr_sim_segment {
 
 struct vsr_sim_end {
     uint32_t node;
-    uint32_t object;   /* Socket object, or NONE when closed or pending. */
-    uint32_t attached; /* An object was or is attached. */
-    uint32_t closed;   /* The socket went away. */
+    uint32_t object; /* Socket object, or NONE when closed or pending. */
+    uint32_t closed; /* The socket went away. */
     uint32_t reset;
     uint32_t fin_sent; /* This end sent its FIN. */
+    uint32_t reserved;
     struct vsr_sim_segment *head; /* Segments arriving at this end. */
     struct vsr_sim_segment *tail;
     uint64_t queued; /* Bytes in the queue, arrived or not. */
@@ -372,8 +373,26 @@ struct vsr_sim {
 /* world.c: allocation that aborts on exhaustion (test infrastructure). */
 void *vsr_sim_alloc(size_t size);
 void *vsr_sim_grow(void *memory, size_t count, size_t size);
+/* Grows a table of pointers (the element type is a pointer, whatever it
+ * points at) to count entries. */
+void *vsr_sim_grow_table(void *table, size_t count);
+/* Both spellings: C11's for the compilers and the GNU attribute for
+ * cppcheck, which ignores _Noreturn and evaluates #if against the compile
+ * command alone, so a compiler guard around the attribute would hide it.
+ * Every compiler this tree builds with accepts both. */
 _Noreturn void vsr_sim_fatal(const char *message, uint32_t node,
-                             uint64_t user_data);
+                             uint64_t user_data) __attribute__((noreturn));
+
+/* The record fields are const void * as the kernel's are, though a READ,
+ * RECV, GETSOCKOPT or STATX writes through them: the caller made the
+ * memory writable by naming it. Copying the pointer value casts nothing. */
+static inline void *vsr_sim_mutable(const void *pointer)
+{
+    void *writable;
+
+    memcpy(&writable, &pointer, sizeof(writable));
+    return writable;
+}
 
 /* Generator (PCG-XSH-RR 64/32), the only source of randomness. */
 uint32_t vsr_sim_pcg_next(struct vsr_sim_pcg *pcg);
@@ -407,16 +426,22 @@ void vsr_sim_exec_post(struct vsr_sim_node *node, uint32_t op, int32_t result,
 /* Parks the op until due_ns, when the action runs. */
 void vsr_sim_exec_arm(struct vsr_sim_node *node, uint32_t op, uint64_t due_ns,
                       uint32_t action);
-void vsr_sim_exec_event(struct vsr_sim_node *node, uint32_t op,
-                        uint32_t generation);
+/* A due event of a WAITING or NOTIF op (world.c checked its generation). */
+void vsr_sim_exec_event(struct vsr_sim_node *node, uint32_t op);
+/* The op takes a reference on the object it is parked on or works on; the
+ * reference drops at the op's terminal completion, so a CLOSE of the
+ * descriptor never ends the op and the object outlives the descriptor
+ * (decision 58), as a pending io_uring request holds its file. */
+void vsr_sim_exec_hold(struct vsr_sim_node *node, uint32_t op, uint32_t object);
 /* The object a record's fd names, honouring FIXED_FILE; -EBADF. */
 int vsr_sim_exec_resolve(struct vsr_sim_node *node, int32_t fd, bool fixed,
                          uint32_t *object);
 /* Installs a new object as a descriptor, or a slot with DIRECT (-ENFILE,
  * -EINVAL, -ENXIO); the result is the descriptor or slot. check only
  * reports whether install would succeed. */
-int vsr_sim_exec_install(struct vsr_sim_node *node, const struct vsr_io_sqe *sqe,
-                         uint32_t object, bool check);
+int vsr_sim_exec_install(struct vsr_sim_node *node,
+                         const struct vsr_io_sqe *sqe, uint32_t object,
+                         bool check);
 /* FIXED_BUFFER: the memory lies inside region sqe->buffer_index. */
 int vsr_sim_exec_region(const struct vsr_sim_node *node,
                         const struct vsr_io_sqe *sqe, const void *base,
@@ -430,18 +455,24 @@ uint32_t vsr_sim_exec_waiter(const struct vsr_sim_node *node, uint32_t object,
                              uint8_t opcode);
 struct vsr_sim_ring *vsr_sim_exec_ring(struct vsr_sim_node *node,
                                        uint32_t group);
-/* Hands the head buffer's unconsumed space to a receive and takes it back
- * after `used` bytes were written; returns BUFFER_MORE when it stays. */
+/* Aborts when the head buffer's unconsumed bytes changed since the kernel
+ * took ownership of them. */
 void vsr_sim_ring_verify(const struct vsr_sim_node *node,
                          const struct vsr_sim_ring *ring);
+/* Hands the head buffer's unconsumed space to a receive and takes it back
+ * after `used` bytes were written; returns BUFFER_MORE when it stays. */
 uint16_t vsr_sim_ring_consume(struct vsr_sim_node *node,
                               struct vsr_sim_ring *ring, uint32_t used);
 uint64_t vsr_sim_checksum(const void *bytes, size_t size, uint64_t seed);
+/* Verifies every buffer the executor still references (in-flight sources
+ * and provided buffers), then drops every op, completion, object, table
+ * and ring of the node. */
 void vsr_sim_exec_crash(struct vsr_sim_node *node);
 void vsr_sim_exec_free(struct vsr_sim_node *node);
+/* Whether the node's recorded wait is satisfied now. */
+bool vsr_sim_exec_ready(const struct vsr_sim_node *node);
 /* Earliest world time at which the node's recorded wait is satisfied
  * without further events, or NEVER. */
-bool vsr_sim_exec_ready(const struct vsr_sim_node *node);
 uint64_t vsr_sim_exec_wake_at(const struct vsr_sim_node *node);
 
 /* net.c */
@@ -452,10 +483,17 @@ void vsr_sim_net_cancel(struct vsr_sim_node *node, uint32_t op);
 void vsr_sim_net_serve(struct vsr_sim_node *node, uint32_t object);
 /* The last reference to a socket object went away. */
 void vsr_sim_net_close(struct vsr_sim_node *node, uint32_t object);
-bool vsr_sim_net_segment(struct vsr_sim *sim, uint32_t connection,
-                         uint32_t end, uint32_t generation);
+bool vsr_sim_net_segment(struct vsr_sim *sim, uint32_t connection, uint32_t end,
+                         uint32_t generation);
 bool vsr_sim_net_stall(struct vsr_sim *sim, uint32_t connection,
                        uint32_t generation);
+/* Whether a queued SEGMENT or STALL event still has something to do, so
+ * that advance can tell a pending event from a superseded one. */
+bool vsr_sim_net_segment_live(const struct vsr_sim *sim, uint32_t connection,
+                              uint32_t end, uint32_t generation,
+                              uint64_t due_ns);
+bool vsr_sim_net_stall_live(const struct vsr_sim *sim, uint32_t connection,
+                            uint32_t generation);
 void vsr_sim_net_partition(struct vsr_sim *sim, uint32_t a, uint32_t b);
 void vsr_sim_net_reset_between(struct vsr_sim *sim, uint32_t a, uint32_t b);
 /* Resets every connection of a crashed node, removes its listeners. */
@@ -463,7 +501,9 @@ void vsr_sim_net_crash(struct vsr_sim_node *node);
 void vsr_sim_net_free(struct vsr_sim *sim);
 
 /* disk.c */
-void vsr_sim_disk_init(struct vsr_sim_disk *disk, uint64_t block_bytes);
+/* Creates the root directory; -ENOMEM leaves an empty disk that
+ * vsr_sim_disk_free accepts. */
+int vsr_sim_disk_init(struct vsr_sim_disk *disk, uint64_t block_bytes);
 void vsr_sim_disk_free(struct vsr_sim_disk *disk);
 void vsr_sim_disk_start(struct vsr_sim_node *node, uint32_t op);
 void vsr_sim_disk_finish(struct vsr_sim_node *node, uint32_t op);

@@ -44,8 +44,7 @@ static uint32_t entry_new(struct vsr_sim_disk *disk, uint32_t parent,
         ++index;
     }
     if (index == disk->entries_count) {
-        disk->entries = vsr_sim_grow(disk->entries, (size_t)index + 1,
-                                     sizeof(*disk->entries));
+        disk->entries = vsr_sim_grow_table(disk->entries, (size_t)index + 1);
         disk->entries[index] = vsr_sim_alloc(sizeof(struct vsr_sim_entry));
         ++disk->entries_count;
     }
@@ -79,8 +78,7 @@ static uint32_t inode_new(struct vsr_sim_disk *disk, uint32_t mode)
         ++index;
     }
     if (index == disk->inodes_count) {
-        disk->inodes = vsr_sim_grow(disk->inodes, (size_t)index + 1,
-                                    sizeof(*disk->inodes));
+        disk->inodes = vsr_sim_grow_table(disk->inodes, (size_t)index + 1);
         disk->inodes[index] = vsr_sim_alloc(sizeof(struct vsr_sim_inode));
         ++disk->inodes_count;
     }
@@ -119,14 +117,35 @@ static void inode_maybe_free(struct vsr_sim_disk *disk, uint32_t index)
     inode->used = 0;
 }
 
-void vsr_sim_disk_init(struct vsr_sim_disk *disk, uint64_t block_bytes)
+int vsr_sim_disk_init(struct vsr_sim_disk *disk, uint64_t block_bytes)
 {
-    uint32_t root;
+    struct vsr_sim_entry *root;
 
     memset(disk, 0, sizeof(*disk));
     disk->block_bytes = block_bytes;
-    root = entry_new(disk, 0, "", 0, true);
-    disk->entries[root]->mode = 0755;
+    /* The root is the one allocation create reports instead of aborting. */
+    disk->entries = calloc(1, sizeof(void *)); /* A table of pointers. */
+    root = calloc(1, sizeof(*root));
+    if (disk->entries == NULL || root == NULL) {
+        free(disk->entries);
+        free(root);
+        disk->entries = NULL;
+        return -ENOMEM;
+    }
+    root->name = calloc(1, 1);
+    if (root->name == NULL) {
+        free(disk->entries);
+        free(root);
+        disk->entries = NULL;
+        return -ENOMEM;
+    }
+    root->used = 1;
+    root->directory = 1;
+    root->inode = VSR_SIM_NONE;
+    root->mode = 0755;
+    disk->entries[0] = root;
+    disk->entries_count = 1;
+    return 0;
 }
 
 void vsr_sim_disk_free(struct vsr_sim_disk *disk)
@@ -395,8 +414,7 @@ static size_t read_range(const struct vsr_sim_disk *disk,
     if (offset >= inode->size) {
         return 0;
     }
-    count = inode->size - offset < size ? (size_t)(inode->size - offset)
-                                        : size;
+    count = inode->size - offset < size ? (size_t)(inode->size - offset) : size;
     while (done < count) {
         uint64_t at = offset + done;
         uint64_t b = at / disk->block_bytes;
@@ -408,8 +426,8 @@ static size_t read_range(const struct vsr_sim_disk *disk,
             take = count - done;
         }
         if (b < inode->block_count) {
-            source = durable ? inode->blocks[b].durable
-                             : inode->blocks[b].bytes;
+            source =
+                durable ? inode->blocks[b].durable : inode->blocks[b].bytes;
         }
         if (source == NULL) {
             memset(bytes + done, 0, take);
@@ -464,8 +482,8 @@ static int check_data(struct vsr_sim_node *node, const struct vsr_sim_op *op,
                       const struct vsr_sim_object *object)
 {
     const struct vsr_io_sqe *sqe = &op->sqe;
-    bool vectored = sqe->opcode == VSR_IO_SQE_READV ||
-                    sqe->opcode == VSR_IO_SQE_WRITEV;
+    bool vectored =
+        sqe->opcode == VSR_IO_SQE_READV || sqe->opcode == VSR_IO_SQE_WRITEV;
     bool direct = (object->flags & O_DIRECT) != 0;
     uint64_t block = node->disk.block_bytes;
     uint64_t total = 0;
@@ -537,14 +555,6 @@ static void capture(struct vsr_sim_node *node, struct vsr_sim_op *op,
     }
 }
 
-static void hold(struct vsr_sim_node *node, struct vsr_sim_op *op,
-                 uint32_t object)
-{
-    op->object = object;
-    op->holds = 1;
-    ++vsr_sim_object(node, object)->refs;
-}
-
 static void arm(struct vsr_sim_node *node, uint32_t index, bool sync)
 {
     struct vsr_sim *sim = node->world;
@@ -589,7 +599,7 @@ void vsr_sim_disk_start(struct vsr_sim_node *node, uint32_t index)
             return;
         }
         if (object_index != VSR_SIM_NONE) {
-            hold(node, op, object_index);
+            vsr_sim_exec_hold(node, index, object_index);
         }
         arm(node, index, false);
         return;
@@ -597,9 +607,9 @@ void vsr_sim_disk_start(struct vsr_sim_node *node, uint32_t index)
     default:
         break;
     }
-    error = vsr_sim_exec_resolve(
-        node, sqe->fd, (sqe->flags & VSR_IO_SQE_FIXED_FILE) != 0,
-        &object_index);
+    error = vsr_sim_exec_resolve(node, sqe->fd,
+                                 (sqe->flags & VSR_IO_SQE_FIXED_FILE) != 0,
+                                 &object_index);
     if (error != 0) {
         vsr_sim_exec_complete(node, index, error, 0, 0);
         return;
@@ -612,7 +622,7 @@ void vsr_sim_disk_start(struct vsr_sim_node *node, uint32_t index)
             vsr_sim_exec_complete(node, index, -EINVAL, 0, 0);
             return;
         }
-        hold(node, op, object_index);
+        vsr_sim_exec_hold(node, index, object_index);
         if (object->kind == VSR_SIM_OBJECT_FILE) {
             capture(node, op, node->disk.inodes[object->inode]);
         }
@@ -640,7 +650,7 @@ void vsr_sim_disk_start(struct vsr_sim_node *node, uint32_t index)
         if (access == O_RDONLY) {
             error = -EBADF;
         } else if (sqe->op_flags != 0 || sqe->length == 0 ||
-                   sqe->offset > INT64_MAX - sqe->length) {
+                   sqe->offset > (uint64_t)INT64_MAX - sqe->length) {
             error = -EINVAL;
         }
         break;
@@ -652,7 +662,7 @@ void vsr_sim_disk_start(struct vsr_sim_node *node, uint32_t index)
         vsr_sim_exec_complete(node, index, error, 0, 0);
         return;
     }
-    hold(node, op, object_index);
+    vsr_sim_exec_hold(node, index, object_index);
     arm(node, index, false);
 }
 
@@ -673,13 +683,13 @@ static int finish_read(struct vsr_sim_node *node, const struct vsr_sim_op *op,
     for (uint32_t i = 0; i < count; ++i) {
         unsigned char *target =
             sqe->opcode == VSR_IO_SQE_READ
-                ? (unsigned char *)(uintptr_t)sqe->addr
+                ? (unsigned char *)vsr_sim_mutable(sqe->addr)
                 : (unsigned char *)op->vecs[i].base;
         size_t size =
             sqe->opcode == VSR_IO_SQE_READ ? sqe->length : op->vecs[i].length;
         size_t got = size == 0 ? 0
-                               : read_range(disk, inode, offset + total,
-                                            target, size, false);
+                               : read_range(disk, inode, offset + total, target,
+                                            size, false);
 
         /* Bit rot per block read: flipped bytes, no error. */
         for (size_t done = 0; done < got;) {
@@ -840,8 +850,8 @@ static int finish_openat(struct vsr_sim_node *node, const struct vsr_sim_op *op,
     }
     {
         uint32_t inode = inode_new(disk, sqe->length & 07777u);
-        uint32_t entry = entry_new(disk, found.parent, found.leaf,
-                                   found.leaf_length, false);
+        uint32_t entry =
+            entry_new(disk, found.parent, found.leaf, found.leaf_length, false);
 
         disk->entries[entry]->inode = inode;
         disk->inodes[inode]->links = 1;
@@ -1025,7 +1035,7 @@ static int finish_statx(struct vsr_sim_node *node, const struct vsr_sim_op *op,
     } else {
         result.stx_mode = (uint16_t)(S_IFDIR | disk->entries[entry]->mode);
     }
-    memcpy((void *)(uintptr_t)op->sqe.addr2, &result, sizeof(result));
+    memcpy(vsr_sim_mutable(op->sqe.addr2), &result, sizeof(result));
     return 0;
 }
 
@@ -1152,15 +1162,14 @@ void vsr_sim_disk_crash(struct vsr_sim *sim, struct vsr_sim_node *node)
                 continue;
             }
             if (block->durable != NULL) {
-                memcpy(block->bytes, block->durable,
-                       (size_t)disk->block_bytes);
+                memcpy(block->bytes, block->durable, (size_t)disk->block_bytes);
             } else {
                 memset(block->bytes, 0, (size_t)disk->block_bytes);
             }
             block->written_at = block->synced_at;
             block->dirty = 0;
-            vsr_sim_emit(sim, VSR_SIM_TRACE_TORN, node->index,
-                         VSR_SIM_NO_NODE, b * disk->block_bytes);
+            vsr_sim_emit(sim, VSR_SIM_TRACE_TORN, node->index, VSR_SIM_NO_NODE,
+                         b * disk->block_bytes);
         }
         inode->opens = 0;
         inode_maybe_free(disk, i);
@@ -1189,7 +1198,7 @@ static int inspect(const struct vsr_sim *sim, uint32_t node, const char *path,
     int error;
 
     if (sim == NULL || node >= sim->nodes_count || path == NULL) {
-        return VSR_EINVAL;
+        return -EINVAL;
     }
     *disk = &sim->nodes[node].disk;
     error = lookup(*disk, 0, path, &found);
@@ -1228,7 +1237,7 @@ int vsr_sim_file_size(const struct vsr_sim *sim, uint32_t node,
     int error;
 
     if (size == NULL) {
-        return VSR_EINVAL;
+        return -EINVAL;
     }
     error = inspect_file(sim, node, path, &disk, &inode);
     if (error == 0) {
@@ -1246,13 +1255,13 @@ static int inspect_read(const struct vsr_sim *sim, uint32_t node,
     int error;
 
     if (read == NULL || (bytes == NULL && size > 0)) {
-        return VSR_EINVAL;
+        return -EINVAL;
     }
     error = inspect_file(sim, node, path, &disk, &inode);
     if (error == 0) {
-        *read = size == 0 ? 0
-                          : read_range(disk, inode, offset, bytes, size,
-                                       durable);
+        *read = size == 0
+                    ? 0
+                    : read_range(disk, inode, offset, bytes, size, durable);
     }
     return error;
 }
@@ -1322,8 +1331,7 @@ static uint32_t sorted_children(const struct vsr_sim_disk *disk,
         }
         at = count++;
         while (at > 0 &&
-               strcmp(disk->entries[children[at - 1]]->name, entry->name) >
-                   0) {
+               strcmp(disk->entries[children[at - 1]]->name, entry->name) > 0) {
             children[at] = children[at - 1];
             --at;
         }
@@ -1341,7 +1349,7 @@ int vsr_sim_dir_count(const struct vsr_sim *sim, uint32_t node,
     int error;
 
     if (count == NULL) {
-        return VSR_EINVAL;
+        return -EINVAL;
     }
     error = inspect(sim, node, path, &disk, &entry);
     if (error != 0) {
@@ -1369,7 +1377,7 @@ int vsr_sim_dir_entry(const struct vsr_sim *sim, uint32_t node,
     int error;
 
     if (name == NULL) {
-        return VSR_EINVAL;
+        return -EINVAL;
     }
     error = inspect(sim, node, path, &disk, &entry);
     if (error != 0) {
@@ -1388,7 +1396,7 @@ int vsr_sim_dir_entry(const struct vsr_sim *sim, uint32_t node,
     free(children);
     length = strlen(found->name);
     if (length + 1 > name_size) {
-        return VSR_EINVAL;
+        return -EINVAL;
     }
     memcpy(name, found->name, length + 1);
     if (size != NULL) {
