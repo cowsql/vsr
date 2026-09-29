@@ -3208,6 +3208,78 @@ static void test_random(uint64_t seed)
     engine_forget(b);
 }
 
+/* -------------------------------------------------------------------------
+ * Review: shutdown order, the requester's clock, close after a failure
+ * ---------------------------------------------------------------------- */
+
+/* vsr_io_close shuts the links down before the streams (implementation
+ * section 7.7): a stream whose link the link module's shutdown closes still
+ * ends CANCELLED on the closing engine (vsr-io.h: CANCELLED when the engine
+ * closes), not RETRY as for a loss; the peer, which sees a loss, reports
+ * RETRY. */
+static void test_review_shutdown_order(void)
+{
+    const unsigned char *bytes = pattern(21);
+    struct engine *a;
+    struct engine *b;
+    struct sink k;
+    struct feed d;
+    uint32_t index = NONE;
+
+    world_reset(21);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    /* Both engines close mid-transfer, DATA ops held at the requester. */
+    open_stream(&k, &d, 1, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    k.hold = true;
+    CHECK(feed_write_buffers(&d, 1, bytes, 5 * CHUNK, 0) == VSR_OK);
+    settle();
+    sink_drain(&k);
+    CHECK(k.data_ops == WINDOW);
+    vsr_io_links_shutdown(a->io);
+    vsr_io_streams_shutdown(a->io);
+    vsr_io_links_shutdown(b->io);
+    vsr_io_streams_shutdown(b->io);
+    pump(&k, &d);
+    CHECK(d.ended && d.end.status == VSR_IO_CANCELLED && d.written_count == 1);
+    sink_complete(&k, k.held_count);
+    settle();
+    sink_drain(&k);
+    CHECK(k.ended && k.end.status == VSR_IO_CANCELLED);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    engine_forget(a);
+    engine_forget(b);
+    /* Only the source's engine closes: CANCELLED there, RETRY at the
+     * requester, which sees the connection go. */
+    world_reset(22);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    open_stream(&k, &d, 2, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    CHECK(feed_write_buffers(&d, 1, bytes, CHUNK, 0) == VSR_OK);
+    pump(&k, &d);
+    CHECK(k.data_ops == 1 && !k.ended && !d.ended);
+    vsr_io_links_shutdown(b->io);
+    vsr_io_streams_shutdown(b->io);
+    pump(&k, &d);
+    CHECK(d.ended && d.end.status == VSR_IO_CANCELLED && d.written_count == 1);
+    CHECK(k.ended && k.end.status == VSR_IO_RETRY && k.end.bytes == CHUNK);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    engine_forget(a);
+    engine_forget(b);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = argc > 1 ? strtoull(argv[1], NULL, 10) : 4242;
@@ -3222,6 +3294,7 @@ int main(int argc, char **argv)
     test_library();
     test_timeout();
     test_shutdown();
+    test_review_shutdown_order();
     test_random(seed);
     test_random(seed + 1);
     printf("stream: ok\n");

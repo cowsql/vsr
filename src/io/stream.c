@@ -1374,7 +1374,11 @@ void vsr_io_streams_link_lost(struct vsr_io *io, uint32_t index, int32_t error)
         return;
     }
     stream->link_gone = 1;
-    stream_loss_effects(io, stream, VSR_IO_RETRY);
+    /* vsr_io_close shuts the links down before the streams (section 7.7):
+     * a link closed by that shutdown ends its stream CANCELLED, as the
+     * stream shutdown would, not RETRY as for a loss (decision B3). */
+    stream_loss_effects(io, stream,
+                        io->links.closing ? VSR_IO_CANCELLED : VSR_IO_RETRY);
 }
 
 void vsr_io_streams_sent(struct vsr_io *io, uint32_t index,
