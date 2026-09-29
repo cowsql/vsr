@@ -4284,7 +4284,7 @@ static void test_stream(void)
 {
     static unsigned char bytes[PAGE];
     static unsigned char scratch[PAGE + 64];
-    static unsigned char hello[12] = "hello world!";
+    static unsigned char hello[] = "hello world!";
     struct engine *a;
     struct vsr_io_address address;
     const struct vsr_io_link *link;
