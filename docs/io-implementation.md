@@ -812,10 +812,16 @@ worker) still completes then, so the caller sees such records complete
 before deinit.
 
 Tests: `tests/integration/executor_conformance` (section 8) run over this
-executor; `tests/unit/uring_translate` for the record-to-SQE table with a
-fake SQE buffer (every opcode and flag combination, rejection of
-out-of-region fixed buffers); `tests/integration/uring_smoke` for the ring
-against the kernel.
+executor, as the default ring and as the `uring-sqpoll` (SQ thread idling
+after 10 ms) and `uring-napi` (20 us busy poll) columns;
+`tests/unit/uring_translate` for the record-to-SQE table with a fake SQE
+buffer (every opcode and flag combination, rejection of out-of-region
+fixed buffers); `tests/integration/uring_smoke` for the ring against the
+kernel, the whole suite over the default, SQPOLL, NAPI and SQPOLL+NAPI
+rings (a variant refused with `EPERM` is reported and skipped). Loopback
+sockets carry no NAPI id, so the NAPI runs cover the registration (read
+back from the kernel) and every path with busy polling enabled, not the
+polling of a device queue.
 
 ### Simulation (`src/sim/sim.h`)
 
@@ -1648,7 +1654,7 @@ with node 0 talking to node 1.
 | --- | --- | --- | --- |
 | `cursor`, `codec`, `pool`, `slots`, `deadline`, `link`, `stream`, `store`, `snapshot`, `sim_world`, `client`, `uring_translate` | unit | `UNIT_TESTS`, each `tests_unit_NAME_SOURCES = tests/unit/NAME.c`, `_LDADD = $(LIBVSR)` | Section 3 |
 | `frame`, `recovery` | fuzzy (libFuzzer) | `if FUZZING` programs and the `fuzz` target, with corpora under `tests/fuzzy/corpus/frame` and `corpus/recovery` | Decoder and recovery never crash; recovered prefixes satisfy the invariants |
-| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise), then over both again through the fault-injecting wrapper | Section 8 |
+| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise) as the default, SQPOLL and NAPI rings, then over the sim and the default ring again through the fault-injecting wrapper | Section 8 |
 | `engine` | integration | `INTEGRATION_TESTS` | Over the sim: attach NEW, RECOVER, JOIN; empty-store checks; a three-replica group commits, replies, checkpoints, fetches, restarts; STATUS emission; close and detach sequencing; max_clients admission at the primary |
 | `streams`, `snapshots` | integration | `INTEGRATION_TESTS` | Section 3 |
 | `iocluster`, `iocluster_extended` | fuzzy (seeded) | `FUZZY_TESTS`; `SEED COUNT STEPS [trace\|quiet] [PROFILE] [SEEDS]` as `tests/fuzzy/cluster`; the extended program sets a wider default profile | Below |
