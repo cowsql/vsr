@@ -480,7 +480,7 @@ Purpose: the two sides of a bulk transfer over a STREAM-purpose link.
 State: `limits.streams` entries, each with a ring of `stream_window`
 UNITS in stream order (a chunk: a DATA op at the requester, a chunk read
 or send at the source) and a ring of `stream_window` queued WRITES (the
-source's `STREAM_WRITE` events). Handles and ids (decision T1): the
+source's `STREAM_WRITE` events). Handles and ids (decision 93): the
 source's handle is `generation << 32 | index`, never reused; SERVE and
 DATA op ids carry their kind in the top two bits (`VSR_IO_STREAM_OP_*`),
 the generation, the unit and the stream, so the engine routes a rail
@@ -506,7 +506,7 @@ synthesized on link loss with `RETRY`; the requester closes its link at
 the END frame; the END op is emitted at poll once every DATA op was
 completed and the link's sends were notified, and the cookie is then
 reusable. The lease of a `STREAM_OPEN` ends with its `STREAM_END`: the
-engine emits no RELEASE op for its own event kinds (decision T2).
+engine emits no RELEASE op for its own event kinds (decision 94).
 
 Source: an accepted STREAM link waits for the request frame; the stream
 is created then (no free stream, or no room in the forwarded ring: the
@@ -536,19 +536,19 @@ chunk frame whose CRC the module computes over header and payload; a
 SENT unit is released once the link's `notified_offset` passes its frame
 (a FILE unit's slab then). `STREAM_WRITTEN` is emitted, in write order,
 once a write is fully chunked and its last unit released; it ends the
-write's lease (decision T2) and is emitted for every queued write, also
+write's lease (decision 94) and is emitted for every queued write, also
 when the stream ends early. `STREAM_CLOSE` (OK only for an OPEN stream,
 or one ending under the caller whose END op is still to come) queues END
 with the status after the last chunk of the last write. The source's END
 op (accepted streams only) is emitted once the END frame is notified (or
 the link is gone); the stream then LINGERS on its link until the
 requester's close reaches it, or the inactivity timer closes it
-(decision T4): a source closing first would cut the frames a requester
+(decision 96): a source closing first would cut the frames a requester
 blocked on its window still holds in its link, which the link module
 discards at EOF. Library-owned streams get no WRITTEN and hear their end
 through `vsr_io_snapshots_stream_end`.
 
-Early ends (decision T5): link loss ends a stream with `RETRY`, unless it
+Early ends (decision 97): link loss ends a stream with `RETRY`, unless it
 is a source whose END frame already reached the kernel (`sent_offset`),
 which keeps its status; a frame the stream's state refuses (a chunk or
 end at the source, a second request, a request at the requester, a chunk
@@ -1352,8 +1352,8 @@ the reason:
 | CORE REQUEST | `vsr_io_store_admit(client)`; false: stop with `ELIMIT`; else queue (ring full: stop with `AGAIN`) |
 | CORE COMPLETE for an op the snapshot module forwarded | `vsr_io_snapshots_forwarded_done`; the event is consumed, the lease (if any) released immediately after the data is copied |
 | CORE COMPLETE, STOP, CLIENT_QUERY, READ, CHECKPOINT | queue |
-| COMPLETE (rail) | by `vsr_io_streams_op_kind(id)`: SERVE -> `streams_served`; DATA -> `streams_data_done`; else `links_handshake_done`; a stale id is `EINVAL` (decision T1) |
-| STREAM_OPEN / WRITE / CLOSE | `streams_open` / `write` / `close`; `ELIMIT` from open and `AGAIN` from write (the write queue is full) stop; no RELEASE op follows these events' leases: STREAM_END and STREAM_WRITTEN release them (decision T2) |
+| COMPLETE (rail) | by `vsr_io_streams_op_kind(id)`: SERVE -> `streams_served`; DATA -> `streams_data_done`; else `links_handshake_done`; a stale id is `EINVAL` (decision 93) |
+| STREAM_OPEN / WRITE / CLOSE | `streams_open` / `write` / `close`; `ELIMIT` from open and `AGAIN` from write (the write queue is full) stop; no RELEASE op follows these events' leases: STREAM_END and STREAM_WRITTEN release them (decision 94) |
 
 A replica in STOPPED refuses every CORE event with `EINVAL`.
 
@@ -1426,7 +1426,7 @@ drops the reference or pin, and marks the entry free; a stale id is
 The caller's leases on engine-level events (STREAM_OPEN's request,
 STREAM_WRITE's buffers) get no RELEASE op: the STREAM_END of the stream
 and the write's STREAM_WRITTEN say the bytes are no longer read
-(decision T2).
+(decision 94).
 
 ### 7.7 Replica attach, start, stop, detach
 
@@ -1621,9 +1621,9 @@ of `docs/io-design.md`:
 | `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | 75, 76 |
 | `store.h` | `VSR_IO_SEGMENT_FREEING`; `vsr_io_load_ref` and `load_refs`, the pending load's resolved records and read state, `cold_slab`; `reindexed`, `restored`, the `base_*` fields and `base_slot`; the client entry's `next_offset`; a LOAD completion's lease carries every OK result; `release` only unpins | 77, 78, 79, 80 |
 | `link.h`, `stream.h` (internal) | Send side of `vsr_io_link`: unwrapped 64-bit ring counters (`header_*`, `vsr_io_send.header_*`), the build (`vec_count`, `build_bytes`), `nodelay_set`, `VSR_IO_STAGE_NODELAY`; `vsr_io_links_send` contract (RETRY only when the engine completes at once); `vsr_io_links_open_stream` and `vsr_io_links_send_frame` contracts; `vsr_io_streams_frame` returns whether the frame was consumed; `vsr_io_streams_sent` at every send result and NOTIF | 82, 83, 84, 85 |
-| `vsr-io.h` | Bulk streams: the engine emits no RELEASE for a STREAM_OPEN or STREAM_WRITE lease (STREAM_END and STREAM_WRITTEN end them; a WRITTEN follows every queued write, also on an early end); `vsr_io_submit` refuses a STREAM_WRITE with `AGAIN` while `stream_window` writes are queued | T2, T3 |
-| `stream.h` (internal) | Units are chunks (`vsr_io_stream_unit` states READING, READY, SENT, DATA), the write queue (`vsr_io_stream_queued_write`, `writes` rings), handles and op ids (`VSR_IO_STREAM_OP_*`, `vsr_io_streams_op_kind`, `vsr_io_streams_handle`), `generation`, `ended`, `aborted`, `link_gone`, `end_*`, `send_end`, `closing`; `vsr_io_streams_deadline`; `vsr_io_streams_size` is ELIMIT beyond 65535 streams or window | T1, T3, T4, T5 |
-| `snapshot.h` (internal) | `vsr_io_snapshots_serve` returns OK to serve or the END status; `vsr_io_snapshots_stream_data` takes the DATA op id; `stream_end` is told for both sides of a library stream; weak stubs in stream.c until snapshot.c | T6 |
+| `vsr-io.h` | Bulk streams: the engine emits no RELEASE for a STREAM_OPEN or STREAM_WRITE lease (STREAM_END and STREAM_WRITTEN end them; a WRITTEN follows every queued write, also on an early end); `vsr_io_submit` refuses a STREAM_WRITE with `AGAIN` while `stream_window` writes are queued | 94, 95 |
+| `stream.h` (internal) | Units are chunks (`vsr_io_stream_unit` states READING, READY, SENT, DATA), the write queue (`vsr_io_stream_queued_write`, `writes` rings), handles and op ids (`VSR_IO_STREAM_OP_*`, `vsr_io_streams_op_kind`, `vsr_io_streams_handle`), `generation`, `ended`, `aborted`, `link_gone`, `end_*`, `send_end`, `closing`; `vsr_io_streams_deadline`; `vsr_io_streams_size` is ELIMIT beyond 65535 streams or window | 93, 95, 96, 97 |
+| `snapshot.h` (internal) | `vsr_io_snapshots_serve` returns OK to serve or the END status; `vsr_io_snapshots_stream_data` takes the DATA op id; `stream_end` is told for both sides of a library stream; weak stubs in stream.c until snapshot.c | 98 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
