@@ -76,19 +76,19 @@ static struct fake_call *fake_record(struct fake *fake, enum fake_kind kind)
 
 static uint64_t fake_now(void *ctx)
 {
-    struct fake *fake = ctx;
+    struct fake *self = ctx;
 
-    return fake->now;
+    return self->now;
 }
 
 static void fake_random(void *ctx, void *bytes, size_t size)
 {
-    struct fake *fake = ctx;
+    struct fake *self = ctx;
     unsigned char *out = bytes;
 
-    fake->randoms++;
+    self->randoms++;
     for (size_t i = 0; i < size; ++i) {
-        out[i] = (unsigned char)(i * 7u + fake->randoms);
+        out[i] = (unsigned char)(i * 7u + self->randoms);
     }
 }
 
@@ -96,14 +96,14 @@ static int fake_submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
                                 uint32_t count, uint32_t want,
                                 uint64_t min_wait_ns, uint64_t deadline_ns)
 {
-    struct fake *fake = ctx;
+    struct fake *self = ctx;
 
     (void)sqes;
     (void)count;
     (void)want;
     (void)min_wait_ns;
     (void)deadline_ns;
-    fake->submits++;
+    self->submits++;
     return 0;
 }
 
@@ -139,25 +139,25 @@ static int fake_register_buffers(void *ctx, uint32_t regions)
 static int fake_update_buffer(void *ctx, uint32_t index,
                               const struct vsr_io_region *region)
 {
-    struct fake *fake = ctx;
-    struct fake_call *call = fake_record(fake, FAKE_UPDATE_BUFFER);
-    int result = fake->fail_update_buffer;
+    struct fake *self = ctx;
+    struct fake_call *call = fake_record(self, FAKE_UPDATE_BUFFER);
+    int result = self->fail_update_buffer;
 
     call->index = index;
     if (region != NULL) {
         call->base = region->base;
         call->size = region->size;
     }
-    fake->fail_update_buffer = 0;
+    self->fail_update_buffer = 0;
     return result;
 }
 
 static int fake_buffer_ring(void *ctx, uint16_t group, uint32_t entries,
                             uint32_t flags, const struct vsr_io_region *memory)
 {
-    struct fake *fake = ctx;
-    struct fake_call *call = fake_record(fake, FAKE_BUFFER_RING);
-    int result = fake->fail_buffer_ring;
+    struct fake *self = ctx;
+    struct fake_call *call = fake_record(self, FAKE_BUFFER_RING);
+    int result = self->fail_buffer_ring;
 
     call->index = group;
     call->entries = entries;
@@ -166,7 +166,7 @@ static int fake_buffer_ring(void *ctx, uint16_t group, uint32_t entries,
         call->base = memory->base;
         call->size = memory->size;
     }
-    fake->fail_buffer_ring = 0;
+    self->fail_buffer_ring = 0;
     return result;
 }
 
@@ -183,9 +183,9 @@ static int fake_provide(void *ctx, uint16_t group,
 
 static void fake_wake(void *ctx)
 {
-    struct fake *fake = ctx;
+    struct fake *self = ctx;
 
-    fake->wakes++;
+    self->wakes++;
 }
 
 static const struct vsr_io_executor_ops fake_ops = {
@@ -656,6 +656,7 @@ static void test_init(void)
     struct vsr_io_layout layout;
     struct vsr_io_region region;
     struct vsr_io_region pool;
+    struct vsr_io_executor_ops partial = fake_ops;
     const struct vsr_io_limits *l = &options.limits;
     uint32_t base;
     unsigned char random[16];
@@ -880,13 +881,9 @@ static void test_init(void)
     region.base = metadata;
     options.executor.ops = NULL;
     CHECK(vsr_io_init(&options, &region, &pool, &io) == VSR_EINVAL);
-    {
-        struct vsr_io_executor_ops partial = fake_ops;
-
-        partial.provide = NULL;
-        options.executor.ops = &partial;
-        CHECK(vsr_io_init(&options, &region, &pool, &io) == VSR_EINVAL);
-    }
+    partial.provide = NULL;
+    options.executor.ops = &partial;
+    CHECK(vsr_io_init(&options, &region, &pool, &io) == VSR_EINVAL);
     options.executor.ops = &fake_ops;
     options.limits.batch = 1;
     CHECK(vsr_io_init(&options, &region, &pool, &io) == VSR_ELIMIT);

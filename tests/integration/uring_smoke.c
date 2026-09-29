@@ -1505,7 +1505,6 @@ static void test_pressure(void)
     struct vsr_io_uring_options o = options();
     struct fixture f;
     struct vsr_io_sqe batch[100];
-    struct vsr_io_cqe cqe;
     uint32_t seen;
     uint64_t expect;
     int32_t listener;
@@ -1526,7 +1525,8 @@ static void test_pressure(void)
     batch[51].opcode = 200; /* Rejected: fails records 52..54. */
     submit(&f, batch, 100);
     for (uint32_t i = 0; i < 100; ++i) {
-        cqe = take(&f, 1000 + i);
+        struct vsr_io_cqe cqe = take(&f, 1000 + i);
+
         if (i == 51) {
             CHECK(cqe.result == -EINVAL);
         } else if (i > 51 && i < 55) {

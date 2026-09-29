@@ -1310,6 +1310,20 @@ static bool vector_put(struct sink *sink, const void *data, size_t size,
     return true;
 }
 
+static void vector_init(struct vector *vector, struct vsr_io_writer *writer,
+                        struct vsr_io_vec *vecs, uint32_t capacity,
+                        uint64_t budget, uint64_t skip)
+{
+    vector->sink.put = vector_put;
+    vector->writer = writer;
+    vector->vecs = vecs;
+    vector->capacity = capacity;
+    vector->count = 0;
+    vector->budget = budget;
+    vector->skip = skip;
+    vector->position = 0;
+}
+
 /* -------------------------------------------------------------------------
  * Messages
  * ---------------------------------------------------------------------- */
@@ -1375,14 +1389,7 @@ int vsr_io_encoder_emit(struct vsr_io_encoder *encoder,
         (vecs == NULL && capacity != 0) || writer->used > writer->capacity) {
         return VSR_EINVAL;
     }
-    vector.sink.put = vector_put;
-    vector.writer = writer;
-    vector.vecs = vecs;
-    vector.capacity = capacity;
-    vector.count = 0;
-    vector.budget = budget;
-    vector.skip = encoder->offset;
-    vector.position = 0;
+    vector_init(&vector, writer, vecs, capacity, budget, encoder->offset);
     walker.sink = &vector.sink;
     walker.limits = NULL;
     walker.payload = 0;
@@ -2030,17 +2037,23 @@ int vsr_io_codec_put_record(const struct vsr_store *transaction,
     walker.aggregate = UINT64_MAX;
     for (uint32_t i = 0; i < transaction->count; ++i) {
         size_t before = copy.used;
+        size_t length;
         int rc = walk_change(&walker, &transaction->changes[i]);
 
         if (rc == VSR_AGAIN) {
             return VSR_ELIMIT;
         }
         TRY(rc);
-        if (fixed + before > UINT32_MAX || copy.used - before > UINT32_MAX) {
+        /* False positives: walk_change advanced copy.used through the sink
+         * (walker.sink points into copy), which cppcheck does not follow. */
+        /* cppcheck-suppress duplicateExpression */
+        length = copy.used - before;
+        /* cppcheck-suppress unsignedLessThanZero */
+        if (fixed + before > UINT32_MAX || length > UINT32_MAX) {
             return VSR_ELIMIT;
         }
         offsets[i] = (uint32_t)(fixed + before);
-        lengths[i] = (uint32_t)(copy.used - before);
+        lengths[i] = (uint32_t)length;
     }
     total = fixed + copy.used;
     padded = total + padding_of(total);

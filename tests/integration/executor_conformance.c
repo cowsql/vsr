@@ -1285,7 +1285,6 @@ static void scenario_link_chains(struct fixture *f)
 static void scenario_submit_and_wait(struct fixture *f)
 {
     struct vsr_io_sqe records[100];
-    struct vsr_io_cqe cqe;
     uint64_t t0;
     uint64_t deadline;
     bool seen[100];
@@ -1332,7 +1331,8 @@ static void scenario_submit_and_wait(struct fixture *f)
     }
     submit(f, records, 100);
     for (uint32_t i = 0; i < 100; ++i) {
-        cqe = take_next(f);
+        struct vsr_io_cqe cqe = take_next(f);
+
         CHECK(cqe.user_data >= UD(1000) && cqe.user_data < UD(1100));
         CHECK(!seen[cqe.user_data - UD(1000)] && cqe.result == 0);
         seen[cqe.user_data - UD(1000)] = true;

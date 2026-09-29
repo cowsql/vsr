@@ -1223,7 +1223,7 @@ static void test_frames(void)
         memcpy(copy, bytes, 24);
         switch (variant) {
         case 0:
-            vsr_io_put_u32(copy + 4, 1u | 0u << 16); /* kind 0 */
+            vsr_io_put_u32(copy + 4, 1u); /* version 1, kind 0 */
             break;
         case 1:
             vsr_io_put_u32(copy + 4, 1u | 6u << 16); /* kind 6 */
@@ -2255,7 +2255,6 @@ static void test_sizing(void)
         {
             struct builder b;
             struct vsr_limits larger = *limits;
-            struct vsr_message *message;
             uint32_t length;
             uint32_t crc;
 
@@ -2267,6 +2266,7 @@ static void test_sizing(void)
             for (unsigned variant = 0; variant < 4; ++variant) {
                 struct vsr_io_bump region;
                 struct vsr_io_cursor cursor;
+                struct vsr_message *message;
                 struct vsr_message *decoded;
                 struct vsr_limits mixed = *limits;
 
