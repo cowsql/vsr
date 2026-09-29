@@ -54,7 +54,9 @@
  * registered after setup instead, and every enter and register call takes
  * the registered-ring path. Init then probes the opcode table
  * (IORING_REGISTER_PROBE) and the feature bits once and refuses an older
- * kernel with -ENOSYS (decision 53); nothing is probed after that. The
+ * kernel with -ENOSYS (decision 53), also when setup itself refused a flag
+ * the kernel does not know with -EINVAL (a plain ring's feature bits tell
+ * that from bad options); nothing is probed after that. The
  * sparse file and buffer tables are registered by register_files() and
  * register_buffers() (once each, as the contract states), at most
  * options.file_slots and options.buffer_regions entries; buffer rings are

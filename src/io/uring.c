@@ -1917,6 +1917,27 @@ static void unregister_ring_fd(struct vsr_io_uring_ring *ring)
     ring->enter_flags = 0;
 }
 
+/* io_uring_setup refused the ring with -EINVAL: bad options, or a kernel
+ * that does not know a setup flag, which is how every kernel before 6.6
+ * (NO_SQARRAY, the newest flag used) answers. Such a kernel also lacks
+ * IORING_FEAT_MIN_TIMEOUT (6.12), so the feature bits of a plain ring tell
+ * the two apart: -ENOSYS for the old kernel, as the feature check and the
+ * probe answer it, -EINVAL for options a current kernel refuses. */
+static int classify_refusal(void)
+{
+    struct io_uring_params params;
+    int fd;
+
+    memset(&params, 0, sizeof(params));
+    fd = ring_setup(1, &params);
+    if (fd < 0) {
+        return fd;
+    }
+    (void)close(fd);
+    return (params.features & REQUIRED_FEATURES) == REQUIRED_FEATURES ? -EINVAL
+                                                                      : -ENOSYS;
+}
+
 /* The one-time check of decision 53: every opcode the translation table
  * emits must be supported, else the kernel is too old. */
 static int probe_opcodes(const struct vsr_io_uring_ring *ring)
@@ -2077,6 +2098,9 @@ int vsr_io_uring_init(void *memory, size_t size,
         params.sq_thread_cpu = options->sqpoll_cpu;
     }
     rc = ring_setup(options->sq_entries, &params);
+    if (rc == -EINVAL) {
+        rc = classify_refusal();
+    }
     if (rc < 0) {
         return rc;
     }

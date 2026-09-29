@@ -767,7 +767,10 @@ completions). Init checks once that the feature bits it relies on
 (`SINGLE_MMAP`, `NODROP`, `EXT_ARG`, `MIN_TIMEOUT`, `REG_REG_RING`,
 `RSRC_TAGS`, `CQE_SKIP`, `LINKED_FILE`) are set and that `IORING_REGISTER_PROBE` reports
 every opcode the translation table emits, and fails with `-ENOSYS`
-otherwise (decision 53); nothing is probed after that and there is no
+otherwise (decision 53); a setup refused with `-EINVAL` is classified by
+the feature bits of a plain one-entry ring, `-ENOSYS` when they lack a
+required one (a kernel before 6.6 refuses `NO_SQARRAY` so), else
+`-EINVAL` (decision U1); nothing is probed after that and there is no
 fallback. `submit_and_wait` translates the records into the SQ (a full SQ
 is drained by an enter, under `SQPOLL` by `SQ_WAIT`), publishes the tail
 and enters once with `GETEVENTS` and no minimum so completions already due
@@ -816,9 +819,11 @@ executor, as the default ring and as the `uring-sqpoll` (SQ thread idling
 after 10 ms) and `uring-napi` (20 us busy poll) columns;
 `tests/unit/uring_translate` for the record-to-SQE table with a fake SQE
 buffer (every opcode and flag combination, rejection of out-of-region
-fixed buffers); `tests/integration/uring_smoke` for the ring against the
-kernel, the whole suite over the default, SQPOLL, NAPI and SQPOLL+NAPI
-rings (a variant refused with `EPERM` is reported and skipped). Loopback
+fixed buffers); `tests/integration/uring_refusals` for init's refusals on
+emulated older kernels (section 9); `tests/integration/uring_smoke` for
+the ring against the kernel, the whole suite over the default, SQPOLL,
+NAPI and SQPOLL+NAPI rings (a variant refused with `EPERM` is reported
+and skipped). Loopback
 sockets carry no NAPI id, so the NAPI runs cover the registration (read
 back from the kernel) and every path with busy polling enabled, not the
 polling of a device queue.
@@ -1654,6 +1659,7 @@ with node 0 talking to node 1.
 | --- | --- | --- | --- |
 | `cursor`, `codec`, `pool`, `slots`, `deadline`, `link`, `stream`, `store`, `snapshot`, `sim_world`, `client`, `uring_translate` | unit | `UNIT_TESTS`, each `tests_unit_NAME_SOURCES = tests/unit/NAME.c`, `_LDADD = $(LIBVSR)` | Section 3 |
 | `frame`, `recovery` | fuzzy (libFuzzer) | `if FUZZING` programs and the `fuzz` target, with corpora under `tests/fuzzy/corpus/frame` and `corpus/recovery` | Decoder and recovery never crash; recovered prefixes satisfy the invariants |
+| `uring_refusals` | integration | `INTEGRATION_TESTS` (skips without a ring or seccomp) | `vsr_io_uring_init` on emulated kernels, each in a forked child under a seccomp filter: no io_uring (`ENOSYS`) and io_uring disabled (`EPERM`) pass through; Linux 6.1 (setup refuses `NO_SQARRAY`, old features), 6.11 (no `MIN_TIMEOUT`), 6.14 (no `READV_FIXED`) and a kernel without networking are `-ENOSYS`, answered by a supervisor thread through `SECCOMP_RET_USER_NOTIF`; no descriptor stays open; a nonexistent SQPOLL CPU stays `-EINVAL` (decision U1) |
 | `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise) as the default, SQPOLL and NAPI rings, then over the sim and the default ring again through the fault-injecting wrapper | Section 8 |
 | `engine` | integration | `INTEGRATION_TESTS` | Over the sim: attach NEW, RECOVER, JOIN; empty-store checks; a three-replica group commits, replies, checkpoints, fetches, restarts; STATUS emission; close and detach sequencing; max_clients admission at the primary |
 | `streams`, `snapshots` | integration | `INTEGRATION_TESTS` | Section 3 |
@@ -1736,6 +1742,7 @@ of `docs/io-design.md`:
 | `stream.h` (internal) | Units are chunks (`vsr_io_stream_unit` states READING, READY, SENT, DATA), the write queue (`vsr_io_stream_queued_write`, `writes` rings), handles and op ids (`VSR_IO_STREAM_OP_*`, `vsr_io_streams_op_kind`, `vsr_io_streams_handle`), `generation`, `ended`, `aborted`, `link_gone`, `end_*`, `send_end`, `closing`; `vsr_io_streams_deadline`; `vsr_io_streams_size` is ELIMIT beyond 65535 streams or window | 93, 95, 96, 97 |
 | `snapshot.h` (internal) | `vsr_io_snapshots_serve` returns OK to serve or the END status; `vsr_io_snapshots_stream_data` takes the DATA op id; `stream_end` is told for both sides of a library stream; weak stubs in stream.c until snapshot.c | 98 |
 | `link.h` (internal) | `vsr_io_link.recv_paused` and `recv_cancelled`; the shutdown slot also carries a paused receive's CANCEL (the teardown waits for it); a stream link whose frame waits is not closed for its held runs but paused, and its receive's `-ECANCELED` is not a loss | 99 |
+| `vsr-io.h` | `vsr_io_uring_init` names its refusals: `-ENOSYS` (no io_uring, or a kernel older than the baseline, including one whose setup refuses a flag with `EINVAL`), `-EPERM`, `-EINVAL` | U1 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

@@ -272,7 +272,10 @@ struct vsr_io_need {
 /* Executor state, one page-aligned region. Returns OK/EINVAL/ELIMIT. */
 int vsr_io_uring_layout(const struct vsr_io_uring_options *options,
                         struct vsr_io_need *need);
-/* memory must satisfy the layout; returns OK or a negative errno. */
+/* memory must satisfy the layout; returns OK or a negative errno: -ENOSYS
+ * for a kernel without io_uring or older than the baseline, -EPERM when
+ * io_uring is disabled for the caller, -EINVAL for options the kernel
+ * refuses. */
 int vsr_io_uring_init(void *memory, size_t size,
                       const struct vsr_io_uring_options *options,
                       struct vsr_io_executor *out);
