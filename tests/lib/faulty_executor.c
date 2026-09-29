@@ -29,6 +29,21 @@ static bool chance(struct faulty_executor *faulty, uint32_t ppm)
     return test_random_bounded(&faulty->random, PPM) < ppm;
 }
 
+/* The largest power of two dividing a request's offset and length, as a
+ * shift: a count in whole units of it keeps the request's alignment, so
+ * the rest of a short O_DIRECT or whole-block transfer stays aligned. */
+static uint8_t align_shift(uint64_t offset, uint32_t length)
+{
+    uint64_t bits = offset | length;
+    uint8_t shift = 0;
+
+    while (shift < 31u && (bits & 1u) == 0) {
+        bits >>= 1;
+        ++shift;
+    }
+    return shift;
+}
+
 /* Uniform in [1, value - 1]; value must be > 1. */
 static uint32_t shorter(struct faulty_executor *faulty, uint32_t value)
 {
@@ -53,6 +68,7 @@ static void remember(struct faulty_executor *faulty,
     record->user_data = sqe->user_data;
     record->opcode = sqe->opcode;
     record->flags = flags;
+    record->align_shift = align_shift(sqe->offset, sqe->length);
     faulty->record_next = (faulty->record_next + 1u) % FAULTY_EXECUTOR_RECORDS;
 }
 
@@ -100,10 +116,33 @@ static bool eio_eligible(uint8_t opcode)
            opcode == VSR_IO_SQE_FSYNC;
 }
 
-static bool is_held(const struct faulty_executor *faulty, uint64_t user_data)
+/* Completions whose relative order the caller relies on: those of one
+ * user_data; those naming one provided buffer, since where an incremental
+ * buffer's bytes lie follows from the order of its completions across
+ * every receive on the ring; and those of LINK chains, whose members
+ * complete in chain order (decision 62). Ids of different groups, and
+ * members of different chains, are ordered too, which is merely stricter:
+ * chained completions are never delayed on their own. */
+static bool ordered(const struct faulty_executor_held *earlier,
+                    const struct faulty_executor_held *later)
 {
-    for (uint32_t i = 0; i < faulty->held_count; ++i) {
-        if (faulty->held[i].cqe.user_data == user_data) {
+    const struct vsr_io_cqe *a = &earlier->cqe;
+    const struct vsr_io_cqe *b = &later->cqe;
+
+    return a->user_data == b->user_data ||
+           ((a->flags & b->flags & VSR_IO_CQE_BUFFER) != 0 &&
+            a->buffer_id == b->buffer_id) ||
+           (earlier->chained != 0 && later->chained != 0);
+}
+
+/* Whether the newest held entry is ordered after an earlier one. */
+static bool is_behind(const struct faulty_executor *faulty)
+{
+    const struct faulty_executor_held *newest =
+        &faulty->held[faulty->held_count - 1u];
+
+    for (uint32_t i = 0; i + 1u < faulty->held_count; ++i) {
+        if (ordered(&faulty->held[i], newest)) {
             return true;
         }
     }
@@ -126,7 +165,6 @@ static void admit(struct faulty_executor *faulty, const struct vsr_io_cqe *cqe)
         }
         return;
     }
-    behind = is_held(faulty, cqe->user_data);
     held = &faulty->held[faulty->held_count++];
     memset(held, 0, sizeof(*held));
     held->cqe = *cqe;
@@ -134,26 +172,35 @@ static void admit(struct faulty_executor *faulty, const struct vsr_io_cqe *cqe)
     if (record != NULL) {
         chained = (record->flags & RECORD_CHAINED) != 0;
     }
+    held->chained = chained ? 1u : 0u;
+    behind = is_behind(faulty);
     if (record != NULL && !chained) {
         uint16_t special = VSR_IO_CQE_BUFFER | VSR_IO_CQE_BUFFER_MORE |
                            VSR_IO_CQE_MORE | VSR_IO_CQE_NOTIF;
+        uint32_t units;
 
         if (eio_eligible(record->opcode) && held->cqe.result >= 0 &&
             chance(faulty, options->eio_ppm)) {
             held->cqe.result = -EIO;
             ++faulty->stats.eio;
         }
+        /* In whole units of the request's alignment: a file's rest is
+         * issued again at its offset, which O_DIRECT (and the store's
+         * whole-block writes) need aligned. */
+        units = held->cqe.result > 0
+                    ? (uint32_t)held->cqe.result >> record->align_shift
+                    : 0;
         if ((record->opcode == VSR_IO_SQE_READ ||
              record->opcode == VSR_IO_SQE_WRITE) &&
-            held->cqe.result > 1 && (held->cqe.flags & special) == 0 &&
+            units > 1 && (held->cqe.flags & special) == 0 &&
             (record->flags & RECORD_ZERO_COPY) == 0 &&
             chance(faulty, options->short_ppm)) {
             held->cqe.result =
-                (int32_t)shorter(faulty, (uint32_t)held->cqe.result);
+                (int32_t)(shorter(faulty, units) << record->align_shift);
             ++faulty->stats.shortened;
         }
     }
-    /* A completion behind an earlier one of its user_data waits for it
+    /* A completion behind an earlier one it is ordered after waits for it
      * anyway and is not held on its own account. */
     if (!chained && !behind && chance(faulty, options->delay_ppm)) {
         uint32_t most =
@@ -167,6 +214,44 @@ static void admit(struct faulty_executor *faulty, const struct vsr_io_cqe *cqe)
     }
 }
 
+/* The wait the inner executor must do for the caller's, given what the
+ * wrapper holds. Completions due now count toward `want` and, being
+ * available, end a batching window as the inner's own would. A delayed one
+ * becomes due only through reaps, so while one is held the wait does not
+ * block: the caller then sees an early return, as after a wake. */
+static void held_wait(const struct faulty_executor *faulty, uint32_t *want,
+                      uint64_t *min_wait_ns, uint64_t *deadline_ns)
+{
+    uint32_t due = faulty->held_count;
+
+    if (due == 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < faulty->held_count; ++i) {
+        if (faulty->held[i].reaps > 0) {
+            due = 0;
+            break;
+        }
+    }
+    if (due == 0 || due >= *want) {
+        *want = 0;
+        *min_wait_ns = 0;
+        *deadline_ns = 0;
+        return;
+    }
+    *want -= due;
+    if (*min_wait_ns > 0) {
+        uint64_t now = faulty->inner.ops->now(faulty->inner.ctx);
+        uint64_t end = *min_wait_ns > VSR_NO_DEADLINE - now
+                           ? VSR_NO_DEADLINE
+                           : now + *min_wait_ns;
+
+        if (end < *deadline_ns) {
+            *deadline_ns = end;
+        }
+    }
+}
+
 static int faulty_submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
                                   uint32_t count, uint32_t want,
                                   uint64_t min_wait_ns, uint64_t deadline_ns)
@@ -177,7 +262,14 @@ static int faulty_submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
     bool tail_linked = false;
     bool follows_link = false;
     uint32_t total = count;
+    uint32_t shortened = 0;
+    int rc;
 
+    if (count > 0 && sqes == NULL) {
+        /* Refused by the inner executor, as it would be bare. */
+        return faulty->inner.ops->submit_and_wait(
+            faulty->inner.ctx, sqes, count, want, min_wait_ns, deadline_ns);
+    }
     for (uint32_t i = 0; i < count; ++i) {
         if (sqes[i].user_data == FAULTY_EXECUTOR_USER_DATA) {
             return -EINVAL;
@@ -213,17 +305,16 @@ static int faulty_submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
         }
         if (shortenable(sqe) && chance(faulty, faulty->options.short_ppm)) {
             faulty->batch[i].length = shorter(faulty, sqe->length);
-            ++faulty->stats.shortened;
+            ++shortened;
         }
     }
-    if (faulty->held_count > 0) {
-        /* Held completions need reaps, not waiting. */
-        want = 0;
-        min_wait_ns = 0;
-        deadline_ns = 0;
+    held_wait(faulty, &want, &min_wait_ns, &deadline_ns);
+    rc = faulty->inner.ops->submit_and_wait(faulty->inner.ctx, forward, total,
+                                            want, min_wait_ns, deadline_ns);
+    if (rc == 0) {
+        faulty->stats.shortened += shortened;
     }
-    return faulty->inner.ops->submit_and_wait(faulty->inner.ctx, forward, total,
-                                              want, min_wait_ns, deadline_ns);
+    return rc;
 }
 
 static uint32_t faulty_reap(void *ctx, struct vsr_io_cqe *cqes,
@@ -252,13 +343,13 @@ static uint32_t faulty_reap(void *ctx, struct vsr_io_cqe *cqes,
         }
     }
     /* Deliver in arrival order what is due and not behind an undelivered
-     * completion of the same user_data. */
+     * completion it is ordered after. */
     for (uint32_t i = 0; i < faulty->held_count; ++i) {
         struct faulty_executor_held entry = faulty->held[i];
         bool keep = entry.reaps > 0 || delivered == capacity;
 
         for (uint32_t j = 0; !keep && j < kept; ++j) {
-            keep = faulty->held[j].cqe.user_data == entry.cqe.user_data;
+            keep = ordered(&faulty->held[j], &entry);
         }
         if (keep) {
             faulty->held[kept++] = entry;

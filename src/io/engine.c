@@ -268,7 +268,7 @@ static int engine_plan(const struct vsr_io_options *options,
     }
     /* Deadline handles: links + nodes + 4 * replicas + streams. */
     capacity = 0;
-    for (uint16_t kind = 0; kind < VSR_IO_DEADLINE_KINDS; ++kind) {
+    for (uint16_t kind = 0; kind < (uint16_t)VSR_IO_DEADLINE_KINDS; ++kind) {
         if (!vsr_size_add(capacity, deadline_count(limits, kind), &capacity)) {
             return VSR_ELIMIT;
         }
@@ -384,7 +384,7 @@ static void bind_deadlines(struct vsr_io *io)
 {
     const struct vsr_io_limits *limits = &io->options.limits;
 
-    for (uint16_t kind = 0; kind < VSR_IO_DEADLINE_KINDS; ++kind) {
+    for (uint16_t kind = 0; kind < (uint16_t)VSR_IO_DEADLINE_KINDS; ++kind) {
         uint32_t base = deadline_base(limits, kind);
         uint32_t count = deadline_count(limits, kind);
 

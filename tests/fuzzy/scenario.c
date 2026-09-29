@@ -820,7 +820,7 @@ static void send_check_epoch(struct simulation *s, uint32_t index)
     CHECK(result.result == VSR_OK || result.result == VSR_AGAIN);
 }
 
-static void membership(struct simulation *s)
+static void membership_step(struct simulation *s)
 {
     uint32_t kind = choose(s, 8);
     uint32_t index = choose(s, s->count);
@@ -847,10 +847,10 @@ static void membership(struct simulation *s)
         propose(s, index);
 }
 
-static void event(struct simulation *s)
+static void random_event(struct simulation *s)
 {
     if (flag(s, SCENARIO_MEMBERSHIP) && choose(s, 8) == 0) {
-        membership(s);
+        membership_step(s);
         return;
     }
     uint32_t action = choose(s, 24);
@@ -1102,7 +1102,7 @@ static void heal(struct simulation *s)
     CHECK(false);
 }
 
-static void warm(struct simulation *s)
+static void warm_up(struct simulation *s)
 {
     for (uint32_t i = 0; i < 16; ++i) {
         uint32_t client = i % CLIENTS;
@@ -1197,9 +1197,9 @@ void scenario_run(const struct scenario_options *options,
         s.requests[i] = 1;
     CHECK(mem_cluster_run(s.cluster, 100000) < 100000);
     if (flag(&s, SCENARIO_WARM))
-        warm(&s);
+        warm_up(&s);
     for (s.step = 0; s.step < options->steps; ++s.step) {
-        event(&s);
+        random_event(&s);
         check(&s);
     }
     heal(&s);

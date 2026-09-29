@@ -182,7 +182,7 @@ int vsr_client_init(void *memory, size_t size,
         *out = NULL;
         return VSR_EINVAL;
     }
-    if (overlaps(memory, size, out, sizeof(*out))) {
+    if (overlaps(memory, size, out, sizeof(struct vsr_client *))) {
         return VSR_EINVAL;
     }
     *out = NULL;

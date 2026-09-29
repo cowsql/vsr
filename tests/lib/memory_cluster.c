@@ -153,6 +153,9 @@ static _Noreturn void oracle_fail(const struct mem_node *node,
         fprintf(stderr, " op %" PRIu64 " type %" PRIu32, op->id, op->type);
     fputs(": ", stderr);
     va_start(arguments, format);
+    /* False positive: clang-tidy 18 reports it only for a file that the
+     * compilation database lists twice (the extended fuzz cluster).
+     * NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
     vfprintf(stderr, format, arguments);
     va_end(arguments);
     fputc('\n', stderr);
@@ -284,7 +287,7 @@ struct mem_node *mem_cluster_add(struct mem_cluster *cluster,
     mem_node_output_capacity(node, 16);
     CHECK(node_init(node) == VSR_OK);
     cluster->nodes = resize(cluster->nodes, cluster->node_count + 1,
-                            sizeof(*cluster->nodes));
+                            sizeof(struct mem_node *));
     cluster->nodes[cluster->node_count++] = node;
     return node;
 }
@@ -373,7 +376,7 @@ static void outputs_accept(struct mem_node *node,
         mem_graph_watch_sources(effect->graph);
         effect->op = mem_clone_op(effect->graph, op);
         node->effects = resize(node->effects, node->effect_count + 1,
-                               sizeof(*node->effects));
+                               sizeof(struct mem_effect *));
         node->effects[node->effect_count++] = effect;
     }
 }
@@ -604,8 +607,8 @@ static void history_record(struct mem_node *node, const struct vsr_entry *entry)
     }
     CHECK(entry->op == node->history_count + 1);
     /* This independent history is never truncated, including on crash/replay. */
-    node->history =
-        resize(node->history, node->history_count + 1, sizeof(*node->history));
+    node->history = resize(node->history, node->history_count + 1,
+                           sizeof(const struct vsr_entry *));
     node->history[node->history_count++] =
         mem_clone(node->history_graph, MEM_ENTRY, entry);
 }
@@ -789,7 +792,7 @@ static void observe_store(struct mem_node *node, uint64_t first)
                 CHECK(op == node->committed_count + 1);
                 node->committed_history =
                     resize(node->committed_history, node->committed_count + 1,
-                           sizeof(*node->committed_history));
+                           sizeof(const struct vsr_entry *));
                 node->committed_history[node->committed_count++] =
                     mem_clone(node->history_graph, MEM_ENTRY, entry);
             }
@@ -1228,7 +1231,7 @@ snapshot_capture(struct mem_node *node, const struct vsr_snapshot_task *task)
         snapshot->image = node->cluster->application->capture(
             node->application, &snapshot->image_size);
     snapshot->history = mem_graph_alloc(snapshot->graph, (size_t)task->op,
-                                        sizeof(*snapshot->history));
+                                        sizeof(const struct vsr_entry *));
     for (uint64_t i = 0; i < task->op; i++)
         snapshot->history[(size_t)i] =
             mem_clone(snapshot->graph, MEM_ENTRY, node->history[(size_t)i]);
@@ -1236,7 +1239,7 @@ snapshot_capture(struct mem_node *node, const struct vsr_snapshot_task *task)
     struct mem_cluster *cluster = node->cluster;
     const size_t count = cluster->snapshot_count;
     struct mem_snapshot **snapshots =
-        resize(cluster->snapshots, count + 1, sizeof(*snapshots));
+        resize(cluster->snapshots, count + 1, sizeof(struct mem_snapshot *));
     snapshots[count] = snapshot;
     cluster->snapshots = snapshots;
     cluster->snapshot_count = count + 1;
@@ -1491,7 +1494,7 @@ struct mem_step mem_node_notify(struct mem_node *node, size_t index, int status,
     effect_destroy(effect);
     if (index + 1 < node->effect_count)
         memmove(&node->effects[index], &node->effects[index + 1],
-                (node->effect_count - index - 1) * sizeof(*node->effects));
+                (node->effect_count - index - 1) * sizeof(struct mem_effect *));
     node->effect_count--;
     node->completed++;
     check_stopped(node);

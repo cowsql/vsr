@@ -340,7 +340,7 @@ static void test_backpressure_and_bounded_steps(void)
     struct request_input requests[2];
     request_init(&requests[0], 1, 81);
     request_init(&requests[1], 2, 82);
-    struct vsr_op output[1];
+    struct vsr_op output[1] = {{0}};
     struct vsr_update update = {.ops = output, .capacity = 1};
     uint64_t operation = 0;
     bool consumed = false;
@@ -392,7 +392,7 @@ static void test_completion_reservation_and_fatal_failure(void)
     vsr_operation_publish(fixture.v, operation);
     CHECK(fixture.v->reserved_leases == 1);
     CHECK(fixture.v->reserved_bytes == fixture.options.limits.result_bytes);
-    struct vsr_op output[8];
+    struct vsr_op output[8] = {{0}};
     struct vsr_update update = {.ops = output, .capacity = 8};
     CHECK(vsr_step(fixture.v, NULL, &update) == VSR_OK);
     CHECK(update.count == 1 && output[0].type == VSR_OP_LOAD);
@@ -449,7 +449,7 @@ static void test_inconsistent_completion_is_consumed(void)
     CHECK(operation != NULL);
     CHECK(vsr_operation_copy(operation, &apply) == VSR_OK);
     vsr_operation_publish(fixture.v, operation);
-    struct vsr_op outputs[8];
+    struct vsr_op outputs[8] = {{0}};
     struct vsr_update update = {.ops = outputs, .capacity = 8};
     CHECK(vsr_step(fixture.v, NULL, &update) == VSR_OK);
     CHECK(update.count == 1 && outputs[0].type == VSR_OP_APPLY);

@@ -852,7 +852,9 @@ struct vsr_io_store_options {
     uint64_t cache_bytes;        /* Tail ring, a multiple of block_bytes and at
                                least write_behind_bytes + the core's
                                pinned_payload_bytes + twice the largest
-                               record, so a held STORE always proceeds. */
+                               record + twice the segment header +
+                               block_bytes, so a held STORE always
+                               proceeds. */
     uint8_t direct_io;           /* Default 1. */
     uint8_t sync_mode;           /* enum vsr_io_sync_mode */
     uint8_t on_write_error;      /* enum vsr_io_write_error */
