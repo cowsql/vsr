@@ -271,7 +271,12 @@ struct vsr_io_recovery {
     uint64_t load_op;       /* The RECOVERY load op to complete. */
 };
 
+struct vsr_io_replica;
+
 struct vsr_io_store {
+    struct vsr_io_replica *replica; /* The replica embedding the store (set
+                                       by init): LOAD results take its
+                                       leases and its engine's pool. */
     struct vsr_io_store_options options;
     struct vsr_limits limits;
     uint32_t state;      /* enum vsr_io_store_state */
@@ -445,6 +450,8 @@ int vsr_io_store_size(const struct vsr_io_store_options *options,
                       const struct vsr_limits *limits, uint32_t regions,
                       size_t *metadata_bytes, size_t *metadata_alignment,
                       size_t *tail_bytes, size_t *tail_alignment);
+/* `store` must be the `store` member of a vsr_io_replica, which init
+ * records in store->replica. */
 void vsr_io_store_init(struct vsr_io_store *store, void *metadata,
                        size_t metadata_size, void *tail, size_t tail_size,
                        const struct vsr_io_store_options *options,

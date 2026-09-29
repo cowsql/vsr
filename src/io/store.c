@@ -507,6 +507,12 @@ void vsr_io_store_init(struct vsr_io_store *store, void *metadata,
     (void)tail_size;
     memset(store, 0, sizeof(*store));
     memset(base, 0, plan.total);
+    /* The store is only ever a member of a replica (engine attach, and
+     * the unit tests' replicas): the back-pointer is computed once. */
+    store->replica =
+        (struct vsr_io_replica *)(void *)((unsigned char *)store -
+                                          offsetof(struct vsr_io_replica,
+                                                   store));
     store->options = *options;
     store->limits = *limits;
     store->state = VSR_IO_STORE_CLOSED;
@@ -610,13 +616,10 @@ bool vsr_io_store_next_completion(struct vsr_io_store *store,
 }
 
 /* The replica embedding the store: LOAD results need its lease table and
- * its engine's pool, and the store is only ever a member of a replica
- * (engine attach, and the unit test's replica 0). */
+ * its engine's pool. */
 static struct vsr_io_replica *store_replica(struct vsr_io_store *store)
 {
-    return (struct vsr_io_replica *)(void *)((unsigned char *)store -
-                                             offsetof(struct vsr_io_replica,
-                                                      store));
+    return store->replica;
 }
 
 static struct vsr_io_pending_store *stores_at(struct vsr_io_store *store,
