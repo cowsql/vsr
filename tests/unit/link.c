@@ -730,6 +730,9 @@ static void deliver(struct engine *e)
         while (sock->used && sock->owner == e->index && sock->recv_armed) {
             uint32_t take;
 
+            if (e->cq_count + 4 > CQ_CAP) {
+                return; /* The completion queue is full; next step. */
+            }
             if (sock->reset) {
                 sock->recv_armed = false;
                 complete(e, sock->recv_ud, -ECONNRESET, 0, 0);
@@ -2441,10 +2444,927 @@ static void test_capacity(void)
     engine_forget(b);
 }
 
+/* -------------------------------------------------------------------------
+ * Receive framing and MESSAGE delivery
+ * ---------------------------------------------------------------------- */
+
+#define REGIONS 4u
+#define REGION_BYTES 8192u
+#define OPERATIONS 4u
+#define SCRATCH_BYTES (2u * PAGE)
+#define FRAME_FIXED                                                            \
+    160u /* Header 24, envelope 56, PREPARE 8, ENTRIES 8,
+                            ENTRY 56, BLOB 8. */
+#define PAYLOAD_MAX (PAGE - FRAME_FIXED) /* The frame then fills a slab. */
+#define WALK_ROUNDS 160u
+#define WALK_BATCH_BYTES (3u * PAGE)
+#define WALK_PENDING 64u
+
+static struct vsr_io_lease leases[REGIONS];
+static struct vsr_io_queued_event messages[REGIONS];
+static struct vsr_io_queued_event completions[OPERATIONS];
+static _Alignas(16) unsigned char regions[REGIONS][REGION_BYTES];
+
+/* A replica shell for delivery, the way tests/unit/engine_tables.c sets
+ * one up: the tables are the test's. The limits admit a PREPARE whose
+ * frame fills a slab. */
+static struct vsr_io_replica *open_replica(struct engine *e, uint32_t index,
+                                           struct vsr_id id)
+{
+    struct vsr_io_replica *replica = &e->io->replicas[index];
+    size_t region = 0;
+
+    CHECK(replica->io == e->io && replica->index == index);
+    CHECK(replica->state == VSR_IO_REPLICA_FREE);
+    replica->state = VSR_IO_REPLICA_RUNNING;
+    replica->options.cluster = id;
+    replica->options.limits.operations = OPERATIONS;
+    replica->options.limits.members = 3;
+    replica->options.limits.batch_entries = 4;
+    replica->options.limits.spans_per_blob = 1;
+    replica->options.limits.command_bytes = PAGE;
+    replica->options.limits.result_bytes = 64;
+    replica->options.limits.manifest_bytes = 64;
+    replica->options.limits.message_bytes = PAGE;
+    CHECK(vsr_io_codec_message_region(&replica->options.limits, &region) ==
+          VSR_OK);
+    CHECK(region <= REGION_BYTES);
+    replica->regions_count = REGIONS;
+    memset(leases, 0, sizeof(leases));
+    for (uint32_t i = 0; i < REGIONS; ++i) {
+        leases[i].slab = NONE;
+        leases[i].pin = NONE;
+        leases[i].region.base = regions[i];
+        leases[i].region.size = REGION_BYTES;
+    }
+    replica->leases = leases;
+    replica->leases_free = REGIONS;
+    memset(messages, 0, sizeof(messages));
+    replica->messages = messages;
+    replica->messages_head = 0;
+    replica->messages_count = 0;
+    memset(completions, 0, sizeof(completions));
+    replica->completions = completions;
+    replica->completions_head = 0;
+    replica->completions_count = 0;
+    e->io->replicas_count++;
+    return replica;
+}
+
+/* The test's message: a PREPARE carrying one COMMAND entry of `size`
+ * payload bytes derived from `number`, or an envelope-only PREPARE_OK
+ * when size is NONE. */
+struct sample {
+    struct vsr_message message;
+    struct vsr_prepare prepare;
+    struct vsr_entry entry;
+    struct vsr_blob blob;
+    struct vsr_span span;
+    unsigned char payload[PAGE];
+};
+
+static unsigned char payload_byte(uint64_t number, uint32_t i)
+{
+    return (unsigned char)(number * 31 + (uint64_t)i * 7 + 1);
+}
+
+static void sample_init(struct sample *s, struct vsr_id id, uint64_t from,
+                        uint64_t number, uint32_t size)
+{
+    memset(s, 0, sizeof(*s));
+    s->message.cluster = id;
+    s->message.epoch = 1;
+    s->message.view = 2;
+    s->message.from = from;
+    s->message.number = number;
+    if (size == NONE) {
+        s->message.type = VSR_MSG_PREPARE_OK;
+        return;
+    }
+    CHECK(size <= PAYLOAD_MAX);
+    s->message.type = VSR_MSG_PREPARE;
+    s->message.body = &s->prepare;
+    s->prepare.committed = number;
+    s->prepare.batch.entries = &s->entry;
+    s->prepare.batch.count = 1;
+    s->entry.op = number;
+    s->entry.epoch = 1;
+    s->entry.view = 2;
+    s->entry.request.client.hi = 7;
+    s->entry.request.client.lo = number;
+    s->entry.request.number = number;
+    s->entry.type = VSR_REQUEST_COMMAND;
+    s->entry.body = &s->blob;
+    for (uint32_t i = 0; i < size; ++i) {
+        s->payload[i] = payload_byte(number, i);
+    }
+    s->span.data = s->payload;
+    s->span.size = size;
+    s->blob.spans = size > 0 ? &s->span : NULL;
+    s->blob.size = size;
+    s->blob.count = size > 0 ? 1 : 0;
+}
+
+/* Frame bytes of a sample of `size`. */
+static size_t frame_bytes(uint32_t size)
+{
+    if (size == NONE) {
+        return VSR_IO_FRAME_HEADER_BYTES + sizeof(struct vsr_io_wire_message);
+    }
+    return FRAME_FIXED + ((size + 7u) & ~7u);
+}
+
+/* Encodes a MESSAGE frame, header and body, into `out` with the codec's
+ * encoder; returns the frame's bytes. */
+static size_t encode_message(unsigned char *out,
+                             const struct vsr_message *message,
+                             const struct vsr_limits *limits)
+{
+    static unsigned char headers[1024];
+    struct vsr_io_writer writer = {headers, sizeof(headers), 0};
+    struct vsr_io_encoder encoder;
+    struct vsr_io_vec vecs[16];
+    uint32_t length = 0;
+    uint32_t crc = 0;
+    uint32_t count = 0;
+    bool done = false;
+    size_t used = 0;
+
+    CHECK(vsr_io_codec_message_digest(message, limits, &length, &crc) ==
+          VSR_OK);
+    vsr_io_encoder_begin(&encoder, message, length, crc);
+    CHECK(vsr_io_encoder_emit(&encoder, &writer, vecs, 16, &count,
+                              SCRATCH_BYTES, &done) == VSR_OK);
+    CHECK(done && count > 0);
+    for (uint32_t i = 0; i < count; ++i) {
+        CHECK(used + vecs[i].length <= SCRATCH_BYTES);
+        memcpy(out + used, vecs[i].base, vecs[i].length);
+        used += vecs[i].length;
+    }
+    CHECK(used == VSR_IO_FRAME_HEADER_BYTES + length);
+    return used;
+}
+
+/* A sample's frame into `out`. */
+static size_t put_sample(unsigned char *out, const struct vsr_limits *limits,
+                         struct vsr_id id, uint64_t from, uint64_t number,
+                         uint32_t size)
+{
+    struct sample s;
+    size_t n;
+
+    sample_init(&s, id, from, number, size);
+    n = encode_message(out, &s.message, limits);
+    CHECK(n == frame_bytes(size));
+    return n;
+}
+
+/* The next delivered MESSAGE of the replica, checked against the sample
+ * it must be; returns its lease. */
+static uint32_t take_message(struct vsr_io_replica *replica, uint64_t from,
+                             uint64_t number, uint32_t size)
+{
+    struct vsr_io_queued_event *queued;
+    const struct vsr_message *m;
+    uint32_t lease;
+
+    CHECK(replica->messages_count > 0);
+    queued = &replica->messages[replica->messages_head];
+    replica->messages_head =
+        (replica->messages_head + 1) % replica->regions_count;
+    replica->messages_count--;
+    CHECK(queued->event.type == VSR_EVENT_MESSAGE);
+    CHECK(queued->kind == VSR_IO_EVENT_CORE);
+    lease = queued->lease;
+    CHECK(lease < REGIONS && leases[lease].state == 1);
+    CHECK(queued->event.lease == vsr_io_lease_id(replica, lease));
+    m = queued->event.data;
+    CHECK(m->cluster.hi == replica->options.cluster.hi);
+    CHECK(m->cluster.lo == replica->options.cluster.lo);
+    CHECK(m->from == from && m->number == number);
+    CHECK(m->epoch == 1 && m->view == 2);
+    if (size == NONE) {
+        CHECK(m->type == VSR_MSG_PREPARE_OK && m->body == NULL);
+        return lease;
+    }
+    {
+        const struct vsr_prepare *p = m->body;
+        const struct vsr_blob *blob;
+
+        CHECK(m->type == VSR_MSG_PREPARE && p != NULL);
+        CHECK(p->committed == number && p->batch.count == 1);
+        CHECK(p->batch.entries[0].op == number);
+        CHECK(p->batch.entries[0].type == VSR_REQUEST_COMMAND);
+        CHECK(p->batch.entries[0].request.client.lo == number);
+        blob = p->batch.entries[0].body;
+        CHECK(blob != NULL && blob->size == size);
+        if (size == 0) {
+            CHECK(blob->count == 0);
+        } else {
+            const unsigned char *data;
+
+            CHECK(blob->count == 1 && blob->spans[0].size == size);
+            data = blob->spans[0].data;
+            /* Zero copy: the span points into the pool, at the lease's
+             * slab. */
+            CHECK(vsr_io_pool_contains(&replica->io->pool, data, size));
+            CHECK(vsr_io_pool_locate(&replica->io->pool, data) ==
+                  leases[lease].slab);
+            for (uint32_t i = 0; i < size; ++i) {
+                CHECK(data[i] == payload_byte(number, i));
+            }
+        }
+    }
+    return lease;
+}
+
+/* Bytes the peer wrote that the engine has not received yet. */
+static uint32_t peer_unread(uint32_t peer)
+{
+    const struct sock *sock = &world.socks[peer];
+
+    CHECK(sock->used && sock->peer != NONE);
+    return world.socks[sock->peer].inbox_len;
+}
+
+static uint32_t pool_refs(const struct engine *e)
+{
+    uint32_t refs = 0;
+
+    for (uint32_t i = 0; i < SLABS; ++i) {
+        refs += e->io->pool.entries[i].refs;
+    }
+    return refs;
+}
+
+/* The kernel retires the ring's n-th buffer after `bytes` more bytes, so
+ * a delivery continues in the following one. */
+static void ring_cut(struct engine *e, uint32_t n, uint32_t bytes)
+{
+    struct ring_entry *entry = &e->ring[(e->ring_head + n) % RING_ENTRIES];
+
+    CHECK(n < e->ring_count && bytes > 0);
+    CHECK(entry->consumed + bytes <= entry->length);
+    entry->length = entry->consumed + bytes;
+}
+
+static uint32_t ring_room(const struct engine *e, uint32_t n)
+{
+    const struct ring_entry *entry =
+        &e->ring[(e->ring_head + n) % RING_ENTRIES];
+
+    CHECK(n < e->ring_count);
+    return entry->length - entry->consumed;
+}
+
+/* A test-owned peer presenting itself as `node` links to e in TRUSTED
+ * mode; e's HELLO is read off the peer. */
+static uint32_t peer_link(struct engine *e, uint64_t node)
+{
+    unsigned char bytes[VSR_IO_PREAMBLE_BYTES + HELLO_BYTES];
+    unsigned char hello[HELLO_BYTES];
+    uint32_t peer = peer_connect(e);
+    size_t n;
+
+    n = put_preamble(bytes);
+    n += put_hello(bytes + n, VSR_IO_HANDSHAKE_TRUSTED, VSR_IO_PURPOSE_PEER,
+                   node, 5);
+    peer_write(peer, bytes, n);
+    world_settle();
+    CHECK(link_to(e, node, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED) != NULL);
+    CHECK(peer_read(peer, hello, sizeof(hello)) == HELLO_BYTES);
+    return peer;
+}
+
+/* Engine 0 as node 2 with one replica of `cluster`, linked from a
+ * test-owned peer that is node 1, authorized as replica 1. */
+struct receiver {
+    struct engine *e;
+    struct vsr_io_replica *replica;
+    const struct vsr_limits *limits;
+    const struct vsr_io_link *link;
+    uint32_t peer;
+};
+
+/* Read through a call so that a static checker cannot fold a comparison
+ * across the world's steps. */
+static uint64_t reassembled_count(const struct receiver *r)
+{
+    return r->e->io->links.reassembled;
+}
+
+static void receiver_relink(struct receiver *r)
+{
+    r->peer = peer_link(r->e, 1);
+    r->link = link_to(r->e, 1, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED);
+    CHECK(r->link != NULL);
+}
+
+static void receiver_open(struct receiver *r, uint64_t seed)
+{
+    world_reset(seed);
+    r->e = engine_open(0, 2, VSR_IO_HANDSHAKE_TRUSTED);
+    CHECK(vsr_io_links_node_set(r->e->io, 1, NULL) == VSR_OK);
+    world_settle();
+    receiver_relink(r);
+    r->replica = open_replica(r->e, 0, cluster);
+    r->limits = &r->replica->options.limits;
+    CHECK(vsr_io_links_authorize(r->e->io, cluster, 1, 1) == VSR_OK);
+    world_settle();
+    CHECK(pool_refs(r->e) == 1); /* The link's send slab. */
+}
+
+/* Nothing held on the link and the pool's references are the link's send
+ * slab plus `outstanding` message leases and `taken` slabs of the test. */
+static void check_drained(const struct receiver *r, uint32_t outstanding,
+                          uint32_t taken)
+{
+    const struct vsr_io_link *link = r->link;
+
+    CHECK(link->state == VSR_IO_LINK_ESTABLISHED);
+    CHECK(link->partial_length == 0 && link->partial_slab == NONE);
+    CHECK(link->held_count == 0 && link->reassembly_slab == NONE);
+    CHECK(!link->retry && r->e->io->links.retries_due == 0);
+    CHECK(pool_refs(r->e) == 1 + outstanding + taken);
+}
+
+/* One frame written, delivered and released; `reassembled` says whether
+ * it had to be copied. */
+static void deliver_one(struct receiver *r, const unsigned char *frame,
+                        size_t n, uint64_t number, uint32_t size,
+                        bool reassembled)
+{
+    uint64_t before = r->e->io->links.reassembled;
+    uint32_t lease;
+
+    peer_write(r->peer, frame, n);
+    world_settle();
+    CHECK(r->e->io->links.reassembled == before + (reassembled ? 1 : 0));
+    CHECK(r->replica->messages_count == 1);
+    lease = take_message(r->replica, 1, number, size);
+    CHECK(pool_refs(r->e) == 2);
+    vsr_io_lease_release(r->replica, lease);
+    check_drained(r, 0, 0);
+    CHECK(r->e->io->links.nodes[0].last_received_ns == world.now);
+}
+
+/* Frames split at every byte boundary across two and three slabs,
+ * including the header's, with and without random slicing within a
+ * slab. */
+static void test_receive_splits(void)
+{
+    struct receiver r;
+    unsigned char frame[SCRATCH_BYTES];
+    uint64_t number = 0;
+    size_t na = frame_bytes(100);
+    size_t nb = frame_bytes(NONE);
+    size_t n;
+
+    receiver_open(&r, 21);
+    /* One frame across two slabs, every boundary. */
+    for (uint32_t slice = 0; slice < 2; ++slice) {
+        world.slice_max = slice == 0 ? 0 : 7;
+        for (uint32_t p = 1; p < na; ++p) {
+            n = put_sample(frame, r.limits, cluster, 1, ++number, 100);
+            ring_cut(r.e, 0, p);
+            deliver_one(&r, frame, n, number, 100, true);
+        }
+    }
+    world.slice_max = 0;
+    /* A two-frame stream split at every byte: the second frame is
+     * decoded in place in the second slab (a split exactly between the
+     * frames copies nothing). */
+    for (uint32_t p = 1; p < na + nb; ++p) {
+        uint64_t before = r.e->io->links.reassembled;
+        uint32_t lease;
+
+        n = put_sample(frame, r.limits, cluster, 1, number + 1, 100);
+        n += put_sample(frame + n, r.limits, cluster, 1, number + 2, NONE);
+        ring_cut(r.e, 0, p);
+        peer_write(r.peer, frame, n);
+        world_settle();
+        CHECK(r.e->io->links.reassembled == before + (p == na ? 0 : 1));
+        CHECK(r.replica->messages_count == 2);
+        lease = take_message(r.replica, 1, number + 1, 100);
+        vsr_io_lease_release(r.replica, lease);
+        lease = take_message(r.replica, 1, number + 2, NONE);
+        vsr_io_lease_release(r.replica, lease);
+        check_drained(&r, 0, 0);
+        number += 2;
+    }
+    /* Three slabs: the second holds q bytes of the frame. */
+    for (uint32_t p = 1; p < na; ++p) {
+        static const uint32_t cuts[] = {1, 7, 8, 9, 16, 23, 24, 25, 56, 100};
+
+        for (uint32_t c = 0; c < sizeof(cuts) / sizeof(cuts[0]); ++c) {
+            uint32_t q = cuts[c];
+
+            if (p + q >= na) {
+                continue;
+            }
+            n = put_sample(frame, r.limits, cluster, 1, ++number, 100);
+            ring_cut(r.e, 0, p);
+            ring_cut(r.e, 1, q);
+            deliver_one(&r, frame, n, number, 100, true);
+        }
+    }
+    /* The header alone across three slabs, one byte in the middle. */
+    for (uint32_t p = 1; p + 1 < VSR_IO_FRAME_HEADER_BYTES; ++p) {
+        n = put_sample(frame, r.limits, cluster, 1, ++number, 8);
+        ring_cut(r.e, 0, p);
+        ring_cut(r.e, 1, 1);
+        deliver_one(&r, frame, n, number, 8, true);
+    }
+    peer_close(r.peer);
+    world_settle();
+    check_quiet(r.e);
+    CHECK(pool_refs(r.e) == 0);
+    engine_forget(r.e);
+}
+
+/* Many frames in one slab, a frame ending exactly at a slab's end, and
+ * frames that fill a whole slab. */
+static void test_receive_fill(void)
+{
+    struct receiver r;
+    static unsigned char frame[INBOX_BYTES];
+    uint64_t number = 0;
+    uint64_t before;
+    uint32_t lease;
+    uint32_t room;
+    size_t n = 0;
+
+    receiver_open(&r, 22);
+    /* 40 envelope-only frames in one write, all within the slab: they are
+     * delivered in order, REGIONS at a time, the rest waiting in place. */
+    for (uint32_t i = 0; i < 40; ++i) {
+        n += put_sample(frame + n, r.limits, cluster, 1, ++number, NONE);
+    }
+    CHECK(n <= ring_room(r.e, 0));
+    before = r.e->io->links.reassembled;
+    peer_write(r.peer, frame, n);
+    for (uint64_t taken = 0; taken < 40;) {
+        world_settle();
+        CHECK(r.replica->messages_count ==
+              (40 - taken < REGIONS ? 40 - taken : REGIONS));
+        CHECK(r.link->retry == (40 - taken > REGIONS));
+        CHECK(pool_refs(r.e) ==
+              1 + r.replica->messages_count + (r.link->retry ? 1 : 0));
+        while (r.replica->messages_count > 0) {
+            lease = take_message(r.replica, 1, ++taken, NONE);
+            vsr_io_lease_release(r.replica, lease);
+        }
+    }
+    world_settle();
+    CHECK(reassembled_count(&r) == before);
+    check_drained(&r, 0, 0);
+    /* A frame ending exactly at the slab's end needs no copy; the frame
+     * after it starts the next slab. */
+    room = ring_room(r.e, 0);
+    CHECK(room > FRAME_FIXED + 8 && room % 8 == 0);
+    n = put_sample(frame, r.limits, cluster, 1, number + 1, room - FRAME_FIXED);
+    CHECK(n == room);
+    n += put_sample(frame + n, r.limits, cluster, 1, number + 2, NONE);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(reassembled_count(&r) == before);
+    CHECK(r.replica->messages_count == 2);
+    lease = take_message(r.replica, 1, number + 1, room - FRAME_FIXED);
+    vsr_io_lease_release(r.replica, lease);
+    lease = take_message(r.replica, 1, number + 2, NONE);
+    vsr_io_lease_release(r.replica, lease);
+    check_drained(&r, 0, 0);
+    number += 2;
+    /* Two slab-sized frames back to back: each straddles and is copied
+     * whole; the payload arrives byte-identical. */
+    CHECK(frame_bytes(PAYLOAD_MAX) == PAGE);
+    n = put_sample(frame, r.limits, cluster, 1, number + 1, PAYLOAD_MAX);
+    n += put_sample(frame + n, r.limits, cluster, 1, number + 2, PAYLOAD_MAX);
+    CHECK(ring_room(r.e, 0) < PAGE);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(r.e->io->links.reassembled == before + 2);
+    CHECK(r.replica->messages_count == 2);
+    lease = take_message(r.replica, 1, number + 1, PAYLOAD_MAX);
+    vsr_io_lease_release(r.replica, lease);
+    lease = take_message(r.replica, 1, number + 2, PAYLOAD_MAX);
+    vsr_io_lease_release(r.replica, lease);
+    check_drained(&r, 0, 0);
+    number += 2;
+    /* A slab-sized frame that starts a fresh slab fills it exactly and is
+     * decoded in place. */
+    room = ring_room(r.e, 0);
+    n = put_sample(frame, r.limits, cluster, 1, number + 1, room - FRAME_FIXED);
+    n += put_sample(frame + n, r.limits, cluster, 1, number + 2, PAYLOAD_MAX);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(r.e->io->links.reassembled == before + 2);
+    CHECK(r.replica->messages_count == 2);
+    lease = take_message(r.replica, 1, number + 1, room - FRAME_FIXED);
+    vsr_io_lease_release(r.replica, lease);
+    lease = take_message(r.replica, 1, number + 2, PAYLOAD_MAX);
+    vsr_io_lease_release(r.replica, lease);
+    check_drained(&r, 0, 0);
+    peer_close(r.peer);
+    world_settle();
+    check_quiet(r.e);
+    CHECK(pool_refs(r.e) == 0);
+    engine_forget(r.e);
+}
+
+/* Every free slab taken by the test, until released. */
+static uint32_t pool_dry(struct engine *e, uint32_t *taken)
+{
+    uint32_t count = 0;
+
+    for (;;) {
+        uint32_t slab = vsr_io_pool_acquire(&e->io->pool, false);
+
+        if (slab == NONE) {
+            break;
+        }
+        CHECK(count < SLABS);
+        taken[count++] = slab;
+    }
+    CHECK(e->io->pool.free_count == 0);
+    return count;
+}
+
+static void pool_refill(struct engine *e, uint32_t *taken, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i) {
+        vsr_io_pool_release(&e->io->pool, taken[i]);
+    }
+}
+
+/* Delivery refused and retried at poll, the reassembly slab unavailable
+ * then available, refusals of every kind, and closing with bytes held. */
+static void test_receive_pressure(void)
+{
+    struct receiver r;
+    unsigned char frame[SCRATCH_BYTES];
+    uint32_t taken[SLABS];
+    uint32_t taken_count;
+    uint32_t held[REGIONS];
+    uint64_t number = 0;
+    uint64_t rejected = 0;
+    uint64_t before;
+    uint32_t lease;
+    size_t n;
+
+    receiver_open(&r, 23);
+    /* The replica's regions all leased: the next frame stays in place,
+     * a poll after a lease release delivers it. */
+    for (uint32_t i = 0; i < REGIONS; ++i) {
+        n = put_sample(frame, r.limits, cluster, 1, ++number, 16);
+        peer_write(r.peer, frame, n);
+        world_settle();
+        held[i] = take_message(r.replica, 1, number, 16);
+    }
+    CHECK(r.replica->leases_free == 0);
+    n = put_sample(frame, r.limits, cluster, 1, ++number, 16);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(r.replica->messages_count == 0);
+    CHECK(r.link->retry && r.e->io->links.retries_due == 1);
+    CHECK(r.link->partial_length == n);
+    CHECK(pool_refs(r.e) == 1 + REGIONS + 1);
+    engine_step(r.e);
+    CHECK(r.link->retry && r.replica->messages_count == 0);
+    vsr_io_lease_release(r.replica, held[0]);
+    engine_step(r.e);
+    CHECK(!r.link->retry && r.e->io->links.retries_due == 0);
+    CHECK(r.replica->messages_count == 1);
+    lease = take_message(r.replica, 1, number, 16);
+    vsr_io_lease_release(r.replica, lease);
+    for (uint32_t i = 1; i < REGIONS; ++i) {
+        vsr_io_lease_release(r.replica, held[i]);
+    }
+    check_drained(&r, 0, 0);
+    /* The same with the frame straddling: reassembled, then blocked. */
+    for (uint32_t i = 0; i < REGIONS; ++i) {
+        n = put_sample(frame, r.limits, cluster, 1, ++number, 16);
+        peer_write(r.peer, frame, n);
+        world_settle();
+        held[i] = take_message(r.replica, 1, number, 16);
+    }
+    n = put_sample(frame, r.limits, cluster, 1, ++number, 16);
+    ring_cut(r.e, 0, 40);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(r.replica->messages_count == 0 && r.link->retry);
+    CHECK(r.link->reassembly_slab == r.link->partial_slab);
+    CHECK(r.link->partial_length == n && r.link->held_count == 0);
+    CHECK(pool_refs(r.e) == 1 + REGIONS + 1);
+    for (uint32_t i = 0; i < REGIONS; ++i) {
+        vsr_io_lease_release(r.replica, held[i]);
+    }
+    engine_step(r.e);
+    lease = take_message(r.replica, 1, number, 16);
+    CHECK(leases[lease].slab == r.link->reassembly_slab ||
+          r.link->reassembly_slab == NONE);
+    vsr_io_lease_release(r.replica, lease);
+    check_drained(&r, 0, 0);
+    /* The pool dry: a straddling frame waits with both runs held; a slab
+     * freed later lets poll reassemble and deliver it. */
+    before = r.e->io->links.reassembled;
+    taken_count = pool_dry(r.e, taken);
+    CHECK(taken_count > 0);
+    n = put_sample(frame, r.limits, cluster, 1, ++number, 200);
+    ring_cut(r.e, 0, 100);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(r.replica->messages_count == 0 && r.link->retry);
+    CHECK(r.link->partial_length == 100 && r.link->held_count == 1);
+    CHECK(r.link->held[0].length == n - 100);
+    CHECK(r.link->reassembly_slab == NONE);
+    CHECK(reassembled_count(&r) == before);
+    CHECK(pool_refs(r.e) == 1 + taken_count + 2);
+    engine_step(r.e);
+    CHECK(r.link->retry && r.link->held_count == 1);
+    vsr_io_pool_release(&r.e->io->pool, taken[--taken_count]);
+    engine_step(r.e);
+    CHECK(r.e->io->links.reassembled == before + 1);
+    CHECK(r.replica->messages_count == 1 && !r.link->retry);
+    lease = take_message(r.replica, 1, number, 200);
+    vsr_io_lease_release(r.replica, lease);
+    check_drained(&r, 0, taken_count);
+    pool_refill(r.e, taken, taken_count);
+    world_settle();
+    check_drained(&r, 0, 0);
+    /* Refusals that drop the frame and keep the link: an unauthorized
+     * sender, a cluster without a replica, a body shorter than its
+     * envelope. */
+    n = put_sample(frame, r.limits, cluster, 3, ++number, 16);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(r.e->io->stats.frames_rejected == ++rejected);
+    CHECK(r.replica->messages_count == 0);
+    check_drained(&r, 0, 0);
+    {
+        struct vsr_id other = {9, 9};
+
+        n = put_sample(frame, r.limits, other, 1, ++number, 16);
+        ring_cut(r.e, 0, 30);
+        peer_write(r.peer, frame, n);
+        world_settle();
+        CHECK(r.e->io->stats.frames_rejected == ++rejected);
+        CHECK(r.replica->messages_count == 0);
+        check_drained(&r, 0, 0);
+    }
+    memset(frame + VSR_IO_FRAME_HEADER_BYTES, 0, 8);
+    vsr_io_codec_put_frame(
+        frame, VSR_IO_FRAME_MESSAGE, 8,
+        vsr_io_crc32c(0, frame + VSR_IO_FRAME_HEADER_BYTES, 8));
+    peer_write(r.peer, frame, VSR_IO_FRAME_HEADER_BYTES + 8);
+    world_settle();
+    CHECK(r.e->io->stats.frames_rejected == ++rejected);
+    check_drained(&r, 0, 0);
+    /* A frame the replica's decoder rejects (a truncated body under a
+     * valid CRC) is dropped by the engine and counted. */
+    n = put_sample(frame, r.limits, cluster, 1, ++number, 16);
+    vsr_io_codec_put_frame(
+        frame, VSR_IO_FRAME_MESSAGE, (uint32_t)(n - 24 - 8),
+        vsr_io_crc32c(0, frame + VSR_IO_FRAME_HEADER_BYTES, n - 24 - 8));
+    peer_write(r.peer, frame, n - 8);
+    world_settle();
+    CHECK(r.e->io->stats.frames_rejected == ++rejected);
+    check_drained(&r, 0, 0);
+    /* A delivered frame after the refusals: the link is unharmed. */
+    n = put_sample(frame, r.limits, cluster, 1, ++number, 16);
+    deliver_one(&r, frame, n, number, 16, false);
+    /* A bad body CRC in a reassembled frame closes the link (-EBADMSG),
+     * with every reference released. */
+    n = put_sample(frame, r.limits, cluster, 1, ++number, 100);
+    frame[n - 1] ^= 0x40;
+    ring_cut(r.e, 0, 50);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(r.e->io->stats.frames_rejected == ++rejected);
+    CHECK(r.e->io->links.nodes[0].last_error == -EBADMSG);
+    CHECK(peer_eof(r.peer));
+    peer_close(r.peer);
+    world_settle();
+    check_quiet(r.e);
+    CHECK(pool_refs(r.e) == 0);
+    /* An oversized length in a header reassembled across two slabs. */
+    receiver_relink(&r);
+    vsr_io_codec_put_frame(frame, VSR_IO_FRAME_MESSAGE, PAGE - 24 + 8, 0);
+    ring_cut(r.e, 0, 10);
+    peer_write(r.peer, frame, VSR_IO_FRAME_HEADER_BYTES);
+    world_settle();
+    CHECK(r.e->io->stats.frames_rejected == ++rejected);
+    CHECK(r.e->io->links.nodes[0].last_error == -EBADMSG);
+    peer_close(r.peer);
+    world_settle();
+    check_quiet(r.e);
+    CHECK(pool_refs(r.e) == 0);
+    /* A frame the peer never finishes, held across slabs with the pool
+     * dry: closing the link returns every reference. */
+    receiver_relink(&r);
+    taken_count = pool_dry(r.e, taken);
+    n = put_sample(frame, r.limits, cluster, 1, ++number, 300);
+    ring_cut(r.e, 0, 60);
+    ring_cut(r.e, 1, 60);
+    peer_write(r.peer, frame, n - 8);
+    world_settle();
+    CHECK(r.link->partial_length == 60 && r.link->held_count == 2);
+    CHECK(pool_refs(r.e) == 1 + taken_count + 3);
+    vsr_io_links_close(r.e->io, (uint32_t)(r.link - r.e->io->links.links), 0);
+    CHECK(r.e->io->links.retries_due == 0);
+    CHECK(pool_refs(r.e) == 1 + taken_count);
+    world_settle();
+    pool_refill(r.e, taken, taken_count);
+    peer_close(r.peer);
+    world_settle();
+    check_quiet(r.e);
+    CHECK(pool_refs(r.e) == 0);
+    /* A whole frame blocked on a region, and bytes behind it, at close. */
+    receiver_relink(&r);
+    for (uint32_t i = 0; i < REGIONS; ++i) {
+        n = put_sample(frame, r.limits, cluster, 1, ++number, 16);
+        peer_write(r.peer, frame, n);
+        world_settle();
+        held[i] = take_message(r.replica, 1, number, 16);
+    }
+    n = put_sample(frame, r.limits, cluster, 1, ++number, 16);
+    n += put_sample(frame + n, r.limits, cluster, 1, ++number, 16);
+    ring_cut(r.e, 0, (uint32_t)n - 8);
+    peer_write(r.peer, frame, n);
+    world_settle();
+    CHECK(r.link->retry && r.link->held_count == 1);
+    CHECK(pool_refs(r.e) == 1 + REGIONS + 2);
+    vsr_io_links_close(r.e->io, (uint32_t)(r.link - r.e->io->links.links),
+                       -ECONNRESET);
+    CHECK(pool_refs(r.e) == 1 + REGIONS);
+    CHECK(r.e->io->links.retries_due == 0);
+    for (uint32_t i = 0; i < REGIONS; ++i) {
+        vsr_io_lease_release(r.replica, held[i]);
+    }
+    peer_close(r.peer);
+    world_settle();
+    check_quiet(r.e);
+    CHECK(pool_refs(r.e) == 0);
+    /* Closing the second link of the node leaves the messages already
+     * delivered untouched. */
+    CHECK(r.replica->messages_count == 0);
+    engine_forget(r.e);
+}
+
+/* Random MESSAGE sequences under random slicing, slab cuts, pool drought
+ * and lease holding: every authorized message arrives exactly once, in
+ * order, byte-identical, nothing else does, and the references balance. */
+static void test_receive_random(uint64_t seed)
+{
+    struct receiver r;
+    static unsigned char batch[WALK_BATCH_BYTES + PAGE];
+    uint32_t pending[WALK_PENDING]; /* Sizes of the frames sent, in order. */
+    uint32_t pending_head = 0;
+    uint32_t pending_count = 0;
+    uint32_t taken[SLABS];
+    uint32_t taken_count = 0;
+    uint32_t held[REGIONS];
+    uint32_t held_count = 0;
+    uint64_t sent = 0;
+    uint64_t received = 0;
+    uint64_t rejected = 0;
+    uint64_t delivered_bytes = 0;
+
+    printf("link: random walk seed %" PRIu64 "\n", seed);
+    receiver_open(&r, seed);
+    for (uint32_t round = 0; round < WALK_ROUNDS; ++round) {
+        struct test_random *random = &world.random;
+        uint32_t frames = 1 + test_random_bounded(random, 6);
+        size_t used = 0;
+
+        for (uint32_t f = 0; f < frames; ++f) {
+            uint32_t roll = test_random_bounded(random, 12);
+            uint32_t size;
+
+            switch (test_random_bounded(random, 5)) {
+            case 0:
+                size = NONE;
+                break;
+            case 1:
+                size = PAYLOAD_MAX - 8 * test_random_bounded(random, 4);
+                break;
+            case 2:
+                size = test_random_bounded(random, 64);
+                break;
+            default:
+                size = test_random_bounded(random, PAYLOAD_MAX + 1);
+                break;
+            }
+            if (used + frame_bytes(size) > WALK_BATCH_BYTES ||
+                pending_count == WALK_PENDING) {
+                break;
+            }
+            if (roll == 0) {
+                used +=
+                    put_sample(batch + used, r.limits, cluster, 3, 77, size);
+                rejected++;
+            } else if (roll == 1) {
+                struct vsr_id other = {9, 9};
+
+                used += put_sample(batch + used, r.limits, other, 1, 78, size);
+                rejected++;
+            } else {
+                used += put_sample(batch + used, r.limits, cluster, 1, ++sent,
+                                   size);
+                pending[(pending_head + pending_count++) % WALK_PENDING] = size;
+            }
+        }
+        if (used == 0) {
+            continue;
+        }
+        world.slice_max = test_random_bounded(random, 3) == 0
+                              ? 0
+                              : 1 + test_random_bounded(random, 500);
+        if (test_random_bounded(random, 2) == 0) {
+            uint32_t room = ring_room(r.e, 0);
+
+            ring_cut(r.e, 0, 1 + test_random_bounded(random, room));
+        }
+        if (test_random_bounded(random, 3) == 0 && r.e->ring_count > 1) {
+            ring_cut(r.e, 1,
+                     1 + test_random_bounded(random, ring_room(r.e, 1)));
+        }
+        if (taken_count == 0 && test_random_bounded(random, 4) == 0) {
+            taken_count = pool_dry(r.e, taken);
+        }
+        peer_write(r.peer, batch, used);
+        /* Until the batch is through: delivered messages checked in order,
+         * some leases kept; when stuck on a region or a slab, one is given
+         * back. */
+        for (uint32_t attempt = 0;; ++attempt) {
+            CHECK(attempt < 96);
+            world_settle();
+            while (r.replica->messages_count > 0) {
+                uint32_t size = pending[pending_head];
+                uint32_t lease;
+
+                CHECK(pending_count > 0);
+                pending_head = (pending_head + 1) % WALK_PENDING;
+                pending_count--;
+                lease = take_message(r.replica, 1, ++received, size);
+                delivered_bytes += frame_bytes(size);
+                if (held_count < REGIONS - 1 &&
+                    test_random_bounded(random, 3) == 0) {
+                    held[held_count++] = lease;
+                } else {
+                    vsr_io_lease_release(r.replica, lease);
+                }
+            }
+            CHECK(r.link->state == VSR_IO_LINK_ESTABLISHED);
+            if (pending_count == 0 && peer_unread(r.peer) == 0 &&
+                r.link->partial_length == 0 && r.link->held_count == 0 &&
+                r.e->io->stats.frames_rejected == rejected) {
+                break;
+            }
+            if (held_count > 0 &&
+                (taken_count == 0 || test_random_bounded(random, 2) == 0)) {
+                vsr_io_lease_release(r.replica, held[--held_count]);
+            } else if (taken_count > 0) {
+                vsr_io_pool_release(&r.e->io->pool, taken[--taken_count]);
+            }
+        }
+        if (test_random_bounded(random, 3) == 0) {
+            while (held_count > 0) {
+                vsr_io_lease_release(r.replica, held[--held_count]);
+            }
+            pool_refill(r.e, taken, taken_count);
+            taken_count = 0;
+            world_settle();
+            check_drained(&r, 0, 0);
+        }
+    }
+    while (held_count > 0) {
+        vsr_io_lease_release(r.replica, held[--held_count]);
+    }
+    pool_refill(r.e, taken, taken_count);
+    world.slice_max = 0;
+    world_settle();
+    CHECK(received == sent && pending_count == 0);
+    CHECK(r.e->io->stats.frames_rejected == rejected);
+    CHECK(r.e->io->stats.bytes_received >= delivered_bytes);
+    check_drained(&r, 0, 0);
+    printf("link: random walk %" PRIu64 " messages, %" PRIu64
+           " reassembled, %" PRIu64 " rejected\n",
+           received, r.e->io->links.reassembled, rejected);
+    peer_close(r.peer);
+    world_settle();
+    check_quiet(r.e);
+    CHECK(pool_refs(r.e) == 0);
+    engine_forget(r.e);
+}
+
 int main(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    uint64_t seed = 0x5EED2u;
+
+    if (argc > 1) {
+        seed = strtoull(argv[1], NULL, 0);
+    }
     test_tables();
     test_backoff();
     test_link_wanted();
@@ -2458,6 +3378,10 @@ int main(int argc, char **argv)
     test_adopt_and_close();
     test_listener_and_pressure();
     test_capacity();
+    test_receive_splits();
+    test_receive_fill();
+    test_receive_pressure();
+    test_receive_random(seed);
     printf("link: ok\n");
     return 0;
 }

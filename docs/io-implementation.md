@@ -341,26 +341,48 @@ carves frames:
    with the frame limit); reject -> close.
 3. If the whole frame (header + length) is within the current slab's
    delivered bytes, decode it in place; else, if it continues in the same
-   slab on a later CQE, wait; else (the next CQE names another slab) copy
-   the partial bytes into a fresh reassembly slab
-   (`vsr_io_pool_acquire`, waiting if none is free) and append every later
-   CQE's bytes into it until the frame is complete, then decode from the
-   reassembly slab. Since a frame fits one slab and the reassembly slab is
-   fresh, this always fits.
+   slab on a later CQE, wait; else (the next CQE names another slab, or
+   the partial's frame is still to be delivered) the delivery joins the
+   link's HELD runs (`held[VSR_IO_LINK_HELD]`, arrival order, one pool
+   reference each, a delivery contiguous with the last run merging into
+   it). Once the partial run is consumed the first held run becomes the
+   partial; while the partial's frame is incomplete and a run is held,
+   the frame is reassembled (decision 76): the partial bytes are copied
+   into a reassembly slab acquired for the frame (`vsr_io_pool_acquire`
+   with internal priority, counted in `links.reassembled`) and the
+   frame's missing bytes, header first so that its length is known and
+   never past the frame's end, are copied behind them from the held run,
+   so the bytes that follow the frame stay in place for zero-copy
+   carving. A frame fits one slab (`frame_limit` is `slab_bytes`) and the
+   run starts at the slab's offset 0, so the copy always fits; the slab
+   is released once the frame is consumed. No free slab: the runs stay
+   held, `retry` is set and every `vsr_io_links_poll` carves again; a
+   link needing more than `VSR_IO_LINK_HELD` runs is closed with
+   `-ENOBUFS`.
 4. Decoding: check the body CRC over the cursor; HELLO goes to the
-   handshake, MESSAGE to `vsr_io_engine_deliver` (which allocates a region,
-   decodes, checks that `message.from` is authorized for `link.node` in
-   `message.cluster`, and queues the event; a rejection counts
-   `frames_rejected` and drops the frame; a missing region leaves the bytes
-   in place and retries next poll), stream frames to `vsr_io_streams_frame`.
+   handshake, stream frames to `vsr_io_streams_frame`. A MESSAGE on an
+   established peer link (decisions 67 and 75): the envelope's `cluster` and
+   `from` are read, the replica of the cluster resolved
+   (`vsr_io_engine_replica`) and `vsr_io_links_lookup(cluster, from)` must
+   equal the link's node; then `vsr_io_engine_deliver` allocates a
+   region, decodes and queues the event. A body shorter than its
+   envelope, a cluster without a replica, an unauthorized `from` or a
+   body the decoder rejects is dropped and counted in `frames_rejected`,
+   the link staying up; a MESSAGE before the handshake or on a stream
+   link closes the link with `-EPROTO`. A replica without a free region
+   leaves the bytes in place with `retry` set; the next poll delivers
+   them. Every accepted frame updates the node's `last_received_ns`.
 5. The slab reference taken at `recv_begin` is released once every byte of
-   that CQE has been decoded (each MESSAGE lease took its own reference) or
-   discarded.
+   its run has been decoded (each MESSAGE lease took its own reference)
+   or discarded; closing a link releases the partial, the held runs and
+   the reassembly slab at once.
 
 Invariants: a link never has two sends in flight; `notified_offset <=
 sent_offset <= stream_offset`; every queued message completes exactly
 once; a slab is referenced by a link only while it holds bytes not yet
-leased or discarded.
+leased or discarded, exactly once per run (the partial's reference is
+the reassembly slab's own once the run lives there); `retries_due`
+counts the links with `retry` set.
 
 Tests: `tests/unit/link`: a fake engine feeding CQEs and checking records:
 dial with backoff to 16x, accept, both handshake modes, refusal on mode and
@@ -368,7 +390,16 @@ version mismatch, simultaneous dial with carrier election on both ends and
 idle closure of the loser, send classification for the three flag cases,
 coalescing bounds, a message spanning two sends, short sends, NOTIF
 ordering and RETRY on close, receive splits at every byte boundary of a
-two-frame stream across one and two slabs, revoke and address change.
+two-frame stream across one, two and three slabs (the header's too),
+many frames in one slab, a frame ending exactly at a slab's end,
+slab-sized frames, delivery refused for want of a region and retried at
+poll, the reassembly slab unavailable then available, a bad CRC and an
+oversized length in reassembled frames, an unauthorized sender and an
+unknown cluster dropped, closing with runs held (references back to
+zero), a seeded random walk of MESSAGE sequences under random slicing,
+slab cuts, pool drought and lease holding (every authorized message
+exactly once, in order, byte-identical, references balanced), revoke and
+address change.
 
 ### Streams (`src/io/stream.h`)
 
@@ -1342,6 +1373,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | `cache_bytes` rule: two headers and a block of slack besides the two records | 69 |
 | `store.h` | Extents carry their segment, a header flag and their last sequence; the store keeps `file_head`, `superblock_dirty`, `growth` and the log path; the check rule adds the executor-length bounds | 69, 70 |
 | `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | 72, 73 |
+| `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | 75, 76 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

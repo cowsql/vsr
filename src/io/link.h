@@ -42,10 +42,22 @@
  *
  * Receiving: every link runs one multishot RECV with BUFFER_SELECT from the
  * pool's group. Delivered bytes are carved into frames in place; a frame
- * that straddles two slabs is copied into a fresh REASSEMBLY slab, and a
- * frame is decoded only when complete. Bytes not yet consumed keep their
- * slab referenced; when the pool runs dry the kernel stops delivering,
- * which is the intended backpressure.
+ * that straddles slabs is copied, up to its own end, into a fresh
+ * REASSEMBLY slab acquired for it, and a frame is decoded only when
+ * complete. The unconsumed bytes form the PARTIAL run (one slab,
+ * contiguous) that carving works on, plus up to VSR_IO_LINK_HELD later
+ * runs in arrival order, each holding exactly one pool reference, that
+ * wait for the reassembly copy or for the partial's frame to be delivered
+ * (a MESSAGE whose replica has no free region stays in place and is
+ * retried at every poll). When the pool runs dry the kernel stops
+ * delivering, which is the intended backpressure; a reassembly that finds
+ * no free slab waits with its runs held and retries at poll, and a link
+ * that would need more than VSR_IO_LINK_HELD held runs is closed with
+ * -ENOBUFS. A MESSAGE is handed to the replica of its cluster only when
+ * its `from` is authorized for the link's node (decision 67); a MESSAGE
+ * that fails that check, names no replica of this engine, or is shorter
+ * than its envelope is dropped and counted in frames_rejected, while a
+ * frame the header, CRC or link state refuses closes the link.
  *
  * Descriptors (decision 72): a link's socket is a RAW descriptor until the
  * engine takes it over, and an engine FILE SLOT from then on. A dialed link
@@ -65,6 +77,7 @@
 #define VSR_IO_LISTENERS_MAX 8u     /* Listen addresses per engine. */
 #define VSR_IO_LISTEN_BACKLOG 128u
 #define VSR_IO_LINK_ORPHANS 16u  /* Accepted sockets awaiting a CLOSE. */
+#define VSR_IO_LINK_HELD 8u      /* Received runs waiting behind the partial. */
 #define VSR_IO_PREAMBLE_BYTES 8u /* VSR_IO_WIRE_MAGIC on the wire. */
 
 enum vsr_io_link_state {
@@ -117,6 +130,14 @@ struct vsr_io_queued_send {
     uint64_t end; /* Stream offset after this message, once assigned. */
 };
 
+/* A contiguous run of delivered, unconsumed bytes in one slab, holding
+ * one pool reference. */
+struct vsr_io_run {
+    uint32_t slab;
+    uint32_t offset;
+    uint32_t length;
+};
+
 struct vsr_io_send {
     uint32_t slot;         /* Slot table index; INDEX_NONE when unused. */
     uint32_t state;        /* 0 free, 1 in flight, 2 sent awaiting NOTIF. */
@@ -166,11 +187,18 @@ struct vsr_io_link {
                                                        8-byte receive. */
     /* Receive side. */
     uint32_t recv_slot;
-    uint32_t partial_slab; /* Slab holding an incomplete frame, or NONE. */
+    uint32_t partial_slab; /* Slab of the run being carved, or NONE. */
     uint32_t partial_offset;
     uint32_t partial_length;
-    uint32_t reassembly_slab; /* Fresh slab a straddling frame is copied to. */
+    uint32_t reassembly_slab; /* Set while the partial run lives in a slab
+                                 acquired for a straddling frame, which it
+                                 then equals; NONE otherwise. */
     uint32_t preamble_seen;   /* Bytes of the 8-byte preamble matched. */
+    uint32_t held_count;      /* Runs delivered after the partial. */
+    bool retry;               /* Carving stopped short of the bytes it
+                                 holds (no region, no reassembly slab);
+                                 poll retries. */
+    struct vsr_io_run held[VSR_IO_LINK_HELD];
     /* Send side. */
     uint32_t send_slab;   /* Pool slab holding header bytes; INDEX_NONE. */
     uint32_t header_head; /* Ring over the send slab. */
@@ -227,6 +255,8 @@ struct vsr_io_links {
     uint64_t handshake_ops;  /* HANDSHAKE op ids issued, from 1. */
     uint32_t dials_due;      /* Nodes with `due` set. */
     uint32_t handshakes_due; /* EXTERNAL links whose op is still to emit. */
+    uint32_t retries_due;    /* Links with `retry` set. */
+    uint64_t reassembled;    /* Frames copied into a reassembly slab. */
     uint32_t listen_started; /* 1 once the first prepare set listeners up. */
     uint32_t orphans_count;  /* Accepted descriptors with no free link,
                                 closed by the next prepare. */
@@ -282,8 +312,10 @@ int vsr_io_links_send_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
 void vsr_io_links_close(struct vsr_io *io, uint32_t link, int32_t error);
 
 /* Poll-time work: due dials and LINK_WANTED, HANDSHAKE ops the forwarded
- * ring could not take earlier, carrier election after state changes. Emits
- * LINK_WANTED and HANDSHAKE ops through the engine's forwarded-op queue. */
+ * ring could not take earlier, carrier election after state changes, and
+ * the carving of held bytes that stopped short (a replica without a free
+ * region, a pool without a reassembly slab). Emits LINK_WANTED and
+ * HANDSHAKE ops through the engine's forwarded-op queue. */
 void vsr_io_links_poll(struct vsr_io *io, uint64_t now);
 /* A popped LINK deadline (handshake or idle timeout of link `index`) or
  * DIAL deadline (backoff of node `index`), dispatched by the engine's poll
