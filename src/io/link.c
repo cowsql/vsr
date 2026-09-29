@@ -428,7 +428,7 @@ int vsr_io_links_node_clear(struct vsr_io *io, uint64_t node)
     }
     entry = &links->nodes[index];
     node_close_links(io, index, -ECONNABORTED);
-    /* A cleared node is unknown, so nothing may act as it (decision L2). */
+    /* A cleared node is unknown, so nothing may act as it (decision 73). */
     for (uint32_t i = 0; i < links->authorizations_count; ++i) {
         if (links->authorizations[i].node == node) {
             memset(&links->authorizations[i], 0,
@@ -470,7 +470,7 @@ int vsr_io_links_authorize(struct vsr_io *io, struct vsr_id cluster,
     }
     if (node == VSR_IO_NO_NODE) {
         /* Revoke: idempotent; the node's links close once nothing names
-         * it any more (decision L2). */
+         * it any more (decision 73). */
         if (entry == NULL) {
             return VSR_OK;
         }
@@ -1162,7 +1162,7 @@ static void link_hello(struct vsr_io *io, struct vsr_io_link *link,
     }
     node_index = vsr_io_links_node_index(&io->links, hello->node);
     if (node_index == LINK_NONE) {
-        /* Unknown nodes cannot be authorized for anything (decision L2). */
+        /* Unknown nodes cannot be authorized for anything (decision 73). */
         io->stats.frames_rejected++;
         link_close(io, index, -EPROTO);
         return;

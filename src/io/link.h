@@ -47,7 +47,7 @@
  * slab referenced; when the pool runs dry the kernel stops delivering,
  * which is the intended backpressure.
  *
- * Descriptors (decision L1): a link's socket is a RAW descriptor until the
+ * Descriptors (decision 72): a link's socket is a RAW descriptor until the
  * engine takes it over, and an engine FILE SLOT from then on. A dialed link
  * issues SOCKET, then CONNECT on the raw descriptor; a listener runs a plain
  * multishot ACCEPT; vsr_io_adopt brings a raw descriptor. The takeover

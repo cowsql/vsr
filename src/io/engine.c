@@ -196,7 +196,7 @@ static int check_options(const struct vsr_io_options *options)
         limits->slab_bytes % ENGINE_PAGE_BYTES != 0) {
         return VSR_EINVAL;
     }
-    /* The link module keeps listener state in a fixed table (decision L1). */
+    /* The link module keeps listener state in a fixed table (decision 72). */
     if (options->listen_count > VSR_IO_LISTENERS_MAX) {
         return VSR_ELIMIT;
     }

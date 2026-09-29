@@ -1262,7 +1262,7 @@ static void test_tables(void)
     }
     CHECK(vsr_io_links_authorize(a->io, cluster, 9, 7) == VSR_ELIMIT);
     CHECK(vsr_io_links_lookup(&a->io->links, cluster, 8) == 7);
-    /* Clearing a node removes its authorizations (decision L2). */
+    /* Clearing a node removes its authorizations (decision 73). */
     CHECK(vsr_io_links_node_clear(a->io, 7) == VSR_OK);
     CHECK(vsr_io_links_lookup(&a->io->links, cluster, 8) == VSR_IO_NO_NODE);
     CHECK(vsr_io_links_lookup(&a->io->links, other, 1) == 6);

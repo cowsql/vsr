@@ -241,7 +241,7 @@ Link life cycle:
  any ─error, timeout, revoke, close─▶ CLOSING ─recv terminated, NOTIFs in─▶ FREE
 ```
 
-Descriptors (decision L1): a link's socket is a raw descriptor
+Descriptors (decision 72): a link's socket is a raw descriptor
 (`raw_fd`) until the engine takes it over into an engine file slot (`fd`)
 through `vsr_io_engine_install`, at the CONNECT or ACCEPT completion in
 TRUSTED mode, at the caller's OK HANDSHAKE completion in EXTERNAL mode,
@@ -287,7 +287,7 @@ for `idle_timeout_ns` is closed; the carrier is never idle-closed while the
 node has queued sends, and is idle-closed otherwise like any link, since a
 node with no traffic needs no link (the next SEND redials).
 
-Dialing (decision L2): a node with an address and no established or
+Dialing (decision 73): a node with an address and no established or
 pending link is dialed when a SEND is queued for it or a replica
 authorizes it (`wanted`), immediately the first time and then at
 `next_dial_ns` = failure time + `connect_backoff_ns << min(attempts - 1,
@@ -1105,7 +1105,7 @@ returns immediately and prepares again):
 2. `vsr_io_links_prepare`: listener setup on the first call (SOCKET
    DIRECT into an engine slot, BIND, LISTEN, then a plain multishot
    ACCEPT, one chain per listen address, LINKed with SKIP_SUCCESS on all
-   but the ACCEPT; decision L1), orphan closes, then per link: the dial's
+   but the ACCEPT; decision 72), orphan closes, then per link: the dial's
    SOCKET or CONNECT, the EXTERNAL preamble receive, the control bytes
    (preamble, HELLO) and coalesced sends, receive arming and re-arming,
    the teardown (SHUTDOWN, CANCEL of the receive, CLOSE of the slot, or a
@@ -1127,7 +1127,7 @@ slot table); then by `slot.kind`: LISTEN, CONNECT, RECV, SEND, SHUTDOWN ->
 `vsr_io_snapshots_complete`; STREAM -> `vsr_io_streams_complete`. The
 module consumes the slot (`vsr_io_slots_consumed` with the record's MORE,
 or `vsr_io_slots_free` for a zero-copy send refused before the kernel took
-it), since it knows what each completion means (decision L3). Nothing
+it), since it knows what each completion means (decision 74). Nothing
 steps a core here; every effect is queued for the next poll, and a
 time-based effect uses `io->now`, the last poll time.
 
@@ -1321,7 +1321,7 @@ of `docs/io-design.md`:
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | One `libvsr.a` with liburing; three headers installed (done by the build skeleton) | 32 |
 | `vsr-io.h` | Platform note: Linux >= 6.18 through the io_uring syscalls, no liburing; `vsr_io_uring_init` probes once and fails with `-ENOSYS` on an older kernel | 52, 53 |
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | liburing dropped: no pkg-config check, no `Requires.private`; the kernel's UAPI header vendored under `src/io/uapi` | 52 |
-| `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | L1, L2 |
+| `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | 72, 73 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

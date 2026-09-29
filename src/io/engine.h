@@ -195,7 +195,7 @@ void vsr_io_engine_slot_free(struct vsr_io *io, uint32_t slot);
 void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size);
 /* Installs a raw descriptor into an engine file slot (the executor's
  * update_file, which takes the descriptor over); 0 or a negative errno. The
- * link module calls it when it takes a socket over (decision L1). */
+ * link module calls it when it takes a socket over (decision 72). */
 int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd);
 
 #endif /* VSR_IO_ENGINE_H */
