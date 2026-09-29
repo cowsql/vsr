@@ -303,7 +303,7 @@ never dials its own node id. Due dials are found by poll through
 `last_error` is the last failure of a link identified as its; an inbound
 link that failed before identifying itself is nobody's.
 
-Send path per link (decisions 38 and L6), executed in
+Send path per link (decisions 38 and 82), executed in
 `vsr_io_links_prepare`. The bytes a link sends form one stream counted by
 `stream_offset`; the BUILD is the send under construction, `vec_count`
 vectors in `vecs` covering the `build_bytes` bytes below `stream_offset`,
@@ -350,7 +350,7 @@ is below a frame header plus one inline copy and the front holds more.
    calls `vsr_io_streams_sent` (also at a zero-copy result, when the
    vectors are free again).
 
-Queue rules (decision L7): `vsr_io_links_send` digests the message
+Queue rules (decision 83): `vsr_io_links_send` digests the message
 (`vsr_io_codec_message_digest` with the replica's limits), wants a link to
 the node, and returns `RETRY` for the engine to complete at once when the
 destination is unknown, unauthorized or the own node, the message cannot
@@ -373,7 +373,7 @@ engine is going away, and a NOTIF still pending on a closing link reads
 the bytes for microseconds at most. `messages_sent` and
 `messages_retried` count every outcome, the returned `RETRY` included.
 
-TCP_NODELAY (decision L9): with `options.nodelay` every taken-over socket
+TCP_NODELAY (decision 85): with `options.nodelay` every taken-over socket
 gets one SETSOCKOPT record on its connect slot (idle by then, tagged
 `VSR_IO_STAGE_NODELAY`) whose result is ignored, so a socket without the
 option is simply left as it is; a dialed AF_UNIX peer skips it.
@@ -505,7 +505,7 @@ Timeouts: a stream with no progress for `handshake_timeout_ns` (the only
 per-stream duration in the options; a dedicated option is deferred) ends
 with `RETRY`.
 
-What the link module gives the stream module (decision L8):
+What the link module gives the stream module (decision 84):
 `vsr_io_links_open_stream` dials a STREAM-purpose link at once, whatever
 the node's backoff (`EINVAL` for an unknown, caller-dialed or own node,
 `ELIMIT` with no free link entry), and `vsr_io_streams_link_up` /
@@ -1217,7 +1217,7 @@ in emission order (decision 51):
 
 | Op | Route |
 | --- | --- |
-| SEND | `vsr_io_links_send(replica, id, message, arg)`; `RETRY` returned -> COMPLETE(RETRY) queued; OK -> queued, completed later through the replica's completion ring (decision L7) |
+| SEND | `vsr_io_links_send(replica, id, message, arg)`; `RETRY` returned -> COMPLETE(RETRY) queued; OK -> queued, completed later through the replica's completion ring (decision 83) |
 | LOAD, STORE, SYNC, RECLAIM | `vsr_io_store_*`; completions arrive through `next_completion` |
 | SNAPSHOT_CAPTURE, FETCH, SYNC, DROP | `vsr_io_snapshots_*`; a status returned -> COMPLETE queued |
 | RELEASE with `VSR_IO_LEASE_ENGINE` | `vsr_io_lease_resolve`; release the region and slab/pin |
@@ -1465,7 +1465,7 @@ of `docs/io-design.md`:
 | `store.h` | Extents carry their segment, a header flag and their last sequence; the store keeps `file_head`, `superblock_dirty`, `growth` and the log path; the check rule adds the executor-length bounds | 69, 70 |
 | `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | 72, 73 |
 | `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | 75, 76 |
-| `link.h`, `stream.h` (internal) | Send side of `vsr_io_link`: unwrapped 64-bit ring counters (`header_*`, `vsr_io_send.header_*`), the build (`vec_count`, `build_bytes`), `nodelay_set`, `VSR_IO_STAGE_NODELAY`; `vsr_io_links_send` contract (RETRY only when the engine completes at once); `vsr_io_links_open_stream` and `vsr_io_links_send_frame` contracts; `vsr_io_streams_frame` returns whether the frame was consumed; `vsr_io_streams_sent` at every send result and NOTIF | L6, L7, L8, L9 |
+| `link.h`, `stream.h` (internal) | Send side of `vsr_io_link`: unwrapped 64-bit ring counters (`header_*`, `vsr_io_send.header_*`), the build (`vec_count`, `build_bytes`), `nodelay_set`, `VSR_IO_STAGE_NODELAY`; `vsr_io_links_send` contract (RETRY only when the engine completes at once); `vsr_io_links_open_stream` and `vsr_io_links_send_frame` contracts; `vsr_io_streams_frame` returns whether the frame was consumed; `vsr_io_streams_sent` at every send result and NOTIF | 82, 83, 84, 85 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
