@@ -1034,7 +1034,7 @@ int vsr_io_streams_write(struct vsr_io *io,
                     io->options.limits.file_slots)) {
         /* A caller's range reads a slot of the caller's: an engine slot
          * (a socket, the store's log) would stream the engine's own bytes
-         * to the peer (decision B6). The library reads engine slots. */
+         * to the peer (decision B5). The library reads engine slots. */
         return VSR_EINVAL;
     }
     if (stream->writes_count == window) {
@@ -1523,7 +1523,7 @@ void vsr_io_streams_complete(struct vsr_io *io, uint32_t slot,
         /* A read error, or the file ends inside the write's range. The
          * unit stays in the ring for the abort: the END's byte count stops
          * at the first chunk the link never took, which may be this one
-         * (decision B5); the abort releases it (its slot is NONE). */
+         * (decision 97); the abort releases it (its slot is NONE). */
         source_fail(io, stream, VSR_IO_FAILED);
         STREAMS_ASSERT(unit->state == VSR_IO_UNIT_FREE);
         stream_drive(io, stream);
