@@ -1295,7 +1295,12 @@ static struct vsr_io_options engine_options(struct engine *e, uint64_t node)
     l->batch = SQ_CAP;
     l->slabs = SLABS;
     l->slab_bytes = PAGE;
-    l->caller_slabs = 0;
+    /* The caller's untaken share stays FREE (decision 54); the internal
+     * acquires of the links (send slabs) and of this module (staging) can
+     * take it. Without it the ring holds every slab above the reserve of
+     * replicas + 1 while idle peer links return none, and a module slab
+     * can starve a new stream link's send slab (docs section 11). */
+    l->caller_slabs = 8;
     l->file_slots = FILE_SLOTS;
     l->buffer_regions = 3;
     options.file_slot_base = FILE_SLOT_BASE;
@@ -2324,6 +2329,68 @@ static const struct dfile *clients_file(const struct engine *e,
     return dfile_named(e, path);
 }
 
+/* Releases an engine lease a core completion carried, as the core's
+ * RELEASE op would. */
+static void core_release(struct engine *e, uint64_t lease)
+{
+    struct vsr_io_replica *replica = NULL;
+    uint32_t index = NONE;
+
+    CHECK(vsr_io_lease_resolve(e->io, lease, &replica, &index) == VSR_OK);
+    CHECK(replica == e->replica);
+    vsr_io_lease_release(replica, index);
+}
+
+/* The next core completion is `op` with `status`; an OK CAPTURE or FETCH
+ * carries a checkpoint of `id` under an engine lease, checked against the
+ * caller's result in `h` and released. */
+static void expect_checkpoint(struct engine *e, uint64_t op, struct vsr_id id,
+                              const struct task_holder *h)
+{
+    struct vsr_event event;
+    const struct vsr_checkpoint *result;
+    struct vsr_io_replica *replica = NULL;
+    uint32_t index = NONE;
+
+    CHECK(core_take(e, &event));
+    if (event.id != op || event.status != VSR_IO_OK) {
+        fprintf(stderr,
+                "core completion op %" PRIu64 " status %d, expected %" PRIu64
+                " OK\n",
+                event.id, event.status, op);
+    }
+    CHECK(event.type == VSR_EVENT_COMPLETE && event.id == op &&
+          event.status == VSR_IO_OK);
+    result = event.data;
+    CHECK(result != NULL && event.lease != 0);
+    CHECK(vsr_io_lease_resolve(e->io, event.lease, &replica, &index) == VSR_OK);
+    /* The whole graph lives in the lease's region (vsr.h). */
+    {
+        const unsigned char *base = replica->leases[index].region.base;
+        size_t used = replica->leases[index].region.used;
+        const unsigned char *at = (const unsigned char *)result;
+
+        CHECK(at >= base && at + sizeof(*result) <= base + used);
+        CHECK(result->epoch == NULL ||
+              ((const unsigned char *)result->epoch >= base &&
+               (const unsigned char *)result->epoch < base + used));
+        CHECK(result->manifest.count == 0 ||
+              ((const unsigned char *)result->manifest.spans[0].data >= base &&
+               (const unsigned char *)result->manifest.spans[0].data <
+                   base + used));
+    }
+    CHECK(result->id.hi == id.hi && result->id.lo == id.lo);
+    CHECK(result->op == h->checkpoint.op && result->view == h->checkpoint.view);
+    CHECK(result->epoch != NULL && result->epoch->current != NULL &&
+          result->epoch->current->count == 1 &&
+          result->epoch->current->members[0].id == 1);
+    CHECK(result->manifest.size == sizeof(h->manifest_bytes) &&
+          result->manifest.count == 1 &&
+          memcmp(result->manifest.spans[0].data, h->manifest_bytes,
+                 sizeof(h->manifest_bytes)) == 0);
+    core_release(e, event.lease);
+}
+
 /* Runs a CAPTURE at the store's readable sequence to the point where the
  * op is forwarded; returns the generated id. */
 static struct vsr_id capture_begin(struct engine *e, struct task_holder *h,
@@ -2356,17 +2423,12 @@ static struct vsr_id capture(struct engine *e)
     struct task_holder h;
     uint64_t op;
     struct vsr_id id = capture_begin(e, &h, &op);
-    const struct vsr_checkpoint *result;
 
     task_result(&h, id);
     CHECK(vsr_io_snapshots_forwarded_done(e->io, REPLICA, op, VSR_IO_OK,
                                           &h.checkpoint) == VSR_OK);
     settle_retry();
-    result = expect_core(e, op, VSR_IO_OK);
-    CHECK(result != NULL && result->id.hi == id.hi && result->id.lo == id.lo);
-    CHECK(result->manifest.size == sizeof(h.manifest_bytes) &&
-          memcmp(result->manifest.spans[0].data, h.manifest_bytes,
-                 sizeof(h.manifest_bytes)) == 0);
+    expect_checkpoint(e, op, id, &h);
     CHECK(entry_of(e, id) != NULL &&
           entry_of(e, id)->state == VSR_IO_SNAPSHOT_WRITTEN);
     CHECK(e->store->last_capture.hi == id.hi);
@@ -2415,6 +2477,69 @@ static uint32_t file_parse(const unsigned char *bytes, uint64_t size,
     CHECK(vsr_io_codec_get_clients_trailer(&cursor, &trailer) == VSR_OK);
     CHECK(trailer == header.count && cursor.position == size);
     return count;
+}
+
+/* A store with `count` clients (0x40 + i), each completed with a result of
+ * `result` bytes; transactions from `sequence` on, four clients each.
+ * Returns the next sequence. */
+static uint64_t store_clients(struct engine *e, uint64_t sequence,
+                              uint32_t count, size_t result)
+{
+    for (uint32_t done = 0; done < count;) {
+        struct vsr_id ids[4];
+        uint64_t numbers[4];
+        uint64_t ops[4];
+        uint32_t n = count - done < 4 ? count - done : 4;
+
+        for (uint32_t i = 0; i < n; ++i) {
+            ids[i].hi = 0x40 + done + i;
+            ids[i].lo = 1;
+            numbers[i] = 3;
+            ops[i] = 20 + done + i;
+        }
+        store_run(e, txn_clients(e, sequence, n, ids, numbers, ops, result));
+        sequence++;
+        done += n;
+    }
+    return sequence;
+}
+
+/* A FETCH of `id` from replica `peer`: the task names the checkpoint the
+ * core wants (the id, op 5, view 1). Returns the module's answer. */
+static int fetch_start(struct engine *e, struct task_holder *h,
+                       struct vsr_id id, uint64_t peer, uint64_t *op)
+{
+    task_init(h, id, 5, 0, peer);
+    *op = next_op(e);
+    return vsr_io_snapshots_fetch(e->io, REPLICA, *op, &h->task);
+}
+
+/* A whole FETCH of `id` by e from replica `peer`, expected to succeed. */
+static void fetch(struct engine *e, struct vsr_id id, uint64_t peer)
+{
+    struct task_holder h;
+    uint64_t op;
+    const struct vsr_op *forwarded;
+
+    CHECK(fetch_start(e, &h, id, peer, &op) == VSR_OK);
+    settle();
+    forwarded = forwarded_core(e, VSR_OP_SNAPSHOT_FETCH, op);
+    CHECK(forwarded != NULL && forwarded->data == &h.task);
+    CHECK(clients_file(e, id, false) != NULL &&
+          clients_file(e, id, true) == NULL);
+    task_result(&h, id);
+    CHECK(vsr_io_snapshots_forwarded_done(e->io, REPLICA, op, VSR_IO_OK,
+                                          &h.checkpoint) == VSR_OK);
+    settle();
+    expect_checkpoint(e, op, id, &h);
+    expect_no_core(e);
+}
+
+/* The bytes of two files are equal. */
+static bool files_equal(const struct dfile *x, const struct dfile *y)
+{
+    return x != NULL && y != NULL && x->size == y->size &&
+           memcmp(x->data, y->data, x->size) == 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -2614,7 +2739,7 @@ static void test_capture(void)
         CHECK(vsr_io_snapshots_forwarded_done(a->io, REPLICA, op, VSR_IO_OK,
                                               &h.checkpoint) == VSR_OK);
         settle();
-        CHECK(expect_core(a, op, VSR_IO_OK) != NULL);
+        expect_checkpoint(a, op, id, &h);
         CHECK(vsr_io_snapshots_forwarded_done(a->io, REPLICA, op, VSR_IO_OK,
                                               &h.checkpoint) == VSR_EINVAL);
     }
@@ -2630,6 +2755,49 @@ static void test_capture(void)
     engine_crash(a);
 }
 
+/* A library stream carries a file of several chunks, in order: the
+ * requester writes each chunk to clients-<id>.tmp at its offset, verifies
+ * the records as they arrive, renames the file at the verified END and
+ * only then forwards the FETCH; the source closes its slot at the end. */
+static void test_fetch(void)
+{
+    struct engine *a;
+    struct engine *b;
+    struct vsr_id id;
+    const struct dfile *source;
+    const struct dfile *copy;
+    uint32_t refs_a;
+    uint32_t refs_b;
+
+    world_reset(2);
+    two_engines();
+    a = &world.engines[0];
+    b = &world.engines[1];
+    expect_store(a, store_start(a, VSR_START_NEW), VSR_IO_NOT_FOUND);
+    store_run(a, txn_identity(a, 1, VSR_MEMBER_FULL));
+    store_clients(a, 2, 8, 64);
+    refs_a = pool_refs(a); /* The peer links' send slabs. */
+    refs_b = pool_refs(b);
+    id = capture(a);
+    source = clients_file(a, id, false);
+    CHECK(source != NULL && source->size == 64 + 8 * (40 + 64 + 4) + 8);
+    CHECK(source->size > 3 * CHUNK);
+    fetch(b, id, 1);
+    copy = clients_file(b, id, false);
+    CHECK(files_equal(source, copy));
+    CHECK(copy->refs == 0 && clients_file(b, id, true) == NULL);
+    CHECK(entry_of(b, id) != NULL &&
+          entry_of(b, id)->state == VSR_IO_SNAPSHOT_WRITTEN &&
+          entry_of(b, id)->sequence == 0 &&
+          entry_of(b, id)->bytes == source->size);
+    settle();
+    CHECK(entry_of(a, id)->readers == 0 && source->refs == 1);
+    CHECK(pool_refs(a) == refs_a && pool_refs(b) == refs_b);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(b->replica->leases_free == REGIONS &&
+          a->replica->leases_free == REGIONS);
+}
+
 int main(void)
 {
     /* TEMP: helpers of the tests still to come. */
@@ -2643,6 +2811,8 @@ int main(void)
     (void)submit_sync;
     (void)store_populate;
     (void)expect_no_core;
+    (void)expect_core;
     test_capture();
+    test_fetch();
     return 0;
 }

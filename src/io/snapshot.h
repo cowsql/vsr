@@ -116,9 +116,17 @@ struct vsr_io_snapshot {
                                found by a load); 0 once unlinked. */
     uint32_t sync_failed;   /* SYNC: the fdatasync failed; reported once
                                the transient slot is closed. */
+    uint32_t job_next;      /* JOB_SYNC to start once the RELEASE whose
+                               CLOSE is in flight completes, or NONE. */
+    uint32_t lease;         /* CAPTURE, FETCH: the engine lease reserved
+                               when the op was taken; the caller's
+                               checkpoint is copied into its region and the
+                               OK completion carries it. NONE otherwise. */
     uint32_t reserved;
     const struct vsr_snapshot_task *task; /* The core op's task, pinned
                                              until the op completes. */
+    const struct vsr_checkpoint *result;  /* The caller's checkpoint copied
+                                             into the lease region, or NULL. */
 };
 
 /* One executor record of the module in flight: its slot-table index and
@@ -204,26 +212,29 @@ struct vsr_io_snapshots {
     uint32_t dir_state;  /* 0 closed, 1 opening, 2 open, 3 failed */
     uint32_t dir_slot;   /* Engine file slot of the directory, or NONE. */
     uint32_t dir_fileop; /* Its open in flight, or NONE. */
-    uint32_t retry;      /* 1 when a step waits for a resource: the CAPTURE
-                            deadline is armed. */
+    uint32_t retry;      /* 1 when a step waited for a resource since the
+                            last poll: the CAPTURE deadline is armed. */
     uint32_t closed;
     uint32_t max_clients;
-    int32_t error; /* Last errno of the module's I/O, or zero. */
-    uint32_t reserved;
-    struct vsr_snapshot_task task;   /* Forwarded CAPTURE task copy. */
-    struct vsr_checkpoint template;  /* Its checkpoint with the new id. */
-    unsigned char *template_region;  /* Epoch and memberships copy. */
-    size_t region_bytes;             /* Of each checkpoint region. */
-    struct vsr_checkpoint result[2]; /* Caller's CAPTURE (0) and FETCH (1)
-                                        result copies returned to the core. */
-    unsigned char *result_region;    /* [2 * region_bytes] */
-    unsigned char request[56];       /* The fetch's wire request, pinned
-                                        until its stream ends. */
+    int32_t error;         /* Last errno of the module's I/O, or zero. */
+    uint32_t pending_base; /* Registry index of a file loaded for a held
+                              RESTORE or PUBLISH that the store has not
+                              packed yet (its slot stays open), or NONE. */
+    struct vsr_snapshot_task task;  /* Forwarded CAPTURE task copy. */
+    struct vsr_checkpoint template; /* Its checkpoint with the new id. */
+    unsigned char *template_region; /* Epoch and memberships copy. */
+    size_t region_bytes;            /* Of a checkpoint copy. */
+    unsigned char request[56];      /* The fetch's wire request, pinned
+                                       until its stream ends. */
 };
 
 /* Bytes and alignment of the module's memory for the core limits, the
  * engine limits (stream_window, streams) and the store's max_clients;
- * ELIMIT on overflow. */
+ * ELIMIT on overflow. region_bytes is what a deep copy of a checkpoint
+ * needs: the engine's lease regions (vsr_io_codec_load_region, which
+ * holds a recovered row's checkpoint) must hold it. */
+int vsr_io_snapshots_region_bytes(const struct vsr_limits *limits,
+                                  size_t *bytes);
 int vsr_io_snapshots_size(const struct vsr_limits *limits,
                           const struct vsr_io_limits *io_limits,
                           uint32_t max_clients, size_t *bytes,
@@ -235,11 +246,16 @@ void vsr_io_snapshots_init(struct vsr_io_snapshots *snapshots, void *memory,
 
 /* Core ops intercepted by the engine, in emission order. Returns OK when
  * taken, or a status to complete the core op with at once (RETRY when a
- * registry entry, a slab, a file slot or a stream cannot be obtained now,
- * or another CAPTURE or FETCH still uses the writer or reader; FAILED for
- * a task that contradicts the registry). A taken op is forwarded to the
- * caller from the module's poll (with the same op id) and completed to the
- * core through vsr_io_engine_complete_core when both halves are done. */
+ * registry entry, a slab, a file slot, an engine lease or a stream cannot
+ * be obtained now, or another CAPTURE or FETCH still uses the writer or
+ * reader; FAILED for a task that contradicts the registry). A taken op is
+ * forwarded to the caller from the module's poll (with the same op id) and
+ * completed to the core through vsr_io_engine_complete_core when both
+ * halves are done. An OK CAPTURE or FETCH completion carries the caller's
+ * checkpoint deep-copied into an engine lease region (the core retains it
+ * under that lease until its RELEASE op); every other completion carries
+ * no data and no lease. A DROP of an id the registry does not hold is
+ * forwarded like any other and unlinks clients-<id> if it exists. */
 int vsr_io_snapshots_capture(struct vsr_io *io, uint32_t replica, uint64_t op,
                              const struct vsr_snapshot_task *task);
 int vsr_io_snapshots_sync(struct vsr_io *io, uint32_t replica, uint64_t op,
@@ -250,8 +266,9 @@ int vsr_io_snapshots_drop(struct vsr_io *io, uint32_t replica, uint64_t op,
                           const struct vsr_snapshot_task *task);
 /* The caller completed the forwarded half (a CORE COMPLETE event whose op
  * id was forwarded by this module). data is the caller's vsr_checkpoint
- * for CAPTURE and FETCH, copied into result_region; EINVAL when the id is
- * not outstanding. */
+ * for CAPTURE and FETCH, copied into the op's lease region at once (the
+ * engine may release the caller's lease right after); EINVAL when the id
+ * is not outstanding. */
 int vsr_io_snapshots_forwarded_done(struct vsr_io *io, uint32_t replica,
                                     uint64_t op, int32_t status,
                                     const void *data);
@@ -260,7 +277,8 @@ bool vsr_io_snapshots_owns(const struct vsr_io_snapshots *snapshots,
 
 /* Source side of a library stream (called by the stream module at the
  * request frame, before any file is open): resolves the request to a local
- * file and returns OK to serve it, setting streams[stream].replica; the
+ * file (complete, with no CAPTURE outstanding on it; NOT_FOUND otherwise)
+ * and returns OK to serve it, setting streams[stream].replica; the
  * module then opens the file into a slot and feeds one FILE write of the
  * whole file and CLOSE OK through vsr_io_streams_write / close, using
  * vsr_io_streams_handle(&io->streams, stream). Any other status refuses:

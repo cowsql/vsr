@@ -214,13 +214,21 @@ static int plan_of(const struct vsr_limits *limits,
         !place(&offset, bytes, alignof(struct vsr_io_snapshot_serve),
                &plan->serves) ||
         !region_bytes(limits, &plan->region_bytes) ||
-        !vsr_size_mul(plan->region_bytes, 3, &bytes) ||
-        !place(&offset, bytes, 16, &plan->regions)) {
+        !place(&offset, plan->region_bytes, 16, &plan->regions)) {
         return VSR_ELIMIT;
     }
     plan->count = (uint32_t)count;
     plan->total = offset;
     return VSR_OK;
+}
+
+int vsr_io_snapshots_region_bytes(const struct vsr_limits *limits,
+                                  size_t *bytes)
+{
+    if (limits == NULL || bytes == NULL) {
+        return VSR_EINVAL;
+    }
+    return region_bytes(limits, bytes) ? VSR_OK : VSR_ELIMIT;
 }
 
 int vsr_io_snapshots_size(const struct vsr_limits *limits,
@@ -266,8 +274,11 @@ void vsr_io_snapshots_init(struct vsr_io_snapshots *snapshots, void *memory,
         snapshots->entries[i].file_slot = -1;
         snapshots->entries[i].fileop = NONE;
         snapshots->entries[i].tmp_slot = NONE;
+        snapshots->entries[i].job_next = NONE;
+        snapshots->entries[i].lease = NONE;
     }
     snapshots->capture = NONE;
+    snapshots->pending_base = NONE;
     snapshots->writer.snapshot = NONE;
     snapshots->writer.slab = NONE;
     snapshots->writer.cold_slab = NONE;
@@ -293,7 +304,6 @@ void vsr_io_snapshots_init(struct vsr_io_snapshots *snapshots, void *memory,
     snapshots->max_clients = max_clients;
     snapshots->region_bytes = plan.region_bytes;
     snapshots->template_region = base + plan.regions;
-    snapshots->result_region = base + plan.regions + plan.region_bytes;
 }
 
 /* -------------------------------------------------------------------------
@@ -336,6 +346,8 @@ static struct vsr_io_snapshot *entry_take(struct vsr_io_snapshots *s,
             entry->file_slot = -1;
             entry->fileop = NONE;
             entry->tmp_slot = NONE;
+            entry->job_next = NONE;
+            entry->lease = NONE;
             return entry;
         }
     }
@@ -346,14 +358,20 @@ static void entry_free(struct vsr_io_snapshots *s,
                        struct vsr_io_snapshot *entry)
 {
     SNAPSHOT_ASSERT(entry->fileop == NONE && entry->file_slot < 0 &&
-                    entry->tmp_slot == NONE);
+                    entry->tmp_slot == NONE && entry->lease == NONE &&
+                    entry->readers == 0);
     if (s->capture == entry_index(s, entry)) {
         s->capture = NONE;
+    }
+    if (s->pending_base == entry_index(s, entry)) {
+        s->pending_base = NONE;
     }
     memset(entry, 0, sizeof(*entry));
     entry->file_slot = -1;
     entry->fileop = NONE;
     entry->tmp_slot = NONE;
+    entry->job_next = NONE;
+    entry->lease = NONE;
 }
 
 /* Builds "<dir>/clients-<id>[.tmp]" (or "<dir>" alone, "." when empty)
@@ -392,21 +410,45 @@ static bool path_of(char *buffer, const char *dir, struct vsr_id id, bool file,
     return true;
 }
 
-static void complete_core(struct vsr_io_replica *rep, uint64_t op,
-                          int32_t status, const void *data)
+/* Completes the core op in progress on `entry` with `status`, exactly
+ * once: an OK CAPTURE or FETCH hands the caller's checkpoint over under
+ * the entry's lease, any other outcome releases the lease; the op fields
+ * are cleared. */
+static void op_complete(struct vsr_io_replica *rep,
+                        struct vsr_io_snapshot *entry, int32_t status)
 {
     struct vsr_io_completion completion;
 
-    completion.op = op;
+    SNAPSHOT_ASSERT(entry->op != 0 && entry->forwarded == 0);
+    completion.op = entry->op;
     completion.status = status;
     completion.lease = NONE;
-    completion.data = data;
+    completion.data = NULL;
+    if (status == VSR_IO_OK && entry->result != NULL &&
+        (entry->op_type == VSR_OP_SNAPSHOT_CAPTURE ||
+         entry->op_type == VSR_OP_SNAPSHOT_FETCH)) {
+        completion.lease = entry->lease;
+        completion.data = entry->result;
+        entry->lease = NONE;
+    }
+    if (entry->lease != NONE) {
+        vsr_io_lease_release(rep, entry->lease);
+        entry->lease = NONE;
+    }
+    entry->result = NULL;
+    entry->op = 0;
+    entry->op_type = 0;
+    entry->task = NULL;
     vsr_io_engine_complete_core(rep, &completion);
 }
 
-static void retry_later(struct vsr_io_snapshots *s)
+/* A step waits for a resource (a slab, a slot, a file operation): the
+ * replica's CAPTURE deadline makes the loop poll and prepare again. */
+static void retry_later(struct vsr_io *io, struct vsr_io_replica *rep)
 {
-    s->retry = 1;
+    rep->snapshots.retry = 1;
+    vsr_io_deadlines_arm(&io->deadlines, rep->deadline_capture,
+                         io->now + SNAPSHOT_RETRY_NS);
 }
 
 /* Frees an engine file slot the module holds, clearing its descriptor. */
@@ -473,18 +515,15 @@ static bool copy_epoch(struct vsr_io_bump *region, const struct vsr_epoch *in,
     return true;
 }
 
-/* Deep copy of a checkpoint into a region of region_bytes: the epoch, the
- * manifest bytes as one span. False when it does not fit (a manifest
- * beyond the limits). */
-static bool copy_checkpoint(unsigned char *memory, size_t size,
+/* Deep copy of a checkpoint's graph into `region`: the epoch, the
+ * manifest bytes as one span; `out` itself is the caller's. False when it
+ * does not fit (a manifest beyond the limits). */
+static bool copy_checkpoint(struct vsr_io_bump *region,
                             const struct vsr_checkpoint *in,
                             struct vsr_checkpoint *out)
 {
-    struct vsr_io_bump region;
-
-    vsr_io_bump_init(&region, memory, size);
     *out = *in;
-    if (!copy_epoch(&region, in->epoch, &out->epoch)) {
+    if (!copy_epoch(region, in->epoch, &out->epoch)) {
         return false;
     }
     out->manifest.spans = NULL;
@@ -499,14 +538,16 @@ static bool copy_checkpoint(unsigned char *memory, size_t size,
             return false;
         }
         bytes_size = (size_t)in->manifest.size;
-        bytes = vsr_io_bump_alloc(&region, bytes_size, 1);
+        bytes = vsr_io_bump_alloc(region, bytes_size, 1);
         span =
-            vsr_io_bump_alloc(&region, sizeof(*span), alignof(struct vsr_span));
+            vsr_io_bump_alloc(region, sizeof(*span), alignof(struct vsr_span));
         if (bytes == NULL || span == NULL) {
             return false;
         }
         for (uint32_t i = 0; i < in->manifest.count; ++i) {
-            if (in->manifest.spans[i].size > bytes_size - at) {
+            if (in->manifest.spans[i].size > bytes_size - at ||
+                (in->manifest.spans[i].size > 0 &&
+                 in->manifest.spans[i].data == NULL)) {
                 return false;
             }
             memcpy(bytes + at, in->manifest.spans[i].data,
@@ -521,6 +562,27 @@ static bool copy_checkpoint(unsigned char *memory, size_t size,
         out->manifest.spans = span;
         out->manifest.count = 1;
     }
+    return true;
+}
+
+/* The caller's checkpoint of a CAPTURE or FETCH, deep-copied into the
+ * entry's lease region (the checkpoint itself first): false when it does
+ * not fit. */
+static bool result_copy(struct vsr_io_replica *rep,
+                        struct vsr_io_snapshot *entry,
+                        const struct vsr_checkpoint *in)
+{
+    struct vsr_io_bump *region = &rep->leases[entry->lease].region;
+    struct vsr_checkpoint *out;
+
+    region->used = 0;
+    out =
+        vsr_io_bump_alloc(region, sizeof(*out), alignof(struct vsr_checkpoint));
+    if (out == NULL || !copy_checkpoint(region, in, out)) {
+        region->used = 0;
+        return false;
+    }
+    entry->result = out;
     return true;
 }
 
@@ -741,7 +803,7 @@ static bool writer_locate(struct vsr_io *io, struct vsr_io_replica *rep,
         if (w->cold_slab == NONE) {
             w->cold_slab = vsr_io_pool_acquire(&io->pool, false);
             if (w->cold_slab == NONE) {
-                retry_later(s);
+                retry_later(io, rep);
                 return false;
             }
         }
@@ -864,8 +926,8 @@ static void writer_done(struct vsr_io *io, uint32_t replica, uint32_t step,
         return;
     case STEP_READ:
         e = &w->table[w->next];
-        if (result < 0) {
-            s->error = result;
+        if (result < 0 || (uint32_t)result > io->pool.slab_bytes) {
+            s->error = result < 0 ? result : -EIO;
             writer_finish(io, replica, VSR_IO_FAILED);
             return;
         }
@@ -1068,9 +1130,15 @@ static void reader_start(struct vsr_io_clients_reader *r, uint32_t snapshot,
  * Base loads
  * ---------------------------------------------------------------------- */
 
-/* The load is over: the store resumes with `status`; on OK the file's
- * slot becomes the base slot. An entry this load created for an id the
- * registry did not hold is freed unless the file was found. */
+static void base_track(struct vsr_io *io, uint32_t replica);
+
+/* The load is over: the store resumes with `status`. On OK the file's
+ * slot stays open with the entry: base_track makes it the base slot once
+ * the store's client base names the id (at once for a recovery load,
+ * whose merge applies in base_end; when the held RESTORE or PUBLISH packs
+ * otherwise, the entry being the pending base until then). An entry this
+ * load created for an id the registry did not hold is freed unless the
+ * file was found. */
 static void load_finish(struct vsr_io *io, uint32_t replica, int32_t status)
 {
     struct vsr_io_replica *rep = replica_of(io, replica);
@@ -1084,6 +1152,9 @@ static void load_finish(struct vsr_io *io, uint32_t replica, int32_t status)
     entry->step = STEP_IDLE;
     if (status == VSR_IO_OK && entry->tmp_slot != NONE) {
         if (entry->file_slot >= 0) {
+            if (rep->store.base_slot == entry->file_slot) {
+                rep->store.base_slot = (int32_t)entry->tmp_slot;
+            }
             slot_drop(io, (uint32_t)entry->file_slot);
         }
         entry->file_slot = (int32_t)entry->tmp_slot;
@@ -1093,7 +1164,7 @@ static void load_finish(struct vsr_io *io, uint32_t replica, int32_t status)
         if (entry->sequence == 0) {
             entry->sequence = sequence;
         }
-        rep->store.base_slot = entry->file_slot;
+        s->pending_base = entry_index(s, entry);
     } else {
         if (entry->tmp_slot != NONE) {
             slot_drop(io, entry->tmp_slot);
@@ -1108,6 +1179,7 @@ static void load_finish(struct vsr_io *io, uint32_t replica, int32_t status)
         vsr_io_store_base_end(&rep->store, id, sequence);
     }
     vsr_io_store_base_resume(&rep->store, status);
+    base_track(io, replica);
 }
 
 int vsr_io_snapshots_load_base(struct vsr_io *io, uint32_t replica,
@@ -1138,13 +1210,13 @@ int vsr_io_snapshots_load_base(struct vsr_io *io, uint32_t replica,
     }
     slab = vsr_io_pool_acquire(&io->pool, false);
     if (slab == NONE) {
-        retry_later(s);
+        retry_later(io, rep);
         return VSR_IO_RETRY;
     }
     slot = vsr_io_engine_slot_alloc(io);
     if (slot == NONE) {
         vsr_io_pool_release(&io->pool, slab);
-        retry_later(s);
+        retry_later(io, rep);
         return VSR_IO_RETRY;
     }
     if (entry == NULL) {
@@ -1152,7 +1224,7 @@ int vsr_io_snapshots_load_base(struct vsr_io *io, uint32_t replica,
         if (entry == NULL) {
             vsr_io_pool_release(&io->pool, slab);
             vsr_io_engine_slot_free(io, slot);
-            retry_later(s);
+            retry_later(io, rep);
             return VSR_IO_RETRY;
         }
         entry->library_status = VSR_IO_OK;
@@ -1209,8 +1281,8 @@ static void load_done(struct vsr_io *io, uint32_t replica, uint32_t step,
         return;
     case STEP_READ:
         r->reads = 0;
-        if (result < 0) {
-            s->error = result;
+        if (result < 0 || (uint32_t)result > io->pool.slab_bytes - r->filled) {
+            s->error = result < 0 ? result : -EIO;
             reader_fail(r, VSR_IO_FAILED);
         } else if (result == 0) {
             reader_fail(r, VSR_IO_CORRUPT); /* Shorter than its size. */
@@ -1252,15 +1324,23 @@ static void load_done(struct vsr_io *io, uint32_t replica, uint32_t step,
 static void fetch_settle(struct vsr_io *io, uint32_t replica,
                          struct vsr_io_snapshot *entry);
 
-/* Completes every held chunk at once (the file is no longer written). */
+/* Completes the head chunk: its bytes are no longer needed. */
+static void chunk_pop(struct vsr_io *io, struct vsr_io_snapshots *s)
+{
+    struct vsr_io_snapshot_chunk *chunk = &s->chunks[s->chunks_head];
+
+    SNAPSHOT_ASSERT(s->chunks_count > 0 && !s->chunk_writing);
+    (void)vsr_io_streams_data_done(io, chunk->op);
+    s->chunks_head = (s->chunks_head + 1) % s->chunks_capacity;
+    s->chunks_count--;
+}
+
+/* Completes every held chunk at once (the file is no longer written);
+ * the head's write, when one is out, completes first. */
 static void chunks_flush(struct vsr_io *io, struct vsr_io_snapshots *s)
 {
     while (s->chunks_count > 0 && !s->chunk_writing) {
-        struct vsr_io_snapshot_chunk *chunk = &s->chunks[s->chunks_head];
-
-        (void)vsr_io_streams_data_done(io, chunk->op);
-        s->chunks_head = (s->chunks_head + 1) % s->chunks_capacity;
-        s->chunks_count--;
+        chunk_pop(io, s);
     }
 }
 
@@ -1271,8 +1351,8 @@ static void fetch_finish(struct vsr_io *io, uint32_t replica, int32_t status)
     struct vsr_io_replica *rep = replica_of(io, replica);
     struct vsr_io_snapshots *s = &rep->snapshots;
     struct vsr_io_snapshot *entry = &s->entries[s->reader.snapshot];
-    uint64_t op = entry->op;
 
+    SNAPSHOT_ASSERT(s->chunks_count == 0 && !s->chunk_writing);
     entry->job = VSR_IO_SNAPSHOT_JOB_NONE;
     entry->step = STEP_IDLE;
     entry->library_status = status;
@@ -1287,8 +1367,9 @@ static void fetch_finish(struct vsr_io *io, uint32_t replica, int32_t status)
         entry->forward_due = 1;
         return;
     }
+    /* The caller never saw the op: the core hears the library's status. */
+    op_complete(rep, entry, status);
     entry_free(s, entry);
-    complete_core(rep, op, status, NULL);
 }
 
 /* The stream ended and no record is in flight: decide the outcome. */
@@ -1327,6 +1408,7 @@ int vsr_io_snapshots_fetch(struct vsr_io *io, uint32_t replica, uint64_t op,
     uint64_t node;
     uint32_t slab;
     uint32_t slot;
+    uint32_t lease;
     uint32_t index = NONE;
     struct vsr_id id;
 
@@ -1348,9 +1430,14 @@ int vsr_io_snapshots_fetch(struct vsr_io *io, uint32_t replica, uint64_t op,
         /* Already held locally: nothing to transfer. */
         if (entry->op != 0 || entry->state == VSR_IO_SNAPSHOT_WRITING ||
             entry->state == VSR_IO_SNAPSHOT_FETCHING ||
-            entry->state == VSR_IO_SNAPSHOT_DROPPING) {
+            entry->state == VSR_IO_SNAPSHOT_DROPPING || !entry->on_disk) {
             return VSR_IO_RETRY;
         }
+        lease = vsr_io_lease_alloc(rep, NONE, NONE);
+        if (lease == NONE) {
+            return VSR_IO_RETRY;
+        }
+        entry->lease = lease;
         entry->op = op;
         entry->op_type = VSR_OP_SNAPSHOT_FETCH;
         entry->task = task;
@@ -1366,19 +1453,26 @@ int vsr_io_snapshots_fetch(struct vsr_io *io, uint32_t replica, uint64_t op,
     if (node == VSR_IO_NO_NODE) {
         return VSR_IO_RETRY;
     }
+    lease = vsr_io_lease_alloc(rep, NONE, NONE);
+    if (lease == NONE) {
+        return VSR_IO_RETRY;
+    }
     slab = vsr_io_pool_acquire(&io->pool, false);
     if (slab == NONE) {
+        vsr_io_lease_release(rep, lease);
         return VSR_IO_RETRY;
     }
     slot = vsr_io_engine_slot_alloc(io);
     if (slot == NONE) {
         vsr_io_pool_release(&io->pool, slab);
+        vsr_io_lease_release(rep, lease);
         return VSR_IO_RETRY;
     }
     entry = entry_take(s, id, VSR_IO_SNAPSHOT_FETCHING);
     if (entry == NULL) {
         vsr_io_pool_release(&io->pool, slab);
         vsr_io_engine_slot_free(io, slot);
+        vsr_io_lease_release(rep, lease);
         return VSR_IO_RETRY;
     }
     memset(&request, 0, sizeof(request));
@@ -1400,9 +1494,11 @@ int vsr_io_snapshots_fetch(struct vsr_io *io, uint32_t replica, uint64_t op,
         entry_free(s, entry);
         vsr_io_pool_release(&io->pool, slab);
         vsr_io_engine_slot_free(io, slot);
+        vsr_io_lease_release(rep, lease);
         return VSR_IO_RETRY;
     }
     io->streams.streams[index].replica = replica;
+    entry->lease = lease;
     entry->op = op;
     entry->op_type = VSR_OP_SNAPSHOT_FETCH;
     entry->task = task;
@@ -1491,7 +1587,12 @@ static void fetch_done(struct vsr_io *io, uint32_t replica, uint32_t step,
             s->error = result < 0 ? result : -EIO;
             reader_fail(r, VSR_IO_FAILED);
         }
-        chunks_flush(io, s);
+        /* The head chunk is on file; the others wait for their writes
+         * unless the file is no longer written. */
+        chunk_pop(io, s);
+        if (r->stage == STAGE_FAILED) {
+            chunks_flush(io, s);
+        }
         if (r->stream == NONE && s->chunks_count == 0) {
             fetch_end_decide(io, replica);
         }
@@ -1555,11 +1656,14 @@ int vsr_io_snapshots_serve(struct vsr_io *io, uint32_t stream,
     id.hi = request->snapshot_hi;
     id.lo = request->snapshot_lo;
     entry = entry_find(s, id);
+    /* A file is served once complete and published to the core: not while
+     * its CAPTURE is outstanding (a failed caller half discards it). */
     if (s->closed || entry == NULL ||
         (entry->state != VSR_IO_SNAPSHOT_WRITTEN &&
          entry->state != VSR_IO_SNAPSHOT_SYNCING &&
          entry->state != VSR_IO_SNAPSHOT_DURABLE) ||
-        entry->job == VSR_IO_SNAPSHOT_JOB_DISCARD || !entry->on_disk) {
+        entry->job == VSR_IO_SNAPSHOT_JOB_DISCARD || !entry->on_disk ||
+        (entry->op != 0 && entry->op_type == VSR_OP_SNAPSHOT_CAPTURE)) {
         return VSR_IO_NOT_FOUND;
     }
     if (stream >= s->serves_count) {
@@ -1611,8 +1715,13 @@ static void serve_done(struct vsr_io *io, uint32_t replica, uint32_t stream,
         vsr_io_engine_slot_free(io, serve->slot);
         serve->slot = NONE;
         serve->state = SERVE_OPEN;
-        (void)vsr_io_streams_close(
-            io, handle, result == -ENOENT ? VSR_IO_NOT_FOUND : VSR_IO_FAILED);
+        if (!serve->ended) {
+            /* The handle is the stream's only while it has not ended: an
+             * ended stream's index may serve another stream already. */
+            (void)vsr_io_streams_close(io, handle,
+                                       result == -ENOENT ? VSR_IO_NOT_FOUND
+                                                         : VSR_IO_FAILED);
+        }
     } else if (serve->ended) {
         serve->state = SERVE_CLOSING;
     } else {
@@ -1668,8 +1777,13 @@ void vsr_io_snapshots_stream_end(struct vsr_io *io, uint32_t replica,
         struct vsr_io_snapshot_serve *serve = &s->serves[stream];
 
         serve->ended = 1;
-        if (serve->state == SERVE_OPENING) {
+        if (serve->state == SERVE_OPENING && serve->fileop != NONE) {
             return; /* The open completes first. */
+        }
+        if (serve->state == SERVE_OPENING && serve->slot != NONE) {
+            /* The open was never issued: the slot holds nothing. */
+            vsr_io_engine_slot_free(io, serve->slot);
+            serve->slot = NONE;
         }
         if (serve->slot != NONE) {
             serve->state = SERVE_CLOSING;
@@ -1687,6 +1801,8 @@ void vsr_io_snapshots_stream_end(struct vsr_io *io, uint32_t replica,
  * other half failed): close the kept slot, unlink. */
 static void discard_start(struct vsr_io_snapshot *entry)
 {
+    SNAPSHOT_ASSERT(entry->readers == 0 &&
+                    entry->job == VSR_IO_SNAPSHOT_JOB_NONE);
     entry->job = VSR_IO_SNAPSHOT_JOB_DISCARD;
     entry->step = entry->file_slot >= 0 ? STEP_CLOSE : STEP_UNLINK;
 }
@@ -1704,10 +1820,7 @@ static void capture_settle(struct vsr_io *io, uint32_t replica,
     }
     if (entry->caller_status == VSR_IO_OK &&
         entry->library_status == VSR_IO_OK) {
-        complete_core(rep, entry->op, VSR_IO_OK, &s->result[0]);
-        entry->op = 0;
-        entry->op_type = 0;
-        entry->task = NULL;
+        op_complete(rep, entry, VSR_IO_OK);
         s->capture = NONE;
         return;
     }
@@ -1717,7 +1830,7 @@ static void capture_settle(struct vsr_io *io, uint32_t replica,
     }
     status = entry->caller_status != VSR_IO_OK ? entry->caller_status
                                                : entry->library_status;
-    complete_core(rep, entry->op, status, NULL);
+    op_complete(rep, entry, status);
     entry_free(s, entry);
 }
 
@@ -1732,10 +1845,7 @@ static void fetch_settle(struct vsr_io *io, uint32_t replica,
         return;
     }
     if (entry->caller_status == VSR_IO_OK) {
-        complete_core(rep, entry->op, VSR_IO_OK, &s->result[1]);
-        entry->op = 0;
-        entry->op_type = 0;
-        entry->task = NULL;
+        op_complete(rep, entry, VSR_IO_OK);
         return;
     }
     /* A fetched file the caller failed on is a private partial object
@@ -1748,10 +1858,7 @@ static void fetch_settle(struct vsr_io *io, uint32_t replica,
         entry->state = VSR_IO_SNAPSHOT_DROPPING;
         entry->unlink_due = 1;
     }
-    complete_core(rep, entry->op, entry->caller_status, NULL);
-    entry->op = 0;
-    entry->op_type = 0;
-    entry->task = NULL;
+    op_complete(rep, entry, entry->caller_status);
     if (!entry->on_disk) {
         entry_free(s, entry);
     }
@@ -1769,12 +1876,9 @@ static void sync_settle(struct vsr_io *io, uint32_t replica,
     }
     status = entry->caller_status != VSR_IO_OK ? entry->caller_status
                                                : entry->library_status;
-    complete_core(rep, entry->op, status, NULL);
     entry->state =
         status == VSR_IO_OK ? VSR_IO_SNAPSHOT_DURABLE : VSR_IO_SNAPSHOT_WRITTEN;
-    entry->op = 0;
-    entry->op_type = 0;
-    entry->task = NULL;
+    op_complete(rep, entry, status);
 }
 
 static void drop_settle(struct vsr_io *io, uint32_t replica,
@@ -1786,10 +1890,11 @@ static void drop_settle(struct vsr_io *io, uint32_t replica,
         return;
     }
     if (entry->caller_status != VSR_IO_OK) {
-        complete_core(rep, entry->op, entry->caller_status, NULL);
-        entry->op = 0;
-        entry->op_type = 0;
-        entry->task = NULL;
+        op_complete(rep, entry, entry->caller_status);
+        if (!entry->on_disk && entry->file_slot < 0 &&
+            entry->job == VSR_IO_SNAPSHOT_JOB_NONE) {
+            entry_free(&rep->snapshots, entry); /* An unknown id's entry. */
+        }
         return;
     }
     entry->state = VSR_IO_SNAPSHOT_DROPPING;
@@ -1797,10 +1902,7 @@ static void drop_settle(struct vsr_io *io, uint32_t replica,
     if (entry->readers > 0) {
         /* A served stream still reads it: the unlink waits, the core
          * does not. */
-        complete_core(rep, entry->op, VSR_IO_OK, NULL);
-        entry->op = 0;
-        entry->op_type = 0;
-        entry->task = NULL;
+        op_complete(rep, entry, VSR_IO_OK);
     }
 }
 
@@ -1811,9 +1913,11 @@ int vsr_io_snapshots_capture(struct vsr_io *io, uint32_t replica, uint64_t op,
     struct vsr_io_snapshots *s;
     struct vsr_io_snapshot *entry;
     struct vsr_io_clients_writer *w;
+    struct vsr_io_bump template;
     struct vsr_id id;
     uint32_t slab;
     uint32_t slot;
+    uint32_t lease;
     uint32_t count;
 
     if (io == NULL || replica >= io->options.limits.replicas || op == 0 ||
@@ -1830,13 +1934,19 @@ int vsr_io_snapshots_capture(struct vsr_io *io, uint32_t replica, uint64_t op,
     if (s->closed || w->snapshot != NONE || s->capture != NONE) {
         return VSR_IO_RETRY;
     }
+    lease = vsr_io_lease_alloc(rep, NONE, NONE);
+    if (lease == NONE) {
+        return VSR_IO_RETRY;
+    }
     slab = vsr_io_pool_acquire(&io->pool, false);
     if (slab == NONE) {
+        vsr_io_lease_release(rep, lease);
         return VSR_IO_RETRY;
     }
     slot = vsr_io_engine_slot_alloc(io);
     if (slot == NONE) {
         vsr_io_pool_release(&io->pool, slab);
+        vsr_io_lease_release(rep, lease);
         return VSR_IO_RETRY;
     }
     do {
@@ -1846,14 +1956,16 @@ int vsr_io_snapshots_capture(struct vsr_io *io, uint32_t replica, uint64_t op,
     if (entry == NULL) {
         vsr_io_pool_release(&io->pool, slab);
         vsr_io_engine_slot_free(io, slot);
+        vsr_io_lease_release(rep, lease);
         return VSR_IO_RETRY;
     }
     s->task = *task;
-    if (!copy_checkpoint(s->template_region, s->region_bytes, task->checkpoint,
-                         &s->template)) {
+    vsr_io_bump_init(&template, s->template_region, s->region_bytes);
+    if (!copy_checkpoint(&template, task->checkpoint, &s->template)) {
         entry_free(s, entry);
         vsr_io_pool_release(&io->pool, slab);
         vsr_io_engine_slot_free(io, slot);
+        vsr_io_lease_release(rep, lease);
         return VSR_IO_FAILED;
     }
     s->template.id = id;
@@ -1861,6 +1973,7 @@ int vsr_io_snapshots_capture(struct vsr_io *io, uint32_t replica, uint64_t op,
     count =
         vsr_io_store_snapshot_clients(&rep->store, w->table, s->max_clients);
     SNAPSHOT_ASSERT(count <= s->max_clients);
+    entry->lease = lease;
     entry->op = op;
     entry->op_type = VSR_OP_SNAPSHOT_CAPTURE;
     entry->task = task;
@@ -1912,7 +2025,11 @@ int vsr_io_snapshots_sync(struct vsr_io *io, uint32_t replica, uint64_t op,
         entry->state == VSR_IO_SNAPSHOT_DROPPING || !entry->on_disk) {
         return VSR_IO_FAILED;
     }
-    if (entry->op != 0 || entry->job != VSR_IO_SNAPSHOT_JOB_NONE) {
+    /* A RELEASE of the kept slot is housekeeping: a SYNC cancels it while
+     * its CLOSE is still to issue, or follows it (a RETRY would fence the
+     * replica). */
+    if (entry->op != 0 || (entry->job != VSR_IO_SNAPSHOT_JOB_NONE &&
+                           entry->job != VSR_IO_SNAPSHOT_JOB_RELEASE)) {
         return VSR_IO_RETRY;
     }
     entry->op = op;
@@ -1922,6 +2039,10 @@ int vsr_io_snapshots_sync(struct vsr_io *io, uint32_t replica, uint64_t op,
     entry->library_status = -1;
     entry->forward_due = 1;
     entry->state = VSR_IO_SNAPSHOT_SYNCING;
+    if (entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE && entry->fileop != NONE) {
+        entry->job_next = VSR_IO_SNAPSHOT_JOB_SYNC;
+        return VSR_OK;
+    }
     entry->job = VSR_IO_SNAPSHOT_JOB_SYNC;
     entry->step = entry->file_slot >= 0 ? STEP_FSYNC : STEP_OPEN;
     return VSR_OK;
@@ -1943,18 +2064,30 @@ int vsr_io_snapshots_drop(struct vsr_io *io, uint32_t replica, uint64_t op,
     }
     rep = replica_of(io, replica);
     s = &rep->snapshots;
+    if (id_zero(task->checkpoint->id)) {
+        return VSR_IO_FAILED;
+    }
     entry = entry_find(s, task->checkpoint->id);
     if (s->closed) {
         return VSR_IO_RETRY;
     }
-    if (entry == NULL || entry->state == VSR_IO_SNAPSHOT_WRITING ||
-        entry->state == VSR_IO_SNAPSHOT_FETCHING ||
-        entry->state == VSR_IO_SNAPSHOT_DROPPING) {
+    if (entry == NULL) {
+        /* An id the registry does not hold (a file left by an earlier
+         * run, or none): forwarded all the same, then clients-<id> is
+         * unlinked if it exists. */
+        entry = entry_take(s, task->checkpoint->id, VSR_IO_SNAPSHOT_DURABLE);
+        if (entry == NULL) {
+            return VSR_IO_RETRY;
+        }
+    } else if (entry->state == VSR_IO_SNAPSHOT_WRITING ||
+               entry->state == VSR_IO_SNAPSHOT_FETCHING ||
+               entry->state == VSR_IO_SNAPSHOT_DROPPING) {
         return VSR_IO_FAILED;
-    }
-    if (entry->op != 0 || entry->job != VSR_IO_SNAPSHOT_JOB_NONE) {
+    } else if (entry->op != 0 || (entry->job != VSR_IO_SNAPSHOT_JOB_NONE &&
+                                  entry->job != VSR_IO_SNAPSHOT_JOB_RELEASE)) {
         return VSR_IO_RETRY;
     }
+    /* With a RELEASE pending, the unlink job starts once it ends. */
     entry->op = op;
     entry->op_type = VSR_OP_SNAPSHOT_DROP;
     entry->task = task;
@@ -2007,13 +2140,11 @@ int vsr_io_snapshots_forwarded_done(struct vsr_io *io, uint32_t replica,
     if ((entry->op_type == VSR_OP_SNAPSHOT_CAPTURE ||
          entry->op_type == VSR_OP_SNAPSHOT_FETCH) &&
         caller == VSR_IO_OK) {
-        uint32_t k = entry->op_type == VSR_OP_SNAPSHOT_CAPTURE ? 0 : 1;
         const struct vsr_checkpoint *checkpoint = data;
 
-        if (checkpoint == NULL ||
-            !copy_checkpoint(s->result_region + k * s->region_bytes,
-                             s->region_bytes, checkpoint, &s->result[k]) ||
-            !id_equal(s->result[k].id, entry->id)) {
+        /* The core adopts the checkpoint for this id only (vsr.h). */
+        if (checkpoint == NULL || !id_equal(checkpoint->id, entry->id) ||
+            !result_copy(rep, entry, checkpoint)) {
             caller = VSR_IO_FAILED;
         }
     }
@@ -2146,11 +2277,13 @@ static void unlink_job_done(struct vsr_io *io, uint32_t replica,
         return;
     }
     if (entry->op != 0) {
-        complete_core(rep, entry->op, status, NULL);
+        op_complete(rep, entry, status);
     }
     entry_free(s, entry);
 }
 
+/* The kept slot of a file that is neither the base nor the latest capture
+ * is closed; a SYNC that arrived meanwhile starts now. */
 static void release_done(struct vsr_io *io, uint32_t replica,
                          struct vsr_io_snapshot *entry)
 {
@@ -2163,14 +2296,21 @@ static void release_done(struct vsr_io *io, uint32_t replica,
     entry->file_slot = -1;
     entry->step = STEP_IDLE;
     entry->job = VSR_IO_SNAPSHOT_JOB_NONE;
+    if (entry->job_next == VSR_IO_SNAPSHOT_JOB_SYNC) {
+        entry->job_next = NONE;
+        entry->job = VSR_IO_SNAPSHOT_JOB_SYNC;
+        entry->step = STEP_OPEN;
+    }
 }
 
 /* -------------------------------------------------------------------------
  * Poll
  * ---------------------------------------------------------------------- */
 
-/* Keeps store.base_slot on the base's open file and closes the slots of
- * files that are neither the base nor the latest capture. */
+/* Keeps store.base_slot on the base's open file (the module owns that
+ * field: the store only reads through it) and closes the slots of files
+ * that are neither the base, nor the latest capture, nor a file loaded for
+ * a held RESTORE or PUBLISH the store has yet to pack. */
 static void base_track(struct vsr_io *io, uint32_t replica)
 {
     struct vsr_io_replica *rep = replica_of(io, replica);
@@ -2185,12 +2325,17 @@ static void base_track(struct vsr_io *io, uint32_t replica)
     } else if (store->cold_active == 0) {
         store->base_slot = -1;
     }
+    if (s->pending_base != NONE &&
+        (&s->entries[s->pending_base] == base ||
+         s->entries[s->pending_base].file_slot < 0)) {
+        s->pending_base = NONE; /* Packed (or its file closed). */
+    }
     for (uint32_t i = 0; i < s->count; ++i) {
         struct vsr_io_snapshot *entry = &s->entries[i];
 
         if (entry->state == VSR_IO_SNAPSHOT_FREE || entry->file_slot < 0 ||
             entry->job != VSR_IO_SNAPSHOT_JOB_NONE || entry == base ||
-            id_equal(entry->id, store->last_capture) ||
+            i == s->pending_base || id_equal(entry->id, store->last_capture) ||
             store->cold_active != 0) {
             continue;
         }
@@ -2367,20 +2512,20 @@ static bool prepare_entry(struct vsr_io *io, uint32_t replica, uint32_t index,
     if (step == STEP_OPEN && entry->tmp_slot == NONE) {
         entry->tmp_slot = vsr_io_engine_slot_alloc(io);
         if (entry->tmp_slot == NONE) {
-            retry_later(s);
+            retry_later(io, rep);
             return false;
         }
     }
     op = fileop_take(s);
     if (op == NONE) {
-        retry_later(s);
+        retry_later(io, rep);
         return false;
     }
     slot = vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_CLIENTS, 1, replica,
                               SUB_ENTRY | index, step);
     if (slot == NONE) {
         fileop_free(s, op);
-        retry_later(s);
+        retry_later(io, rep);
         return false;
     }
     fileop = &s->fileops[op];
@@ -2526,14 +2671,16 @@ static bool prepare_serve(struct vsr_io *io, uint32_t replica, uint32_t stream,
     if (serve->fileop != NONE) {
         return false;
     }
-    if (serve->state == SERVE_OPENING && serve->slot == NONE) {
+    /* OPENING: the open is still to issue (a slot may be allocated from an
+     * earlier attempt that found no file operation free). */
+    if (serve->state == SERVE_OPENING) {
         step = STEP_OPEN;
     } else if (serve->state == SERVE_CLOSING && serve->slot != NONE) {
         step = STEP_CLOSE;
     } else {
         return false;
     }
-    if (step == STEP_OPEN) {
+    if (step == STEP_OPEN && serve->slot == NONE) {
         serve->slot = vsr_io_engine_slot_alloc(io);
         if (serve->slot == NONE) {
             /* No file slot: refuse; the end frees the serve. */
@@ -2545,14 +2692,14 @@ static bool prepare_serve(struct vsr_io *io, uint32_t replica, uint32_t stream,
     }
     op = fileop_take(s);
     if (op == NONE) {
-        retry_later(s);
+        retry_later(io, rep);
         return false;
     }
     slot = vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_CLIENTS, 1, replica,
                               SUB_SERVE | stream, step);
     if (slot == NONE) {
         fileop_free(s, op);
-        retry_later(s);
+        retry_later(io, rep);
         return false;
     }
     fileop = &s->fileops[op];
@@ -2593,20 +2740,20 @@ static bool prepare_dir(struct vsr_io *io, uint32_t replica,
     if (s->dir_slot == NONE) {
         s->dir_slot = vsr_io_engine_slot_alloc(io);
         if (s->dir_slot == NONE) {
-            retry_later(s);
+            retry_later(io, rep);
             return false;
         }
     }
     op = fileop_take(s);
     if (op == NONE) {
-        retry_later(s);
+        retry_later(io, rep);
         return false;
     }
     slot = vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_CLIENTS, 1, replica,
                               SUB_DIR, STEP_OPEN);
     if (slot == NONE) {
         fileop_free(s, op);
-        retry_later(s);
+        retry_later(io, rep);
         return false;
     }
     fileop = &s->fileops[op];
@@ -2802,6 +2949,12 @@ int vsr_io_snapshots_close(struct vsr_io *io, uint32_t replica)
         if (entry->tmp_slot != NONE) {
             slot_drop(io, entry->tmp_slot);
             entry->tmp_slot = NONE;
+        }
+        if (entry->lease != NONE) {
+            /* An op the stopped core no longer waits for. */
+            vsr_io_lease_release(rep, entry->lease);
+            entry->lease = NONE;
+            entry->result = NULL;
         }
     }
     if (s->dir_slot != NONE) {
