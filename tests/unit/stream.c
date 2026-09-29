@@ -1730,7 +1730,7 @@ static const struct vsr_io_stream *stream_at(const struct engine *e,
 
 static void test_basic(void)
 {
-    static unsigned char hello[12] = "hello world!";
+    static unsigned char hello[] = "hello world!";
     const unsigned char *bytes = pattern(1);
     struct engine *a;
     struct engine *b;
@@ -1747,7 +1747,7 @@ static void test_basic(void)
     a = &world.engines[0];
     b = &world.engines[1];
     settle();
-    open_stream(&k, &d, 77, hello, sizeof(hello), &index);
+    open_stream(&k, &d, 77, hello, sizeof(hello) - 1, &index);
     s = stream_at(a, index);
     CHECK(s->state == VSR_IO_STREAM_DIALING &&
           s->owner == VSR_IO_STREAM_CALLER);
