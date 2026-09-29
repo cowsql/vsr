@@ -25,6 +25,8 @@
  * on every eligible completion with its counter, and a seeded random walk
  * with mixed rates checking exactly-once delivery, zero-copy result-then-
  * NOTIF order, an intact byte stream and a trace that repeats per seed.
+ * Then the review cases, one test each, every one naming the property it
+ * holds the wrapper to. `faulty_executor [SEED [TEST]]` runs one test.
  */
 
 #define BLOCK 4096u
@@ -806,15 +808,451 @@ static void test_reserved(void)
     close_world(&w);
 }
 
+/* ------------------------------------------------------------------------
+ * Review cases: ordering the caller relies on, plausible counts, waits,
+ * chains, capacities
+ * --------------------------------------------------------------------- */
+
+#define NOPS 1600u
+
+static uint8_t nop_seen[NOPS];
+
+static struct faulty_executor_options rates(void)
+{
+    struct faulty_executor_options options;
+
+    memset(&options, 0, sizeof(options));
+    options.seed = seed;
+    return options;
+}
+
+static void set_rates(struct world *w, uint32_t node,
+                      const struct faulty_executor_options *options)
+{
+    faulty_executor_set_options(w->faulty[node], options);
+}
+
+/* Node 1 listens on PORT. */
+static int32_t listen_on(struct world *w, uint64_t user_data)
+{
+    struct vsr_io_address address = vsr_sim_address(w->sim, 1, PORT);
+    int32_t listener = make_socket(w, 1, user_data);
+    struct vsr_io_sqe sqe = make_sqe(VSR_IO_SQE_BIND, listener, user_data + 1);
+
+    sqe.addr = &address.sockaddr;
+    sqe.length = address.length;
+    CHECK(run(w, 1, &sqe).result == 0);
+    sqe = make_sqe(VSR_IO_SQE_LISTEN, listener, user_data + 2);
+    sqe.length = 4;
+    CHECK(run(w, 1, &sqe).result == 0);
+    return listener;
+}
+
+/* Node 0's client connected to node 1's accepted server end. */
+static void connect_pair(struct world *w, int32_t listener, uint64_t user_data,
+                         int32_t *client, int32_t *server)
+{
+    struct vsr_io_address address = vsr_sim_address(w->sim, 1, PORT);
+    struct vsr_io_sqe sqe = make_sqe(VSR_IO_SQE_ACCEPT, listener, user_data);
+
+    submit(w, 1, &sqe, 1);
+    *client = make_socket(w, 0, user_data + 1);
+    sqe = make_sqe(VSR_IO_SQE_CONNECT, *client, user_data + 2);
+    sqe.addr = &address.sockaddr;
+    sqe.length = address.length;
+    CHECK(run(w, 0, &sqe).result == 0);
+    *server = wait_for(w, 1, user_data).result;
+    CHECK(*server >= 0);
+}
+
+/* Node 0 sends all of bytes on client (its wrapper must be quiet). */
+static void send_exact(struct world *w, int32_t client, const void *bytes,
+                       uint32_t size, uint64_t user_data)
+{
+    struct vsr_io_sqe sqe = make_sqe(VSR_IO_SQE_SEND, client, user_data);
+
+    sqe.addr = bytes;
+    sqe.length = size;
+    CHECK(run(w, 0, &sqe).result == (int32_t)size);
+}
+
+/* Records of a LINK chain get no fault, and a batch whose last record is
+ * linked gets no appended CANCEL, which would join that chain. */
+static void test_chains(void)
+{
+    static char read_buffer[MESSAGE_BYTES];
+    static char recv_buffer[MESSAGE_BYTES];
+    struct faulty_executor_options quiet = rates();
+    struct faulty_executor_options all = rates();
+    struct faulty_executor_stats stats;
+    struct vsr_io_sqe batch[2];
+    struct vsr_io_cqe cqe;
+    struct world w;
+    int32_t listener;
+    int32_t client;
+    int32_t server;
+    int32_t fd;
+    uint32_t got;
+
+    all.eio_ppm = PPM;
+    all.short_ppm = PPM;
+    all.delay_ppm = PPM;
+    all.delay_reaps_max = 2;
+    all.cancel_recv_ppm = PPM;
+    open_world(&w, &traces[0], &quiet);
+    batch[0] = make_sqe(VSR_IO_SQE_OPENAT, VSR_SIM_ROOT, 0x10);
+    batch[0].addr = "chain";
+    batch[0].op_flags = O_CREAT | O_RDWR;
+    batch[0].length = 0600;
+    fd = run(&w, 0, &batch[0]).result;
+    CHECK(fd >= 0);
+    listener = listen_on(&w, 0x20);
+    connect_pair(&w, listener, 0x30, &client, &server);
+    set_rates(&w, 0, &all);
+    set_rates(&w, 1, &all);
+
+    /* A WRITE linked to a READ: both whole, neither -EIO nor delayed. */
+    batch[0] = make_sqe(VSR_IO_SQE_WRITE, fd, 0x90);
+    batch[0].flags = VSR_IO_SQE_LINK;
+    batch[0].addr = MESSAGE;
+    batch[0].length = MESSAGE_BYTES;
+    batch[1] = make_sqe(VSR_IO_SQE_READ, fd, 0x91);
+    batch[1].addr = read_buffer;
+    batch[1].length = MESSAGE_BYTES;
+    submit(&w, 0, batch, 2);
+    CHECK(wait_for(&w, 0, 0x90).result == (int32_t)MESSAGE_BYTES);
+    CHECK(wait_for(&w, 0, 0x91).result == (int32_t)MESSAGE_BYTES);
+    CHECK(memcmp(read_buffer, MESSAGE, MESSAGE_BYTES) == 0);
+    faulty_executor_stats(w.faulty[0], &stats);
+    CHECK(stats.eio == 0 && stats.shortened == 0 && stats.delayed == 0);
+
+    /* A RECV ending a chain is neither shortened nor cancelled. */
+    set_rates(&w, 0, &quiet);
+    batch[0] = make_sqe(VSR_IO_SQE_NOP, -1, 0x92);
+    batch[0].flags = VSR_IO_SQE_LINK;
+    batch[1] = make_sqe(VSR_IO_SQE_RECV, server, 0x93);
+    batch[1].addr = recv_buffer;
+    batch[1].length = MESSAGE_BYTES;
+    submit(&w, 1, batch, 2);
+    send_exact(&w, client, MESSAGE, MESSAGE_BYTES, 0x94);
+    CHECK(wait_for(&w, 1, 0x92).result == 0);
+    CHECK(wait_for(&w, 1, 0x93).result == (int32_t)MESSAGE_BYTES);
+    CHECK(memcmp(recv_buffer, MESSAGE, MESSAGE_BYTES) == 0);
+
+    /* A RECV before a linked tail: shortened (it is not in the chain) but
+     * never cancelled. */
+    batch[0] = make_sqe(VSR_IO_SQE_RECV, server, 0x95);
+    batch[0].addr = recv_buffer;
+    batch[0].length = MESSAGE_BYTES;
+    batch[1] = make_sqe(VSR_IO_SQE_NOP, -1, 0x96);
+    batch[1].flags = VSR_IO_SQE_LINK;
+    submit(&w, 1, batch, 2);
+    send_exact(&w, client, MESSAGE, MESSAGE_BYTES, 0x97);
+    CHECK(wait_for(&w, 1, 0x96).result == 0);
+    cqe = wait_for(&w, 1, 0x95);
+    CHECK(cqe.result > 0 && cqe.result < (int32_t)MESSAGE_BYTES);
+    got = (uint32_t)cqe.result;
+    CHECK(memcmp(recv_buffer, MESSAGE, got) == 0);
+    faulty_executor_stats(w.faulty[1], &stats);
+    CHECK(stats.cancelled == 0 && stats.shortened == 1);
+    set_rates(&w, 1, &quiet);
+    while (got < MESSAGE_BYTES) {
+        batch[0] = make_sqe(VSR_IO_SQE_RECV, server, 0x98 + got);
+        batch[0].addr = recv_buffer;
+        batch[0].length = MESSAGE_BYTES - got;
+        cqe = run(&w, 1, &batch[0]);
+        CHECK(cqe.result > 0);
+        CHECK(memcmp(recv_buffer, &MESSAGE[got], (size_t)cqe.result) == 0);
+        got += (uint32_t)cqe.result;
+    }
+    close_world(&w);
+}
+
+/* More completions than the wrapper holds, each delayed: the rest wait in
+ * the inner executor, and every one arrives exactly once. */
+static void test_capacity(void)
+{
+    struct faulty_executor_options options = rates();
+    struct faulty_executor_stats stats;
+    struct vsr_io_sqe batch[200];
+    struct world w;
+    uint32_t delivered = 0;
+    uint32_t most = 0;
+
+    options.delay_ppm = PPM;
+    options.delay_reaps_max = 3;
+    open_world(&w, &traces[0], &options);
+    memset(nop_seen, 0, sizeof(nop_seen));
+    for (uint32_t first = 0; first < NOPS; first += 200) {
+        for (uint32_t i = 0; i < 200; ++i) {
+            batch[i] = make_sqe(VSR_IO_SQE_NOP, -1, 0x1000 + first + i);
+        }
+        submit(&w, 0, batch, 200);
+    }
+    for (uint32_t spin = 0; delivered < NOPS; ++spin) {
+        struct vsr_io_cqe cqes[16];
+        struct vsr_io_executor ex = w.ex[0];
+        uint32_t count = ex.ops->reap(ex.ctx, cqes, 16);
+
+        CHECK(spin < SPIN_MAX);
+        CHECK(w.faulty[0]->held_count <= FAULTY_EXECUTOR_HELD);
+        most = w.faulty[0]->held_count > most ? w.faulty[0]->held_count : most;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint64_t index = cqes[i].user_data - 0x1000;
+
+            CHECK(index < NOPS && nop_seen[index] == 0);
+            CHECK(cqes[i].result == 0 && cqes[i].flags == 0);
+            nop_seen[index] = 1;
+        }
+        delivered += count;
+    }
+    CHECK(most == FAULTY_EXECUTOR_HELD);
+    faulty_executor_stats(w.faulty[0], &stats);
+    CHECK(stats.delayed == NOPS);
+    close_world(&w);
+}
+
+/* The user_data map: the newest record of a user_data decides, and a
+ * record pushed out of the map by later ones only ever gets delayed. */
+static void test_map(void)
+{
+    static char read_buffer[MESSAGE_BYTES];
+    struct faulty_executor_options options = rates();
+    struct vsr_io_sqe batch[128];
+    struct vsr_io_sqe sqe;
+    struct world w;
+    int32_t fd;
+
+    options.eio_ppm = PPM;
+    open_world(&w, &traces[0], &options);
+    sqe = make_sqe(VSR_IO_SQE_OPENAT, VSR_SIM_ROOT, 0x10);
+    sqe.addr = "map";
+    sqe.op_flags = O_CREAT | O_RDWR;
+    sqe.length = 0600;
+    fd = run(&w, 0, &sqe).result;
+    CHECK(fd >= 0);
+
+    /* A successful SKIP_SUCCESS write never completes, so its entry stays;
+     * a NOP reusing its user_data must not be taken for the write. */
+    sqe = make_sqe(VSR_IO_SQE_WRITE, fd, 0x2000);
+    sqe.flags = VSR_IO_SQE_SKIP_SUCCESS;
+    sqe.addr = MESSAGE;
+    sqe.length = MESSAGE_BYTES;
+    submit(&w, 0, &sqe, 1);
+    for (uint32_t spin = 0; vsr_sim_inflight(w.sim, 0) > 0; ++spin) {
+        CHECK(spin < SPIN_MAX);
+        CHECK(vsr_sim_advance(w.sim) >= 0);
+    }
+    sqe = make_sqe(VSR_IO_SQE_NOP, -1, 0x2000);
+    CHECK(run(&w, 0, &sqe).result == 0);
+
+    /* A READ outlives more records than the map holds. */
+    sqe = make_sqe(VSR_IO_SQE_READ, fd, 0x2001);
+    sqe.addr = read_buffer;
+    sqe.length = MESSAGE_BYTES;
+    submit(&w, 0, &sqe, 1);
+    for (uint32_t first = 0; first < FAULTY_EXECUTOR_RECORDS; first += 128) {
+        struct vsr_io_cqe cqes[128];
+        uint32_t count = 0;
+
+        for (uint32_t i = 0; i < 128; ++i) {
+            batch[i] = make_sqe(VSR_IO_SQE_NOP, -1, 0x10000 + first + i);
+        }
+        submit(&w, 0, batch, 128);
+        while (count < 128) {
+            uint32_t got = reap(&w, 0, cqes, 128 - count);
+
+            CHECK(got > 0);
+            for (uint32_t i = 0; i < got; ++i) {
+                CHECK(cqes[i].user_data != 0x2001);
+            }
+            count += got;
+        }
+    }
+    CHECK(vsr_sim_inflight(w.sim, 0) == 1);
+    CHECK(wait_for(&w, 0, 0x2001).result == (int32_t)MESSAGE_BYTES);
+    CHECK(memcmp(read_buffer, MESSAGE, MESSAGE_BYTES) == 0);
+    close_world(&w);
+}
+
+/* A CANCEL of a completion the wrapper holds finds nothing, as one of a
+ * completion still in the ring's CQ does; the completion then arrives. */
+static void test_cancel_held(void)
+{
+    struct faulty_executor_options options = rates();
+    struct vsr_io_sqe sqe;
+    struct vsr_io_cqe cqe;
+    struct world w;
+
+    options.delay_ppm = PPM;
+    options.delay_reaps_max = 1000;
+    open_world(&w, &traces[0], &options);
+    sqe = make_sqe(VSR_IO_SQE_NOP, -1, 0xA0);
+    submit(&w, 0, &sqe, 1);
+    CHECK(reap(&w, 0, &cqe, 1) == 0);
+    sqe = make_sqe(VSR_IO_SQE_CANCEL, -1, 0xA1);
+    sqe.offset = 0xA0;
+    CHECK(run(&w, 0, &sqe).result == -ENOENT);
+    CHECK(wait_for(&w, 0, 0xA0).result == 0);
+    CHECK(run(&w, 0, &sqe).result == -ENOENT);
+    CHECK(w.parked_count[0] == 0);
+    /* Torn down with a completion held: nothing refers to it, and init
+     * over a new inner executor starts empty. */
+    sqe = make_sqe(VSR_IO_SQE_NOP, -1, 0xA2);
+    submit(&w, 0, &sqe, 1);
+    CHECK(reap(&w, 0, &cqe, 1) == 0);
+    CHECK(w.faulty[0]->held_count == 1);
+    close_world(&w);
+    open_world(&w, &traces[0], &options);
+    CHECK(w.faulty[0]->held_count == 0);
+    CHECK(reap(&w, 0, &cqe, 1) == 0);
+    close_world(&w);
+}
+
+/* A completion is held for 1..delay_reaps_max reaps (0 counting as 1). */
+static void test_delay_bounds(void)
+{
+    static const uint32_t limits[] = {0, 1, 3};
+    struct faulty_executor_options options = rates();
+    struct world w;
+    uint64_t user_data = 0xB000;
+
+    options.delay_ppm = PPM;
+    open_world(&w, &traces[0], &options);
+    for (uint32_t l = 0; l < sizeof(limits) / sizeof(limits[0]); ++l) {
+        uint32_t most = limits[l] > 0 ? limits[l] : 1u;
+        bool seen[3] = {false, false, false};
+
+        options.delay_reaps_max = limits[l];
+        set_rates(&w, 0, &options);
+        for (uint32_t i = 0; i < 200; ++i) {
+            struct vsr_io_sqe sqe = make_sqe(VSR_IO_SQE_NOP, -1, user_data++);
+            struct vsr_io_cqe cqe;
+            uint32_t calls = 1;
+
+            submit(&w, 0, &sqe, 1);
+            while (reap(&w, 0, &cqe, 1) == 0) {
+                ++calls;
+                CHECK(calls <= most + 1);
+            }
+            /* The first reap pulled and held it. */
+            CHECK(calls >= 2);
+            seen[calls - 2] = true;
+        }
+        for (uint32_t r = 0; r < most; ++r) {
+            CHECK(seen[r]);
+        }
+    }
+    close_world(&w);
+}
+
+/* Only a batch of at most FAULTY_EXECUTOR_BATCH records gets
+ * submission-side faults, and an appended CANCEL needs room in it. */
+static void test_batches(void)
+{
+    static const uint32_t sizes[] = {FAULTY_EXECUTOR_BATCH - 1,
+                                     FAULTY_EXECUTOR_BATCH,
+                                     FAULTY_EXECUTOR_BATCH + 1};
+    static const uint32_t cancels[] = {1, 0, 0};
+    static struct vsr_io_sqe batch[FAULTY_EXECUTOR_BATCH + 1];
+    static char buffer[MESSAGE_BYTES];
+    struct faulty_executor_options all = rates();
+    struct world w;
+    int32_t listener;
+    int32_t client;
+    int32_t server;
+    uint64_t user_data = 0x5000;
+
+    open_world(&w, &traces[0], &all);
+    listener = listen_on(&w, 0x20);
+    connect_pair(&w, listener, 0x30, &client, &server);
+    all.short_ppm = PPM;
+    all.cancel_recv_ppm = PPM;
+    set_rates(&w, 1, &all);
+    for (uint32_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); ++k) {
+        struct faulty_executor_stats before;
+        struct faulty_executor_stats after;
+        uint32_t cancelled = 0;
+        uint32_t got;
+
+        faulty_executor_stats(w.faulty[1], &before);
+        for (uint32_t i = 0; i < sizes[k]; ++i) {
+            batch[i] = make_sqe(VSR_IO_SQE_RECV, server, user_data++);
+            batch[i].addr = buffer;
+            batch[i].length = MESSAGE_BYTES;
+        }
+        submit(&w, 1, batch, sizes[k]);
+        do {
+            struct vsr_io_cqe cqes[8];
+
+            got = reap(&w, 1, cqes, 8);
+            for (uint32_t i = 0; i < got; ++i) {
+                CHECK(cqes[i].result == -ECANCELED);
+                ++cancelled;
+            }
+        } while (got > 0);
+        faulty_executor_stats(w.faulty[1], &after);
+        CHECK(cancelled == cancels[k]);
+        CHECK(after.cancelled - before.cancelled == cancels[k]);
+        CHECK(after.shortened - before.shortened ==
+              (sizes[k] <= FAULTY_EXECUTOR_BATCH ? sizes[k] : 0));
+    }
+    close_world(&w);
+}
+
+/* Rates above 1,000,000 ppm saturate: the same trace as at 1,000,000. */
+static void test_saturated(void)
+{
+    struct faulty_executor_options options = rates();
+    struct faulty_executor_stats first;
+    struct faulty_executor_stats second;
+
+    options.eio_ppm = PPM;
+    options.short_ppm = PPM;
+    options.delay_ppm = PPM;
+    options.delay_reaps_max = 3;
+    (void)run_scenario(&traces[0], &options, &first);
+    options.eio_ppm = UINT32_MAX;
+    options.short_ppm = UINT32_MAX;
+    options.delay_ppm = UINT32_MAX;
+    (void)run_scenario(&traces[1], &options, &second);
+    CHECK(same_trace(&traces[0], &traces[1]));
+    CHECK(memcmp(&first, &second, sizeof(first)) == 0);
+    CHECK(first.eio > 0 && first.delayed > 0);
+}
+
+struct unit {
+    const char *name;
+    void (*run)(void);
+};
+
+static const struct unit units[] = {
+    {"reserved", test_reserved},
+    {"transparent", test_transparent},
+    {"each_fault", test_each_fault},
+    {"random_walk", test_random_walk},
+    {"chains", test_chains},
+    {"capacity", test_capacity},
+    {"map", test_map},
+    {"cancel_held", test_cancel_held},
+    {"delay_bounds", test_delay_bounds},
+    {"batches", test_batches},
+    {"saturated", test_saturated},
+};
+
+/* Usage: faulty_executor [SEED [TEST]]. */
 int main(int argc, char **argv)
 {
+    const char *only = argc > 2 ? argv[2] : NULL;
+
     if (argc > 1) {
         seed = strtoull(argv[1], NULL, 0);
     }
     printf("faulty_executor seed %" PRIu64 "\n", seed);
-    test_reserved();
-    test_transparent();
-    test_each_fault();
-    test_random_walk();
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); ++i) {
+        if (only == NULL || strcmp(only, units[i].name) == 0) {
+            units[i].run();
+        }
+    }
     return 0;
 }
