@@ -1631,8 +1631,10 @@ static void link_hello(struct vsr_io *io, struct vsr_io_link *link,
         return;
     }
     node_index = vsr_io_links_node_index(&io->links, hello->node);
-    if (node_index == LINK_NONE) {
-        /* Unknown nodes cannot be authorized for anything (decision 73). */
+    if (node_index == LINK_NONE || hello->node == io->options.node) {
+        /* Unknown nodes cannot be authorized for anything (decision 73),
+         * and nothing may claim to be this engine: it never dials itself,
+         * so such a link could only inject its own replicas' frames. */
         io->stats.frames_rejected++;
         link_close(io, index, -EPROTO);
         return;
@@ -1681,7 +1683,9 @@ int vsr_io_links_handshake_done(struct vsr_io *io, uint64_t op, int32_t status,
     } else {
         uint32_t node_index = vsr_io_links_node_index(links, done->node);
 
-        if (node_index == LINK_NONE) {
+        /* Unknown, or this engine's own identity (a reflected handshake,
+         * say): refused like the HELLO's claim. */
+        if (node_index == LINK_NONE || done->node == io->options.node) {
             link_close(io, index, -EACCES);
             return VSR_OK;
         }
@@ -2138,8 +2142,8 @@ int vsr_io_links_adopt(struct vsr_io *io, int fd, uint64_t node, uint32_t flags)
         if (node != VSR_IO_NO_NODE) {
             return VSR_EINVAL;
         }
-    } else if (node_index == LINK_NONE) {
-        return VSR_EINVAL;
+    } else if (node_index == LINK_NONE || node == io->options.node) {
+        return VSR_EINVAL; /* Unknown, or the engine itself. */
     }
     index =
         link_alloc(io, VSR_IO_PURPOSE_PEER,

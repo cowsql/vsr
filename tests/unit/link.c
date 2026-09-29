@@ -4821,6 +4821,81 @@ static void test_send_random(uint64_t seed)
     engine_forget(p.b);
 }
 
+/* -------------------------------------------------------------------------
+ * Review: identity, completion and teardown corners
+ * ---------------------------------------------------------------------- */
+
+
+/* An inbound peer claiming the engine's own node identity is refused in
+ * both modes, and adopt refuses the own node too: a link to the own node
+ * can never be legitimate (decision 73). */
+static void test_review_own_node(void)
+{
+    struct engine *a;
+    const struct vsr_io_forwarded *op;
+    struct vsr_io_handshake_done done;
+    unsigned char bytes[128];
+    uint32_t peer;
+    uint32_t engine_side;
+    size_t n;
+
+    world_reset(41);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_TRUSTED);
+    CHECK(vsr_io_links_node_set(a->io, 1, NULL) == VSR_OK);
+    CHECK(vsr_io_links_node_set(a->io, 2, NULL) == VSR_OK);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    (void)forwarded_take(a, VSR_IO_OP_LINK_WANTED);
+    n = put_preamble(bytes);
+    n += put_hello(bytes + n, VSR_IO_HANDSHAKE_TRUSTED, VSR_IO_PURPOSE_PEER, 1,
+                   7);
+    refuse(a, bytes, n, a->io->stats.frames_rejected, -EPROTO);
+    CHECK(node_state(a, 1) == VSR_IO_NODE_UNLINKED);
+    CHECK(a->io->links.nodes[0].carrier == NONE);
+    /* Adopting a connection as the own node: EINVAL either way. */
+    peer = sock_alloc(TEST_OWNER);
+    engine_side = sock_alloc(0);
+    world.socks[peer].raw_fd = fd_alloc();
+    world.socks[engine_side].raw_fd = fd_alloc();
+    world.socks[peer].peer = engine_side;
+    world.socks[engine_side].peer = peer;
+    CHECK(vsr_io_links_adopt(a->io, world.socks[engine_side].raw_fd, 1, 0) ==
+          VSR_EINVAL);
+    CHECK(vsr_io_links_adopt(a->io, world.socks[engine_side].raw_fd, 1,
+                             VSR_IO_ADOPT_HANDSHAKE | VSR_IO_ADOPT_OUTBOUND) ==
+          VSR_EINVAL);
+    world_settle();
+    check_quiet(a);
+    CHECK(node_state(a, 1) == VSR_IO_NODE_UNLINKED);
+    sock_drop(engine_side);
+    sock_drop(peer);
+    engine_forget(a);
+    /* EXTERNAL: the caller's completion naming the own node is refused
+     * like an unknown one, without a takeover. */
+    world_reset(42);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_EXTERNAL);
+    CHECK(vsr_io_links_node_set(a->io, 1, NULL) == VSR_OK);
+    world_settle();
+    peer = peer_connect(a);
+    n = put_preamble(bytes);
+    peer_write(peer, bytes, n);
+    world_settle();
+    op = forwarded_take(a, VSR_IO_OP_HANDSHAKE);
+    CHECK(op != NULL);
+    done.node = 1;
+    CHECK(vsr_io_links_handshake_done(a->io, op->op.op.id, VSR_IO_OK, &done) ==
+          VSR_OK);
+    world_settle();
+    CHECK(peer_eof(peer));
+    CHECK(a->updates == 0);
+    check_quiet(a);
+    CHECK(node_state(a, 1) == VSR_IO_NODE_UNLINKED);
+    peer_close(peer);
+    engine_forget(a);
+}
+
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 0x5EED2u;
@@ -4854,6 +4929,7 @@ int main(int argc, char **argv)
     test_send_reject();
     test_stream();
     test_send_random(seed);
+    test_review_own_node();
     printf("link: ok\n");
     return 0;
 }
