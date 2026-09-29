@@ -225,7 +225,9 @@ int vsr_io_streams_data_done(struct vsr_io *io, uint64_t op);
  * slab `slab`, which the module retains (vsr_io_pool_retain) if it keeps
  * them past the call. Returns false to leave the frame where it is, the
  * link then retries it at every poll (a window with no free unit, no free
- * stream, no room in the forwarded ring); an inbound link is bound to its
+ * stream, no room in the forwarded ring) and pauses its receive until
+ * every byte it holds is carved (decision 99: the TCP window throttles
+ * the source meanwhile); an inbound link is bound to its
  * stream by setting links.links[link].stream at the request frame, which
  * also exempts it from the idle close. A frame the stream's state refuses
  * (a chunk at the source, a second request, a chunk at the wrong offset, a

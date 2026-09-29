@@ -103,6 +103,12 @@ struct sock {
     bool recv_select;
     unsigned char *recv_addr;
     uint32_t recv_len;
+    bool send_parked; /* A SEND waiting for room in the peer's inbox: the
+                         socket buffer is full, the TCP window closed. */
+    uint64_t send_ud;
+    const struct vsr_io_vec *send_vecs; /* Pinned while the send is out. */
+    uint32_t send_count;
+    bool send_zero_copy;
     bool accept_armed;
     uint64_t accept_ud;
     uint32_t backlog[8];
@@ -159,7 +165,9 @@ struct world {
     struct test_random random;
     uint32_t slice_max;
     bool hold_notifs;
+    bool hold_cancels; /* A CANCEL's own result is held like a NOTIF. */
     uint32_t short_send;
+    uint32_t inbox_limit; /* Socket buffer bytes: a full one parks sends. */
     uint32_t reject_send; /* Zero-copy sends to refuse with -EINVAL. */
     uint32_t link_queue;  /* limits.link_queue of the next engine_open. */
     uint32_t slab_bytes;  /* limits.slab_bytes of the next engine_open. */
@@ -245,8 +253,8 @@ static void sock_drop(uint32_t index)
     struct sock *sock = &world.socks[index];
 
     if (sock->raw_fd >= 0 || sock->slot >= 0 || sock->recv_armed ||
-        sock->accept_armed) {
-        return;
+        sock->accept_armed || sock->send_parked) {
+        return; /* A parked send keeps the socket until it completes. */
     }
     if (sock->peer != NONE) {
         struct sock *peer = &world.socks[sock->peer];
@@ -553,6 +561,102 @@ static void cancel_record(struct engine *e, uint64_t user_data, int *result)
     *result = -ENOENT;
 }
 
+/* Transmits a SEND into the peer's inbox, which is the socket buffer:
+ * what fits, short when world.short_send says so. A full inbox PARKS the
+ * send until the peer receives, as the kernel holds a send while the TCP
+ * window is closed; a parked send is retried at every step of its engine
+ * (sends_resume) and fails once the socket is shut down, reset or
+ * unpaired. Completes the record, with the zero-copy NOTIF rules. */
+static void sock_send(struct engine *e, uint32_t index, uint64_t user_data,
+                      const struct vsr_io_vec *vecs, uint32_t count,
+                      bool zero_copy)
+{
+    struct sock *sock = &world.socks[index];
+    uint32_t total = 0;
+    uint32_t sent = 0;
+    int result;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        total += (uint32_t)vecs[i].length;
+    }
+    if (sock->reset) {
+        result = -ECONNRESET;
+    } else if (sock->peer == NONE || sock->shutdown) {
+        result = -EPIPE;
+    } else {
+        uint32_t limit = world.short_send > 0 && world.short_send < total
+                             ? world.short_send
+                             : total;
+        uint32_t room = world.inbox_limit - world.socks[sock->peer].inbox_len;
+
+        if (limit > room) {
+            limit = room;
+        }
+        for (uint32_t i = 0; i < count && sent < limit; ++i) {
+            uint32_t take = (uint32_t)vecs[i].length;
+
+            if (take > limit - sent) {
+                take = limit - sent;
+            }
+            inbox_append(sock->peer, vecs[i].base, take);
+            sent += take;
+        }
+        result = (int)sent;
+    }
+    if (zero_copy && world.reject_send > 0) {
+        /* Refused at translation: once, without MORE, no NOTIF
+         * (decision 62); nothing reached the socket. */
+        world.reject_send--;
+        if (sent > 0) {
+            inbox_consume_tail(sock->peer, sent);
+        }
+        complete(e, user_data, -EINVAL, 0, 0);
+        return;
+    }
+    if (result == 0 && total > 0) {
+        sock->send_parked = true;
+        sock->send_ud = user_data;
+        sock->send_vecs = vecs;
+        sock->send_count = count;
+        sock->send_zero_copy = zero_copy;
+        return;
+    }
+    if (!zero_copy) {
+        complete(e, user_data, result, 0, 0);
+        return;
+    }
+    complete(e, user_data, result, VSR_IO_CQE_MORE, 0);
+    if (world.hold_notifs) {
+        CHECK(world.held_count < CQ_CAP);
+        world.held[world.held_count].user_data = user_data;
+        world.held[world.held_count].result = 0;
+        world.held[world.held_count].flags = VSR_IO_CQE_NOTIF;
+        world.held[world.held_count].buffer_id = 0;
+        world.held_engine[world.held_count] = e->index;
+        world.held_count++;
+    } else {
+        complete(e, user_data, 0, VSR_IO_CQE_NOTIF, 0);
+    }
+}
+
+/* Retries the parked sends of an engine's sockets: the peer may have
+ * received (room in its inbox), or the socket may have gone. */
+static void sends_resume(struct engine *e)
+{
+    for (uint32_t i = 0; i < SOCKETS; ++i) {
+        struct sock *sock = &world.socks[i];
+
+        if (sock->used && sock->owner == e->index && sock->send_parked) {
+            sock->send_parked = false;
+            sock_send(e, i, sock->send_ud, sock->send_vecs, sock->send_count,
+                      sock->send_zero_copy);
+            if (!sock->send_parked) {
+                sock_drop(i);
+            }
+        }
+    }
+}
+
 static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
                     bool *chain_failed)
 {
@@ -672,66 +776,23 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
         return;
     case VSR_IO_SQE_SEND: {
         const struct vsr_io_vec *vecs = sqe->addr;
-        bool zero_copy = (sqe->op_flags & VSR_IO_SEND_ZERO_COPY) != 0;
-        uint32_t total = 0;
 
         CHECK((sqe->op_flags & VSR_IO_SEND_VECTORED) != 0);
+        CHECK(!linked && !skip);
         index = record_sock(e, sqe);
         CHECK(index != NONE);
         sock = &world.socks[index];
+        CHECK(!sock->send_parked); /* One send in flight per socket. */
         for (uint32_t i = 0; i < sqe->length; ++i) {
-            total += (uint32_t)vecs[i].length;
             if ((sqe->flags & VSR_IO_SQE_FIXED_BUFFER) != 0) {
                 CHECK(sqe->buffer_index == REGION_BASE);
                 CHECK(vsr_io_pool_contains(&e->io->pool, vecs[i].base,
                                            vecs[i].length));
             }
         }
-        if (sock->peer == NONE || sock->shutdown) {
-            result = -EPIPE;
-        } else {
-            uint32_t limit = world.short_send > 0 && world.short_send < total
-                                 ? world.short_send
-                                 : total;
-            uint32_t sent = 0;
-
-            for (uint32_t i = 0; i < sqe->length && sent < limit; ++i) {
-                uint32_t take = (uint32_t)vecs[i].length;
-
-                if (take > limit - sent) {
-                    take = limit - sent;
-                }
-                inbox_append(sock->peer, vecs[i].base, take);
-                sent += take;
-            }
-            result = (int)sent;
-        }
-        if (zero_copy && world.reject_send > 0) {
-            /* Refused at translation: once, without MORE, no NOTIF
-             * (decision 62); nothing reached the socket. */
-            world.reject_send--;
-            if (result > 0) {
-                inbox_consume_tail(sock->peer, (uint32_t)result);
-            }
-            complete(e, sqe->user_data, -EINVAL, 0, 0);
-            return;
-        }
-        if (zero_copy) {
-            complete(e, sqe->user_data, result, VSR_IO_CQE_MORE, 0);
-            if (world.hold_notifs) {
-                CHECK(world.held_count < CQ_CAP);
-                world.held[world.held_count].user_data = sqe->user_data;
-                world.held[world.held_count].result = 0;
-                world.held[world.held_count].flags = VSR_IO_CQE_NOTIF;
-                world.held[world.held_count].buffer_id = 0;
-                world.held_engine[world.held_count] = e->index;
-                world.held_count++;
-            } else {
-                complete(e, sqe->user_data, 0, VSR_IO_CQE_NOTIF, 0);
-            }
-            return;
-        }
-        break;
+        sock_send(e, index, sqe->user_data, vecs, sqe->length,
+                  (sqe->op_flags & VSR_IO_SEND_ZERO_COPY) != 0);
+        return;
     }
     case VSR_IO_SQE_SETSOCKOPT:
         index = record_sock(e, sqe);
@@ -751,6 +812,12 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
         if (sock->peer != NONE) {
             world.socks[sock->peer].peer_closed = true;
         }
+        if (sock->send_parked) {
+            /* Shutting down wakes a send blocked on the window: -EPIPE. */
+            sock->send_parked = false;
+            sock_send(e, index, sock->send_ud, sock->send_vecs,
+                      sock->send_count, sock->send_zero_copy);
+        }
         break;
     case VSR_IO_SQE_CLOSE:
         index = record_sock(e, sqe);
@@ -768,6 +835,16 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
     case VSR_IO_SQE_CANCEL:
         CHECK(sqe->op_flags == 0);
         cancel_record(e, sqe->offset, &result);
+        if (world.hold_cancels) {
+            CHECK(world.held_count < CQ_CAP);
+            world.held[world.held_count].user_data = sqe->user_data;
+            world.held[world.held_count].result = result;
+            world.held[world.held_count].flags = 0;
+            world.held[world.held_count].buffer_id = 0;
+            world.held_engine[world.held_count] = e->index;
+            world.held_count++;
+            return;
+        }
         break;
     default:
         CHECK(false); /* Unexpected opcode. */
@@ -981,6 +1058,7 @@ static void world_reset(uint64_t seed)
     world.window = WINDOW;
     world.ops = OPS;
     world.chunk_bytes = CHUNK;
+    world.inbox_limit = INBOX_BYTES;
     world.now = 1000000000;
     world.next_fd = FD_BASE;
     test_random_seed(&world.random, seed, 1);
@@ -1091,6 +1169,7 @@ static void engine_step(struct engine *e)
     count = 0;
     vsr_io_links_prepare(io, sqes, SQ_CAP, &count);
     vsr_io_streams_prepare(io, sqes, SQ_CAP, &count);
+    sends_resume(e);
     for (uint32_t i = 0; i < count; ++i) {
         execute(e, &sqes[i], &chain_failed);
     }
@@ -1232,6 +1311,11 @@ static void check_streams(const struct engine *e)
         (void)busy;
     }
     CHECK(active == streams->active);
+    for (uint32_t i = 0; i < e->io->links.nodes_count; ++i) {
+        /* A link is never closed for its held runs: a stream link whose
+         * frame waits pauses its receive instead (decision 99). */
+        CHECK(e->io->links.nodes[i].last_error != -ENOBUFS);
+    }
 }
 
 /* Steps every open engine until a full round moves nothing, checking the
@@ -2053,6 +2137,162 @@ static uint32_t file_transfer(uint64_t cookie, const unsigned char *file,
     return b->reads;
 }
 
+/* A requester whose caller falls behind by more than the link's held-run
+ * bound: the link pauses its receive while the stream's window is full,
+ * the source's sends back up in the socket (the TCP window closes) and
+ * every chunk arrives once the caller catches up; no link is closed with
+ * -ENOBUFS and the source's status matches the requester's (decision 99). */
+static void test_backpressure(void)
+{
+    const unsigned char *bytes = pattern(5);
+    const uint64_t length = 60 * CHUNK; /* Fifteen slabs of chunk frames. */
+    struct engine *a;
+    struct engine *b;
+    struct sink k;
+    struct feed d;
+    uint32_t index = NONE;
+    const struct vsr_io_stream *s;
+    const struct vsr_io_stream *t;
+    const struct vsr_io_link *in;
+    uint32_t pauses = 0;
+    uint32_t slots_free;
+
+    world_reset(17);
+    world.inbox_limit = 4 * PAGE; /* A socket buffer of four slabs. */
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    /* Steady drip: the engines alternate, the caller completes one DATA
+     * op at a time, the source is closed right after its write. */
+    open_stream(&k, &d, 1, NULL, 0, &index);
+    s = stream_at(a, index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    t = stream_at(b, (uint32_t)(d.handle & 0xFFFF));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    k.hold = true;
+    CHECK(feed_write_buffers(&d, 1, bytes, length, 0) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    settle();
+    sink_drain(&k);
+    feed_drain(&d);
+    CHECK(k.data_ops == WINDOW && k.held_count == WINDOW);
+    CHECK(s->units_used == WINDOW);
+    /* The window is full: the link holds the next frame, its receive is
+     * off (no RECV slot) and the source's window is full too: its send
+     * is parked in the socket, so the source's stream cannot end. */
+    in = link_to(a, 2, VSR_IO_OUTBOUND, VSR_IO_LINK_ESTABLISHED);
+    CHECK(in != NULL && in->retry && in->partial_length > 0);
+    CHECK(in->recv_slot == NONE);
+    CHECK(t->units_used == WINDOW && !d.ended);
+    while (!k.ended) {
+        CHECK(k.held_count > 0); /* Else nothing would ever move. */
+        sink_complete(&k, 1);
+        settle();
+        sink_drain(&k);
+        feed_drain(&d);
+        in = link_to(a, 2, VSR_IO_OUTBOUND, VSR_IO_LINK_ESTABLISHED);
+        if (in != NULL && in->recv_slot == NONE) {
+            pauses++;
+        }
+    }
+    CHECK(pauses > 0);
+    CHECK(k.end.status == VSR_IO_OK && k.end.bytes == length);
+    CHECK(k.received == length && memcmp(k.bytes, bytes, length) == 0);
+    CHECK(d.ended && d.end.status == VSR_IO_OK && d.end.bytes == length);
+    CHECK(d.written_count == 1 && d.written[0] == 1);
+    settle();
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    CHECK(links_in_state(a, VSR_IO_LINK_FREE) == LINKS);
+    CHECK(links_in_state(b, VSR_IO_LINK_FREE) == LINKS);
+    /* Burst, with a window of one: the source runs ahead (FILE chunks,
+     * zero-copy) while the requester's engine does not step, filling the
+     * socket buffer; what the socket holds is delivered in one burst,
+     * then the caller catches up through the same drip. */
+    world_reset(18);
+    world.window = 1;
+    world.inbox_limit = 4 * PAGE;
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    b->files[0].bytes = bytes;
+    b->files[0].size = BYTES_MAX;
+    open_stream(&k, &d, 2, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    k.hold = true;
+    CHECK(feed_write_file(&d, 1, FILE_FD_BASE, 0, length) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    for (uint32_t i = 0; i < 200; ++i) {
+        engine_step(b);
+        check_streams(b);
+        feed_drain(&d);
+    }
+    CHECK(!d.ended); /* Its send is parked: the socket buffer is full. */
+    while (!k.ended) {
+        settle();
+        sink_drain(&k);
+        feed_drain(&d);
+        if (!k.ended) {
+            CHECK(k.held_count > 0);
+            sink_complete(&k, 1);
+        }
+    }
+    CHECK(k.end.status == VSR_IO_OK && k.end.bytes == length);
+    CHECK(k.received == length && memcmp(k.bytes, bytes, length) == 0);
+    CHECK(d.ended && d.end.status == VSR_IO_OK && d.written_count == 1);
+    settle();
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    CHECK(links_in_state(a, VSR_IO_LINK_FREE) == LINKS);
+    CHECK(links_in_state(b, VSR_IO_LINK_FREE) == LINKS);
+    /* The pause's CANCEL still out (its result held) when the link
+     * closes: the teardown waits for it before taking the shutdown slot,
+     * then the link frees with every slot returned. */
+    world_reset(19);
+    world.inbox_limit = 4 * PAGE;
+    world.hold_cancels = true;
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    slots_free = a->io->slots.free_count; /* The listener keeps one. */
+    open_stream(&k, &d, 3, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    k.hold = true;
+    CHECK(feed_write_buffers(&d, 1, bytes, length, 0) == VSR_OK);
+    settle();
+    sink_drain(&k);
+    CHECK(k.data_ops == WINDOW);
+    in = link_to(a, 2, VSR_IO_OUTBOUND, VSR_IO_LINK_ESTABLISHED);
+    CHECK(in != NULL && in->recv_slot == NONE && in->shutdown_slot != NONE);
+    CHECK(world.held_count == 1); /* The CANCEL's own result. */
+    vsr_io_streams_shutdown(a->io);
+    sink_complete(&k, k.held_count);
+    settle();
+    sink_drain(&k);
+    CHECK(k.ended && k.end.status == VSR_IO_CANCELLED);
+    CHECK(links_in_state(a, VSR_IO_LINK_CLOSING) == 1);
+    CHECK(in->state == VSR_IO_LINK_CLOSING && !in->torn_down);
+    CHECK(in->shutdown_slot != NONE && world.held_count == 1);
+    world.hold_cancels = false;
+    world_release_notifs();
+    settle();
+    feed_drain(&d);
+    CHECK(links_in_state(a, VSR_IO_LINK_FREE) == LINKS);
+    CHECK(a->io->slots.free_count == slots_free);
+    CHECK(a->io->streams.active == 0 && pool_refs(a) == 0);
+    vsr_io_streams_shutdown(b->io);
+    pump(&k, &d);
+    CHECK(d.ended && b->io->streams.active == 0 && pool_refs(b) == 0);
+}
+
 static void test_file(void)
 {
     const unsigned char *file = pattern(3);
@@ -2179,7 +2419,11 @@ static void test_loss(void)
     CHECK(link != NULL);
     link_reset(a, link);
     pump(&k, &d);
-    CHECK(!k.ended && s->state == VSR_IO_STREAM_ENDING && s->link_gone);
+    /* The requester, paused on its full window (decision 99), has no receive to
+     * read the reset with: its stream stays REQUESTED with the frames the
+     * link holds until the caller frees the window. The source ends. */
+    CHECK(!k.ended && s->state == VSR_IO_STREAM_REQUESTED && !s->link_gone);
+    CHECK(link->state == VSR_IO_LINK_ESTABLISHED && link->recv_slot == NONE);
     CHECK(d.written_count == 1 && d.ended && d.end.status == VSR_IO_RETRY);
     CHECK(d.end.bytes >= k.received && d.end.bytes <= 10 * CHUNK);
     CHECK(t->state == VSR_IO_STREAM_FREE && pool_refs(b) == 0);
@@ -2187,11 +2431,22 @@ static void test_loss(void)
      * END op went out. */
     CHECK(feed_write_buffers(&d, 2, bytes, 10, 0) == VSR_EINVAL);
     CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_EINVAL);
+    /* Each completion admits a held frame; once the link holds nothing
+     * the receive resumes, reads the reset, and END RETRY follows the
+     * last completion: the chunks the kernel had delivered, no more. */
     sink_complete(&k, WINDOW);
     settle();
     sink_drain(&k);
-    CHECK(k.ended && k.end.status == VSR_IO_RETRY);
-    CHECK(k.end.bytes == k.received && k.received == WINDOW * CHUNK);
+    CHECK(!k.ended && k.held_count > 0); /* The link held more chunks. */
+    while (!k.ended) {
+        CHECK(k.held_count > 0);
+        sink_complete(&k, k.held_count);
+        settle();
+        sink_drain(&k);
+    }
+    CHECK(k.end.status == VSR_IO_RETRY);
+    CHECK(k.end.bytes == k.received && k.received > WINDOW * CHUNK);
+    CHECK(k.received < 10 * CHUNK); /* The reset discarded the rest. */
     CHECK(memcmp(k.bytes, bytes, k.received) == 0);
     CHECK(a->io->streams.active == 0 && pool_refs(a) == 0);
     CHECK(links_in_state(a, VSR_IO_LINK_FREE) == LINKS);
@@ -2724,6 +2979,7 @@ static void test_random(uint64_t seed)
         uint32_t lose_at = test_random_bounded(&random, 60);
         bool closed = false;
         bool stopped = false;
+        bool jumped = false; /* The clock advanced: timers may have fired. */
         uint32_t steps = 0;
         uint32_t loser = test_random_bounded(&random, 2);
 
@@ -2814,6 +3070,7 @@ static void test_random(uint64_t seed)
             } else if (action == 7) {
                 world_advance(1 + test_random_bounded(
                                       &random, (uint32_t)HANDSHAKE_NS / 8));
+                jumped = true;
             }
             (void)world_run_checked(1 + test_random_bounded(&random, 3));
             sink_drain(&k);
@@ -2877,12 +3134,12 @@ static void test_random(uint64_t seed)
             CHECK(d.end.bytes == total);
             completed++;
         } else {
-            /* A refusal, a reset, a requester stalled past the timeout,
-             * or the link module's held-run bound at a stalled
-             * requester (its source may have finished: OK there). */
+            /* A refusal, a reset, or a timer (a requester stalled past
+             * the inactivity timeout, or a source whose linger ended
+             * first: OK there); never slowness alone, since the link's
+             * receive pauses instead of running out of held runs. */
             CHECK(k.end.status == VSR_IO_RETRY);
-            CHECK(refuse || lose || d.end.status != VSR_IO_OK ||
-                  a->io->links.nodes[0].last_error != 0);
+            CHECK(refuse || lose || d.end.status != VSR_IO_OK || jumped);
             (void)(refuse ? refused++ : partial++);
         }
         if (!refuse) {
@@ -2919,6 +3176,7 @@ int main(int argc, char **argv)
     test_errors();
     test_basic();
     test_window();
+    test_backpressure();
     test_file();
     test_loss();
     test_protocol();
