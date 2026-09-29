@@ -262,7 +262,14 @@ static int faulty_submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
     bool tail_linked = false;
     bool follows_link = false;
     uint32_t total = count;
+    uint32_t shortened = 0;
+    int rc;
 
+    if (count > 0 && sqes == NULL) {
+        /* Refused by the inner executor, as it would be bare. */
+        return faulty->inner.ops->submit_and_wait(
+            faulty->inner.ctx, sqes, count, want, min_wait_ns, deadline_ns);
+    }
     for (uint32_t i = 0; i < count; ++i) {
         if (sqes[i].user_data == FAULTY_EXECUTOR_USER_DATA) {
             return -EINVAL;
@@ -298,12 +305,16 @@ static int faulty_submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
         }
         if (shortenable(sqe) && chance(faulty, faulty->options.short_ppm)) {
             faulty->batch[i].length = shorter(faulty, sqe->length);
-            ++faulty->stats.shortened;
+            ++shortened;
         }
     }
     held_wait(faulty, &want, &min_wait_ns, &deadline_ns);
-    return faulty->inner.ops->submit_and_wait(faulty->inner.ctx, forward, total,
-                                              want, min_wait_ns, deadline_ns);
+    rc = faulty->inner.ops->submit_and_wait(faulty->inner.ctx, forward, total,
+                                            want, min_wait_ns, deadline_ns);
+    if (rc == 0) {
+        faulty->stats.shortened += shortened;
+    }
+    return rc;
 }
 
 static uint32_t faulty_reap(void *ctx, struct vsr_io_cqe *cqes,

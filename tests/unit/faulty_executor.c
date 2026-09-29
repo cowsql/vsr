@@ -1185,6 +1185,40 @@ static void test_wait(void)
     close_world(&w);
 }
 
+/* A batch the inner executor refuses runs nothing and counts no fault. */
+static void test_refused(void)
+{
+    static char buffer[MESSAGE_BYTES];
+    struct faulty_executor_options options = rates();
+    struct faulty_executor_stats stats;
+    struct vsr_io_sqe batch[3];
+    struct world w;
+
+    options.eio_ppm = PPM;
+    options.short_ppm = PPM;
+    options.delay_ppm = PPM;
+    options.cancel_recv_ppm = PPM;
+    open_world(&w, &traces[0], &options);
+    batch[0] = make_sqe(VSR_IO_SQE_SEND, 3, 0x80);
+    batch[0].addr = MESSAGE;
+    batch[0].length = MESSAGE_BYTES;
+    batch[1] = make_sqe(VSR_IO_SQE_RECV, 3, 0x81);
+    batch[1].addr = buffer;
+    batch[1].length = MESSAGE_BYTES;
+    /* The inner executor's reserved value, then the wrapper's. */
+    batch[2] = make_sqe(VSR_IO_SQE_NOP, -1, UINT64_MAX);
+    CHECK(w.ex[0].ops->submit_and_wait(w.ex[0].ctx, batch, 3, 0, 0, 0) ==
+          -EINVAL);
+    batch[2].user_data = FAULTY_EXECUTOR_USER_DATA;
+    CHECK(w.ex[0].ops->submit_and_wait(w.ex[0].ctx, batch, 3, 0, 0, 0) ==
+          -EINVAL);
+    CHECK(vsr_sim_inflight(w.sim, 0) == 0);
+    faulty_executor_stats(w.faulty[0], &stats);
+    CHECK(stats.eio == 0 && stats.shortened == 0 && stats.delayed == 0 &&
+          stats.cancelled == 0);
+    close_world(&w);
+}
+
 /* Records of a LINK chain get no fault, and a batch whose last record is
  * linked gets no appended CANCEL, which would join that chain. */
 static void test_chains(void)
@@ -1623,21 +1657,14 @@ struct unit {
 };
 
 static const struct unit units[] = {
-    {"reserved", test_reserved},
-    {"transparent", test_transparent},
-    {"each_fault", test_each_fault},
-    {"random_walk", test_random_walk},
-    {"chains", test_chains},
-    {"capacity", test_capacity},
-    {"map", test_map},
-    {"cancel_held", test_cancel_held},
-    {"wait", test_wait},
-    {"direct_short", test_direct_short},
-    {"buffer_order", test_buffer_order},
-    {"chain_buffer", test_chain_buffer},
-    {"delay_bounds", test_delay_bounds},
-    {"batches", test_batches},
-    {"saturated", test_saturated},
+    {"reserved", test_reserved},         {"transparent", test_transparent},
+    {"each_fault", test_each_fault},     {"random_walk", test_random_walk},
+    {"refused", test_refused},           {"chains", test_chains},
+    {"capacity", test_capacity},         {"map", test_map},
+    {"cancel_held", test_cancel_held},   {"wait", test_wait},
+    {"direct_short", test_direct_short}, {"buffer_order", test_buffer_order},
+    {"chain_buffer", test_chain_buffer}, {"delay_bounds", test_delay_bounds},
+    {"batches", test_batches},           {"saturated", test_saturated},
 };
 
 /* Usage: faulty_executor [SEED [TEST]]. */
