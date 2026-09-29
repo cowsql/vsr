@@ -243,7 +243,7 @@ int vsr_init(void *memory, size_t size, const struct vsr_options *options,
     }
     /* An out pointer inside the arena is never written; every other error
      * clears it as promised, before any other overlap is rejected. */
-    if (overlaps(memory, size, out, sizeof(*out))) {
+    if (overlaps(memory, size, out, sizeof(struct vsr *))) {
         return VSR_EINVAL;
     }
     *out = NULL;

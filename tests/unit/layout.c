@@ -81,11 +81,11 @@ static int layout_result(const struct vsr_options *options)
  * "input_leases >= transfers + 8" and "batch_entries <= log_cache_entries". */
 static void coherent(struct vsr_options *options)
 {
-    struct vsr_limits *limits = &options->limits;
-    if (limits->input_leases < limits->transfers + 8u)
-        limits->input_leases = limits->transfers + 8u;
-    if (limits->log_cache_entries < limits->batch_entries)
-        limits->log_cache_entries = limits->batch_entries;
+    struct vsr_limits *bounds = &options->limits;
+    if (bounds->input_leases < bounds->transfers + 8u)
+        bounds->input_leases = bounds->transfers + 8u;
+    if (bounds->log_cache_entries < bounds->batch_entries)
+        bounds->log_cache_entries = bounds->batch_entries;
 }
 
 /* Each limit reserves capacity; raising any one of them never shrinks the

@@ -85,10 +85,11 @@ static void check_state(const struct vsr_io_deadlines *set, uint32_t capacity,
     for (uint32_t p = 1; p < set->count; ++p) {
         uint32_t parent = set->heap[(p - 1) / 2];
         uint32_t child = set->heap[p];
+        uint64_t parent_when = set->entries[parent].when;
+        uint64_t child_when = set->entries[child].when;
 
-        CHECK(set->entries[parent].when < set->entries[child].when ||
-              (set->entries[parent].when == set->entries[child].when &&
-               parent < child));
+        CHECK(parent_when < child_when ||
+              (parent_when == child_when && parent < child));
     }
     CHECK(vsr_io_deadlines_earliest(set) == minimum);
 }
@@ -97,7 +98,7 @@ static void check_state(const struct vsr_io_deadlines *set, uint32_t capacity,
 static void check_model(const struct vsr_io_deadlines *set)
 {
     check_state(set, CAPACITY, model);
-    for (uint16_t kind = 0; kind < VSR_IO_DEADLINE_KINDS; ++kind) {
+    for (uint16_t kind = 0; kind < (uint16_t)VSR_IO_DEADLINE_KINDS; ++kind) {
         for (uint32_t index = 0; index < kind_count[kind]; ++index) {
             const struct vsr_io_deadline_entry *entry =
                 &set->entries[kind_base[kind] + index];

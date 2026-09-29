@@ -42,7 +42,6 @@ static uint64_t seed = 1;
 
 struct trace_entry {
     uint32_t node;
-    uint32_t reserved;
     struct vsr_io_cqe cqe;
 };
 
