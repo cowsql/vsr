@@ -1689,8 +1689,8 @@ static int32_t apply_publish(struct vsr_io_store *store, uint64_t sequence,
     }
     store->anchor = checkpoint;
     if (id_equal(checkpoint.id, store->last_capture)) {
-        base_apply(store, checkpoint.id, store->last_capture_sequence,
-                   sequence, BASE_FROM_CAPTURE);
+        base_apply(store, checkpoint.id, store->last_capture_sequence, sequence,
+                   BASE_FROM_CAPTURE);
     } else if (store->base_state == BASE_LOADED &&
                id_equal(store->base_id, checkpoint.id)) {
         base_apply(store, checkpoint.id, sequence, sequence, BASE_FROM_FILE);

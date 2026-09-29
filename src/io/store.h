@@ -78,9 +78,9 @@ enum vsr_io_store_state {
 
 enum vsr_io_segment_phase {
     VSR_IO_SEGMENT_FREE,
-    VSR_IO_SEGMENT_HEADER, /* Header packed; its write not yet complete. */
-    VSR_IO_SEGMENT_OPEN,   /* Records may be packed into it. */
-    VSR_IO_SEGMENT_SEALED, /* Full; records only read. */
+    VSR_IO_SEGMENT_HEADER,  /* Header packed; its write not yet complete. */
+    VSR_IO_SEGMENT_OPEN,    /* Records may be packed into it. */
+    VSR_IO_SEGMENT_SEALED,  /* Full; records only read. */
     VSR_IO_SEGMENT_FREEING, /* Freed; reused only once the superblock
                                naming the new start segment is on disk. */
     VSR_IO_SEGMENT_FLUSHING /* That superblock write completed; in

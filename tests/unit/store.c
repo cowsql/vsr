@@ -5365,8 +5365,7 @@ static void checked_image(struct checked *c)
             const struct checked_header *header = &headers[s];
 
             if (header->valid && !header->visited &&
-                header->last_sequence == c->sequence &&
-                header->run >= c->run &&
+                header->last_sequence == c->sequence && header->run >= c->run &&
                 (best == NONE || header->number > headers[best].number)) {
                 best = s;
             }
@@ -5559,9 +5558,8 @@ static void walk_apply(uint64_t sequence)
             break;
         case VSR_STORE_TRIM:
             if (change->first > walk.log_begin) {
-                walk.log_begin = change->first < walk.log_end
-                                     ? change->first
-                                     : walk.log_end;
+                walk.log_begin =
+                    change->first < walk.log_end ? change->first : walk.log_end;
             }
             break;
         case VSR_STORE_CLIENTS:
@@ -5709,9 +5707,9 @@ static const struct txn *walk_txn(uint8_t action, uint8_t arg)
             break;
         }
         t = txn_begin(q);
-        txn_add(t, VSR_STORE_TRUNCATE, end - 1 - (arg % 3) < begin + 1
-                                           ? begin + 1
-                                           : end - 1 - (arg % 3),
+        txn_add(t, VSR_STORE_TRUNCATE,
+                end - 1 - (arg % 3) < begin + 1 ? begin + 1
+                                                : end - 1 - (arg % 3),
                 0, NULL);
         if ((arg & 0x80) != 0) {
             struct vsr_id none = {0, 0};
@@ -5888,7 +5886,8 @@ static void walk_check_request(uint32_t ci)
         const struct walk_entry *e = &walk.entries[at - 1];
         const struct vsr_entry *entry = &txns[e->sequence].entries[e->index];
 
-        if (e->sequence != 0 && walk_client_index(entry->request.client) == ci) {
+        if (e->sequence != 0 &&
+            walk_client_index(entry->request.client) == ci) {
             found = at - 1;
         }
     }
@@ -6184,15 +6183,16 @@ static void walk_seeded(uint64_t seed, size_t size)
     /* On stderr, unbuffered: a failing walk names its seed. */
     fprintf(stderr, "store: walk seed %" PRIu64 "\n", seed);
     walk_run(bytes, size);
-    fprintf(stderr, "store: walk seed %" PRIu64 ": %" PRIu64 " steps, %" PRIu64
-           " stores (%" PRIu64 " held), %" PRIu64 " syncs, %" PRIu64
-           " reclaims, %" PRIu64 " loads (%" PRIu64 " cold), %" PRIu64
-           " captures, %" PRIu64 " crashes (%" PRIu64 " torn, %" PRIu64
-           " blocks lost, %" PRIu64 " flips): %" PRIu64 " recovered, %" PRIu64
-           " not found, %" PRIu64 " corrupt\n",
-           seed, s->steps, s->stores, s->held, s->syncs, s->reclaims, s->loads,
-           s->cold, s->captures, s->crashes, s->torn, s->lost, s->flips,
-           s->recovered, s->not_found, s->corrupt);
+    fprintf(stderr,
+            "store: walk seed %" PRIu64 ": %" PRIu64 " steps, %" PRIu64
+            " stores (%" PRIu64 " held), %" PRIu64 " syncs, %" PRIu64
+            " reclaims, %" PRIu64 " loads (%" PRIu64 " cold), %" PRIu64
+            " captures, %" PRIu64 " crashes (%" PRIu64 " torn, %" PRIu64
+            " blocks lost, %" PRIu64 " flips): %" PRIu64 " recovered, %" PRIu64
+            " not found, %" PRIu64 " corrupt\n",
+            seed, s->steps, s->stores, s->held, s->syncs, s->reclaims, s->loads,
+            s->cold, s->captures, s->crashes, s->torn, s->lost, s->flips,
+            s->recovered, s->not_found, s->corrupt);
 }
 
 static void test_walk(void)
