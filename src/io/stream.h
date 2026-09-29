@@ -110,14 +110,22 @@ int vsr_io_streams_served(struct vsr_io *io, uint64_t op, int32_t status);
 int vsr_io_streams_data_done(struct vsr_io *io, uint64_t op);
 
 /* Inbound frames on a stream link, from the link module: request at the
- * source; chunk and end at the requester. bytes are pinned by `slab`. */
-void vsr_io_streams_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
+ * source; chunk and end at the requester. The body's bytes live in pool
+ * slab `slab`, which the module retains (vsr_io_pool_retain) if it keeps
+ * them past the call. Returns false to leave the frame where it is, the
+ * link then retries it at every poll (a window with no free unit); an
+ * inbound link is bound to its stream by setting links.links[link].stream
+ * at the request frame, which also exempts it from the idle close. */
+bool vsr_io_streams_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
                           const struct vsr_io_cursor *body, uint32_t slab);
 /* Link lifecycle from the link module. */
 void vsr_io_streams_link_up(struct vsr_io *io, uint32_t stream);
 void vsr_io_streams_link_lost(struct vsr_io *io, uint32_t stream,
                               int32_t error);
-/* Send progress: the link's notified offset advanced; releases units. */
+/* Send progress: called at every send completion and NOTIF of the
+ * stream's link with its notified offset (unchanged at a zero-copy
+ * result); releases the units up to it and retries a frame that got
+ * EBUSY. */
 void vsr_io_streams_sent(struct vsr_io *io, uint32_t stream,
                          uint64_t notified_offset);
 
