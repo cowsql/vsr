@@ -4727,157 +4727,311 @@ static uint64_t fill_slot(uint64_t sequence)
     return sequence - 1;
 }
 
+/* Slot 0 freed with the superblock write naming slot 1 as the start
+ * dirty, slot 1 full: the transaction returned (at the next sequence)
+ * needs slot 0. Slot 0 holds sequence 1 and the records up to the one
+ * that opened slot 1; a TRIM, a capture and its PUBLISH, a SYNC and a
+ * RECLAIM put every floor term above it; the records that filled slot 1
+ * after the SYNC are written, not flushed. */
+static const struct txn *freeing_setup(const struct config *c)
+{
+    struct vsr_id x = {0x51, 1};
+    const struct txn *t;
+    uint64_t published;
+    uint64_t sequence;
+    uint64_t op;
+
+    harness_open(c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    sequence = fill_slot(2); /* Opened slot 1. */
+    CHECK(h.store->current == 1 && h.store->segments[0].number == 1);
+    store_run(txn_trim(++sequence, h.store->log_end - 1));
+    harness_capture(x);
+    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    published = sequence;
+    for (;;) {
+        t = txn_append(++sequence, 4, 250);
+        CHECK(h.store->head % BLOCK == 0); /* No wrap padding to count. */
+        if (h.store->segments[1].used + t->bytes > c->segment_bytes) {
+            break;
+        }
+        store_run(t);
+    }
+    CHECK(h.store->written > h.store->flushed); /* Unflushed records. */
+    expect_completion(submit_reclaim(published), VSR_IO_OK);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FREEING);
+    CHECK(h.store->start_slot == 1 && h.store->superblock_dirty == 1);
+    return t;
+}
+
+/* Completes every pending WRITE, prepares, and again until none is. */
+static void complete_writes(void)
+{
+    harness_prepare();
+    for (uint32_t at = pending_of(VSR_IO_SQE_WRITE); at != NONE;
+         at = pending_of(VSR_IO_SQE_WRITE)) {
+        harness_complete(at);
+        harness_prepare();
+    }
+}
+
 /* A freed slot is reused only once the superblock naming the new start
  * segment is on media (decision S15): in FDATASYNC mode the write's
- * completion makes the slot FLUSHING, the store asks for a flush, and
- * the flush's completion makes it FREE; a STORE needing the slot waits.
- * A crash losing the superblock's unflushed block meanwhile recovers
- * through the older superblock, whose start slot is untouched. */
+ * completion makes the slot FLUSHING, the store asks for a flush of its
+ * own, and the completion of a flush issued after that makes it FREE; a
+ * STORE needing the slot waits meanwhile. Variants: a crash that loses
+ * the superblock's unflushed block (the older copy names segment 1 in
+ * slot 0, which must still be there: reusing the slot at the write's
+ * completion made this recovery a false CORRUPT); the flush freeing the
+ * slot for the held STORE; a SYNC naming the held STORE's sequence (the
+ * store's own flush does not wait for it: that would never end); a
+ * flush issued before the write completed, which does not count. */
 static void test_freeing_flush(void)
 {
     struct config c = script_config(VSR_IO_SYNC_FDATASYNC);
     struct vsr_io_completion completion;
-    struct vsr_id x = {0x51, 1};
-    uint64_t sequence;
+    const struct txn *t;
     uint64_t superblock_at;
+    uint64_t store_op;
     uint64_t op;
     uint32_t at;
 
     c.max_segments = 2;
-    for (uint32_t crash = 0; crash < 2; ++crash) {
-        harness_open(&c);
-        harness_start(VSR_START_NEW);
-        store_run(txn_identity(1, VSR_MEMBER_FULL));
-        sequence = fill_slot(2); /* Opened slot 1. */
-        CHECK(h.store->current == 1 && h.store->segments[0].number == 1);
+    /* The crash. */
+    t = freeing_setup(&c);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    CHECK(at != NONE && h.pending[at].sqe.offset < 2 * BLOCK);
+    superblock_at = h.pending[at].sqe.offset;
+    harness_complete(at);
+    (void)submit(t);
+    complete_writes();
+    snapshot_take();
+    disk_lose_block(superblock_at / BLOCK);
+    expect_recovered(&c, t->store.sequence - 1); /* Held, never packed. */
+    CHECK(h.store->start_slot == 0 && h.store->segments[0].number == 1);
+    harness_close();
+    /* The flush frees the slot and the held STORE takes it. */
+    t = freeing_setup(&c);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
+    store_op = submit(t);
+    CHECK(h.store->stores_count == 1);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_FSYNC);
+    CHECK(at != NONE);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
+    harness_complete(at);
+    CHECK(h.store->stores_count == 0 && h.store->current == 0);
+    CHECK(h.store->segments[0].number > 2 &&
+          h.store->segments[0].phase == VSR_IO_SEGMENT_HEADER);
+    expect_completion(store_op, VSR_IO_OK);
+    harness_run();
+    expect_no_completion();
+    harness_close();
+    /* A SYNC of the held sequence: the flush the SYNCs wait for needs
+     * that STORE written, the STORE needs the slot. */
+    t = freeing_setup(&c);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    store_op = submit(t);
+    op = submit_sync(t->store.sequence);
+    harness_run();
+    expect_completion(store_op, VSR_IO_OK);
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->flushed == t->store.sequence);
+    harness_close();
+    /* A flush in flight when the write completes was issued before it:
+     * the slot waits for the next one. */
+    t = freeing_setup(&c);
+    op = submit_sync(t->store.sequence - 1);
+    harness_poll(); /* No sync delay: the flush is due. */
+    CHECK(harness_prepare() == 2);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
+    store_op = submit(t);
+    harness_complete(pending_of(VSR_IO_SQE_FSYNC));
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
+    CHECK(h.store->stores_count == 1);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_FSYNC));
+    CHECK(h.store->stores_count == 0 && h.store->current == 0);
+    expect_completion(store_op, VSR_IO_OK);
+    harness_run();
+    while (next_completion(&completion)) {
+        CHECK(false);
+    }
+    harness_close();
+}
+
+/* Completes pending SQEs, preparing more, until only the WRITE starting
+ * at file offset `lost` is left: the write a crash then loses. */
+static void run_except(uint64_t lost)
+{
+    for (unsigned rounds = 0; rounds < 1000; ++rounds) {
+        uint32_t found = NONE;
+
+        harness_poll();
+        harness_prepare();
+        for (uint32_t i = 0; i < PENDING_MAX && found == NONE; ++i) {
+            if (h.pending[i].state == 1 &&
+                (h.pending[i].sqe.opcode != VSR_IO_SQE_WRITE ||
+                 h.pending[i].sqe.offset != lost)) {
+                found = i;
+            }
+        }
+        if (found == NONE) {
+            return;
+        }
+        harness_complete(found);
+    }
+    CHECK(false);
+}
+
+/* Slot 0 holds sequence 1, a CLIENTS record of client 0xC at 2 and the
+ * records up to the one that opened slot 1, whose sequence is returned;
+ * two slots at most. */
+static uint64_t media_setup(const struct config *c)
+{
+    struct vsr_id client = {0xC, 1};
+    uint64_t number = 1;
+    uint64_t op = 1;
+    uint64_t sequence;
+
+    harness_open(c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_clients(2, 1, &client, &number, &op, 16));
+    sequence = fill_slot(3);
+    CHECK(h.store->current == 1 && h.store->segments[0].number == 1);
+    return sequence;
+}
+
+/* A crash that loses every unflushed block, then the recovery of
+ * `sequence`, whose log and clients read back as before (the snapshot
+ * check). */
+static void crash_recover(const struct config *c, uint64_t sequence)
+{
+    disk_crash(true);
+    expect_recovered(c, sequence);
+    CHECK(h.store->reclaimed == 0 && h.store->client_base_pending == 0);
+}
+
+/* The freeing floor counts the RECLAIM revision and the client base as
+ * of the sequence on media (decision S16): a crash can bring back any
+ * revision from there on, whose row must be served whole. Each part
+ * puts a change above the media with its record's write still out, lets
+ * everything else complete (the superblock naming a new start segment
+ * and the flush after it, when a slot was freed) and crashes, losing
+ * that write: the recovered row needs slot 0, which freeing by the
+ * RECLAIM or the base as they stood in memory gave up. Then the terms
+ * follow a SYNC, and a STORE finding nothing to free while a term waits
+ * holds and gets the flush it needs rather than failing. */
+static void test_reclaim_media(void)
+{
+    struct vsr_id x = {0x51, 1};
+
+    for (uint32_t mode = 0; mode < 2; ++mode) {
+        struct config c = script_config(mode == 0 ? VSR_IO_SYNC_FDATASYNC
+                                                  : VSR_IO_SYNC_DSYNC);
+        const struct txn *t;
+        uint64_t reclaimed;
+        uint64_t retained;
+        uint64_t sequence;
+        uint64_t pending;
+        uint64_t floor;
+        uint64_t op;
+        uint32_t phase;
+
+        c.max_segments = 2;
+        /* The RECLAIM term: the base covers client 0xC's record, the
+         * TRIM and its RECLAIM are above the media. */
+        sequence = media_setup(&c);
+        harness_capture(x);
+        store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+        op = submit_sync(sequence);
+        harness_run();
+        expect_completion(op, VSR_IO_OK);
+        t = txn_trim(++sequence, h.store->log_end - 1);
+        expect_completion(submit(t), VSR_IO_OK); /* Packed, not written. */
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        reclaimed = h.store->reclaimed;
+        retained = h.store->retained_begin;
+        floor = vsr_io_store_free_floor(h.store);
+        phase = h.store->segments[0].phase;
+        run_except(t->file_offset);
+        crash_recover(&c, sequence - 1);
+        harness_close();
+        /* What kept slot 0 (checked after the recovery, the verdict). */
+        CHECK(reclaimed == sequence - 1 && retained == 1);
+        CHECK(floor == 3 && phase == VSR_IO_SEGMENT_SEALED); /* Op 1. */
+        /* The base term: the TRIM and its RECLAIM are on media, the
+         * PUBLISH of a base covering client 0xC's record is not. */
+        sequence = media_setup(&c);
         store_run(txn_trim(++sequence, h.store->log_end - 1));
         op = submit_sync(sequence);
         harness_run();
         expect_completion(op, VSR_IO_OK);
-        vsr_io_store_base_set(h.store, x, sequence); /* The base term. */
         expect_completion(submit_reclaim(sequence), VSR_IO_OK);
-        CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FREEING);
-        CHECK(h.store->superblock_dirty == 1);
-        CHECK(harness_prepare() >= 1);
-        at = pending_of(VSR_IO_SQE_WRITE);
-        CHECK(at != NONE && h.pending[at].sqe.offset < 2 * BLOCK);
-        superblock_at = h.pending[at].sqe.offset;
-        harness_complete(at);
-        CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
-        CHECK(harness_prepare() >= 1);
-        CHECK(pending_of(VSR_IO_SQE_FSYNC) != NONE);
-        /* STOREs needing the slot wait for the flush. */
-        while (h.store->stores_count == 0) {
-            submit(txn_append(++sequence, 4, 250));
-            harness_prepare();
-            while (pending_of(VSR_IO_SQE_WRITE) != NONE) {
-                harness_complete(pending_of(VSR_IO_SQE_WRITE));
-            }
-        }
-        CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
-        CHECK(h.store->segments[0].number == 0);
-        if (crash == 0) {
-            /* The flush frees the slot and the held STORE takes it. */
-            harness_complete(pending_of(VSR_IO_SQE_FSYNC));
-            CHECK(h.store->segments[0].number > 2 &&
-                  h.store->segments[0].phase == VSR_IO_SEGMENT_HEADER);
-            CHECK(h.store->stores_count == 0);
-            harness_run();
-            while (next_completion(&completion)) {
-                CHECK(completion.status == VSR_IO_OK);
-            }
-            harness_close();
+        CHECK(vsr_io_store_free_floor(h.store) == 1); /* Base 0 + 1. */
+        harness_capture(x);
+        t = txn_publish(++sequence, x, h.store->log_end - 1);
+        expect_completion(submit(t), VSR_IO_OK);
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        CHECK(h.store->client_base == sequence - 1);
+        pending = h.store->client_base_pending;
+        floor = h.store->client_base_floor;
+        phase = h.store->segments[0].phase;
+        run_except(t->file_offset);
+        crash_recover(&c, sequence - 1);
+        harness_close();
+        CHECK(pending == sequence && floor == 0);
+        CHECK(phase == VSR_IO_SEGMENT_SEALED);
+        /* The SYNC of the PUBLISH lets both terms through. */
+        sequence = media_setup(&c);
+        store_run(txn_trim(++sequence, h.store->log_end - 1));
+        harness_capture(x);
+        store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        CHECK(h.store->segments[0].number == 1 ||
+              mode == 1); /* O_DSYNC: on media once written. */
+        op = submit_sync(sequence);
+        harness_run();
+        expect_completion(op, VSR_IO_OK);
+        CHECK(h.store->reclaimed == sequence);
+        CHECK(h.store->client_base_floor == sequence - 1 &&
+              h.store->client_base_pending == 0);
+        CHECK(h.store->segments[0].number == 0 &&
+              h.store->segments[0].phase == VSR_IO_SEGMENT_FREE);
+        harness_close();
+        if (mode == 1) {
             continue;
         }
-        /* The superblock write is lost with the crash: the older copy
-         * names segment 1 in slot 0, still there. */
-        disk_lose_block(superblock_at / BLOCK);
-        snapshot_take();
-        expect_recovered(&c, h.store->readable);
+        /* A STORE that needs a slot while only a term waiting for the
+         * media keeps slot 0: held, and the store flushes on its own. */
+        sequence = media_setup(&c);
+        store_run(txn_trim(++sequence, h.store->log_end - 1));
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        harness_capture(x);
+        store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        CHECK(h.store->segments[0].number == 1);
+        CHECK(disk.flushes == 0 && h.store->syncs_count == 0);
+        while (h.store->current == 1) {
+            op = submit(txn_append(++sequence, 4, 250));
+            harness_run();
+            expect_completion(op, VSR_IO_OK);
+        }
+        CHECK(h.store->current == 0 && disk.flushes >= 2);
+        CHECK(h.store->client_base_floor == h.store->client_base);
         harness_close();
     }
-}
-
-/* A RECLAIM applies as far as the sequence on media (decision S16): a
- * crash can bring back any revision from there on, and a segment those
- * revisions need is not freed. Here the TRIM and the RECLAIM are above
- * the flushed sequence; the crash loses the unflushed records and
- * recovers the flushed sequence, whose log reads back whole. The base
- * term of the floor follows the same rule. */
-static void test_reclaim_media(void)
-{
-    struct config c = script_config(VSR_IO_SYNC_FDATASYNC);
-    struct vsr_id x = {0x51, 1};
-    uint64_t sequence;
-    uint64_t flushed;
-    uint64_t base;
-    uint64_t op;
-
-    harness_open(&c);
-    harness_start(VSR_START_NEW);
-    store_run(txn_identity(1, VSR_MEMBER_FULL));
-    vsr_io_store_base_set(h.store, x, 1); /* The base term: 2. */
-    sequence = fill_slot(2); /* Opened slot 1. */
-    flushed = sequence - 1;
-    op = submit_sync(flushed);
-    harness_run();
-    expect_completion(op, VSR_IO_OK);
-    CHECK(h.store->flushed == flushed);
-    store_run(txn_trim(++sequence, h.store->log_end - 1));
-    expect_completion(submit_reclaim(sequence), VSR_IO_OK);
-    harness_run();
-    CHECK(h.store->reclaim == sequence && h.store->reclaimed == flushed);
-    CHECK(h.store->segments[0].number == 1 &&
-          h.store->segments[0].phase == VSR_IO_SEGMENT_SEALED);
-    CHECK(h.store->retained_begin == 1);
-    CHECK(vsr_io_store_free_floor(h.store) == 2); /* Record of op 1. */
-    /* The base term: a PUBLISH above the media keeps the older base. */
-    base = h.store->client_base_floor;
-    harness_capture(x);
-    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
-    CHECK(h.store->client_base_pending == sequence);
-    CHECK(h.store->client_base_floor == base);
-    CHECK(h.store->client_base > base);
-    /* The crash: every block written since the flush is lost. */
-    for (uint64_t at = 0; at < disk.size / BLOCK; ++at) {
-        if (disk.dirty[at] != 0) {
-            disk_lose_block(at);
-        }
-    }
-    expect_recovered(&c, flushed);
-    CHECK(h.store->reclaimed == 0 && h.store->client_base_pending == 0);
-    for (uint64_t at = h.store->log_begin; at < h.store->log_end; ++at) {
-        const struct vsr_loaded *loaded;
-        uint32_t lease = NONE;
-
-        op = load_log(flushed, at, at + 1, 1, limits.message_bytes);
-        harness_run();
-        loaded = expect_loaded(op, VSR_IO_OK, &lease);
-        CHECK(loaded->count == 1);
-        release_lease(lease);
-    }
-    harness_close();
-    /* The SYNC lets the RECLAIM through: the slot frees, the base term
-     * follows the PUBLISH. */
-    harness_open(&c);
-    harness_start(VSR_START_NEW);
-    store_run(txn_identity(1, VSR_MEMBER_FULL));
-    vsr_io_store_base_set(h.store, x, 1);
-    sequence = fill_slot(2);
-    store_run(txn_trim(++sequence, h.store->log_end - 1));
-    expect_completion(submit_reclaim(sequence), VSR_IO_OK);
-    harness_run();
-    CHECK(h.store->segments[0].number == 1);
-    harness_capture(x);
-    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
-    base = h.store->client_base;
-    op = submit_sync(sequence);
-    harness_run();
-    expect_completion(op, VSR_IO_OK);
-    CHECK(h.store->reclaimed == sequence - 1);
-    CHECK(h.store->client_base_floor == base);
-    CHECK(h.store->segments[0].number == 0);
-    harness_close();
 }
 
 /* -------------------------------------------------------------------------

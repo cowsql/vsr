@@ -2025,8 +2025,11 @@ static bool store_pack(struct vsr_io_store *store,
                        !segment_freeing(store)) {
                 if (reclaim_pending(store)) {
                     /* A floor term waits for the media (decision S16):
-                     * the flush that advances it may free a slot. */
-                    flush_request(store);
+                     * the flush that advances it may free a slot (the
+                     * writes' completions come back here otherwise). */
+                    if (store->written > store->flushed) {
+                        flush_request(store);
+                    }
                 } else {
                     /* Every slot is kept by a floor: nothing can free. */
                     store_abort(store, pending, VSR_IO_FAILED);
@@ -2128,14 +2131,21 @@ static uint64_t durable_now(const struct vsr_io_store *store)
                                                          : store->flushed;
 }
 
-/* The revisions a crash can bring back are those from the sequence on
- * media on (the recovered sequence is at least it, decision 89): the
- * RECLAIM revision applies as far as that sequence and the rest as it
- * advances, and the floor's client base term is the base as of it
- * (decision S16). */
+/* The sequence on media as freeing sees it: a crash brings back any
+ * revision from it on (the recovered sequence is at least it, decision
+ * 89). In memory-only mode nothing is written any more, so a slot freed
+ * in the table is never rewritten on disk and every term applies. */
+static uint64_t media_sequence(const struct vsr_io_store *store)
+{
+    return memory_only(store) ? UINT64_MAX : durable_now(store);
+}
+
+/* The RECLAIM revision applies as far as the sequence on media and the
+ * rest as it advances; the floor's client base term is the base as of
+ * that sequence (decision S16). Then whatever the floor allows frees. */
 static void reclaim_apply(struct vsr_io_store *store)
 {
-    uint64_t media = durable_now(store);
+    uint64_t media = media_sequence(store);
     uint64_t target = store->reclaim < media ? store->reclaim : media;
 
     if (store->client_base_pending != 0 &&
@@ -2162,11 +2172,15 @@ static bool reclaim_pending(const struct vsr_io_store *store)
 }
 
 /* The client base changed at revision `at`: the floor's base term
- * follows once that revision is on media. */
+ * follows once that revision is on media, and at once when the base went
+ * down (the floor is then right for the revisions on either side). */
 static void base_mark(struct vsr_io_store *store, uint64_t at)
 {
-    if (at > durable_now(store)) {
+    if (at > media_sequence(store)) {
         store->client_base_pending = at;
+        if (store->client_base < store->client_base_floor) {
+            store->client_base_floor = store->client_base;
+        }
     } else {
         store->client_base_floor = store->client_base;
         store->client_base_pending = 0;
@@ -2332,9 +2346,21 @@ static void write_error(struct vsr_io_store *store, int32_t error)
     store->error = error;
     if (store->options.on_write_error == VSR_IO_WRITE_ERROR_FENCE) {
         store_fail(store, VSR_IO_FAILED);
+        return;
     }
     /* CONTINUE: the store stops writing and serves from memory; no SYNC
-     * is ever issued in replicated mode, so nothing else waits. */
+     * is ever issued in replicated mode, so nothing else waits. A freed
+     * slot no superblock or flush will release is free in the table, and
+     * the floor terms waiting for the media apply (memory_only). */
+    for (uint32_t i = 0; i < store->slots; ++i) {
+        if (store->segments[i].phase == VSR_IO_SEGMENT_FREEING ||
+            store->segments[i].phase == VSR_IO_SEGMENT_FLUSHING) {
+            store->segments[i].phase = VSR_IO_SEGMENT_FREE;
+        }
+    }
+    store->freeing_flush = FREEING_FLUSH_NONE;
+    store->flush_own = 0;
+    reclaim_apply(store);
 }
 
 /* A record or header write completed: the segment opens when its header
@@ -2388,15 +2414,16 @@ static void write_done(struct vsr_io_store *store, uint32_t index,
     syncs_settle(store);
 }
 
-/* A flush the store wants for itself: FLUSHING slots wait for one issued
- * after their superblock write completed (decision S15). */
+/* A flush the store wants for itself (FLUSHING slots wait for one issued
+ * after their superblock write completed, decision S15; a floor term
+ * waits for the media, decision S16): issued as soon as none is out,
+ * without waiting for flush_target, which a SYNC of a STORE held for a
+ * slot would never let the written sequence reach. */
 static void flush_request(struct vsr_io_store *store)
 {
     if (store->options.sync_mode == VSR_IO_SYNC_FDATASYNC &&
-        store->error == 0 && store->flush_pending == FLUSH_NONE &&
-        store->flush_slot == NONE) {
-        store->flush_pending = FLUSH_DUE;
-        store->flush_deadline = VSR_NO_DEADLINE;
+        store->error == 0 && store->flush_slot == NONE) {
+        store->flush_own = 1;
     }
 }
 
@@ -4273,14 +4300,22 @@ static bool prepare_write(struct vsr_io *io, uint32_t replica,
     return true;
 }
 
+/* A SYNC's flush once the written sequence reached flush_target, or the
+ * store's own (flush_request); either covers `written` at issue. An own
+ * flush leaves a SYNC's request pending when it does not satisfy it. */
 static bool prepare_flush(struct vsr_io *io, uint32_t replica,
                           struct vsr_io_store *store, struct vsr_io_sqe *sqe)
 {
     uint32_t slot;
+    bool due;
 
     if (store->options.sync_mode != VSR_IO_SYNC_FDATASYNC ||
-        store->flush_pending != FLUSH_DUE || store->flush_slot != NONE ||
-        store->error != 0 || store->written < store->flush_target) {
+        store->flush_slot != NONE || store->error != 0) {
+        return false;
+    }
+    due = store->flush_pending == FLUSH_DUE &&
+          store->written >= store->flush_target;
+    if (!due && store->flush_own == 0) {
         return false;
     }
     slot = take_slot(io, VSR_IO_SLOT_FLUSH, replica, 0, store->written);
@@ -4291,7 +4326,10 @@ static bool prepare_flush(struct vsr_io *io, uint32_t replica,
             vsr_io_slots_user_data(&io->slots, slot));
     sqe->op_flags = VSR_IO_FSYNC_DATASYNC;
     store->flush_slot = slot;
-    store->flush_pending = FLUSH_NONE;
+    if (due) {
+        store->flush_pending = FLUSH_NONE;
+    }
+    store->flush_own = 0;
     if (store->freeing_flush == FREEING_FLUSH_WANTED) {
         store->freeing_flush = FREEING_FLUSH_INFLIGHT;
     }

@@ -368,6 +368,9 @@ struct vsr_io_store {
                                   apply sync_delay_ns to it. */
     uint32_t freeing_flush;    /* FLUSHING slots wait for a flush: 1 one
                                   is wanted, 2 one issued since is out. */
+    uint32_t flush_own;        /* 1 when the store wants a flush of its own
+                                  (decisions S15, S16), issued without
+                                  waiting for flush_target. */
     uint64_t flush_target;     /* Sequence the pending flush must cover. */
     uint64_t flush_deadline;   /* sync_delay / flush_interval expiry. */
     uint64_t superblock_floor; /* durable_floor of the newest superblock. */
