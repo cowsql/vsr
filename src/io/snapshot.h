@@ -144,14 +144,22 @@ int vsr_io_snapshots_forwarded_done(struct vsr_io *io, uint32_t replica,
 bool vsr_io_snapshots_owns(const struct vsr_io_snapshots *snapshots,
                            uint64_t forwarded_op);
 
-/* Source side of a library stream: resolves the request to a local file,
- * opens it and returns the stream's file slot and size through the stream
- * module's FILE write path. */
+/* Source side of a library stream (called by the stream module at the
+ * request frame, before any file is open): resolves the request to a local
+ * file and returns OK to serve it, setting streams[stream].replica; the
+ * module then opens the file into a slot and feeds one FILE write of the
+ * whole file and CLOSE OK through vsr_io_streams_write / close, using
+ * vsr_io_streams_handle(&io->streams, stream). Any other status refuses:
+ * the stream sends END with that status and closes. stream.c carries weak
+ * stubs of these three functions until snapshot.c defines them. */
 int vsr_io_snapshots_serve(struct vsr_io *io, uint32_t stream,
                            const struct vsr_io_wire_library_request *request);
-/* Requester side: chunks and end of the library stream owned by `snapshot`. */
+/* Requester side: chunks of the library stream owned by `snapshot`, each
+ * completed with vsr_io_streams_data_done(op) once its bytes were used
+ * (the slab stays pinned until then). The end is reported for both sides
+ * of a library stream (a served one closes its file slot then). */
 void vsr_io_snapshots_stream_data(struct vsr_io *io, uint32_t replica,
-                                  uint32_t stream, uint64_t offset,
+                                  uint32_t stream, uint64_t op, uint64_t offset,
                                   const struct vsr_span *bytes, uint32_t slab);
 void vsr_io_snapshots_stream_end(struct vsr_io *io, uint32_t replica,
                                  uint32_t stream, int32_t status);

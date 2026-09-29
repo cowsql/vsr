@@ -481,33 +481,100 @@ change.
 
 Purpose: the two sides of a bulk transfer over a STREAM-purpose link.
 
-Requester: `STREAM_OPEN` takes a stream and a link (`ELIMIT` when none),
-dials, sends preamble, HELLO and the request frame, then receives chunks;
-each chunk becomes a `STREAM_DATA` op (a window unit holding the slab
-reference) forwarded in order; the unit is released by the caller's
-completion. When `stream_window` units are outstanding the link's received
-bytes wait in their slabs (backpressure through the pool). `STREAM_END`
-arrives as a frame or is synthesized on link loss with `RETRY`; the op is
-emitted once every DATA op was completed and the cookie is then reusable.
+State: `limits.streams` entries, each with a ring of `stream_window`
+UNITS in stream order (a chunk: a DATA op at the requester, a chunk read
+or send at the source) and a ring of `stream_window` queued WRITES (the
+source's `STREAM_WRITE` events). Handles and ids (decision 93): the
+source's handle is `generation << 32 | index`, never reused; SERVE and
+DATA op ids carry their kind in the top two bits (`VSR_IO_STREAM_OP_*`),
+the generation, the unit and the stream, so the engine routes a rail
+COMPLETE by id alone (HANDSHAKE ids have those bits clear) and a stale
+or repeated completion is `EINVAL`.
 
-Source: an accepted STREAM link waits for the request frame; a request
-beginning with `VSR_IO_LIBRARY_MAGIC` goes to `vsr_io_snapshots_serve`,
-any other becomes a `STREAM_SERVE` op with the request bytes pinned in
-their slab. Refusal (any completion status but OK) sends END with `RETRY`
-and closes. Accepted: `STREAM_WRITE` events are queued in order. A
-BUFFERS write is sent as one or more chunk frames (each at most
-`stream_chunk_bytes`, vectors from the caller's lease, classified by the
-send rule) and `STREAM_WRITTEN` is emitted when the link's
-`notified_offset` passes the last chunk. A FILE write is chunked by
-reading `stream_chunk_bytes` at a time from `slot`/`offset` into a pool
-slab with a `READ | FIXED_FILE | FIXED_BUFFER`, then sent like a BUFFERS
-chunk; at most `stream_window` reads or sends are in flight; the slab is
-released at NOTIF. `STREAM_CLOSE` sends END with the status after the
-last chunk and closes the link.
+Requester: `STREAM_OPEN` takes a stream and a link (`ELIMIT` when none;
+`EINVAL` for a malformed request, a caller request with the library
+prefix, a cookie already in use by a caller stream, an unknown,
+caller-dialed or own node, a closing engine), dials
+(`vsr_io_links_open_stream`); at `link_up` it queues the request frame
+(retried at `sent` and at poll after `EBUSY`; too large for the frame
+limit: FAILED) and receives chunks: each becomes a `STREAM_DATA` op (a
+unit holding one slab reference, `vsr_io_pool_retain`) forwarded in
+order, released by the caller's completion (`vsr_io_streams_data_done`);
+a zero-length chunk is consumed without an op. When `stream_window` units
+are outstanding, or the forwarded ring is full, the frame is left in the
+link (`vsr_io_streams_frame` returns false) and retried at every poll. A
+unit completed out of order frees its slot only once the older ones are
+in (the ring's head moves over freed units). `STREAM_END` arrives as a
+frame (a byte count other than the bytes delivered: FAILED), or is
+synthesized on link loss with `RETRY`; the requester closes its link at
+the END frame; the END op is emitted at poll once every DATA op was
+completed and the link's sends were notified, and the cookie is then
+reusable. The lease of a `STREAM_OPEN` ends with its `STREAM_END`: the
+engine emits no RELEASE op for its own event kinds (decision 94).
+
+Source: an accepted STREAM link waits for the request frame; the stream
+is created then (no free stream, or no room in the forwarded ring: the
+frame is kept and retried at poll; the unbound link is idle-closable
+meanwhile), the link bound (`links.links[link].stream`) and the request
+slab retained. A request beginning with `VSR_IO_LIBRARY_MAGIC` goes to
+`vsr_io_snapshots_serve` (a malformed one closes the link `-EPROTO`); OK
+opens the stream with owner LIBRARY (the module then feeds one FILE write
+and CLOSE through the write and close calls, naming
+`vsr_io_streams_handle`), any other status sends END with that status
+and closes. Any other request becomes a `STREAM_SERVE` op with the
+request bytes pinned in their slab until `vsr_io_streams_served`.
+Refusal (any completion status but OK) sends END with `RETRY` and
+closes; no END op follows a refused stream. Accepted: `STREAM_WRITE`
+events queue in order (`AGAIN` when `stream_window` are queued: resubmit
+after a WRITTEN; `EINVAL` for a handle that is not an OPEN source stream
+or malformed buffers). The queue is chunked in order into units: a
+BUFFERS write into slices of at most `stream_chunk_bytes` and
+`VSR_IO_STREAM_CHUNK_VECTORS` (64) spans, ready at once; a FILE write
+into `stream_chunk_bytes` reads (`READ | FIXED_FILE | FIXED_BUFFER` from
+the caller's slot into a pool slab acquired with internal priority; a
+short read resumes the chunk; a result of 0 or an error ends the stream
+with FAILED after the chunks the link already took). Units are sent in
+stream order (a unit still reading blocks the later ones; `EBUSY` from
+`vsr_io_links_send_frame` is retried at `sent` and at poll), each as one
+chunk frame whose CRC the module computes over header and payload; a
+SENT unit is released once the link's `notified_offset` passes its frame
+(a FILE unit's slab then). `STREAM_WRITTEN` is emitted, in write order,
+once a write is fully chunked and its last unit released; it ends the
+write's lease (decision 94) and is emitted for every queued write, also
+when the stream ends early. `STREAM_CLOSE` (OK only for an OPEN stream,
+or one ending under the caller whose END op is still to come) queues END
+with the status after the last chunk of the last write. The source's END
+op (accepted streams only) is emitted once the END frame is notified (or
+the link is gone); the stream then LINGERS on its link until the
+requester's close reaches it, or the inactivity timer closes it
+(decision 96): a source closing first would cut the frames a requester
+blocked on its window still holds in its link, which the link module
+discards at EOF. Library-owned streams get no WRITTEN and hear their end
+through `vsr_io_snapshots_stream_end`.
+
+Early ends (decision 97): link loss ends a stream with `RETRY`, unless it
+is a source whose END frame already reached the kernel (`sent_offset`),
+which keeps its status; a frame the stream's state refuses (a chunk or
+end at the source, a second request, a request at the requester, a chunk
+at the wrong offset, a malformed body) counts in `frames_rejected` and
+closes the link `-EPROTO`, FAILED on the refusing side; shutdown ends
+every stream `CANCELLED` (`vsr_io_close` is done once `streams.active`
+is zero: the caller still completes its DATA and SERVE ops). At the
+source an early end stops chunking (`aborted`): unsent units are released
+(a read in flight at its completion), `offset` falls back to the first
+byte the link never took, the queued writes are marked chunked so their
+WRITTEN follows, SENT units wait for their NOTIF (the link entry's
+teardown, watched through `stream->link`, or `notified_offset`). The
+module never closes a link from inside `vsr_io_streams_sent` (a send
+completion): closes happen in poll, at frames and at caller calls.
 
 Timeouts: a stream with no progress for `handshake_timeout_ns` (the only
 per-stream duration in the options; a dedicated option is deferred) ends
-with `RETRY`.
+with `RETRY`: the deadline (`VSR_IO_DEADLINE_STREAM`, dispatched to
+`vsr_io_streams_deadline`) is re-armed at every frame, send progress,
+completion and caller call; the requester's covers the dial, the source's
+the SERVE at the caller and the drain and linger after CLOSE; a requester
+waiting for its caller's DATA completions after END is untimed.
 
 What the link module gives the stream module (decision 84):
 `vsr_io_links_open_stream` dials a STREAM-purpose link at once, whatever
@@ -527,13 +594,26 @@ pads to 8 with zeros from its slab and extends the CRC); `EBUSY` while a
 send is in flight, every entry awaits its NOTIF, or the budget, the
 vectors or the ring are full, after which `vsr_io_streams_sent` (called
 at every send result and NOTIF of the link) is the cue to retry.
+`vsr_io_links_close` calls `link_lost` synchronously, so the module sets
+`link_gone` before closing and ignores the re-entrant call.
 
-Tests: `tests/unit/stream` with the fake engine (request, chunks, END,
-window exhaustion, FILE chunking with short reads, link loss both sides,
-refusal, library request routing) and `tests/integration/streams` over the
-simulation (two engines, BUFFERS and FILE transfers of 0, 1, exact-window
-and many chunks with split and corrupt faults, a stream never delays a
-heartbeat on the peer link).
+Tests: `tests/unit/stream` over the real link module in the two-engine
+world of `tests/unit/link` (copied harness, plus caller files behind
+registered slots for FILE reads with short, random and failing results,
+and test doubles of the snapshot hooks): refusals and limits, request,
+chunks, WRITTEN, END and cookie reuse, the window on both sides, FILE
+transfers of 0, 1, exact-window and many chunks with short and random
+reads, EOF and read errors, mixed FILE and BUFFERS writes, link loss on
+either side at every stage, refusal, protocol errors, library streams
+served and requested, timeouts and shutdown, and a seeded random walk
+(`tests/unit/stream SEED`, prints its seed) of transfers with random
+writes, span slicing, receive slicing, held DATA ops and NOTIFs, clock
+jumps and resets, checking every byte arrives exactly once in order, a
+WRITTEN for every queued write, and every slab reference, slot and link
+released after each transfer. `tests/integration/streams` over the
+simulation (two engines, BUFFERS and FILE transfers with split and
+corrupt faults, a stream never delays a heartbeat on the peer link) is
+still to come.
 
 ### Store (`src/io/store.h`)
 
@@ -1274,7 +1354,8 @@ no transaction waits.
  vsr_io_poll(io, now, ops, capacity, count, flags)
    io->now = now; wake_pending = 0
    while deadlines_pop(now, kind, index): dispatch (LINK/DIAL ->
-       vsr_io_links_deadline, FLUSH/SYNC -> store, STREAM -> streams,
+       vsr_io_links_deadline, FLUSH/SYNC -> store, STREAM ->
+       vsr_io_streams_deadline,
        CAPTURE -> snapshots, CORE -> nothing: TIME below handles it)
    links_poll(now); streams_poll(now)
    for each replica in OPENING or RUNNING:
@@ -1335,8 +1416,8 @@ the reason:
 | CORE REQUEST | `vsr_io_store_admit(client)`; false: stop with `ELIMIT`; else queue (ring full: stop with `AGAIN`) |
 | CORE COMPLETE for an op the snapshot module forwarded | `vsr_io_snapshots_forwarded_done`; the event is consumed, the lease (if any) released immediately after the data is copied |
 | CORE COMPLETE, STOP, CLIENT_QUERY, READ, CHECKPOINT | queue |
-| COMPLETE (rail) | HANDSHAKE -> `links_handshake_done`; STREAM_SERVE -> `streams_served`; STREAM_DATA -> `streams_data_done`; unknown id: `EINVAL` |
-| STREAM_OPEN / WRITE / CLOSE | `streams_open` / `write` / `close`; `ELIMIT` from open stops |
+| COMPLETE (rail) | by `vsr_io_streams_op_kind(id)`: SERVE -> `streams_served`; DATA -> `streams_data_done`; else `links_handshake_done`; a stale id is `EINVAL` (decision 93) |
+| STREAM_OPEN / WRITE / CLOSE | `streams_open` / `write` / `close`; `ELIMIT` from open and `AGAIN` from write (the write queue is full) stop; no RELEASE op follows these events' leases: STREAM_END and STREAM_WRITTEN release them (decision 94) |
 
 A replica in STOPPED refuses every CORE event with `EINVAL`.
 
@@ -1375,7 +1456,8 @@ returns immediately and prepares again):
    the teardown (SHUTDOWN, CANCEL of the receive, CLOSE of the slot, or a
    plain CLOSE of a raw descriptor, preceded by a CANCEL of a CONNECT or
    preamble RECV still in flight on it).
-3. `vsr_io_streams_prepare`: file chunk reads.
+3. `vsr_io_streams_prepare`: file chunk reads (slot kind STREAM, one
+   completion each; the same `count` continues the array).
 4. Per replica: `vsr_io_store_prepare` (open/create steps, header writes,
    one record write, superblock write, flush, one cold read), then
    `vsr_io_snapshots_prepare` (clients file reads and writes, fsyncs,
@@ -1405,6 +1487,11 @@ delivery with one slab reference; a LOAD completion's lease at completion
 with a slab reference (cold) or a ring pin (hot). RELEASE frees the region,
 drops the reference or pin, and marks the entry free; a stale id is
 `EINVAL` in the routing, reported through `stats` and ignored.
+
+The caller's leases on engine-level events (STREAM_OPEN's request,
+STREAM_WRITE's buffers) get no RELEASE op: the STREAM_END of the stream
+and the write's STREAM_WRITTEN say the bytes are no longer read
+(decision 94).
 
 ### 7.7 Replica attach, start, stop, detach
 
@@ -1601,6 +1688,9 @@ of `docs/io-design.md`:
 | `link.h`, `stream.h` (internal) | Send side of `vsr_io_link`: unwrapped 64-bit ring counters (`header_*`, `vsr_io_send.header_*`), the build (`vec_count`, `build_bytes`), `nodelay_set`, `VSR_IO_STAGE_NODELAY`; `vsr_io_links_send` contract (RETRY only when the engine completes at once); `vsr_io_links_open_stream` and `vsr_io_links_send_frame` contracts; `vsr_io_streams_frame` returns whether the frame was consumed; `vsr_io_streams_sent` at every send result and NOTIF | 82, 83, 84, 85 |
 | `store.h` | `vsr_io_segment.run` (the header's run, for the successor rule); `vsr_io_recovery` reshaped for the scan (the pool slab and executor slot of the read in flight, the superblock copy, the chunk's offset and the position judged, the sweep mode, the resume offset); the base-load kinds include the recovery's; a LOAD slot's `sub` tells a recovery read from a cold load's | 88, 89, 90 |
 | `codec.h` | `vsr_io_codec_load_region` also holds the recovered row's manifest bytes, copied into the region | 91 |
+| `vsr-io.h` | Bulk streams: the engine emits no RELEASE for a STREAM_OPEN or STREAM_WRITE lease (STREAM_END and STREAM_WRITTEN end them; a WRITTEN follows every queued write, also on an early end); `vsr_io_submit` refuses a STREAM_WRITE with `AGAIN` while `stream_window` writes are queued | 94, 95 |
+| `stream.h` (internal) | Units are chunks (`vsr_io_stream_unit` states READING, READY, SENT, DATA), the write queue (`vsr_io_stream_queued_write`, `writes` rings), handles and op ids (`VSR_IO_STREAM_OP_*`, `vsr_io_streams_op_kind`, `vsr_io_streams_handle`), `generation`, `ended`, `aborted`, `link_gone`, `end_*`, `send_end`, `closing`; `vsr_io_streams_deadline`; `vsr_io_streams_size` is ELIMIT beyond 65535 streams or window | 93, 95, 96, 97 |
+| `snapshot.h` (internal) | `vsr_io_snapshots_serve` returns OK to serve or the END status; `vsr_io_snapshots_stream_data` takes the DATA op id; `stream_end` is told for both sides of a library stream; weak stubs in stream.c until snapshot.c | 98 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1621,3 +1711,14 @@ of `docs/io-design.md`:
   another segment, which recovery reports as `CORRUPT` although nothing
   acknowledged was lost. Converting FREEING to FREE at the flush that
   covers the superblock write (or flushing after it) would close it.
+- Stream backpressure meets the link's held-run bound: a requester whose
+  caller falls behind leaves its chunk frames in the link, and the link
+  closes with `-ENOBUFS` once more than `VSR_IO_LINK_HELD` (8) receive
+  runs are held, which with slabs of one page is about 32 KiB of
+  unconsumed chunks and happens well before the pool starves (the layout's
+  minimum pool exceeds the bound); the stream then ends with RETRY at the
+  requester while the source may have reported OK. "Backpressure through
+  the pool" (the Streams section) therefore needs the link to pause the
+  receive of a link whose stream frame is blocked (cancel and re-arm), or
+  a larger bound for stream links; `tests/unit/stream`'s random walk
+  tolerates the RETRY.
