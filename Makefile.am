@@ -382,10 +382,17 @@ compile-commands:
 compile_commands.json:
 	@echo 'Run make compile-commands first.' >&2; exit 1
 
+# Each source once, though many programs list the test libraries and the
+# example host. Every file is checked; the failing ones are named at the end.
+TIDY_FILES = $(sort $(filter %.c,$(SOURCES)))
+
 tidy: compile_commands.json
-	@set -e; for file in $(filter %.c,$(SOURCES)); do \
-	  $(CLANG_TIDY) --quiet -p . $(srcdir)/$$file; \
-	done
+	@failed=; for file in $(TIDY_FILES); do \
+	  $(CLANG_TIDY) --quiet -p . $(srcdir)/$$file || failed="$$failed $$file"; \
+	done; \
+	if test -n "$$failed"; then \
+	  echo "clang-tidy failed:$$failed" >&2; exit 1; \
+	fi
 
 # The const* suggestions are style-only and keep signatures symmetric with
 # callbacks and mutating siblings. Tests mutate objects that stores, graphs
