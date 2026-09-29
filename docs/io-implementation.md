@@ -434,7 +434,7 @@ carves frames:
    them. Every accepted frame updates the node's `last_received_ns`. A
    stream frame the stream module cannot take yet (`false`: the
    requester's window, or the forwarded ring, is full) stays in place
-   with `retry` set the same way, and the link PAUSES (decision B1,
+   with `retry` set the same way, and the link PAUSES (decision 99,
    `recv_paused`): the next prepare cancels its multishot RECV (a CANCEL
    on the shutdown slot, one completion whose result is ignored, since
    `-ENOENT` or `-EALREADY` mean the receive terminated on its own;
@@ -524,7 +524,7 @@ order, released by the caller's completion (`vsr_io_streams_data_done`);
 a zero-length chunk is consumed without an op. When `stream_window` units
 are outstanding, or the forwarded ring is full, the frame is left in the
 link (`vsr_io_streams_frame` returns false) and retried at every poll,
-and the link pauses its receive meanwhile (decision B1), so a requester
+and the link pauses its receive meanwhile (decision 99), so a requester
 whose caller is behind throttles the source through the socket buffer and
 the TCP window rather than through the link's held runs. A
 unit completed out of order frees its slot only once the older ones are
@@ -1484,7 +1484,7 @@ returns immediately and prepares again):
    SOCKET or CONNECT, the EXTERNAL preamble receive, the control bytes
    (preamble, HELLO) and coalesced sends, receive arming and re-arming
    (not while a stream link is paused: then the CANCEL of its receive on
-   the shutdown slot, decision B1), the teardown (SHUTDOWN, CANCEL of the
+   the shutdown slot, decision 99), the teardown (SHUTDOWN, CANCEL of the
    receive, CLOSE of the slot, or a
    plain CLOSE of a raw descriptor, preceded by a CANCEL of a CONNECT or
    preamble RECV still in flight on it).
@@ -1723,7 +1723,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | Bulk streams: the engine emits no RELEASE for a STREAM_OPEN or STREAM_WRITE lease (STREAM_END and STREAM_WRITTEN end them; a WRITTEN follows every queued write, also on an early end); `vsr_io_submit` refuses a STREAM_WRITE with `AGAIN` while `stream_window` writes are queued | 94, 95 |
 | `stream.h` (internal) | Units are chunks (`vsr_io_stream_unit` states READING, READY, SENT, DATA), the write queue (`vsr_io_stream_queued_write`, `writes` rings), handles and op ids (`VSR_IO_STREAM_OP_*`, `vsr_io_streams_op_kind`, `vsr_io_streams_handle`), `generation`, `ended`, `aborted`, `link_gone`, `end_*`, `send_end`, `closing`; `vsr_io_streams_deadline`; `vsr_io_streams_size` is ELIMIT beyond 65535 streams or window | 93, 95, 96, 97 |
 | `snapshot.h` (internal) | `vsr_io_snapshots_serve` returns OK to serve or the END status; `vsr_io_snapshots_stream_data` takes the DATA op id; `stream_end` is told for both sides of a library stream; weak stubs in stream.c until snapshot.c | 98 |
-| `link.h` (internal) | `vsr_io_link.recv_paused` and `recv_cancelled`; the shutdown slot also carries a paused receive's CANCEL (the teardown waits for it); a stream link whose frame waits is not closed for its held runs but paused, and its receive's `-ECANCELED` is not a loss | B1 |
+| `link.h` (internal) | `vsr_io_link.recv_paused` and `recv_cancelled`; the shutdown slot also carries a paused receive's CANCEL (the teardown waits for it); a stream link whose frame waits is not closed for its held runs but paused, and its receive's `-ECANCELED` is not a loss | 99 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1744,7 +1744,7 @@ of `docs/io-design.md`:
   another segment, which recovery reports as `CORRUPT` although nothing
   acknowledged was lost. Converting FREEING to FREE at the flush that
   covers the superblock write (or flushing after it) would close it.
-- A paused stream link (decision B1) still holds what the kernel
+- A paused stream link (decision 99) still holds what the kernel
   delivered between the frame that blocked and the CANCEL taking effect,
   within the `VSR_IO_LINK_HELD` (8) runs of decision 76: with page slabs a
   burst above about 32 KiB reaped at once (a socket buffer holding more,
