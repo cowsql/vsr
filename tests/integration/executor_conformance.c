@@ -127,6 +127,7 @@ struct fixture {
      * which the factory's own functions use. */
     struct faulty_executor *faulty;
     struct vsr_io_executor inner;
+    bool faults; /* A scenario raised the wrapper's rates. */
     /* Ring. */
     void *memory;
     char dir_path[64];
@@ -2950,6 +2951,255 @@ static void scenario_unix_socket(struct fixture *f)
 }
 
 /* ------------------------------------------------------------------------
+ * The wrapper at nonzero rates: every result is one the contract allows
+ * --------------------------------------------------------------------- */
+
+#define FAULTY_BYTES 3000u
+#define FAULTY_LINK_BYTES 1500u
+#define FAULTY_STEPS 100000u
+
+static uint32_t at_most(uint32_t value, uint32_t bound)
+{
+    return value < bound ? value : bound;
+}
+
+/* A file written and read back in pieces: each result whole, short or
+ * -EIO; the rest of a short count, or the whole piece after -EIO, is
+ * issued again, rewriting the same bytes. */
+static void faulty_file(struct fixture *f, const unsigned char *pattern)
+{
+    static unsigned char back[FAULTY_BYTES];
+    int32_t fd = open_at(f, f->dir, "faulty", O_CREAT | O_RDWR, next_ud(f));
+    uint32_t at = 0;
+
+    CHECK(fd >= 0);
+    for (uint32_t step = 0; at < FAULTY_BYTES; ++step) {
+        uint32_t length = at_most(1u + (step * 37u) % 300u, FAULTY_BYTES - at);
+        int32_t n =
+            io(f, VSR_IO_SQE_WRITE, fd, pattern + at, length, at, next_ud(f));
+
+        CHECK(step < FAULTY_STEPS);
+        CHECK(n == -EIO || (n > 0 && (uint32_t)n <= length));
+        at += n > 0 ? (uint32_t)n : 0;
+    }
+    for (uint32_t step = 0;; ++step) {
+        struct vsr_io_sqe r = rec(VSR_IO_SQE_FSYNC, next_ud(f));
+        int32_t n;
+
+        CHECK(step < FAULTY_STEPS);
+        r.fd = fd;
+        n = run(f, r);
+        CHECK(n == 0 || n == -EIO);
+        if (n == 0) {
+            break;
+        }
+    }
+    at = 0;
+    for (uint32_t step = 0; at < FAULTY_BYTES; ++step) {
+        uint32_t length = at_most(1u + (step * 41u) % 300u, FAULTY_BYTES - at);
+        int32_t n =
+            io(f, VSR_IO_SQE_READ, fd, back + at, length, at, next_ud(f));
+
+        CHECK(step < FAULTY_STEPS);
+        CHECK(n == -EIO || (n > 0 && (uint32_t)n <= length));
+        if (n > 0) {
+            CHECK(memcmp(back + at, pattern + at, (size_t)n) == 0);
+            at += (uint32_t)n;
+        }
+    }
+    CHECK(close_fd(f, fd, false) == 0);
+}
+
+/* Plain receives posted before their bytes (whole, short, or cancelled
+ * with the bytes left queued), then plain and zero-copy sends (whole or
+ * short; a zero-copy result with MORE, then its NOTIF). */
+static void faulty_stream(struct fixture *f, const unsigned char *pattern)
+{
+    static unsigned char got[FAULTY_BYTES];
+    struct link l;
+    uint32_t sent = 0;
+    uint32_t received = 0;
+
+    open_link(f, &l);
+    for (uint32_t step = 0; received < FAULTY_BYTES; ++step) {
+        uint32_t length =
+            at_most(1u + (step * 53u) % 200u, FAULTY_BYTES - received);
+        struct vsr_io_sqe r =
+            recv_record(l.server, false, got + received, length, next_ud(f));
+        struct vsr_io_cqe cqe;
+
+        CHECK(step < FAULTY_STEPS);
+        submit1(f, r);
+        if (sent == received) {
+            uint32_t chunk =
+                at_most(1u + (step * 29u) % 250u, FAULTY_BYTES - sent);
+
+            CHECK(f->factory->peer_send(f, l.peer, pattern + sent, chunk) == 0);
+            sent += chunk;
+        }
+        cqe = take(f, r.user_data);
+        CHECK(cqe.flags == 0);
+        CHECK(cqe.result == -ECANCELED ||
+              (cqe.result > 0 && (uint32_t)cqe.result <= length));
+        if (cqe.result > 0) {
+            CHECK(memcmp(got + received, pattern + received,
+                         (size_t)cqe.result) == 0);
+            received += (uint32_t)cqe.result;
+        }
+    }
+    sent = 0;
+    for (uint32_t step = 0; sent < FAULTY_BYTES; ++step) {
+        uint32_t length =
+            at_most(1u + (step * 41u) % 400u, FAULTY_BYTES - sent);
+        bool zero_copy = step % 3 == 2;
+        struct vsr_io_sqe r =
+            send_record(l.server, false, pattern + sent, length, next_ud(f));
+        struct vsr_io_cqe cqe;
+        int32_t n;
+
+        CHECK(step < FAULTY_STEPS);
+        r.op_flags = zero_copy ? VSR_IO_SEND_ZERO_COPY : 0;
+        submit1(f, r);
+        cqe = take(f, r.user_data);
+        n = cqe.result;
+        CHECK(n > 0 && (uint32_t)n <= length);
+        CHECK(cqe.flags == (zero_copy ? VSR_IO_CQE_MORE : 0));
+        if (zero_copy) {
+            cqe = take(f, r.user_data);
+            CHECK(cqe.result == 0 && cqe.flags == VSR_IO_CQE_NOTIF);
+        }
+        peer_receive_exact(f, l.peer, got + sent, (size_t)n);
+        CHECK(memcmp(got + sent, pattern + sent, (size_t)n) == 0);
+        sent += (uint32_t)n;
+    }
+    close_link(f, &l);
+}
+
+/* Two links' multishot receives on one INCREMENTAL ring: where each
+ * delivery's bytes lie follows from the order of the completions across
+ * both, which delays must keep; a receive ended by an injected CANCEL (or
+ * a full CQ) is re-armed and continues in the head buffer. */
+static void faulty_shared_ring(struct fixture *f,
+                               const unsigned char *patterns[2])
+{
+    struct link links[2];
+    struct buffer_ring ring;
+    struct vsr_io_region memory;
+    unsigned char *ring_memory = page_alloc(4096);
+    unsigned char *pool = page_alloc((size_t)16 * 256);
+    uint64_t armed[2];
+    uint32_t sent[2] = {0, 0};
+    uint32_t received[2] = {0, 0};
+    uint32_t chunks = 0;
+
+    open_link(f, &links[0]);
+    open_link(f, &links[1]);
+    memory.base = ring_memory;
+    memory.size = 4096;
+    CHECK(f->ex.ops->buffer_ring(f->ex.ctx, 11, 16,
+                                 VSR_IO_BUFFER_RING_INCREMENTAL, &memory) == 0);
+    ring_model(&ring, pool, 256, 30, true);
+    CHECK(f->ex.ops->provide(f->ex.ctx, 11, ring.records, 16) == 0);
+    for (uint32_t i = 0; i < 2; ++i) {
+        armed[i] = next_ud(f);
+        submit1(f, select_record(links[i].server, 11, true, armed[i]));
+    }
+    for (uint32_t step = 0; received[0] + received[1] < 2 * FAULTY_LINK_BYTES;
+         ++step) {
+        struct vsr_io_cqe cqe;
+        uint32_t which;
+
+        CHECK(step < FAULTY_STEPS);
+        for (uint32_t i = 0; i < 2; ++i) {
+            if (sent[i] == received[i] && sent[i] < FAULTY_LINK_BYTES) {
+                uint32_t chunk = at_most(1u + (chunks++ * 31u) % 120u,
+                                         FAULTY_LINK_BYTES - sent[i]);
+
+                CHECK(f->factory->peer_send(f, links[i].peer,
+                                            patterns[i] + sent[i], chunk) == 0);
+                sent[i] += chunk;
+            }
+        }
+        cqe = take_next(f);
+        CHECK(cqe.user_data == armed[0] || cqe.user_data == armed[1]);
+        which = cqe.user_data == armed[0] ? 0 : 1;
+        if (cqe.result > 0) {
+            struct provided *head = &ring.buffers[ring.head];
+
+            CHECK(ring.head < 16);
+            CHECK((cqe.flags & VSR_IO_CQE_BUFFER) && cqe.buffer_id == head->id);
+            CHECK((uint32_t)cqe.result <= head->length - head->consumed);
+            CHECK((uint32_t)cqe.result <= sent[which] - received[which]);
+            CHECK(memcmp(head->base + head->consumed,
+                         patterns[which] + received[which],
+                         (size_t)cqe.result) == 0);
+            received[which] += (uint32_t)cqe.result;
+            head->consumed += (uint32_t)cqe.result;
+            if (head->consumed < head->length) {
+                CHECK(cqe.flags & VSR_IO_CQE_BUFFER_MORE);
+            } else {
+                CHECK(!(cqe.flags & VSR_IO_CQE_BUFFER_MORE));
+                ring.head++;
+            }
+        } else {
+            CHECK(cqe.result == -ECANCELED && cqe.flags == 0);
+        }
+        if (!(cqe.flags & VSR_IO_CQE_MORE)) {
+            armed[which] = next_ud(f);
+            submit1(f,
+                    select_record(links[which].server, 11, true, armed[which]));
+        }
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        struct vsr_io_cqe cqe;
+
+        CHECK(cancel_user_data(f, armed[i]) == 0);
+        cqe = take(f, armed[i]);
+        CHECK(cqe.result == -ECANCELED && cqe.flags == 0);
+        close_link(f, &links[i]);
+    }
+    CHECK(f->ex.ops->buffer_ring(f->ex.ctx, 11, 0, 0, NULL) == 0);
+    free(ring_memory);
+    free(pool);
+}
+
+static void scenario_faulty_rates(struct fixture *f)
+{
+    static unsigned char pattern[FAULTY_BYTES];
+    static unsigned char lower[FAULTY_LINK_BYTES];
+    const unsigned char *patterns[2] = {pattern, lower};
+    struct faulty_executor_options options;
+    struct faulty_executor_stats stats;
+
+    if (f->faulty == NULL) {
+        skip("no wrapper");
+    }
+    fill_pattern(pattern, sizeof(pattern));
+    for (uint32_t i = 0; i < FAULTY_LINK_BYTES; ++i) {
+        lower[i] = (unsigned char)(pattern[i] | 0x20); /* Lower case. */
+    }
+    memset(&options, 0, sizeof(options));
+    options.eio_ppm = 250000;
+    options.short_ppm = 300000;
+    options.delay_ppm = 300000;
+    options.delay_reaps_max = 4;
+    options.cancel_recv_ppm = 300000;
+    f->faults = true;
+    faulty_executor_set_options(f->faulty, &options);
+    faulty_file(f, pattern);
+    faulty_stream(f, pattern);
+    faulty_shared_ring(f, patterns);
+    faulty_executor_stats(f->faulty, &stats);
+    printf("  injected: eio %llu, shortened %llu, delayed %llu, "
+           "cancelled %llu\n",
+           (unsigned long long)stats.eio, (unsigned long long)stats.shortened,
+           (unsigned long long)stats.delayed,
+           (unsigned long long)stats.cancelled);
+    CHECK(stats.eio > 0 && stats.shortened > 0 && stats.delayed > 0 &&
+          stats.cancelled > 0);
+}
+
+/* ------------------------------------------------------------------------
  * Factories: the wrapper at rate zero over each executor
  * --------------------------------------------------------------------- */
 
@@ -2973,8 +3223,8 @@ static void faulty_check_quiet(const struct fixture *f)
     struct faulty_executor_stats stats;
 
     faulty_executor_stats(f->faulty, &stats);
-    CHECK(stats.eio == 0 && stats.shortened == 0 && stats.delayed == 0 &&
-          stats.cancelled == 0);
+    CHECK(f->faults || (stats.eio == 0 && stats.shortened == 0 &&
+                        stats.delayed == 0 && stats.cancelled == 0));
 }
 
 static void faulty_unwrap(struct fixture *f)
@@ -3107,6 +3357,7 @@ static const struct scenario scenarios[] = {
     {"cancel_already", scenario_cancel_already},
     {"close_pending", scenario_close_pending},
     {"unix_socket", scenario_unix_socket},
+    {"faulty_rates", scenario_faulty_rates},
 };
 
 static const struct factory *const factories[] = {

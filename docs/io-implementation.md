@@ -1249,7 +1249,14 @@ wraps any `vsr_io_executor`: it forwards records to the inner executor
 and, from a seeded generator, rewrites results (`-EIO`, short counts),
 delays completions by holding them for a number of reaps, and cancels
 receives; it never alters bytes, so it is safe over real files and
-sockets.
+sockets. It keeps every completion order a caller relies on (per
+`user_data`, per provided buffer, per LINK chain), shortens file results
+only in whole units of the request's alignment so the rest of an
+`O_DIRECT` transfer stays aligned, and with every rate zero is
+transparent but for the one `user_data` it reserves:
+`executor_conformance` runs every scenario through it at rate zero over
+both executors, and one more scenario at nonzero rates. Its header states
+what callers may assume of the faults it injects.
 
 `make check` grows by the programs above; `make check-unit`,
 `check-integration` and `check-fuzzy` select layers as before; `make fuzz`
