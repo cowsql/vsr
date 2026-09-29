@@ -662,16 +662,13 @@ static void store_fail(struct vsr_io_store *store, int32_t status)
         complete(store, syncs_at(store, 0)->op, VSR_IO_FAILED, NONE, NULL);
         syncs_pop(store);
     }
-    /* Queued LOADs too; a read in flight completes into a dropped slot
-     * and is ignored by vsr_io_store_complete. */
+    /* Queued LOADs too; a read in flight keeps its slab (cold_slab) until
+     * its completion, which load_done then releases. */
     while (store->loads_count > 0) {
         struct vsr_io_pending_load *load = loads_at(store, 0);
 
         complete(store, load->op, VSR_IO_FAILED, NONE, NULL);
-        if (load->state == LOAD_READING) {
-            store->cold_active = 0;
-        }
-        loads_pop(store, true);
+        loads_pop(store, load->state != LOAD_READING);
     }
     store->base_state = BASE_NONE;
     store->flush_pending = FLUSH_NONE;
