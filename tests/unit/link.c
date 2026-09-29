@@ -4825,7 +4825,6 @@ static void test_send_random(uint64_t seed)
  * Review: identity, completion and teardown corners
  * ---------------------------------------------------------------------- */
 
-
 /* An inbound peer claiming the engine's own node identity is refused in
  * both modes, and adopt refuses the own node too: a link to the own node
  * can never be legitimate (decision 73). */
@@ -4895,7 +4894,6 @@ static void test_review_own_node(void)
     engine_forget(a);
 }
 
-
 /* A send that fails without MORE on a link that is already closing (a
  * demotion, a caller's close, a node change) still completes the messages
  * its stream carried: nothing else releases them once the link is gone. */
@@ -4929,7 +4927,6 @@ static void test_review_failed_send_closing(void)
     engine_forget(p.a);
     engine_forget(p.b);
 }
-
 
 /* A caller-dialed node whose LINK_WANTED goes unanswered retries only the
  * messages that never went out: those a lost link's kernel may still be
@@ -5013,7 +5010,6 @@ static void test_review_link_wanted_retiring(void)
     engine_forget(b);
 }
 
-
 /* The teardown of a link whose raw descriptor still has a record in
  * flight that may never complete on its own (the EXTERNAL acceptor's
  * preamble receive from a silent peer, a CONNECT to a black hole)
@@ -5050,7 +5046,6 @@ static void test_review_teardown_cancel(void)
     engine_forget(a);
 }
 
-
 /* An EXTERNAL link that closes while its HANDSHAKE op waits for room in
  * the forwarded ring leaves nothing due behind. */
 static void test_review_handshakes_due(void)
@@ -5068,9 +5063,8 @@ static void test_review_handshakes_due(void)
         CHECK(vsr_io_links_node_set(a->io, node, NULL) == VSR_OK);
         CHECK(vsr_io_links_authorize(a->io, cluster, node, node) == VSR_OK);
     }
-    for (uint32_t i = 0; i < 8 && a->io->forwarded_count <
-                                      a->io->options.limits.ops;
-         ++i) {
+    for (uint32_t i = 0;
+         i < 8 && a->io->forwarded_count < a->io->options.limits.ops; ++i) {
         world_advance(BACKOFF_NS << i);
         world_settle();
     }
