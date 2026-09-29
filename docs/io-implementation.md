@@ -1777,3 +1777,30 @@ of `docs/io-design.md`:
 - A source throttled by a paused requester makes no send progress and is
   bounded by the inactivity timer like a dead one; a requester slower
   than `handshake_timeout_ns` per window ends RETRY at the source.
+- Where Linux 7.2.6 and the simulation answer differently within the
+  contract (the conformance and smoke logs print these, recorded and not
+  checked), the engine depends on neither answer today, so the
+  simulation is left as it is:
+  - A CANCEL of a disk record: the simulation never cancels disk work
+    (`-EALREADY`, and the record completes); the kernel cancels a write it
+    queued for a worker and had not started (a 1 MiB buffered write on
+    btrfs: the CANCEL 0, the write `-ECANCELED`). The engine cancels only
+    socket records (receives, accepts, connects, by `user_data`); code
+    that ever cancels a disk record must take `-ECANCELED` as well, which
+    the simulation would not exercise.
+  - CANCEL `BY_FD` without `ALL`: the simulation cancels the earliest
+    match, the kernel cancelled the later of two receives (its hash
+    order); the contract leaves it unspecified and the engine never
+    cancels by descriptor.
+  - `update_buffer` of a region a pending record uses: `-EBUSY` in the
+    simulation, 0 on the ring, the kernel keeping the old registration
+    until the record completes (decision 65); the engine registers its
+    pool region once, at init.
+  - Direct I/O alignment is the filesystem's: btrfs and tmpfs serve a
+    misaligned `O_DIRECT` read buffered, the simulation refuses it with
+    `-EINVAL` like ext4 and XFS; the engine aligns everything, and the
+    `odirect_*` conformance rows skip on such a filesystem (they need a
+    build tree on ext4 or XFS to run over the ring).
+  - Short-send lengths depend on socket buffers (6144 of 8 MiB with a
+    4096-byte `SO_SNDBUF` on the ring, 262144 in the simulation); only
+    shortness is contract.
