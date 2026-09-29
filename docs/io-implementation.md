@@ -264,7 +264,7 @@ within `handshake_timeout_ns` closes the link. A peer link from a node
 that is not in the node table is closed (a node must be known to be
 authorized; an unknown node cannot be authorized for any envelope), as is
 one claiming the engine's own node id (the engine never dials itself, so
-such a link could only inject its own replicas' frames; decision R1), a
+such a link could only inject its own replicas' frames; decision 86), a
 second HELLO, a HELLO on an established link, or any other frame before
 the handshake is done.
 
@@ -280,7 +280,7 @@ descriptor and establishes; any other outcome closes it with a plain
 CLOSE. A link closed while the caller holds its descriptor (revoke,
 shutdown, timeout) stays CLOSING until the completion returns it; one
 closed while its preamble RECV or its CONNECT is still in flight has that
-record cancelled by the teardown (decision R2).
+record cancelled by the teardown (decision 87).
 
 Carrier election (decision 41): whenever a peer link to node N becomes
 established or leaves ESTABLISHED, `nodes[N].carrier` is recomputed as the
