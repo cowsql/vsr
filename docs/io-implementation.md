@@ -346,7 +346,7 @@ carves frames:
    reference each, a delivery contiguous with the last run merging into
    it). Once the partial run is consumed the first held run becomes the
    partial; while the partial's frame is incomplete and a run is held,
-   the frame is reassembled (decision L5): the partial bytes are copied
+   the frame is reassembled (decision 76): the partial bytes are copied
    into a reassembly slab acquired for the frame (`vsr_io_pool_acquire`
    with internal priority, counted in `links.reassembled`) and the
    frame's missing bytes, header first so that its length is known and
@@ -360,7 +360,7 @@ carves frames:
    `-ENOBUFS`.
 4. Decoding: check the body CRC over the cursor; HELLO goes to the
    handshake, stream frames to `vsr_io_streams_frame`. A MESSAGE on an
-   established peer link (decision 67, L4): the envelope's `cluster` and
+   established peer link (decisions 67 and 75): the envelope's `cluster` and
    `from` are read, the replica of the cluster resolved
    (`vsr_io_engine_replica`) and `vsr_io_links_lookup(cluster, from)` must
    equal the link's node; then `vsr_io_engine_deliver` allocates a
@@ -1353,7 +1353,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | Platform note: Linux >= 6.18 through the io_uring syscalls, no liburing; `vsr_io_uring_init` probes once and fails with `-ENOSYS` on an older kernel | 52, 53 |
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | liburing dropped: no pkg-config check, no `Requires.private`; the kernel's UAPI header vendored under `src/io/uapi` | 52 |
 | `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | 72, 73 |
-| `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | L4, L5 |
+| `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | 75, 76 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
