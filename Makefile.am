@@ -60,7 +60,7 @@ UNIT_TESTS += tests/unit/descriptors tests/unit/layout
 UNIT_TESTS += tests/unit/crc32c tests/unit/cursor tests/unit/codec \
   tests/unit/pool tests/unit/slots tests/unit/deadline tests/unit/client \
   tests/unit/uring_translate tests/unit/sim_world tests/unit/engine_tables \
-  tests/unit/faulty_executor
+  tests/unit/faulty_executor tests/unit/link
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
@@ -123,6 +123,8 @@ tests_unit_sim_world_SOURCES = tests/unit/sim_world.c
 tests_unit_sim_world_LDADD = $(LIBVSR)
 tests_unit_engine_tables_SOURCES = tests/unit/engine_tables.c
 tests_unit_engine_tables_LDADD = $(LIBVSR)
+tests_unit_link_SOURCES = tests/unit/link.c tests/lib/random.c tests/lib/random.h
+tests_unit_link_LDADD = $(LIBVSR)
 tests_unit_faulty_executor_SOURCES = tests/unit/faulty_executor.c \
   tests/lib/faulty_executor.c tests/lib/faulty_executor.h tests/lib/random.c \
   tests/lib/random.h
