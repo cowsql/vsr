@@ -303,29 +303,80 @@ never dials its own node id. Due dials are found by poll through
 `last_error` is the last failure of a link identified as its; an inbound
 link that failed before identifying itself is nobody's.
 
-Send path per link (decision 38), executed in `vsr_io_links_prepare`:
+Send path per link (decisions 38 and 82), executed in
+`vsr_io_links_prepare`. The bytes a link sends form one stream counted by
+`stream_offset`; the BUILD is the send under construction, `vec_count`
+vectors in `vecs` covering the `build_bytes` bytes below `stream_offset`,
+to which control bytes, encoded messages and stream frames all append.
+Header bytes live in the send slab used as a ring addressed by unwrapped
+64-bit counters (`header_tail` the write position, `header_sent` the
+start of the build's header bytes, `header_head` the floor: the oldest
+live send's `header_begin`); the writer area is the contiguous space at
+the tail, which skips to the slab's start when the space before the end
+is below a frame header plus one inline copy and the front holds more.
 
-1. If a send is in flight, or every `sends[]` entry awaits a NOTIF, or the
-   node's queue is empty and the encoder idle, do nothing.
-2. Otherwise build one send: for the queued messages in order, run
-   `vsr_io_encoder_emit` into the link's `vecs` and the free part of the
-   send slab ring, stopping at `send_coalesce_bytes`, `VSR_IO_SEND_VECTORS`
-   vectors or the ring's free space. Record each message's `end` stream
-   offset as it is fully emitted.
-3. Classify: `fixed` when every vector lies in the pool
-   (`vsr_io_pool_contains`); else `zero_copy` when bytes `>=
-   zero_copy_bytes`. Allocate a SEND slot expecting two completions for a
-   zero-copy send and one otherwise; emit the record.
-4. On the result CQE: a negative result closes the link (queued and
-   in-flight messages complete `RETRY`); a short result re-issues the
-   remainder from the vectors, which stay valid because every referenced
-   byte is pinned by the SEND ops covered; a full result advances
-   `sent_offset` and, for a plain send, `notified_offset`.
-5. On the NOTIF (or the plain send's completion), advance
-   `notified_offset` to the send's `end`; every queued message whose `end
-   <= notified_offset` completes `OK` to its replica (a `COMPLETE` event
-   queued for the next poll); the send-slab ring floor advances past the
-   send's header bytes.
+1. If a send is in flight, or every `sends[]` entry awaits a NOTIF, do
+   nothing. Otherwise the node's carrier extends the build with queued
+   messages in order: `vsr_io_encoder_emit` into the free vectors and the
+   writer area, stopping at `send_coalesce_bytes`, `VSR_IO_SEND_VECTORS`
+   vectors or the ring's room; a message continues in the next build. A
+   message's `end` stream offset is assigned when its encoding starts
+   (its frame length is known from the digest), so the messages handed to
+   the carrier's stream are a prefix of the queue. A new vector contiguous
+   in memory with the previous one (a frame's padding and the next
+   frame's header) merges with it.
+2. Emit the build if it is not empty: classify (`fixed` when every vector
+   lies in the pool, `vsr_io_pool_contains`; else `zero_copy` when bytes
+   `>= zero_copy_bytes`), allocate a SEND slot expecting two completions
+   for a zero-copy send and one otherwise, fill the entry (`begin`, `end`,
+   `header_begin`, `header_end`) and mark the link in flight.
+3. On the result CQE: a negative result closes the link (the queued
+   messages complete `RETRY` through the node's review, below); a short
+   result trims the entry to the bytes sent and leaves the unsent tail of
+   the vectors in place as the next build, its header bytes reserved from
+   the entry's own `header_begin` until it goes out, so stream offsets
+   never rewind and every message `end` stays valid; a full result empties
+   the build. `sent_offset` advances either way.
+4. On the NOTIF (or the plain send's completion) the entry frees; the
+   floor and `notified_offset` are recomputed as the minimum over the live
+   entries (`header_begin` and `begin`), falling back to `header_sent` and
+   `sent_offset`, so NOTIFs may arrive in any order. Then the node's
+   queue completes every message nobody reads any more: the carrier's
+   with `OK` once `end <= notified_offset` (a `COMPLETE` event queued
+   through `vsr_io_engine_complete_core`), a retiring one (below) with
+   `RETRY` once its link's notified offset passed it or that link has no
+   live send; completions may thus leave the queue out of order, and the
+   carrier's encoder index follows the message it is on. A stream link
+   calls `vsr_io_streams_sent` (also at a zero-copy result, when the
+   vectors are free again).
+
+Queue rules (decision 83): `vsr_io_links_send` digests the message
+(`vsr_io_codec_message_digest` with the replica's limits), wants a link to
+the node, and returns `RETRY` for the engine to complete at once when the
+destination is unknown, unauthorized or the own node, the message cannot
+be digested, the replica is unattached or the engine closing, or the
+queue is full of messages on the wire; a full queue with a message not on
+the wire retries the oldest such and takes the newcomer. The node's queue
+is reviewed after every election and dial failure: a carrier change
+RETIRES the started prefix (`retiring` names the old link: the bytes on a
+lost or demoted link are not delivered by the next one, and a zero-copy
+send of that link may still read them, so each message completes `RETRY`
+only at the NOTIF that releases it, or at once when the link has no live
+send) and closes a demoted link that had a frame half sent or a build
+pending (`-ECANCELED`) rather than leave its stream torn; a node with no
+carrier and no peer dial pending (`node_peer_pending`, which counts peer
+links only) retries its waiting messages at once, which is how a failed
+dial, a lost carrier and an unanswered `LINK_WANTED` complete them.
+`vsr_io_node_clear` and `vsr_io_links_shutdown` complete everything at
+once (`RETRY`, `CANCELLED`), retiring messages included: the node or the
+engine is going away, and a NOTIF still pending on a closing link reads
+the bytes for microseconds at most. `messages_sent` and
+`messages_retried` count every outcome, the returned `RETRY` included.
+
+TCP_NODELAY (decision 85): with `options.nodelay` every taken-over socket
+gets one SETSOCKOPT record on its connect slot (idle by then, tagged
+`VSR_IO_STAGE_NODELAY`) whose result is ignored, so a socket without the
+option is simply left as it is; a dialed AF_UNIX peer skips it.
 
 Receive path per link: one multishot RECV with `BUFFER_SELECT` on the
 pool's group, re-armed after `-ENOBUFS` once slabs are provided and after
@@ -378,28 +429,49 @@ carves frames:
    the reassembly slab at once.
 
 Invariants: a link never has two sends in flight; `notified_offset <=
-sent_offset <= stream_offset`; every queued message completes exactly
-once; a slab is referenced by a link only while it holds bytes not yet
-leased or discarded, exactly once per run (the partial's reference is
-the reassembly slab's own once the run lives there); `retries_due`
-counts the links with `retry` set.
+sent_offset <= stream_offset` and `header_head <= header_sent <=
+header_tail <= header_head + slab_bytes`; the build is empty while a send
+is in flight, so `vecs` is the in-flight send's; the messages with `end`
+assigned are a prefix of the node's queue, the retiring ones first, then
+the carrier's;
+every queued message completes exactly once; a slab is referenced by a
+link only while it holds bytes not yet leased or discarded, exactly once
+per run (the partial's reference is the reassembly slab's own once the
+run lives there), plus its send slab; `retries_due` counts the links with
+`retry` set.
 
 Tests: `tests/unit/link`: a fake engine feeding CQEs and checking records:
 dial with backoff to 16x, accept, both handshake modes, refusal on mode and
 version mismatch, simultaneous dial with carrier election on both ends and
-idle closure of the loser, send classification for the three flag cases,
-coalescing bounds, a message spanning two sends, short sends, NOTIF
-ordering and RETRY on close, receive splits at every byte boundary of a
-two-frame stream across one, two and three slabs (the header's too),
-many frames in one slab, a frame ending exactly at a slab's end,
-slab-sized frames, delivery refused for want of a region and retried at
-poll, the reassembly slab unavailable then available, a bad CRC and an
-oversized length in reassembled frames, an unauthorized sender and an
-unknown cluster dropped, closing with runs held (references back to
-zero), a seeded random walk of MESSAGE sequences under random slicing,
-slab cuts, pool drought and lease holding (every authorized message
-exactly once, in order, byte-identical, references balanced), revoke and
-address change.
+idle closure of the loser, send classification for the four flag cases
+(slab-only, inline copy, outside payload below and at `zero_copy_bytes`,
+payload in a taken slab), coalescing bounds (the budget, a message cut at
+the budget and continued, the vector bound with 16 KiB slabs, the ring
+filling, wrapping and draining under held NOTIFs), short sends at every
+byte boundary of a two-frame send, NOTIFs held and released out of order,
+a queue full of messages on the wire and one with a message that yields,
+link loss by reset, by a failed send and by end of stream with messages
+queued, awaiting NOTIF and in flight (every op once, references back to
+the send slabs), a carrier change by an adopted preferred link with whole
+frames and with a frame half sent, a zero-copy send refused at
+translation, stream links (dial, refusals, request, chunk and end frames
+under the flag rule, EBUSY on a send in flight, on every entry busy, on
+the vectors and on the budget, ELIMIT, the idle exemption of a bound
+link, an orderly close, a failed dial that schedules nothing, a stream
+frame on a peer link), receive splits at every byte boundary of a
+two-frame stream across one, two and three slabs (the header's too), many
+frames in one slab, a frame ending exactly at a slab's end, slab-sized
+frames, delivery refused for want of a region and retried at poll, the
+reassembly slab unavailable then available, a bad CRC and an oversized
+length in reassembled frames, an unauthorized sender and an unknown
+cluster dropped, closing with runs held (references back to zero), a
+seeded random walk of MESSAGE sequences under random slicing, slab cuts,
+pool drought and lease holding (every authorized message exactly once, in
+order, byte-identical, references balanced), an end-to-end seeded random
+walk of two engines exchanging messages both ways under short sends, held
+NOTIFs, receive slicing and resets (exactly-once in-order delivery per
+link epoch, every op once, references balanced), revoke and address
+change.
 
 ### Streams (`src/io/stream.h`)
 
@@ -432,6 +504,25 @@ last chunk and closes the link.
 Timeouts: a stream with no progress for `handshake_timeout_ns` (the only
 per-stream duration in the options; a dedicated option is deferred) ends
 with `RETRY`.
+
+What the link module gives the stream module (decision 84):
+`vsr_io_links_open_stream` dials a STREAM-purpose link at once, whatever
+the node's backoff (`EINVAL` for an unknown, caller-dialed or own node,
+`ELIMIT` with no free link entry), and `vsr_io_streams_link_up` /
+`link_lost` follow; a stream dial's failure schedules nothing for the
+node. An inbound STREAM link is bound to its stream by setting
+`links.links[link].stream` at the request frame; a bound link is never
+idle-closed (the module closes it with `vsr_io_links_close`), an unbound
+one is. `vsr_io_streams_frame` receives every stream frame with its slab
+(to retain if the bytes are kept) and returns false to leave the frame in
+place, retried at every poll like a MESSAGE without a region.
+`vsr_io_links_send_frame` queues one raw frame: the codec-put body header,
+payload vectors referenced in place (pinned until `notified_offset`
+passes the returned `end`), `body_crc` over header then payload (the link
+pads to 8 with zeros from its slab and extends the CRC); `EBUSY` while a
+send is in flight, every entry awaits its NOTIF, or the budget, the
+vectors or the ring are full, after which `vsr_io_streams_sent` (called
+at every send result and NOTIF of the link) is the cue to retry.
 
 Tests: `tests/unit/stream` with the fake engine (request, chunks, END,
 window exhaustion, FILE chunking with short reads, link loss both sides,
@@ -1193,7 +1284,7 @@ in emission order (decision 51):
 
 | Op | Route |
 | --- | --- |
-| SEND | `vsr_io_links_send(replica, id, message, arg)`; `RETRY` returned -> COMPLETE(RETRY) queued |
+| SEND | `vsr_io_links_send(replica, id, message, arg)`; `RETRY` returned -> COMPLETE(RETRY) queued; OK -> queued, completed later through the replica's completion ring (decision 83) |
 | LOAD, STORE, SYNC, RECLAIM | `vsr_io_store_*`; completions arrive through `next_completion` |
 | SNAPSHOT_CAPTURE, FETCH, SYNC, DROP | `vsr_io_snapshots_*`; a status returned -> COMPLETE queued |
 | RELEASE with `VSR_IO_LEASE_ENGINE` | `vsr_io_lease_resolve`; release the region and slab/pin |
@@ -1442,6 +1533,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | 72, 73 |
 | `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | 75, 76 |
 | `store.h` | `VSR_IO_SEGMENT_FREEING`; `vsr_io_load_ref` and `load_refs`, the pending load's resolved records and read state, `cold_slab`; `reindexed`, `restored`, the `base_*` fields and `base_slot`; the client entry's `next_offset`; a LOAD completion's lease carries every OK result; `release` only unpins | 77, 78, 79, 80 |
+| `link.h`, `stream.h` (internal) | Send side of `vsr_io_link`: unwrapped 64-bit ring counters (`header_*`, `vsr_io_send.header_*`), the build (`vec_count`, `build_bytes`), `nodelay_set`, `VSR_IO_STAGE_NODELAY`; `vsr_io_links_send` contract (RETRY only when the engine completes at once); `vsr_io_links_open_stream` and `vsr_io_links_send_frame` contracts; `vsr_io_streams_frame` returns whether the frame was consumed; `vsr_io_streams_sent` at every send result and NOTIF | 82, 83, 84, 85 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

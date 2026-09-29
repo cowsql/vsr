@@ -10,6 +10,8 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -40,6 +42,9 @@
  *   world.slice_max           random receive slicing (0: whole runs)
  *   world.hold_notifs         NOTIFs are queued until released
  *   world.short_send          sends complete with at most this many bytes
+ *   world.reject_send         the next zero-copy sends fail at translation
+ *   engine_connect(e, to)     an engine-owned raw socket to a listener
+ *   link_reset(e, link)       the connection of a link is reset
  */
 
 #define PAGE 4096u
@@ -81,6 +86,7 @@ struct sock {
     bool peer_closed;
     bool reset;
     bool shutdown;
+    bool nodelay; /* TCP_NODELAY set through SETSOCKOPT. */
     unsigned char inbox[INBOX_BYTES];
     uint32_t inbox_len;
     /* Pending records. */
@@ -139,6 +145,9 @@ struct world {
     uint32_t slice_max;
     bool hold_notifs;
     uint32_t short_send;
+    uint32_t reject_send; /* Zero-copy sends to refuse with -EINVAL. */
+    uint32_t link_queue;  /* limits.link_queue of the next engine_open. */
+    uint32_t slab_bytes;  /* limits.slab_bytes of the next engine_open. */
     struct vsr_io_cqe held[CQ_CAP]; /* NOTIFs held back, with the engine. */
     uint32_t held_engine[CQ_CAP];
     uint32_t held_count;
@@ -146,7 +155,8 @@ struct world {
 
 static struct world world;
 static _Alignas(4096) unsigned char metadata[ENGINES][1u << 20];
-static _Alignas(4096) unsigned char payload[ENGINES][SLABS * PAGE];
+#define SLAB_BYTES_MAX (4u * PAGE) /* world.slab_bytes at most. */
+static _Alignas(4096) unsigned char payload[ENGINES][SLABS * SLAB_BYTES_MAX];
 
 /* A record's receive buffer is written through its const addr, as the
  * simulation does (vsr_sim_mutable). */
@@ -252,6 +262,13 @@ static void inbox_append(uint32_t index, const unsigned char *bytes,
     CHECK(sock->inbox_len + length <= INBOX_BYTES);
     memcpy(sock->inbox + sock->inbox_len, bytes, length);
     sock->inbox_len += (uint32_t)length;
+}
+
+/* Takes back the last `length` bytes appended to a socket's inbox. */
+static void inbox_consume_tail(uint32_t index, uint32_t length)
+{
+    CHECK(index != NONE && world.socks[index].inbox_len >= length);
+    world.socks[index].inbox_len -= length;
 }
 
 static void inbox_consume(struct sock *sock, uint32_t length)
@@ -663,6 +680,16 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
             }
             result = (int)sent;
         }
+        if (zero_copy && world.reject_send > 0) {
+            /* Refused at translation: once, without MORE, no NOTIF
+             * (decision 62); nothing reached the socket. */
+            world.reject_send--;
+            if (result > 0) {
+                inbox_consume_tail(sock->peer, (uint32_t)result);
+            }
+            complete(e, sqe->user_data, -EINVAL, 0, 0);
+            return;
+        }
         if (zero_copy) {
             complete(e, sqe->user_data, result, VSR_IO_CQE_MORE, 0);
             if (world.hold_notifs) {
@@ -680,6 +707,15 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
         }
         break;
     }
+    case VSR_IO_SQE_SETSOCKOPT:
+        index = record_sock(e, sqe);
+        CHECK(index != NONE);
+        CHECK((sqe->flags & VSR_IO_SQE_FIXED_FILE) != 0);
+        CHECK(sqe->op_flags == (((uint32_t)IPPROTO_TCP << 16) | TCP_NODELAY));
+        CHECK(sqe->length == sizeof(int) && sqe->addr != NULL);
+        CHECK(*(const int *)sqe->addr == 1);
+        world.socks[index].nodelay = true;
+        break;
     case VSR_IO_SQE_SHUTDOWN:
         index = record_sock(e, sqe);
         CHECK(index != NONE);
@@ -830,14 +866,14 @@ static struct vsr_io_options engine_options(struct engine *e, uint64_t node,
     limits->nodes = NODES;
     limits->authorizations = 8;
     limits->links = LINKS;
-    limits->link_queue = 4;
+    limits->link_queue = world.link_queue;
     limits->streams = 2;
     limits->stream_window = 2;
     limits->events = 8;
     limits->ops = 6;
     limits->batch = SQ_CAP;
     limits->slabs = SLABS;
-    limits->slab_bytes = PAGE;
+    limits->slab_bytes = world.slab_bytes;
     limits->caller_slabs = 0;
     limits->file_slots = FILE_SLOTS;
     limits->buffer_regions = 3;
@@ -913,6 +949,8 @@ static void engine_forget(struct engine *e)
 static void world_reset(uint64_t seed)
 {
     memset(&world, 0, sizeof(world));
+    world.link_queue = 4;
+    world.slab_bytes = PAGE;
     world.now = 1000000000;
     world.next_fd = FD_BASE;
     test_random_seed(&world.random, seed, 1);
@@ -1014,18 +1052,30 @@ static void engine_step(struct engine *e)
     deliver(e);
 }
 
-static void world_release_notifs(void)
+/* Releases the i-th held NOTIF (arrival order); the later ones move up. */
+static void world_release_notif(uint32_t i)
 {
-    for (uint32_t i = 0; i < world.held_count; ++i) {
-        cq_push(&world.engines[world.held_engine[i]], &world.held[i]);
+    CHECK(i < world.held_count);
+    cq_push(&world.engines[world.held_engine[i]], &world.held[i]);
+    for (uint32_t j = i; j + 1 < world.held_count; ++j) {
+        world.held[j] = world.held[j + 1];
+        world.held_engine[j] = world.held_engine[j + 1];
     }
-    world.held_count = 0;
+    world.held_count--;
 }
 
-/* Steps every open engine until a full round moves nothing. */
-static void world_settle(void)
+static void world_release_notifs(void)
 {
-    for (uint32_t round = 0; round < 200; ++round) {
+    while (world.held_count > 0) {
+        world_release_notif(0);
+    }
+}
+
+/* Steps every open engine until a full round moves nothing, or `rounds`
+ * rounds went by; true when the world settled. */
+static bool world_run(uint32_t rounds)
+{
+    for (uint32_t round = 0; round < rounds; ++round) {
         bool moved = false;
 
         for (uint32_t i = 0; i < ENGINES; ++i) {
@@ -1045,10 +1095,20 @@ static void world_settle(void)
             }
         }
         if (!moved) {
-            return;
+            return true;
         }
     }
-    CHECK(false); /* The world did not settle. */
+    return false;
+}
+
+static void world_settle_rounds(uint32_t rounds)
+{
+    CHECK(world_run(rounds)); /* The world did not settle. */
+}
+
+static void world_settle(void)
+{
+    world_settle_rounds(200);
 }
 
 /* -------------------------------------------------------------------------
@@ -1064,6 +1124,34 @@ static uint32_t peer_connect(struct engine *e)
     child = world_connect(client, &e->listen);
     CHECK(child != NONE);
     return client;
+}
+
+/* A raw socket owned by engine e, connected to the listener at `to`, for
+ * vsr_io_adopt; returns its descriptor. */
+static int engine_connect(struct engine *e, const struct vsr_io_address *to)
+{
+    uint32_t client = sock_alloc(e->index);
+
+    world.socks[client].raw_fd = fd_alloc();
+    CHECK(world_connect(client, to) != NONE);
+    return world.socks[client].raw_fd;
+}
+
+/* The connection of an established link is reset by the network: both
+ * ends read -ECONNRESET and sends fail. */
+static void link_reset(struct engine *e, const struct vsr_io_link *link)
+{
+    uint32_t index = sock_by_slot(e->index, link->fd);
+    struct sock *sock;
+
+    CHECK(index != NONE);
+    sock = &world.socks[index];
+    if (sock->peer != NONE) {
+        world.socks[sock->peer].reset = true;
+        world.socks[sock->peer].peer = NONE;
+    }
+    sock->reset = true;
+    sock->peer = NONE;
 }
 
 static void peer_write(uint32_t peer, const void *bytes, size_t length)
@@ -1522,6 +1610,13 @@ static void check_linked(struct engine *a, struct engine *b)
     CHECK(in->notified_offset == in->sent_offset);
 }
 
+/* Phase 3 helpers the earlier tests borrow: a replica shell, and a SEND
+ * of a fresh sample message (op id = its number). */
+static struct vsr_io_replica *open_replica(struct engine *e, uint32_t index,
+                                           struct vsr_id id);
+static int send_fresh(struct engine *e, uint32_t index, uint64_t number,
+                      uint32_t size, uint64_t member);
+
 static void test_handshake(uint32_t slice_max)
 {
     struct engine *a;
@@ -1653,11 +1748,17 @@ static void test_election(void)
           (uint32_t)(a_out - a->io->links.links));
     CHECK(b->io->links.nodes[0].carrier ==
           (uint32_t)(b_in - b->io->links.links));
-    /* Sends queued for the node keep the carrier (phase 3 fills the
-     * queue; here the count is set by hand); the other link expires after
+    /* Sends queued for the node keep the carrier: one message each way,
+     * its NOTIF held so it never completes; the other link expires after
      * the idle timeout and is closed at both ends, the carrier stays. */
-    a->io->links.nodes[0].queue_count = 1;
-    b->io->links.nodes[0].queue_count = 1;
+    open_replica(a, 0, cluster);
+    open_replica(b, 0, cluster);
+    world.hold_notifs = true;
+    CHECK(send_fresh(a, 0, 1, 16, 2) == VSR_OK);
+    CHECK(send_fresh(b, 0, 1, 16, 1) == VSR_OK);
+    world_settle();
+    CHECK(a->io->links.nodes[0].queue_count == 1);
+    CHECK(b->io->links.nodes[0].queue_count == 1);
     world_advance(IDLE_NS / 2);
     world_settle();
     CHECK(a->io->links.established == 2);
@@ -1677,8 +1778,11 @@ static void test_election(void)
     world_advance(IDLE_NS);
     world_settle();
     CHECK(a->io->links.established == 1 && b->io->links.established == 1);
-    a->io->links.nodes[0].queue_count = 0;
-    b->io->links.nodes[0].queue_count = 0;
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    CHECK(a->io->links.nodes[0].queue_count == 0);
+    CHECK(b->io->links.nodes[0].queue_count == 0);
     world_advance(IDLE_NS);
     world_settle();
     check_quiet(a);
@@ -2450,20 +2554,20 @@ static void test_capacity(void)
 
 #define REGIONS 4u
 #define REGION_BYTES 8192u
-#define OPERATIONS 4u
-#define SCRATCH_BYTES (2u * PAGE)
+#define OPERATIONS 128u
+#define SCRATCH_BYTES ((size_t)2 * PAGE)
 #define FRAME_FIXED                                                            \
     160u /* Header 24, envelope 56, PREPARE 8, ENTRIES 8,
                             ENTRY 56, BLOB 8. */
 #define PAYLOAD_MAX (PAGE - FRAME_FIXED) /* The frame then fills a slab. */
 #define WALK_ROUNDS 160u
-#define WALK_BATCH_BYTES (3u * PAGE)
+#define WALK_BATCH_BYTES ((size_t)3 * PAGE)
 #define WALK_PENDING 64u
 
-static struct vsr_io_lease leases[REGIONS];
-static struct vsr_io_queued_event messages[REGIONS];
-static struct vsr_io_queued_event completions[OPERATIONS];
-static _Alignas(16) unsigned char regions[REGIONS][REGION_BYTES];
+static struct vsr_io_lease leases[ENGINES][REGIONS];
+static struct vsr_io_queued_event messages[ENGINES][REGIONS];
+static struct vsr_io_queued_event completions[ENGINES][OPERATIONS];
+static _Alignas(16) unsigned char regions[ENGINES][REGIONS][REGION_BYTES];
 
 /* A replica shell for delivery, the way tests/unit/engine_tables.c sets
  * one up: the tables are the test's. The limits admit a PREPARE whose
@@ -2490,21 +2594,21 @@ static struct vsr_io_replica *open_replica(struct engine *e, uint32_t index,
           VSR_OK);
     CHECK(region <= REGION_BYTES);
     replica->regions_count = REGIONS;
-    memset(leases, 0, sizeof(leases));
+    memset(leases[e->index], 0, sizeof(leases[e->index]));
     for (uint32_t i = 0; i < REGIONS; ++i) {
-        leases[i].slab = NONE;
-        leases[i].pin = NONE;
-        leases[i].region.base = regions[i];
-        leases[i].region.size = REGION_BYTES;
+        leases[e->index][i].slab = NONE;
+        leases[e->index][i].pin = NONE;
+        leases[e->index][i].region.base = regions[e->index][i];
+        leases[e->index][i].region.size = REGION_BYTES;
     }
-    replica->leases = leases;
+    replica->leases = leases[e->index];
     replica->leases_free = REGIONS;
-    memset(messages, 0, sizeof(messages));
-    replica->messages = messages;
+    memset(messages[e->index], 0, sizeof(messages[e->index]));
+    replica->messages = messages[e->index];
     replica->messages_head = 0;
     replica->messages_count = 0;
-    memset(completions, 0, sizeof(completions));
-    replica->completions = completions;
+    memset(completions[e->index], 0, sizeof(completions[e->index]));
+    replica->completions = completions[e->index];
     replica->completions_head = 0;
     replica->completions_count = 0;
     e->io->replicas_count++;
@@ -2636,7 +2740,7 @@ static uint32_t take_message(struct vsr_io_replica *replica, uint64_t from,
     CHECK(queued->event.type == VSR_EVENT_MESSAGE);
     CHECK(queued->kind == VSR_IO_EVENT_CORE);
     lease = queued->lease;
-    CHECK(lease < REGIONS && leases[lease].state == 1);
+    CHECK(lease < REGIONS && replica->leases[lease].state == 1);
     CHECK(queued->event.lease == vsr_io_lease_id(replica, lease));
     m = queued->event.data;
     CHECK(m->cluster.hi == replica->options.cluster.hi);
@@ -2669,7 +2773,7 @@ static uint32_t take_message(struct vsr_io_replica *replica, uint64_t from,
              * slab. */
             CHECK(vsr_io_pool_contains(&replica->io->pool, data, size));
             CHECK(vsr_io_pool_locate(&replica->io->pool, data) ==
-                  leases[lease].slab);
+                  replica->leases[lease].slab);
             for (uint32_t i = 0; i < size; ++i) {
                 CHECK(data[i] == payload_byte(number, i));
             }
@@ -3061,7 +3165,7 @@ static void test_receive_pressure(void)
     }
     engine_step(r.e);
     lease = take_message(r.replica, 1, number, 16);
-    CHECK(leases[lease].slab == r.link->reassembly_slab ||
+    CHECK(r.replica->leases[lease].slab == r.link->reassembly_slab ||
           r.link->reassembly_slab == NONE);
     vsr_io_lease_release(r.replica, lease);
     check_drained(&r, 0, 0);
@@ -3218,7 +3322,7 @@ static void test_receive_random(uint64_t seed)
 {
     struct receiver r;
     static unsigned char batch[WALK_BATCH_BYTES + PAGE];
-    uint32_t pending[WALK_PENDING]; /* Sizes of the frames sent, in order. */
+    uint32_t pending[WALK_PENDING] = {0}; /* Frame sizes sent, in order. */
     uint32_t pending_head = 0;
     uint32_t pending_count = 0;
     uint32_t taken[SLABS];
@@ -3358,6 +3462,1365 @@ static void test_receive_random(uint64_t seed)
     engine_forget(r.e);
 }
 
+/* -------------------------------------------------------------------------
+ * The send path: core SENDs over a two-engine world
+ * ---------------------------------------------------------------------- */
+
+#define SAMPLES 128u /* Outstanding SEND ops per engine, as a ring. */
+
+static struct sample samples[ENGINES][SAMPLES];
+static uint32_t samples_next[ENGINES];
+
+/* A fresh sample of the engine's ring, from the engine's own node id (the
+ * tests authorize replica n as node n), pinned until its op completes. */
+static struct sample *sample_fresh(struct engine *e, uint64_t number,
+                                   uint32_t size)
+{
+    struct sample *s = &samples[e->index][samples_next[e->index] % SAMPLES];
+
+    samples_next[e->index]++;
+    sample_init(s, cluster, e->node, number, size);
+    return s;
+}
+
+/* A SEND op of the sample (op id = its number) to `member`. */
+static int send_sample(struct engine *e, uint32_t index, const struct sample *s,
+                       uint64_t member)
+{
+    return vsr_io_links_send(e->io, index, s->message.number, &s->message,
+                             member);
+}
+
+static int send_fresh(struct engine *e, uint32_t index, uint64_t number,
+                      uint32_t size, uint64_t member)
+{
+    return send_sample(e, index, sample_fresh(e, number, size), member);
+}
+
+/* Pops the next internal completion of the replica, false when none. */
+static bool take_completion(struct vsr_io_replica *replica, uint64_t *op,
+                            int32_t *status)
+{
+    const struct vsr_io_queued_event *queued;
+
+    if (replica->completions_count == 0) {
+        return false;
+    }
+    queued = &replica->completions[replica->completions_head];
+    CHECK(queued->event.type == VSR_EVENT_COMPLETE);
+    CHECK(queued->kind == VSR_IO_EVENT_CORE && queued->lease == NONE);
+    CHECK(queued->event.data == NULL && queued->event.lease == 0);
+    *op = queued->event.id;
+    *status = queued->event.status;
+    replica->completions_head =
+        (replica->completions_head + 1) % replica->options.limits.operations;
+    replica->completions_count--;
+    return true;
+}
+
+/* The next completion must be `op` with `status`. */
+static void expect_completion(struct vsr_io_replica *replica, uint64_t op,
+                              int32_t status)
+{
+    uint64_t got_op = 0;
+    int32_t got_status = 0;
+
+    CHECK(take_completion(replica, &got_op, &got_status));
+    CHECK(got_op == op && got_status == status);
+}
+
+/* Two linked engines, each with replica 0 of `cluster`, authorized as
+ * replica 1 (node 1, engine a) and replica 2 (node 2, engine b). */
+struct pair {
+    struct engine *a;
+    struct engine *b;
+    struct vsr_io_replica *ra;
+    struct vsr_io_replica *rb;
+};
+
+static void pair_open(struct pair *p, uint64_t seed, uint32_t link_queue,
+                      uint32_t slab_bytes)
+{
+    world_reset(seed);
+    world.link_queue = link_queue;
+    world.slab_bytes = slab_bytes;
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    p->a = &world.engines[0];
+    p->b = &world.engines[1];
+    p->ra = open_replica(p->a, 0, cluster);
+    p->rb = open_replica(p->b, 0, cluster);
+    /* a dials; b, linked by then, authorizes without dialing. */
+    CHECK(vsr_io_links_authorize(p->a->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    CHECK(vsr_io_links_authorize(p->a->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(p->b->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(p->b->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    check_linked(p->a, p->b);
+    memset(samples_next, 0, sizeof(samples_next));
+}
+
+/* The carrier link of node `node` at engine e. */
+static const struct vsr_io_link *carrier_of(const struct engine *e,
+                                            uint64_t node)
+{
+    uint32_t index = vsr_io_links_node_index(&e->io->links, node);
+
+    CHECK(index != NONE);
+    CHECK(e->io->links.nodes[index].carrier != NONE);
+    return &e->io->links.links[e->io->links.nodes[index].carrier];
+}
+
+/* Settles the world while taking the replica's messages: numbers
+ * first..first + count - 1 in order, all of `size`; leases released. The
+ * receiver has REGIONS leases, so a long batch is delivered in waves. */
+static void drain_messages(struct vsr_io_replica *replica, uint64_t from,
+                           uint64_t first, uint32_t count, uint32_t size)
+{
+    uint32_t taken = 0;
+
+    for (uint32_t attempt = 0; taken < count; ++attempt) {
+        CHECK(attempt < 64);
+        world_settle();
+        while (replica->messages_count > 0) {
+            uint32_t lease = take_message(replica, from, first + taken, size);
+
+            vsr_io_lease_release(replica, lease);
+            taken++;
+        }
+    }
+    world_settle();
+    CHECK(replica->messages_count == 0);
+}
+
+/* One message of each shape, classified by the flag rule (decision 38)
+ * and delivered byte-identical; the SEND op completes OK at the NOTIF. */
+static void test_send_flags(void)
+{
+    struct pair p;
+    struct sample *s;
+    const struct record_log *record;
+    uint32_t slab;
+    uint32_t lease;
+
+    pair_open(&p, 21, 4, PAGE);
+    CHECK(vsr_io_links_send(p.a->io, 0, 1, NULL, 2) == VSR_IO_RETRY);
+    CHECK(vsr_io_links_send(p.a->io, 5, 1, &sample_fresh(p.a, 1, 8)->message,
+                            2) == VSR_IO_RETRY);
+    CHECK(send_fresh(p.a, 0, 1, 8, 9) == VSR_IO_RETRY); /* Unauthorized. */
+    CHECK(send_fresh(p.a, 0, 1, 8, 1) == VSR_IO_RETRY); /* Own node. */
+    CHECK(p.a->io->stats.messages_retried == 4);
+    /* Envelope only: every byte comes from the send slab. */
+    log_clear(p.a);
+    CHECK(send_fresh(p.a, 0, 1, NONE, 2) == VSR_OK);
+    CHECK(p.a->io->links.nodes[0].queue_count == 1);
+    world_settle();
+    CHECK(log_count(p.a, VSR_IO_SQE_SEND) == 1);
+    record = log_last(p.a, VSR_IO_SQE_SEND);
+    CHECK(record->op_flags == (VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED));
+    CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) != 0);
+    CHECK(record->buffer_index == REGION_BASE && record->length == 1);
+    CHECK(p.rb->messages_count == 1);
+    lease = take_message(p.rb, 1, 1, NONE);
+    vsr_io_lease_release(p.rb, lease);
+    expect_completion(p.ra, 1, VSR_IO_OK);
+    CHECK(p.a->io->stats.messages_sent == 1);
+    CHECK(p.a->io->links.nodes[0].queue_count == 0);
+    /* A payload below VSR_IO_INLINE_BYTES is copied into the slab. */
+    log_clear(p.a);
+    CHECK(send_fresh(p.a, 0, 2, 100, 2) == VSR_OK);
+    world_settle();
+    record = log_last(p.a, VSR_IO_SQE_SEND);
+    CHECK(record->op_flags == (VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED));
+    CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) != 0 &&
+          record->length == 1);
+    lease = take_message(p.rb, 1, 2, 100);
+    vsr_io_lease_release(p.rb, lease);
+    expect_completion(p.ra, 2, VSR_IO_OK);
+    /* A referenced payload outside the pool below zero_copy_bytes: a
+     * plain vectored send (header run, payload, padding). */
+    log_clear(p.a);
+    CHECK(send_fresh(p.a, 0, 3, 300, 2) == VSR_OK);
+    world_settle();
+    record = log_last(p.a, VSR_IO_SQE_SEND);
+    CHECK(record->op_flags == VSR_IO_SEND_VECTORED);
+    CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) == 0 &&
+          record->length == 3);
+    lease = take_message(p.rb, 1, 3, 300);
+    vsr_io_lease_release(p.rb, lease);
+    expect_completion(p.ra, 3, VSR_IO_OK);
+    /* At zero_copy_bytes with a vector outside the pool: zero-copy
+     * without FIXED_BUFFER. */
+    log_clear(p.a);
+    CHECK(send_fresh(p.a, 0, 4, PAYLOAD_MAX, 2) == VSR_OK);
+    world_settle();
+    record = log_last(p.a, VSR_IO_SQE_SEND);
+    CHECK(record->op_flags == (VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED));
+    CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) == 0 &&
+          record->length == 2);
+    lease = take_message(p.rb, 1, 4, PAYLOAD_MAX);
+    vsr_io_lease_release(p.rb, lease);
+    expect_completion(p.ra, 4, VSR_IO_OK);
+    /* The same payload in a taken pool slab: fixed. */
+    slab = vsr_io_pool_acquire(&p.a->io->pool, false);
+    CHECK(slab != NONE);
+    s = sample_fresh(p.a, 5, PAYLOAD_MAX);
+    memcpy(vsr_io_pool_slab(&p.a->io->pool, slab), s->payload, PAYLOAD_MAX);
+    s->span.data = vsr_io_pool_slab(&p.a->io->pool, slab);
+    log_clear(p.a);
+    CHECK(send_sample(p.a, 0, s, 2) == VSR_OK);
+    world_settle();
+    record = log_last(p.a, VSR_IO_SQE_SEND);
+    CHECK(record->op_flags == (VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED));
+    CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) != 0 &&
+          record->length == 2);
+    lease = take_message(p.rb, 1, 5, PAYLOAD_MAX);
+    vsr_io_lease_release(p.rb, lease);
+    expect_completion(p.ra, 5, VSR_IO_OK);
+    vsr_io_pool_release(&p.a->io->pool, slab);
+    CHECK(p.a->io->stats.messages_sent == 5);
+    CHECK(p.a->io->stats.bytes_sent == VSR_IO_PREAMBLE_BYTES + HELLO_BYTES +
+                                           frame_bytes(NONE) +
+                                           frame_bytes(100) + frame_bytes(300) +
+                                           2 * frame_bytes(PAYLOAD_MAX));
+    /* Both ways: b's replica sends to node 1. */
+    CHECK(send_fresh(p.b, 0, 1, 40, 1) == VSR_OK);
+    world_settle();
+    lease = take_message(p.ra, 2, 1, 40);
+    vsr_io_lease_release(p.ra, lease);
+    expect_completion(p.rb, 1, VSR_IO_OK);
+    CHECK(pool_refs(p.a) == 1 && pool_refs(p.b) == 1);
+    /* The node's TCP_NODELAY: set on the accepted socket (the dialer's
+     * peer is known to be AF_UNIX and skips it). */
+    {
+        const struct vsr_io_link *in =
+            link_to(p.b, 1, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED);
+        uint32_t sock = sock_by_slot(p.b->index, in->fd);
+
+        CHECK(sock != NONE && world.socks[sock].nodelay);
+        CHECK(in->nodelay_set && in->connect_slot == NONE);
+    }
+    engine_forget(p.a);
+    engine_forget(p.b);
+}
+
+/* Coalescing: queued messages share one send up to send_coalesce_bytes, a
+ * message continues in the next send, the vector bound splits a send,
+ * and the send-slab ring fills, wraps and drains under held NOTIFs. */
+static void test_send_coalesce(void)
+{
+    struct pair p;
+    uint64_t before;
+
+    /* The vector bound, with 16 KiB send slabs so that the ring is not
+     * what cuts the send: 70 messages of two vectors each (a frame's pad
+     * merges with the next header run) need two sends, the first with
+     * VSR_IO_SEND_VECTORS vectors exactly and a message cut in two. */
+    pair_open(&p, 25, 80, SLAB_BYTES_MAX);
+    log_clear(p.a);
+    for (uint64_t i = 0; i < 70; ++i) {
+        CHECK(send_fresh(p.a, 0, 10 + i, 300, 2) == VSR_OK);
+    }
+    engine_step(p.a);
+    CHECK(log_count(p.a, VSR_IO_SQE_SEND) == 1);
+    CHECK(log_last(p.a, VSR_IO_SQE_SEND)->length == VSR_IO_SEND_VECTORS);
+    CHECK(carrier_of(p.a, 2)->encoding != NONE);
+    drain_messages(p.rb, 1, 10, 70, 300);
+    CHECK(log_count(p.a, VSR_IO_SQE_SEND) == 2);
+    for (uint64_t i = 0; i < 70; ++i) {
+        expect_completion(p.ra, 10 + i, VSR_IO_OK);
+    }
+    CHECK(pool_refs(p.a) == 1 && pool_refs(p.b) == 1);
+    engine_forget(p.a);
+    engine_forget(p.b);
+    pair_open(&p, 22, 48, PAGE);
+    /* Three messages queued before a step: one send, three frames. */
+    log_clear(p.a);
+    CHECK(send_fresh(p.a, 0, 1, NONE, 2) == VSR_OK);
+    CHECK(send_fresh(p.a, 0, 2, 100, 2) == VSR_OK);
+    CHECK(send_fresh(p.a, 0, 3, 8, 2) == VSR_OK);
+    CHECK(p.a->io->links.nodes[0].queue_count == 3);
+    world_settle();
+    CHECK(log_count(p.a, VSR_IO_SQE_SEND) == 1);
+    CHECK(log_last(p.a, VSR_IO_SQE_SEND)->length == 1); /* One ring run. */
+    CHECK(p.rb->messages_count == 3);
+    vsr_io_lease_release(p.rb, take_message(p.rb, 1, 1, NONE));
+    vsr_io_lease_release(p.rb, take_message(p.rb, 1, 2, 100));
+    vsr_io_lease_release(p.rb, take_message(p.rb, 1, 3, 8));
+    expect_completion(p.ra, 1, VSR_IO_OK);
+    expect_completion(p.ra, 2, VSR_IO_OK);
+    expect_completion(p.ra, 3, VSR_IO_OK);
+    /* A 200-byte budget over three 80-byte frames: the third is cut at
+     * the budget and continues in a second send. */
+    p.a->io->options.send_coalesce_bytes = 200;
+    log_clear(p.a);
+    before = p.a->io->stats.bytes_sent;
+    CHECK(send_fresh(p.a, 0, 4, NONE, 2) == VSR_OK);
+    CHECK(send_fresh(p.a, 0, 5, NONE, 2) == VSR_OK);
+    CHECK(send_fresh(p.a, 0, 6, NONE, 2) == VSR_OK);
+    world_settle();
+    CHECK(log_count(p.a, VSR_IO_SQE_SEND) == 2);
+    CHECK(p.a->io->stats.bytes_sent == before + 240);
+    CHECK(carrier_of(p.a, 2)->encoding == NONE);
+    drain_messages(p.rb, 1, 4, 3, NONE);
+    expect_completion(p.ra, 4, VSR_IO_OK);
+    expect_completion(p.ra, 5, VSR_IO_OK);
+    expect_completion(p.ra, 6, VSR_IO_OK);
+    /* A message larger than the budget spans several sends. */
+    log_clear(p.a);
+    CHECK(send_fresh(p.a, 0, 7, PAYLOAD_MAX, 2) == VSR_OK);
+    world_settle();
+    CHECK(log_count(p.a, VSR_IO_SQE_SEND) ==
+          (frame_bytes(PAYLOAD_MAX) + 199) / 200);
+    drain_messages(p.rb, 1, 7, 1, PAYLOAD_MAX);
+    expect_completion(p.ra, 7, VSR_IO_OK);
+    p.a->io->options.send_coalesce_bytes = 65536;
+    /* The ring: with NOTIFs held, 100-byte inline payloads (264 slab bytes
+     * per frame) fill the 4096-byte send slab; the send that hits the end
+     * carries a cut frame, nothing goes out until a NOTIF frees the
+     * floor, and the write position wraps to the slab's start. */
+    world.hold_notifs = true;
+    log_clear(p.a);
+    for (uint64_t i = 0; i < 30; ++i) {
+        CHECK(send_fresh(p.a, 0, 100 + i, 100, 2) == VSR_OK);
+        engine_step(p.a);
+        engine_step(p.a);
+        if (world.held_count == VSR_IO_LINK_SENDS) {
+            world_release_notif(0);
+        }
+    }
+    {
+        const struct vsr_io_link *out = carrier_of(p.a, 2);
+
+        CHECK(out->header_tail > PAGE); /* Wrapped at least once. */
+        CHECK(out->header_tail - out->header_head <= PAGE);
+        CHECK(out->notified_offset <= out->sent_offset);
+        CHECK(out->sent_offset <= out->stream_offset);
+    }
+    world.hold_notifs = false;
+    world_release_notifs();
+    drain_messages(p.rb, 1, 100, 30, 100);
+    for (uint64_t i = 0; i < 30; ++i) {
+        expect_completion(p.ra, 100 + i, VSR_IO_OK);
+    }
+    CHECK(p.a->io->links.nodes[0].queue_count == 0);
+    {
+        const struct vsr_io_link *out = carrier_of(p.a, 2);
+
+        CHECK(out->notified_offset == out->stream_offset);
+        CHECK(out->header_head == out->header_tail && out->vec_count == 0);
+        for (uint32_t i = 0; i < VSR_IO_LINK_SENDS; ++i) {
+            CHECK(out->sends[i].slot == NONE);
+        }
+    }
+    CHECK(pool_refs(p.a) == 1 && pool_refs(p.b) == 1);
+    engine_forget(p.a);
+    engine_forget(p.b);
+}
+
+/* Short sends at every byte boundary of a two-frame send: each send
+ * resumes from the short count, the frames arrive byte-identical and
+ * every op completes once. */
+static void test_send_short(void)
+{
+    struct pair p;
+    const uint32_t total = (uint32_t)(frame_bytes(NONE) + frame_bytes(300));
+    uint64_t number = 1;
+
+    pair_open(&p, 23, 4, PAGE);
+    for (uint32_t cut = 1; cut <= total + 1; ++cut) {
+        uint64_t before = p.a->io->stats.bytes_sent;
+        uint64_t sends = p.a->io->stats.sends;
+
+        world.short_send = cut;
+        CHECK(send_fresh(p.a, 0, number, NONE, 2) == VSR_OK);
+        CHECK(send_fresh(p.a, 0, number + 1, 300, 2) == VSR_OK);
+        world_settle_rounds(4 * total);
+        CHECK(p.a->io->stats.sends == sends + (total + cut - 1) / cut);
+        CHECK(p.a->io->stats.bytes_sent == before + total);
+        CHECK(p.rb->messages_count == 2);
+        vsr_io_lease_release(p.rb, take_message(p.rb, 1, number, NONE));
+        vsr_io_lease_release(p.rb, take_message(p.rb, 1, number + 1, 300));
+        expect_completion(p.ra, number, VSR_IO_OK);
+        expect_completion(p.ra, number + 1, VSR_IO_OK);
+        CHECK(p.ra->completions_count == 0);
+        number += 2;
+    }
+    world.short_send = 0;
+    CHECK(pool_refs(p.a) == 1 && pool_refs(p.b) == 1);
+    {
+        const struct vsr_io_link *out = carrier_of(p.a, 2);
+
+        CHECK(out->notified_offset == out->stream_offset &&
+              out->vec_count == 0);
+    }
+    engine_forget(p.a);
+    engine_forget(p.b);
+}
+
+/* Every send entry awaiting its NOTIF: the queue waits, nothing completes
+ * until the NOTIFs come, in any order; a full queue refuses a newcomer
+ * when everything queued is on the wire, else the oldest message not on
+ * the wire yields to it. */
+static void test_send_pressure(void)
+{
+    struct pair p;
+    const struct vsr_io_link *out;
+
+    pair_open(&p, 24, 4, PAGE);
+    out = carrier_of(p.a, 2);
+    world.hold_notifs = true;
+    /* Four messages, one send each, every entry awaiting its NOTIF: the
+     * queue is full of messages on the wire and a fifth is refused. */
+    for (uint64_t i = 1; i <= 4; ++i) {
+        CHECK(send_fresh(p.a, 0, i, 16, 2) == VSR_OK);
+        world_settle();
+    }
+    CHECK(world.held_count == VSR_IO_LINK_SENDS);
+    CHECK(out->inflight == 0 && out->vec_count == 0);
+    CHECK(p.a->io->links.nodes[0].queue_count == 4);
+    CHECK(p.ra->completions_count == 0 && p.rb->messages_count == 4);
+    CHECK(out->notified_offset == VSR_IO_PREAMBLE_BYTES + HELLO_BYTES);
+    CHECK(send_fresh(p.a, 0, 5, 16, 2) == VSR_IO_RETRY);
+    CHECK(p.a->io->stats.messages_retried == 1);
+    /* The second NOTIF alone moves nothing: the first send is still read. */
+    world_release_notif(1);
+    world_settle();
+    CHECK(p.ra->completions_count == 0);
+    CHECK(out->notified_offset == VSR_IO_PREAMBLE_BYTES + HELLO_BYTES);
+    CHECK(p.a->io->links.nodes[0].queue_count == 4);
+    /* The first: messages 1 and 2 complete and two entries free. */
+    world_release_notif(0);
+    world_settle();
+    expect_completion(p.ra, 1, VSR_IO_OK);
+    expect_completion(p.ra, 2, VSR_IO_OK);
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->links.nodes[0].queue_count == 2);
+    CHECK(world.held_count == 2);
+    /* Two more share one send; their delivery waits for a region at the
+     * receiver, whose four are taken; the queue is full again. */
+    CHECK(send_fresh(p.a, 0, 5, 16, 2) == VSR_OK);
+    CHECK(send_fresh(p.a, 0, 6, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(world.held_count == 3);
+    CHECK(p.a->io->links.nodes[0].queue_count == 4);
+    CHECK(p.rb->messages_count == 4 && p.rb->leases_free == 0);
+    CHECK(send_fresh(p.a, 0, 7, 16, 2) == VSR_IO_RETRY);
+    drain_messages(p.rb, 1, 1, 6, 16);
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    for (uint64_t i = 3; i <= 6; ++i) {
+        expect_completion(p.ra, i, VSR_IO_OK);
+    }
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->links.nodes[0].queue_count == 0);
+    CHECK(pool_refs(p.a) == 1 && pool_refs(p.b) == 1);
+    engine_forget(p.a);
+    engine_forget(p.b);
+    /* A queue of eight: four on the wire, four waiting for an entry; the
+     * ninth makes the oldest waiting one yield. */
+    pair_open(&p, 34, 8, PAGE);
+    world.hold_notifs = true;
+    for (uint64_t i = 1; i <= 8; ++i) {
+        CHECK(send_fresh(p.a, 0, i, 16, 2) == VSR_OK);
+        world_settle();
+    }
+    CHECK(world.held_count == VSR_IO_LINK_SENDS);
+    CHECK(p.a->io->links.nodes[0].queue_count == 8);
+    CHECK(send_fresh(p.a, 0, 9, 16, 2) == VSR_OK);
+    expect_completion(p.ra, 5, VSR_IO_RETRY);
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->links.nodes[0].queue_count == 8);
+    drain_messages(p.rb, 1, 1, 4, 16);
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    for (uint64_t i = 1; i <= 4; ++i) {
+        expect_completion(p.ra, i, VSR_IO_OK);
+    }
+    drain_messages(p.rb, 1, 6, 4, 16);
+    for (uint64_t i = 6; i <= 9; ++i) {
+        expect_completion(p.ra, i, VSR_IO_OK);
+    }
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->links.nodes[0].queue_count == 0);
+    CHECK(p.a->io->stats.messages_retried == 1);
+    CHECK(pool_refs(p.a) == 1 && pool_refs(p.b) == 1);
+    engine_forget(p.a);
+    engine_forget(p.b);
+}
+
+/* Link loss with messages queued, awaiting NOTIF and in flight: every op
+ * completes exactly once with RETRY, the link frees once its NOTIFs are
+ * in and the pool's references return to the send slabs. */
+static void test_send_loss(void)
+{
+    struct pair p;
+    const struct vsr_io_link *out;
+    uint64_t op = 0;
+    int32_t status = 0;
+    bool done[16];
+
+    pair_open(&p, 26, 8, PAGE);
+    out = carrier_of(p.a, 2);
+    world.hold_notifs = true;
+    /* Four sends awaiting their NOTIF (messages 1-4), 5 and 6 behind. */
+    for (uint64_t i = 1; i <= 6; ++i) {
+        CHECK(send_fresh(p.a, 0, i, 16, 2) == VSR_OK);
+        world_settle();
+    }
+    CHECK(world.held_count == VSR_IO_LINK_SENDS);
+    CHECK(p.a->io->links.nodes[0].queue_count == 6);
+    /* The network resets the connection: the receive fails, the link
+     * closes, the waiting messages complete RETRY at once and those on
+     * the wire when their NOTIFs release them; none OK. */
+    link_reset(p.a, out);
+    world_settle();
+    CHECK(out->state == VSR_IO_LINK_CLOSING); /* NOTIFs still out. */
+    CHECK(p.a->io->links.nodes[0].queue_count == 4);
+    expect_completion(p.ra, 6, VSR_IO_RETRY);
+    expect_completion(p.ra, 5, VSR_IO_RETRY);
+    CHECK(p.ra->completions_count == 0);
+    CHECK(node_state(p.a, 2) == VSR_IO_NODE_UNLINKED); /* No SEND: no dial. */
+    world.hold_notifs = false;
+    world_release_notif(2);
+    world_settle();
+    CHECK(p.ra->completions_count == 0); /* Send 0 still reads them. */
+    world_release_notifs();
+    world_settle();
+    CHECK(out->state == VSR_IO_LINK_FREE);
+    CHECK(p.a->io->links.nodes[0].queue_count == 0);
+    memset(done, 0, sizeof(done));
+    while (take_completion(p.ra, &op, &status)) {
+        CHECK(op >= 1 && op <= 4 && !done[op] && status == VSR_IO_RETRY);
+        done[op] = true;
+    }
+    for (uint64_t i = 1; i <= 4; ++i) {
+        CHECK(done[i]);
+    }
+    CHECK(p.a->io->stats.messages_retried == 6);
+    CHECK(p.a->io->stats.messages_sent == 0);
+    check_quiet(p.a);
+    CHECK(pool_refs(p.a) == 0);
+    /* b got the four that were on the wire, on a link since reset. */
+    check_quiet(p.b);
+    for (uint64_t i = 1; i <= 4; ++i) {
+        vsr_io_lease_release(p.rb, take_message(p.rb, 1, i, 16));
+    }
+    CHECK(p.rb->messages_count == 0 && pool_refs(p.b) == 0);
+    /* A SEND redials at once; the send then fails on a socket reset
+     * meanwhile (-EPIPE, with the NOTIF a failed zero-copy send still
+     * gets): the op completes RETRY once and the link frees. */
+    CHECK(send_fresh(p.a, 0, 7, 16, 2) == VSR_OK);
+    world_settle();
+    out = carrier_of(p.a, 2);
+    drain_messages(p.rb, 1, 7, 1, 16);
+    expect_completion(p.ra, 7, VSR_IO_OK);
+    link_reset(p.a, out);
+    CHECK(send_fresh(p.a, 0, 8, 16, 2) == VSR_OK);
+    engine_step(p.a); /* The send goes out and fails. */
+    world_settle();
+    expect_completion(p.ra, 8, VSR_IO_RETRY);
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->links.nodes[0].last_error == -EPIPE ||
+          p.a->io->links.nodes[0].last_error == -ECONNRESET);
+    check_quiet(p.a);
+    CHECK(pool_refs(p.a) == 0);
+    world_settle();
+    check_quiet(p.b);
+    /* The peer's process ends while a message is queued behind a send:
+     * end of stream closes the link and the message completes RETRY. */
+    CHECK(send_fresh(p.a, 0, 9, 16, 2) == VSR_OK);
+    world_settle();
+    drain_messages(p.rb, 1, 9, 1, 16);
+    expect_completion(p.ra, 9, VSR_IO_OK);
+    world.hold_notifs = true;
+    CHECK(send_fresh(p.a, 0, 10, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(send_fresh(p.a, 0, 11, 16, 2) == VSR_OK);
+    engine_forget(p.b);
+    world_settle();
+    /* 11 went out too, into a failing send: both await their NOTIFs. */
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->links.nodes[0].queue_count == 2);
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    memset(done, 0, sizeof(done));
+    while (take_completion(p.ra, &op, &status)) {
+        CHECK(op >= 10 && op <= 11 && !done[op] && status == VSR_IO_RETRY);
+        done[op] = true;
+    }
+    CHECK(done[10] && done[11]);
+    check_quiet(p.a);
+    CHECK(pool_refs(p.a) == 0);
+    CHECK(p.a->io->stats.messages_retried == 9);
+    CHECK(p.a->io->stats.messages_sent == 2);
+    engine_forget(p.a);
+}
+
+/* A carrier change with a queue: the messages the old carrier had put on
+ * its stream complete RETRY, the rest go out on the new carrier; a
+ * demoted link with a frame half sent is closed. */
+static void test_send_switch(void)
+{
+    struct engine *a;
+    struct engine *b;
+    struct vsr_io_replica *ra;
+    struct vsr_io_replica *rb;
+    const struct vsr_io_link *in;
+    const struct vsr_io_link *out;
+    int fd;
+
+    world_reset(27);
+    world.link_queue = 8;
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    ra = open_replica(a, 0, cluster);
+    rb = open_replica(b, 0, cluster);
+    /* b dials: at a the inbound link carries for want of a better one. */
+    CHECK(vsr_io_links_authorize(b->io, cluster, 1, 1) == VSR_OK);
+    world_settle();
+    CHECK(vsr_io_links_authorize(a->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
+    CHECK(vsr_io_links_authorize(b->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    in = link_to(a, 2, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED);
+    CHECK(in != NULL && carrier_of(a, 2) == in);
+    CHECK(links_in_state(a, VSR_IO_LINK_ESTABLISHED) == 1);
+    /* Four messages on the wire with NOTIFs held, two queued behind. */
+    world.hold_notifs = true;
+    for (uint64_t i = 1; i <= 6; ++i) {
+        CHECK(send_fresh(a, 0, i, 16, 2) == VSR_OK);
+        world_settle();
+    }
+    CHECK(world.held_count == VSR_IO_LINK_SENDS);
+    CHECK(a->io->links.nodes[0].queue_count == 6);
+    /* a adopts an outbound socket to b with the TRUSTED handshake: the
+     * preferred direction wins the election at both ends. */
+    fd = engine_connect(a, &b->listen);
+    CHECK(vsr_io_links_adopt(a->io, fd, 2,
+                             VSR_IO_ADOPT_HANDSHAKE | VSR_IO_ADOPT_OUTBOUND) ==
+          VSR_OK);
+    world_settle();
+    out = link_to(a, 2, VSR_IO_OUTBOUND, VSR_IO_LINK_ESTABLISHED);
+    CHECK(out != NULL && carrier_of(a, 2) == out);
+    CHECK(in->state == VSR_IO_LINK_ESTABLISHED); /* Whole frames: stays. */
+    CHECK(carrier_of(b, 1) ==
+          link_to(b, 1, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED));
+    /* 1-4 retire until the old link's NOTIFs; 5 and 6 went out on the new
+     * carrier and await theirs; the old link's fourth NOTIF alone frees
+     * nothing, its first releases 1 and 2. */
+    CHECK(ra->completions_count == 0);
+    CHECK(a->io->links.nodes[0].queue_count == 6);
+    CHECK(world.held_count >= VSR_IO_LINK_SENDS + 1); /* Plus HELLOs. */
+    world_release_notif(3);
+    world_settle();
+    CHECK(ra->completions_count == 0);
+    world_release_notif(0);
+    world_settle();
+    expect_completion(ra, 1, VSR_IO_RETRY); /* 2's send is still live. */
+    CHECK(ra->completions_count == 0);
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    for (uint64_t i = 2; i <= 4; ++i) {
+        expect_completion(ra, i, VSR_IO_RETRY);
+    }
+    expect_completion(ra, 5, VSR_IO_OK);
+    expect_completion(ra, 6, VSR_IO_OK);
+    CHECK(a->io->stats.messages_retried == 4 &&
+          a->io->stats.messages_sent == 2);
+    drain_messages(rb, 1, 1, 6, 16);
+    /* Both links idle away: the demoted one, and the carrier of a node
+     * with nothing queued. */
+    world_advance(IDLE_NS);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_ESTABLISHED) == 0);
+    CHECK(in->state == VSR_IO_LINK_FREE && out->state == VSR_IO_LINK_FREE);
+    CHECK(node_state(a, 2) == VSR_IO_NODE_UNLINKED);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    engine_forget(a);
+    engine_forget(b);
+    /* Again, with a message half sent when the carrier is demoted: a
+     * 100-byte budget cuts a 464-byte frame into sends, four go out
+     * (NOTIFs held) and the fifth waits for an entry. */
+    world_reset(37);
+    world.link_queue = 8;
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    ra = open_replica(a, 0, cluster);
+    rb = open_replica(b, 0, cluster);
+    CHECK(vsr_io_links_authorize(b->io, cluster, 1, 1) == VSR_OK);
+    world_settle();
+    CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
+    CHECK(vsr_io_links_authorize(b->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    in = link_to(a, 2, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED);
+    CHECK(in != NULL && carrier_of(a, 2) == in);
+    a->io->options.send_coalesce_bytes = 100;
+    world.hold_notifs = true;
+    {
+        /* The payload in a pool slab: every partial send is zero-copy,
+         * so every entry ends up awaiting a NOTIF. */
+        struct sample *s = sample_fresh(a, 1, 300);
+        uint32_t slab = vsr_io_pool_acquire(&a->io->pool, false);
+
+        CHECK(slab != NONE);
+        memcpy(vsr_io_pool_slab(&a->io->pool, slab), s->payload, 300);
+        s->span.data = vsr_io_pool_slab(&a->io->pool, slab);
+        CHECK(send_sample(a, 0, s, 2) == VSR_OK);
+        vsr_io_pool_release(&a->io->pool, slab); /* The send's now. */
+    }
+    CHECK(send_fresh(a, 0, 2, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(world.held_count == VSR_IO_LINK_SENDS && in->encoding != NONE);
+    CHECK(in->sent_offset == HELLO_BYTES + 400); /* No preamble inbound. */
+    fd = engine_connect(a, &b->listen);
+    CHECK(vsr_io_links_adopt(a->io, fd, 2,
+                             VSR_IO_ADOPT_HANDSHAKE | VSR_IO_ADOPT_OUTBOUND) ==
+          VSR_OK);
+    world_settle();
+    out = link_to(a, 2, VSR_IO_OUTBOUND, VSR_IO_LINK_ESTABLISHED);
+    CHECK(out != NULL && carrier_of(a, 2) == out);
+    CHECK(in->state == VSR_IO_LINK_CLOSING && in->error == -ECANCELED);
+    CHECK(ra->completions_count == 0 && a->io->links.nodes[0].queue_count == 2);
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    CHECK(in->state == VSR_IO_LINK_FREE);
+    expect_completion(ra, 1, VSR_IO_RETRY);
+    expect_completion(ra, 2, VSR_IO_OK);
+    drain_messages(rb, 1, 2, 1, 16);
+    /* b dropped the cut frame with the link it came on. */
+    CHECK(b->io->stats.frames_rejected == 0);
+    CHECK(links_in_state(b, VSR_IO_LINK_ESTABLISHED) == 1);
+    CHECK(pool_refs(a) == 1 && pool_refs(b) == 1);
+    engine_forget(a);
+    engine_forget(b);
+}
+
+/* A zero-copy send refused at translation completes once without MORE:
+ * the link closes with the error, its slot frees, the op completes RETRY
+ * and the next SEND relinks. */
+static void test_send_reject(void)
+{
+    struct pair p;
+
+    pair_open(&p, 28, 4, PAGE);
+    world.reject_send = 1;
+    CHECK(send_fresh(p.a, 0, 1, 16, 2) == VSR_OK);
+    world_settle();
+    expect_completion(p.ra, 1, VSR_IO_RETRY);
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->stats.messages_retried == 1);
+    CHECK(p.a->io->links.nodes[0].last_error == -EINVAL);
+    CHECK(world.reject_send == 0);
+    check_quiet(p.a);
+    check_quiet(p.b);
+    CHECK(pool_refs(p.a) == 0 && pool_refs(p.b) == 0);
+    CHECK(send_fresh(p.a, 0, 2, 16, 2) == VSR_OK);
+    world_settle();
+    drain_messages(p.rb, 1, 2, 1, 16);
+    expect_completion(p.ra, 2, VSR_IO_OK);
+    CHECK(pool_refs(p.a) == 1 && pool_refs(p.b) == 1);
+    engine_forget(p.a);
+    engine_forget(p.b);
+}
+
+/* Stream links: dialed for a stream, raw frames queued under the flag
+ * rule, EBUSY when the send side is full, the idle exemption of a bound
+ * link, an orderly close, a failed dial and refusals. */
+static void test_stream(void)
+{
+    static unsigned char bytes[PAGE];
+    static unsigned char hello[12] = "hello world!";
+    struct engine *a;
+    struct engine *b;
+    const struct vsr_io_link *link;
+    const struct vsr_io_link *in;
+    const struct record_log *record;
+    struct vsr_io_vec vecs[VSR_IO_SEND_VECTORS];
+    unsigned char header[16];
+    uint64_t end = 0;
+    uint64_t before;
+    uint32_t index = 0;
+    uint32_t slab;
+    uint32_t crc;
+    uint32_t peer;
+
+    world_reset(29);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    world_settle();
+    for (uint32_t i = 0; i < PAGE; ++i) {
+        bytes[i] = (unsigned char)(i * 7 + 3);
+    }
+    /* Refusals: an unknown, a caller-dialed and the own node. */
+    CHECK(vsr_io_links_open_stream(a->io, 7, 0, &index) == VSR_EINVAL);
+    CHECK(index == NONE);
+    CHECK(vsr_io_links_node_set(a->io, 3, NULL) == VSR_OK);
+    CHECK(vsr_io_links_open_stream(a->io, 3, 0, &index) == VSR_EINVAL);
+    CHECK(vsr_io_links_open_stream(a->io, 1, 0, &index) == VSR_EINVAL);
+    CHECK(vsr_io_links_open_stream(a->io, 2, 0, NULL) == VSR_EINVAL);
+    /* The dial: a STREAM link at both ends, no carrier, the node LINKED,
+     * and a peer link still dialed when wanted. */
+    CHECK(vsr_io_links_open_stream(a->io, 2, 0, &index) == VSR_OK);
+    CHECK(index != NONE);
+    link = &a->io->links.links[index];
+    CHECK(link->state == VSR_IO_LINK_CONNECTING);
+    CHECK(link->purpose == VSR_IO_PURPOSE_STREAM && link->stream == 0);
+    world_settle();
+    CHECK(link->state == VSR_IO_LINK_ESTABLISHED);
+    CHECK(a->io->links.nodes[0].carrier == NONE);
+    in = link_to(b, 1, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED);
+    CHECK(in != NULL && in->purpose == VSR_IO_PURPOSE_STREAM);
+    CHECK(in->stream == NONE && b->io->links.nodes[0].carrier == NONE);
+    CHECK(node_state(a, 2) == VSR_IO_NODE_LINKED);
+    CHECK(node_state(b, 1) == VSR_IO_NODE_LINKED);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    CHECK(carrier_of(a, 2)->purpose == VSR_IO_PURPOSE_PEER);
+    CHECK(links_in_state(a, VSR_IO_LINK_ESTABLISHED) == 2);
+    /* A request with a 12-byte payload from test memory: header run,
+     * payload and pad, a plain vectored send; the stream module (a stub
+     * here) consumes it at b, nothing rejected. */
+    vsr_io_codec_put_stream_request(header, 12);
+    vecs[0].base = hello;
+    vecs[0].length = 12;
+    crc = vsr_io_crc32c(vsr_io_crc32c(0, header, 8), hello, 12);
+    log_clear(a);
+    before = b->io->stats.bytes_received;
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, vecs, 1, crc, &end) == VSR_OK);
+    CHECK(end == link->stream_offset);
+    CHECK(end == VSR_IO_PREAMBLE_BYTES + HELLO_BYTES + 24 + 8 + 16);
+    world_settle();
+    record = log_last(a, VSR_IO_SQE_SEND);
+    CHECK(record->op_flags == VSR_IO_SEND_VECTORED && record->length == 3);
+    CHECK(b->io->stats.bytes_received == before + 48);
+    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    CHECK(link->notified_offset == end);
+    CHECK(b->io->links.nodes[0].last_received_ns == world.now);
+    /* A chunk from a pool slab: fixed, header run and payload. */
+    slab = vsr_io_pool_acquire(&a->io->pool, false);
+    CHECK(slab != NONE);
+    memcpy(vsr_io_pool_slab(&a->io->pool, slab), bytes, 1000);
+    vsr_io_codec_put_stream_chunk(header, 0, 1000);
+    vecs[0].base = vsr_io_pool_slab(&a->io->pool, slab);
+    vecs[0].length = 1000;
+    crc = vsr_io_crc32c(vsr_io_crc32c(0, header, 16), bytes, 1000);
+    log_clear(a);
+    before = b->io->stats.bytes_received;
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_CHUNK,
+                                  header, 16, vecs, 1, crc, &end) == VSR_OK);
+    world_settle();
+    record = log_last(a, VSR_IO_SQE_SEND);
+    CHECK(record->op_flags == (VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED));
+    CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) != 0 &&
+          record->length == 2);
+    CHECK(b->io->stats.bytes_received == before + 24 + 16 + 1000);
+    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    CHECK(link->notified_offset == end);
+    vsr_io_pool_release(&a->io->pool, slab);
+    /* END: the header alone, one ring run. */
+    vsr_io_codec_put_stream_end(header, 1012, VSR_IO_OK);
+    crc = vsr_io_crc32c(0, header, 16);
+    log_clear(a);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_END, header,
+                                  16, NULL, 0, crc, &end) == VSR_OK);
+    world_settle();
+    record = log_last(a, VSR_IO_SQE_SEND);
+    CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) != 0 &&
+          record->length == 1);
+    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    /* EBUSY while a send is in flight; queued again once its result is
+     * in, and coalesced with what follows. */
+    vsr_io_codec_put_stream_request(header, 0);
+    crc = vsr_io_crc32c(0, header, 8);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, NULL, 0, crc, &end) == VSR_OK);
+    engine_step(a);
+    CHECK(link->inflight == 1);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, NULL, 0, crc, &end) == VSR_EBUSY);
+    engine_step(a);
+    CHECK(link->inflight == 0);
+    log_clear(a);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, NULL, 0, crc, &end) == VSR_OK);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, NULL, 0, crc, &end) == VSR_OK);
+    world_settle();
+    CHECK(log_count(a, VSR_IO_SQE_SEND) == 1);
+    CHECK(log_last(a, VSR_IO_SQE_SEND)->length == 1); /* Contiguous. */
+    CHECK(link->notified_offset == end && link->vec_count == 0);
+    /* Every entry awaiting its NOTIF. */
+    world.hold_notifs = true;
+    for (uint32_t i = 0; i < VSR_IO_LINK_SENDS; ++i) {
+        CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                      header, 8, NULL, 0, crc, &end) == VSR_OK);
+        engine_step(a);
+        engine_step(a);
+    }
+    CHECK(world.held_count == VSR_IO_LINK_SENDS && link->inflight == 0);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, NULL, 0, crc, &end) == VSR_EBUSY);
+    world_release_notif(0);
+    world_settle();
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, NULL, 0, crc, &end) == VSR_OK);
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    CHECK(link->notified_offset == end && end == link->stream_offset);
+    /* The vectors: 100 one-byte payload runs (every other byte, so that
+     * none merges with its neighbour) take 102 (header, runs, pad); 30
+     * more would overflow the array until that send is out. */
+    for (uint32_t i = 0; i < 100; ++i) {
+        vecs[i].base = bytes + (size_t)2 * i;
+        vecs[i].length = 1;
+    }
+    vsr_io_codec_put_stream_chunk(header, 0, 100);
+    crc = vsr_io_crc32c(0, header, 16);
+    for (uint32_t i = 0; i < 100; ++i) {
+        crc = vsr_io_crc32c(crc, vecs[i].base, 1);
+    }
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_CHUNK,
+                                  header, 16, vecs, 100, crc, &end) == VSR_OK);
+    CHECK(link->vec_count == 102);
+    vsr_io_codec_put_stream_chunk(header, 100, 30);
+    crc = vsr_io_crc32c(0, header, 16);
+    for (uint32_t i = 0; i < 30; ++i) {
+        crc = vsr_io_crc32c(crc, vecs[i].base, 1);
+    }
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_CHUNK,
+                                  header, 16, vecs, 30, crc,
+                                  &end) == VSR_EBUSY);
+    world_settle();
+    log_clear(a);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_CHUNK,
+                                  header, 16, vecs, 30, crc, &end) == VSR_OK);
+    world_settle();
+    CHECK(log_last(a, VSR_IO_SQE_SEND)->length == 32);
+    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    /* The coalesce budget: the third 48-byte frame waits for the send. */
+    a->io->options.send_coalesce_bytes = 100;
+    vsr_io_codec_put_stream_request(header, 12);
+    vecs[0].base = hello;
+    vecs[0].length = 12;
+    crc = vsr_io_crc32c(vsr_io_crc32c(0, header, 8), hello, 12);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, vecs, 1, crc, &end) == VSR_OK);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, vecs, 1, crc, &end) == VSR_OK);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, vecs, 1, crc, &end) == VSR_EBUSY);
+    world_settle();
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
+                                  header, 8, vecs, 1, crc, &end) == VSR_OK);
+    world_settle();
+    a->io->options.send_coalesce_bytes = 65536;
+    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    /* ELIMIT beyond the frame limit; EINVAL for a peer link, a bad kind,
+     * a bad index. */
+    vsr_io_codec_put_stream_chunk(header, 0, PAGE);
+    vecs[0].base = bytes;
+    vecs[0].length = PAGE;
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_CHUNK,
+                                  header, 16, vecs, 1, 0, &end) == VSR_ELIMIT);
+    CHECK(vsr_io_links_send_frame(
+              a->io, (uint32_t)(carrier_of(a, 2) - a->io->links.links),
+              VSR_IO_FRAME_STREAM_END, header, 16, NULL, 0, 0,
+              &end) == VSR_EINVAL);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_MESSAGE, header,
+                                  16, NULL, 0, 0, &end) == VSR_EINVAL);
+    CHECK(vsr_io_links_send_frame(a->io, LINKS, VSR_IO_FRAME_STREAM_END, header,
+                                  16, NULL, 0, 0, &end) == VSR_EINVAL);
+    CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_END, header,
+                                  16, NULL, 0, 0, NULL) == VSR_EINVAL);
+    /* Idle: links bound to a stream (b's as the stream module binds it at
+     * the request) live through the idle timeout; the idle peer link
+     * goes. */
+    b->io->links.links[in - b->io->links.links].stream = 1;
+    world_advance(IDLE_NS * 3);
+    world_settle();
+    CHECK(link->state == VSR_IO_LINK_ESTABLISHED);
+    CHECK(in->state == VSR_IO_LINK_ESTABLISHED);
+    CHECK(links_in_state(a, VSR_IO_LINK_ESTABLISHED) == 1);
+    /* The stream module closes its link: orderly at both ends. */
+    vsr_io_links_close(a->io, index, 0);
+    world_settle();
+    CHECK(link->state == VSR_IO_LINK_FREE && in->state == VSR_IO_LINK_FREE);
+    check_quiet(a);
+    check_quiet(b);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    /* A stream dial that fails (nobody listens) schedules nothing for
+     * the node; the stream module hears link_lost (a stub here). */
+    engine_forget(b);
+    CHECK(vsr_io_links_open_stream(a->io, 2, 0, &index) == VSR_OK);
+    world_settle();
+    CHECK(a->io->links.links[index].state == VSR_IO_LINK_FREE);
+    CHECK(a->io->links.nodes[0].attempts == 0);
+    CHECK(a->io->links.nodes[0].next_dial_ns == VSR_NO_DEADLINE);
+    CHECK(a->io->links.nodes[0].last_error == -ECONNREFUSED);
+    /* ELIMIT once every link entry is taken. */
+    for (uint32_t i = 0; i < LINKS; ++i) {
+        CHECK(vsr_io_links_open_stream(a->io, 2, i, &index) == VSR_OK);
+    }
+    CHECK(vsr_io_links_open_stream(a->io, 2, 0, &index) == VSR_ELIMIT);
+    world_settle();
+    check_quiet(a);
+    /* A stream frame on a peer link closes it. */
+    peer = peer_link(a, 2);
+    before = a->io->stats.frames_rejected;
+    vsr_io_codec_put_stream_end(header, 0, VSR_IO_OK);
+    {
+        unsigned char frame[24 + 16];
+
+        vsr_io_codec_put_frame(frame, VSR_IO_FRAME_STREAM_END, 16,
+                               vsr_io_crc32c(0, header, 16));
+        memcpy(frame + 24, header, 16);
+        peer_write(peer, frame, sizeof(frame));
+    }
+    world_settle();
+    CHECK(a->io->stats.frames_rejected == before + 1);
+    CHECK(peer_eof(peer));
+    check_quiet(a);
+    peer_close(peer);
+    engine_forget(a);
+}
+
+/* -------------------------------------------------------------------------
+ * End-to-end random walk: two engines exchanging messages both ways
+ * ---------------------------------------------------------------------- */
+
+#define SEND_WALK_ROUNDS 300u
+#define SEND_WALK_MAX 2048u /* Numbers per direction. */
+#define SEND_WALK_OUT 100u  /* Outstanding ops per direction (< SAMPLES). */
+#define SEND_WALK_PENDING (-1)
+#define SEND_WALK_REFUSED (-2) /* vsr_io_links_send returned RETRY. */
+
+/* One direction of the walk. Every message sent gets a fresh number; its
+ * op's status is recorded once, and the numbers still to be delivered
+ * form a queue in send order. */
+struct walker {
+    struct engine *sender;
+    struct vsr_io_replica *sender_replica;
+    struct vsr_io_replica *receiver;
+    uint64_t from;   /* The sender's node id and replica id. */
+    uint64_t member; /* The receiver's. */
+    uint64_t next;   /* Next number to send. */
+    uint64_t floor;  /* Numbers below it were sent before the last link
+                        epoch change and may have been lost. */
+    int8_t status[SEND_WALK_MAX];
+    uint32_t size[SEND_WALK_MAX];
+    uint32_t queue[SEND_WALK_MAX]; /* Numbers awaiting delivery. */
+    uint32_t queue_head;
+    uint32_t queue_count;
+    uint32_t outstanding; /* Ops with a pending status. */
+    uint32_t held[REGIONS];
+    uint32_t held_count;
+    uint64_t oks;
+    uint64_t retries;
+    uint64_t refused;
+    uint64_t delivered;
+    uint64_t skipped;
+};
+
+static void walker_init(struct walker *w, struct engine *sender,
+                        struct vsr_io_replica *sender_replica,
+                        struct vsr_io_replica *receiver, uint64_t member)
+{
+    memset(w, 0, sizeof(*w));
+    w->sender = sender;
+    w->sender_replica = sender_replica;
+    w->receiver = receiver;
+    w->from = sender->node;
+    w->member = member;
+    w->next = 1;
+    w->floor = 1;
+}
+
+/* The number of the replica's next queued MESSAGE. */
+static uint64_t peek_number(const struct vsr_io_replica *replica)
+{
+    const struct vsr_io_queued_event *queued =
+        &replica->messages[replica->messages_head];
+    const struct vsr_message *m = queued->event.data;
+
+    CHECK(replica->messages_count > 0 && m != NULL);
+    return m->number;
+}
+
+static void walker_send(struct walker *w, uint32_t size)
+{
+    uint64_t n = w->next++;
+    int rc;
+
+    CHECK(n < SEND_WALK_MAX);
+    rc = send_fresh(w->sender, 0, n, size, w->member);
+    CHECK(rc == VSR_OK || rc == VSR_IO_RETRY);
+    w->size[n] = size;
+    w->queue[(w->queue_head + w->queue_count++) % SEND_WALK_MAX] = (uint32_t)n;
+    if (rc == VSR_OK) {
+        w->status[n] = SEND_WALK_PENDING;
+        w->outstanding++;
+    } else {
+        w->status[n] = SEND_WALK_REFUSED;
+        w->refused++;
+    }
+}
+
+/* Every completion of the sender's replica: once per op, OK or RETRY. */
+static void walker_completions(struct walker *w)
+{
+    uint64_t op = 0;
+    int32_t status = 0;
+
+    while (take_completion(w->sender_replica, &op, &status)) {
+        CHECK(op >= 1 && op < w->next && w->status[op] == SEND_WALK_PENDING);
+        CHECK(status == VSR_IO_OK || status == VSR_IO_RETRY);
+        w->status[op] = (int8_t)status;
+        w->outstanding--;
+        if (status == VSR_IO_OK) {
+            w->oks++;
+        } else {
+            w->retries++;
+        }
+    }
+}
+
+/* Every delivered message: in send order, each number at most once,
+ * byte-identical; a number is skipped only when its op did not complete
+ * OK or it was sent before the last link epoch change. */
+static void walker_deliveries(struct walker *w, struct test_random *random)
+{
+    while (w->receiver->messages_count > 0) {
+        uint64_t n = peek_number(w->receiver);
+        uint32_t lease;
+
+        for (;;) {
+            uint32_t head;
+
+            CHECK(w->queue_count > 0);
+            head = w->queue[w->queue_head % SEND_WALK_MAX];
+            if (head == n) {
+                break;
+            }
+            CHECK(head < n);
+            CHECK(w->status[head] != VSR_IO_OK || head < w->floor);
+            w->queue_head++;
+            w->queue_count--;
+            w->skipped++;
+        }
+        w->queue_head++;
+        w->queue_count--;
+        lease = take_message(w->receiver, w->from, n, w->size[n]);
+        w->delivered++;
+        if (w->held_count < REGIONS - 1 &&
+            test_random_bounded(random, 3) == 0) {
+            w->held[w->held_count++] = lease;
+        } else {
+            vsr_io_lease_release(w->receiver, lease);
+        }
+    }
+}
+
+static void walker_release(struct walker *w, bool all,
+                           struct test_random *random)
+{
+    while (w->held_count > 0 && (all || test_random_bounded(random, 2) == 0)) {
+        vsr_io_lease_release(w->receiver, w->held[--w->held_count]);
+    }
+}
+
+/* The identity of a's carrier to node 2, or 0 when none: a change means a
+ * new link epoch on both sides (the same connection carries both ways). */
+static uint64_t carrier_epoch(const struct engine *e)
+{
+    const struct vsr_io_node *node = &e->io->links.nodes[0];
+
+    if (node->carrier == NONE) {
+        return 0;
+    }
+    return (e->io->links.links[node->carrier].established_ns << 8) +
+           node->carrier + 1;
+}
+
+static uint32_t walk_size(struct test_random *random)
+{
+    switch (test_random_bounded(random, 5)) {
+    case 0:
+        return NONE;
+    case 1:
+        return PAYLOAD_MAX - 8 * test_random_bounded(random, 4);
+    case 2:
+        return test_random_bounded(random, 64);
+    default:
+        return test_random_bounded(random, PAYLOAD_MAX + 1);
+    }
+}
+
+/* No link of the engine holds received bytes it has not carved. */
+static bool links_drained(const struct engine *e)
+{
+    for (uint32_t i = 0; i < LINKS; ++i) {
+        const struct vsr_io_link *link = &e->io->links.links[i];
+
+        if (link->partial_length != 0 || link->held_count != 0 || link->retry) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Slabs the links of an engine hold: one send slab per link that has
+ * one. */
+static uint32_t send_slabs(const struct engine *e)
+{
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < LINKS; ++i) {
+        count += e->io->links.links[i].send_slab != NONE ? 1 : 0;
+    }
+    return count;
+}
+
+static void test_send_random(uint64_t seed)
+{
+    struct pair p;
+    static struct walker ab;
+    static struct walker ba;
+    struct walker *walkers[2] = {&ab, &ba};
+    struct test_random *random;
+    uint64_t epoch;
+    uint64_t resets = 0;
+    uint64_t epochs = 0;
+
+    printf("link: send walk seed %" PRIu64 "\n", seed);
+    pair_open(&p, seed, 16, PAGE);
+    random = &world.random;
+    walker_init(&ab, p.a, p.ra, p.rb, 2);
+    walker_init(&ba, p.b, p.rb, p.ra, 1);
+    epoch = carrier_epoch(p.a);
+    for (uint32_t round = 0; round < SEND_WALK_ROUNDS; ++round) {
+        for (uint32_t d = 0; d < 2; ++d) {
+            struct walker *w = walkers[d];
+            uint32_t k = test_random_bounded(random, 5);
+            /* Mostly within the queue's room, sometimes past it. */
+            uint32_t room = 16 - w->sender->io->links.nodes[0].queue_count;
+
+            if (k > room + 1) {
+                k = room + 1;
+            }
+            for (uint32_t i = 0; i < k && w->outstanding < SEND_WALK_OUT; ++i) {
+                walker_send(w, walk_size(random));
+            }
+        }
+        if (test_random_bounded(random, 3) == 0) {
+            world.short_send = test_random_bounded(random, 2) == 0
+                                   ? 0
+                                   : 1 + test_random_bounded(random, 600);
+        }
+        if (test_random_bounded(random, 3) == 0) {
+            world.slice_max = test_random_bounded(random, 2) == 0
+                                  ? 0
+                                  : 1 + test_random_bounded(random, 500);
+        }
+        if (test_random_bounded(random, 4) == 0) {
+            world.hold_notifs = !world.hold_notifs;
+        }
+        if (world.held_count > 0 && test_random_bounded(random, 2) == 0) {
+            world_release_notif(test_random_bounded(random, world.held_count));
+        }
+        if (test_random_bounded(random, 40) == 0 &&
+            p.a->io->links.nodes[0].carrier != NONE) {
+            const struct vsr_io_link *carrier = carrier_of(p.a, 2);
+
+            if (carrier->fd >= 0) {
+                link_reset(p.a, carrier);
+                resets++;
+            }
+        }
+        if (test_random_bounded(random, 30) == 0) {
+            world_advance(IDLE_NS);
+        } else if (test_random_bounded(random, 10) == 0) {
+            world_advance(4 * BACKOFF_NS);
+        }
+        /* A bounded run: under 1-byte sends a frame takes thousands of
+         * steps, and the next round finds the world mid-way. */
+        (void)world_run(1 + test_random_bounded(random, 40));
+        if (carrier_epoch(p.a) != epoch) {
+            epoch = carrier_epoch(p.a);
+            epochs++;
+            ab.floor = ab.next;
+            ba.floor = ba.next;
+        }
+        for (uint32_t d = 0; d < 2; ++d) {
+            walker_completions(walkers[d]);
+            walker_deliveries(walkers[d], random);
+            walker_release(walkers[d], false, random);
+        }
+    }
+    /* Wind down: every op completes, every message in flight arrives or
+     * is lost with its link, every lease goes back. */
+    world.short_send = 0;
+    world.slice_max = 0;
+    world.hold_notifs = false;
+    world_release_notifs();
+    for (uint32_t attempt = 0;; ++attempt) {
+        CHECK(attempt < 64);
+        world_settle_rounds(5000);
+        if (carrier_epoch(p.a) != epoch) {
+            epoch = carrier_epoch(p.a);
+            epochs++;
+            ab.floor = ab.next;
+            ba.floor = ba.next;
+        }
+        for (uint32_t d = 0; d < 2; ++d) {
+            walker_completions(walkers[d]);
+            walker_deliveries(walkers[d], random);
+            walker_release(walkers[d], true, random);
+        }
+        if (ab.outstanding == 0 && ba.outstanding == 0 &&
+            p.ra->messages_count == 0 && p.rb->messages_count == 0 &&
+            world.held_count == 0 && links_drained(p.a) && links_drained(p.b)) {
+            break;
+        }
+        world_advance(16 * BACKOFF_NS);
+    }
+    for (uint32_t d = 0; d < 2; ++d) {
+        const struct walker *w = walkers[d];
+
+        for (uint64_t n = 1; n < w->next; ++n) {
+            CHECK(w->status[n] != SEND_WALK_PENDING);
+        }
+        CHECK(w->sender->io->links.nodes[0].queue_count == 0);
+        CHECK(w->held_count == 0);
+    }
+    CHECK(ab.oks + ab.retries == p.a->io->stats.messages_sent +
+                                     p.a->io->stats.messages_retried -
+                                     ab.refused);
+    CHECK(p.a->io->stats.messages_sent == ab.oks);
+    CHECK(p.b->io->stats.messages_sent == ba.oks);
+    CHECK(pool_refs(p.a) == send_slabs(p.a));
+    CHECK(pool_refs(p.b) == send_slabs(p.b));
+    printf("link: send walk a->b %" PRIu64 " ok %" PRIu64 " retry %" PRIu64
+           " refused %" PRIu64 " delivered %" PRIu64 " skipped, b->a %" PRIu64
+           " ok %" PRIu64 " retry %" PRIu64 " refused %" PRIu64
+           " delivered %" PRIu64 " skipped, %" PRIu64 " resets, %" PRIu64
+           " epochs\n",
+           ab.oks, ab.retries, ab.refused, ab.delivered, ab.skipped, ba.oks,
+           ba.retries, ba.refused, ba.delivered, ba.skipped, resets, epochs);
+    engine_forget(p.a);
+    engine_forget(p.b);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 0x5EED2u;
@@ -3382,6 +4845,15 @@ int main(int argc, char **argv)
     test_receive_fill();
     test_receive_pressure();
     test_receive_random(seed);
+    test_send_flags();
+    test_send_coalesce();
+    test_send_short();
+    test_send_pressure();
+    test_send_loss();
+    test_send_switch();
+    test_send_reject();
+    test_stream();
+    test_send_random(seed);
     printf("link: ok\n");
     return 0;
 }

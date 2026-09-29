@@ -140,7 +140,7 @@ void vsr_io_streams_init(struct vsr_io_streams *streams, void *memory,
  * link event is ignored.
  */
 
-void vsr_io_streams_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
+bool vsr_io_streams_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
                           const struct vsr_io_cursor *body, uint32_t slab)
 {
     (void)io;
@@ -148,6 +148,7 @@ void vsr_io_streams_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
     (void)kind;
     (void)body;
     (void)slab;
+    return true;
 }
 
 void vsr_io_streams_link_up(struct vsr_io *io, uint32_t stream)
