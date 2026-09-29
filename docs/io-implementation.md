@@ -1269,7 +1269,7 @@ with node 0 talking to node 1.
 | --- | --- | --- | --- |
 | `cursor`, `codec`, `pool`, `slots`, `deadline`, `link`, `stream`, `store`, `snapshot`, `sim_world`, `client`, `uring_translate` | unit | `UNIT_TESTS`, each `tests_unit_NAME_SOURCES = tests/unit/NAME.c`, `_LDADD = $(LIBVSR)` | Section 3 |
 | `frame`, `recovery` | fuzzy (libFuzzer) | `if FUZZING` programs and the `fuzz` target, with corpora under `tests/fuzzy/corpus/frame` and `corpus/recovery` | Decoder and recovery never crash; recovered prefixes satisfy the invariants |
-| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise) | Section 8 |
+| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise), then over both again through the fault-injecting wrapper | Section 8 |
 | `engine` | integration | `INTEGRATION_TESTS` | Over the sim: attach NEW, RECOVER, JOIN; empty-store checks; a three-replica group commits, replies, checkpoints, fetches, restarts; STATUS emission; close and detach sequencing; max_clients admission at the primary |
 | `streams`, `snapshots` | integration | `INTEGRATION_TESTS` | Section 3 |
 | `iocluster`, `iocluster_extended` | fuzzy (seeded) | `FUZZY_TESTS`; `SEED COUNT STEPS [trace\|quiet] [PROFILE] [SEEDS]` as `tests/fuzzy/cluster`; the extended program sets a wider default profile | Below |
@@ -1303,7 +1303,14 @@ wraps any `vsr_io_executor`: it forwards records to the inner executor
 and, from a seeded generator, rewrites results (`-EIO`, short counts),
 delays completions by holding them for a number of reaps, and cancels
 receives; it never alters bytes, so it is safe over real files and
-sockets.
+sockets. It keeps every completion order a caller relies on (per
+`user_data`, per provided buffer, per LINK chain), shortens file results
+only in whole units of the request's alignment so the rest of an
+`O_DIRECT` transfer stays aligned, and with every rate zero is
+transparent but for the one `user_data` it reserves:
+`executor_conformance` runs every scenario through it at rate zero over
+both executors, and one more scenario at nonzero rates. Its header states
+what callers may assume of the faults it injects.
 
 `make check` grows by the programs above; `make check-unit`,
 `check-integration` and `check-fuzzy` select layers as before; `make fuzz`
