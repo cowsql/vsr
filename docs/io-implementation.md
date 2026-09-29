@@ -388,7 +388,8 @@ option is simply left as it is; a dialed AF_UNIX peer skips it.
 
 Receive path per link: one multishot RECV with `BUFFER_SELECT` on the
 pool's group, re-armed after `-ENOBUFS` once slabs are provided and after
-any termination while the link is open. Each RECV CQE with `BUFFER` gives
+any termination while the link is open, except while a stream link is
+paused (step 4). Each RECV CQE with `BUFFER` gives
 `(slab, offset, bytes)` through `vsr_io_pool_recv_begin`; the link then
 carves frames:
 
@@ -430,7 +431,23 @@ carves frames:
    the link staying up; a MESSAGE before the handshake or on a stream
    link closes the link with `-EPROTO`. A replica without a free region
    leaves the bytes in place with `retry` set; the next poll delivers
-   them. Every accepted frame updates the node's `last_received_ns`.
+   them. Every accepted frame updates the node's `last_received_ns`. A
+   stream frame the stream module cannot take yet (`false`: the
+   requester's window, or the forwarded ring, is full) stays in place
+   with `retry` set the same way, and the link PAUSES (decision B1,
+   `recv_paused`): the next prepare cancels its multishot RECV (a CANCEL
+   on the shutdown slot, one completion whose result is ignored, since
+   `-ENOENT` or `-EALREADY` mean the receive terminated on its own;
+   `recv_cancelled` tells its `-ECANCELED` termination from a loss), no
+   receive is re-armed while the link is paused or that CANCEL is out,
+   and the pause lifts when a poll's retry carves every byte the link
+   holds (the stream module freed a window unit through
+   `vsr_io_streams_data_done`, or the ring drained), at which point the
+   next prepare re-arms the receive. The socket buffer then fills and the
+   TCP window throttles the source; what the kernel delivered before the
+   cancel took effect joins the held runs, whose bound (step 3) must
+   absorb that burst (section 11). A paused link learns of a reset or an
+   EOF only when it receives again; peer links never pause.
 5. The slab reference taken at `recv_begin` is released once every byte of
    its run has been decoded (each MESSAGE lease took its own reference)
    or discarded; closing a link releases the partial, the held runs and
@@ -506,7 +523,10 @@ unit holding one slab reference, `vsr_io_pool_retain`) forwarded in
 order, released by the caller's completion (`vsr_io_streams_data_done`);
 a zero-length chunk is consumed without an op. When `stream_window` units
 are outstanding, or the forwarded ring is full, the frame is left in the
-link (`vsr_io_streams_frame` returns false) and retried at every poll. A
+link (`vsr_io_streams_frame` returns false) and retried at every poll,
+and the link pauses its receive meanwhile (decision B1), so a requester
+whose caller is behind throttles the source through the socket buffer and
+the TCP window rather than through the link's held runs. A
 unit completed out of order frees its slot only once the older ones are
 in (the ring's head moves over freed units). `STREAM_END` arrives as a
 frame (a byte count other than the bytes delivered: FAILED), or is
@@ -609,12 +629,18 @@ chunks, WRITTEN, END and cookie reuse, the window on both sides, FILE
 transfers of 0, 1, exact-window and many chunks with short and random
 reads, EOF and read errors, mixed FILE and BUFFERS writes, link loss on
 either side at every stage, refusal, protocol errors, library streams
-served and requested, timeouts and shutdown, and a seeded random walk
-(`tests/unit/stream SEED`, prints its seed) of transfers with random
-writes, span slicing, receive slicing, held DATA ops and NOTIFs, clock
-jumps and resets, checking every byte arrives exactly once in order, a
-WRITTEN for every queued write, and every slab reference, slot and link
-released after each transfer. `tests/integration/streams` over the
+served and requested, timeouts and shutdown, backpressure (a requester
+whose caller drips one completion at a time over many chunks with a
+socket buffer of four slabs, alternating and in one burst with a window
+of one, completes byte-identical with the source parked; the harness's
+socket buffer parks a send when full, as the kernel does, and fails it at
+a shutdown or reset), and a seeded random walk (`tests/unit/stream SEED`,
+prints its seed) of transfers with random writes, span slicing, receive
+slicing, held DATA ops and NOTIFs, clock jumps and resets, checking every
+byte arrives exactly once in order, a WRITTEN for every queued write,
+every slab reference, slot and link released after each transfer, that no
+link is ever closed `-ENOBUFS`, and that a transfer ends RETRY only after
+a refusal, a reset or a clock jump, never for slowness alone. `tests/integration/streams` over the
 simulation (two engines, BUFFERS and FILE transfers with split and
 corrupt faults, a stream never delays a heartbeat on the peer link) is
 still to come.
@@ -1456,8 +1482,10 @@ returns immediately and prepares again):
    ACCEPT, one chain per listen address, LINKed with SKIP_SUCCESS on all
    but the ACCEPT; decision 72), orphan closes, then per link: the dial's
    SOCKET or CONNECT, the EXTERNAL preamble receive, the control bytes
-   (preamble, HELLO) and coalesced sends, receive arming and re-arming,
-   the teardown (SHUTDOWN, CANCEL of the receive, CLOSE of the slot, or a
+   (preamble, HELLO) and coalesced sends, receive arming and re-arming
+   (not while a stream link is paused: then the CANCEL of its receive on
+   the shutdown slot, decision B1), the teardown (SHUTDOWN, CANCEL of the
+   receive, CLOSE of the slot, or a
    plain CLOSE of a raw descriptor, preceded by a CANCEL of a CONNECT or
    preamble RECV still in flight on it).
 3. `vsr_io_streams_prepare`: file chunk reads (slot kind STREAM, one
@@ -1695,6 +1723,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | Bulk streams: the engine emits no RELEASE for a STREAM_OPEN or STREAM_WRITE lease (STREAM_END and STREAM_WRITTEN end them; a WRITTEN follows every queued write, also on an early end); `vsr_io_submit` refuses a STREAM_WRITE with `AGAIN` while `stream_window` writes are queued | 94, 95 |
 | `stream.h` (internal) | Units are chunks (`vsr_io_stream_unit` states READING, READY, SENT, DATA), the write queue (`vsr_io_stream_queued_write`, `writes` rings), handles and op ids (`VSR_IO_STREAM_OP_*`, `vsr_io_streams_op_kind`, `vsr_io_streams_handle`), `generation`, `ended`, `aborted`, `link_gone`, `end_*`, `send_end`, `closing`; `vsr_io_streams_deadline`; `vsr_io_streams_size` is ELIMIT beyond 65535 streams or window | 93, 95, 96, 97 |
 | `snapshot.h` (internal) | `vsr_io_snapshots_serve` returns OK to serve or the END status; `vsr_io_snapshots_stream_data` takes the DATA op id; `stream_end` is told for both sides of a library stream; weak stubs in stream.c until snapshot.c | 98 |
+| `link.h` (internal) | `vsr_io_link.recv_paused` and `recv_cancelled`; the shutdown slot also carries a paused receive's CANCEL (the teardown waits for it); a stream link whose frame waits is not closed for its held runs but paused, and its receive's `-ECANCELED` is not a loss | B1 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1715,14 +1744,17 @@ of `docs/io-design.md`:
   another segment, which recovery reports as `CORRUPT` although nothing
   acknowledged was lost. Converting FREEING to FREE at the flush that
   covers the superblock write (or flushing after it) would close it.
-- Stream backpressure meets the link's held-run bound: a requester whose
-  caller falls behind leaves its chunk frames in the link, and the link
-  closes with `-ENOBUFS` once more than `VSR_IO_LINK_HELD` (8) receive
-  runs are held, which with slabs of one page is about 32 KiB of
-  unconsumed chunks and happens well before the pool starves (the layout's
-  minimum pool exceeds the bound); the stream then ends with RETRY at the
-  requester while the source may have reported OK. "Backpressure through
-  the pool" (the Streams section) therefore needs the link to pause the
-  receive of a link whose stream frame is blocked (cancel and re-arm), or
-  a larger bound for stream links; `tests/unit/stream`'s random walk
-  tolerates the RETRY.
+- A paused stream link (decision B1) still holds what the kernel
+  delivered between the frame that blocked and the CANCEL taking effect,
+  within the `VSR_IO_LINK_HELD` (8) runs of decision 76: with page slabs a
+  burst above about 32 KiB reaped at once (a socket buffer holding more,
+  a multishot receive delivering up to its per-wake limit) closes the
+  link `-ENOBUFS` as before, and the transfer ends RETRY. Larger slabs
+  raise the bound in bytes; giving stream links a held capacity of the
+  pool's worth of runs (memory per link) would make the pool the only
+  bound. The unit harness bounds the burst with its socket buffer
+  (`world.inbox_limit`); a burst past the bound is not modelled as a
+  passing test.
+- A source throttled by a paused requester makes no send progress and is
+  bounded by the inactivity timer like a dead one; a requester slower
+  than `handshake_timeout_ns` per window ends RETRY at the source.

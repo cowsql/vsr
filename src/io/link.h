@@ -76,7 +76,14 @@
  * delivering, which is the intended backpressure; a reassembly that finds
  * no free slab waits with its runs held and retries at poll, and a link
  * that would need more than VSR_IO_LINK_HELD held runs is closed with
- * -ENOBUFS. A MESSAGE is handed to the replica of its cluster only when
+ * -ENOBUFS. A STREAM link whose frame the stream module cannot take (the
+ * requester's window is full) PAUSES instead of filling its held runs:
+ * its multishot RECV is cancelled (a CANCEL on the shutdown slot; the
+ * -ECANCELED termination is not a loss) and not re-armed until every byte
+ * it holds is carved, so the socket buffer fills and the TCP window, not
+ * the held-run bound, throttles the source; what the kernel delivered
+ * before the cancel took effect is held meanwhile. A MESSAGE is handed
+ * to the replica of its cluster only when
  * its `from` is authorized for the link's node (decision 67); a MESSAGE
  * that fails that check, names no replica of this engine, or is shorter
  * than its envelope is dropped and counted in frames_rejected, while a
@@ -214,6 +221,10 @@ struct vsr_io_link {
     bool hello_seen;       /* Peer's HELLO accepted. */
     bool torn_down;        /* CLOSING: the teardown records were emitted. */
     bool recv_starved;     /* RECV ended -ENOBUFS; re-arm once provided. */
+    bool recv_paused;      /* STREAM link holding a frame the stream module
+                              could not take: the RECV is cancelled and not
+                              re-armed until every held byte is carved. */
+    bool recv_cancelled;   /* The pause's CANCEL of recv_slot was issued. */
     bool nodelay_set;      /* TCP_NODELAY record issued (or not wanted). */
     int32_t error;         /* Reason for closing, or 0. */
     unsigned char preamble[VSR_IO_PREAMBLE_BYTES]; /* EXTERNAL acceptor's
@@ -251,7 +262,8 @@ struct vsr_io_link {
                                       being encoded, or NONE. */
     uint32_t inflight;             /* 1 while a send is in flight. */
     uint32_t deadline;             /* Deadline handle. */
-    uint32_t shutdown_slot;
+    uint32_t shutdown_slot;        /* The teardown records, or the CANCEL of
+                                      a paused receive (one at a time). */
     struct vsr_io_vec *vecs; /* [VSR_IO_SEND_VECTORS]: the build's vectors,
                                 the in-flight send's while inflight. */
 };
