@@ -494,18 +494,17 @@ static int parse_address(const struct vsr_sim_node *node,
         return -EINVAL;
     }
     memcpy(&family, op->raw, sizeof(family));
-    if (family != AF_INET && family != AF_UNIX) {
-        return -EAFNOSUPPORT;
-    }
-    if (family != domain) {
-        return -EAFNOSUPPORT;
-    }
-    if (family == AF_INET) {
+    /* In the kernel's order: an AF_INET socket checks the length before
+     * the family, an AF_UNIX socket refuses any other family with -EINVAL. */
+    if (domain == AF_INET) {
         struct sockaddr_in in;
         uint32_t ip;
 
         if (op->raw_length < sizeof(in)) {
             return -EINVAL;
+        }
+        if (family != AF_INET) {
+            return -EAFNOSUPPORT;
         }
         memcpy(&in, op->raw, sizeof(in));
         ip = ntohl(in.sin_addr.s_addr);
@@ -529,7 +528,7 @@ static int parse_address(const struct vsr_sim_node *node,
         const unsigned char *name = op->raw + offset;
         size_t length;
 
-        if (op->raw_length <= offset) {
+        if (family != AF_UNIX || op->raw_length <= offset) {
             return -EINVAL;
         }
         length = op->raw_length - offset;

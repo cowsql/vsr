@@ -1979,14 +1979,17 @@ static void scenario_socket_direct(struct fixture *f)
     CHECK(f->factory->peer_close(f, listener, false) == 0);
 }
 
-/* CONNECT: -ECONNREFUSED without a listener, -EAFNOSUPPORT for a foreign
- * family. */
+/* CONNECT: -ECONNREFUSED without a listener; for a foreign family, an
+ * AF_INET socket checks the length first (-EINVAL below a sockaddr_in, then
+ * -EAFNOSUPPORT) and an AF_UNIX socket answers -EINVAL. */
 static void scenario_connect_refused(struct fixture *f)
 {
     struct vsr_io_address address;
     struct sockaddr_un un;
+    struct sockaddr_in in;
     struct vsr_io_sqe r;
     int32_t fd = make_socket(f, AF_INET);
+    int32_t local;
 
     CHECK(fd >= 0);
     f->factory->unused_address(f, &address);
@@ -1998,8 +2001,25 @@ static void scenario_connect_refused(struct fixture *f)
     r.fd = fd;
     r.addr = &un;
     r.length = (uint32_t)(offsetof(struct sockaddr_un, sun_path) + 8);
+    CHECK(run(f, r) == -EINVAL);
+    r = rec(VSR_IO_SQE_CONNECT, UD(3));
+    r.fd = fd;
+    r.addr = &un;
+    r.length = (uint32_t)sizeof(un);
     CHECK(run(f, r) == -EAFNOSUPPORT);
     CHECK(close_fd(f, fd, false) == 0);
+    local = make_socket(f, AF_UNIX);
+    CHECK(local >= 0);
+    memset(&in, 0, sizeof(in));
+    in.sin_family = AF_INET;
+    in.sin_port = htons(1);
+    in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    r = rec(VSR_IO_SQE_CONNECT, UD(4));
+    r.fd = local;
+    r.addr = &in;
+    r.length = (uint32_t)sizeof(in);
+    CHECK(run(f, r) == -EINVAL);
+    CHECK(close_fd(f, local, false) == 0);
 }
 
 /* CONNECT across a partition: -EHOSTUNREACH after connect_timeout_ns. */

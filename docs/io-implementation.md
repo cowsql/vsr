@@ -1596,7 +1596,7 @@ Opcodes:
 | MKDIRAT | result 0 or `-EEXIST` |
 | STATX | fills `addr2` (`struct statx`); the sim fills `stx_size`, `stx_blksize` and `stx_mode` only; result 0 |
 | SOCKET | `length` domain, `op_flags` type, `offset` protocol; `AF_INET`, `AF_INET6` (ring only), `AF_UNIX`; result the descriptor or slot |
-| CONNECT | to `addr` of `length` bytes; result 0, or `-ECONNREFUSED` (no listener), `-EHOSTUNREACH` (partitioned, after `connect_timeout_ns`), `-EAFNOSUPPORT` |
+| CONNECT | to `addr` of `length` bytes; result 0, or `-ECONNREFUSED` (no listener), `-EHOSTUNREACH` (partitioned, after `connect_timeout_ns`); a foreign family as the kernel orders it: an `AF_INET` socket answers `-EINVAL` below a `sockaddr_in`'s length, then `-EAFNOSUPPORT`, an `AF_UNIX` socket `-EINVAL` (BIND likewise) |
 | BIND | result 0 or `-EADDRINUSE` |
 | LISTEN | `length` backlog; result 0 |
 | ACCEPT | with `MULTISHOT`: a completion per accepted connection with `MORE` set, result the descriptor or slot (with `DIRECT`); terminates with `MORE` clear on a negative result: `-ECANCELED` (cancelled), `-ENFILE` (no free slot with `DIRECT`: that connection was accepted and is closed again, so its peer sees a reset; later connections stay queued, decision 65). Closing the listener's descriptor does not terminate it: the listener lives on until the record is cancelled (decision 58). A full completion queue at a delivery also ends it, with that connection's result and `MORE` clear (ring only, decision 68). Without `MULTISHOT`: one accept |
