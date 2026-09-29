@@ -3448,6 +3448,11 @@ static void test_review_chunk_rearms(void)
     settle();
     sink_drain(&k);
     CHECK(!k.ended && s->state == VSR_IO_STREAM_ENDING);
+    /* After the END frame the requester waits for its caller untimed. */
+    world_advance(2 * HANDSHAKE_NS);
+    settle();
+    sink_drain(&k);
+    CHECK(!k.ended && s->state == VSR_IO_STREAM_ENDING && k.held_count == 2);
     k.hold = false;
     sink_complete(&k, k.held_count);
     pump(&k, &d);
@@ -3661,6 +3666,140 @@ static void test_review_full_ring(void)
     engine_forget(b);
 }
 
+/* Handles and op ids of a finished stream never name the stream that
+ * reuses its slot (decision 93: the generation); a zero-length chunk is
+ * consumed without a DATA op (decision 95). */
+static void test_review_stale_ids(void)
+{
+    const unsigned char *bytes = pattern(30);
+    struct engine *a;
+    struct engine *b;
+    struct sink k;
+    struct feed d;
+    struct vsr_io_stream_write write;
+    unsigned char header[16];
+    uint32_t index = NONE;
+    uint32_t first = NONE;
+    uint64_t old_handle;
+    uint64_t old_serve;
+    uint64_t old_data;
+
+    world_reset(30);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    open_stream(&k, &d, 1, NULL, 0, &first);
+    settle();
+    CHECK(feed_take_serve(&d));
+    old_serve = d.serve_op;
+    old_handle = d.handle;
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    k.hold = true;
+    CHECK(feed_write_buffers(&d, 1, bytes, CHUNK, 0) == VSR_OK);
+    settle();
+    sink_drain(&k);
+    CHECK(k.held_count == 1);
+    old_data = k.held_ops[0];
+    /* A zero-length chunk at the stream's offset: consumed, no op. */
+    vsr_io_codec_put_stream_chunk(header, CHUNK, 0);
+    send_raw(b, link_to(b, 1, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED),
+             VSR_IO_FRAME_STREAM_CHUNK, header, 16);
+    settle();
+    sink_drain(&k);
+    CHECK(k.data_ops == 1 && a->io->stats.frames_rejected == 0);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    k.hold = false;
+    sink_complete(&k, 1);
+    pump(&k, &d);
+    CHECK(k.ended && k.end.status == VSR_IO_OK && k.end.bytes == CHUNK);
+    CHECK(d.ended && d.end.status == VSR_IO_OK);
+    /* The next stream takes the same slots on both engines. */
+    open_stream(&k, &d, 2, NULL, 0, &index);
+    settle();
+    CHECK(index == first && feed_take_serve(&d));
+    CHECK((d.handle & 0xFFFF) == (old_handle & 0xFFFF) && d.handle != old_handle);
+    CHECK(vsr_io_streams_served(b->io, old_serve, VSR_IO_OK) == VSR_EINVAL);
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, old_handle, VSR_IO_OK) == VSR_EINVAL);
+    memset(&write, 0, sizeof(write));
+    write.stream = old_handle;
+    write.kind = VSR_IO_WRITE_BUFFERS;
+    CHECK(vsr_io_streams_write(b->io, &write, 0) == VSR_EINVAL);
+    k.hold = true;
+    CHECK(feed_write_buffers(&d, 1, bytes, CHUNK, 0) == VSR_OK);
+    settle();
+    sink_drain(&k);
+    CHECK(k.held_count == 1 && k.held_ops[0] != old_data);
+    CHECK(vsr_io_streams_data_done(a->io, old_data) == VSR_EINVAL);
+    CHECK(stream_at(a, index)->units_used == 1);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    k.hold = false;
+    sink_complete(&k, 1);
+    pump(&k, &d);
+    CHECK(k.ended && k.end.status == VSR_IO_OK && k.end.bytes == CHUNK);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    engine_forget(a);
+    engine_forget(b);
+}
+
+/* A request reaching an engine whose streams shut down is refused at the
+ * link: no SERVE op, no stream; the requester sees a loss. And the
+ * requester's clock covers the dial: a peer that accepts the connection
+ * but never answers the HELLO ends the stream RETRY after the timeout. */
+static void test_review_closing_and_dial(void)
+{
+    struct engine *a;
+    struct engine *b;
+    struct sink k;
+    struct feed d;
+    struct vsr_io_address silent;
+    uint32_t listener;
+    uint32_t index = NONE;
+
+    world_reset(31);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    open_stream(&k, &d, 1, NULL, 0, &index);
+    vsr_io_streams_shutdown(b->io);
+    settle();
+    sink_drain(&k);
+    CHECK(forwarded_count(b, VSR_IO_OP_STREAM_SERVE) == 0);
+    CHECK(b->io->streams.active == 0);
+    CHECK(k.ended && k.end.status == VSR_IO_RETRY && k.end.bytes == 0);
+    CHECK(a->io->streams.active == 0);
+    engine_forget(b);
+    listener = sock_alloc(TEST_OWNER);
+    address_of(&silent, 'S');
+    world.socks[listener].listening = true;
+    world.socks[listener].address = silent;
+    CHECK(vsr_io_links_node_set(a->io, 3, &silent) == VSR_OK);
+    sink_init(&k, a, 2);
+    {
+        struct vsr_io_stream_open open;
+
+        memset(&open, 0, sizeof(open));
+        open.node = 3;
+        CHECK(vsr_io_streams_open(a->io, 2, &open, 0, VSR_IO_STREAM_CALLER,
+                                  &index) == VSR_OK);
+    }
+    settle();
+    CHECK(world.socks[listener].backlog_count == 1); /* Connected. */
+    world_advance(HANDSHAKE_NS - 1);
+    settle();
+    sink_drain(&k);
+    CHECK(!k.ended && stream_at(a, index)->state == VSR_IO_STREAM_DIALING);
+    world_advance(2);
+    settle();
+    sink_drain(&k);
+    CHECK(k.ended && k.end.status == VSR_IO_RETRY && k.end.bytes == 0);
+    CHECK(a->io->streams.active == 0 && pool_refs(a) == 0);
+    engine_forget(a);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = argc > 1 ? strtoull(argv[1], NULL, 10) : 4242;
@@ -3681,6 +3820,8 @@ int main(int argc, char **argv)
     test_review_chunk_rearms();
     test_review_read_in_flight();
     test_review_full_ring();
+    test_review_stale_ids();
+    test_review_closing_and_dial();
     test_random(seed);
     test_random(seed + 1);
     printf("stream: ok\n");
