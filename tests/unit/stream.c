@@ -3800,6 +3800,47 @@ static void test_review_closing_and_dial(void)
     engine_forget(a);
 }
 
+/* A caller's FILE write names a slot of the caller's: one of the engine's
+ * own slots (link sockets, the store's log, a snapshot's clients file) is
+ * EINVAL, since its bytes would stream to the peer. The library's served
+ * streams read an engine slot and are not refused. */
+static void test_review_engine_slot(void)
+{
+    const unsigned char *bytes = pattern(32);
+    struct engine *a;
+    struct engine *b;
+    struct sink k;
+    struct feed d;
+    uint32_t index = NONE;
+    const struct vsr_io_stream *t;
+
+    world_reset(32);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    b->files[0].bytes = bytes;
+    b->files[0].size = BYTES_MAX;
+    open_stream(&k, &d, 1, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    t = stream_at(b, (uint32_t)(d.handle & 0xFFFF));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    CHECK(feed_write_file(&d, 1, FILE_SLOT_BASE, 0, CHUNK) == VSR_EINVAL);
+    CHECK(feed_write_file(&d, 1, FILE_SLOT_BASE + FILE_SLOTS - 1, 0, CHUNK) ==
+          VSR_EINVAL);
+    CHECK(t->writes_count == 0 && t->state == VSR_IO_STREAM_OPEN);
+    CHECK(feed_write_file(&d, 1, FILE_FD_BASE, 0, CHUNK) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    pump(&k, &d);
+    CHECK(k.ended && k.end.status == VSR_IO_OK && k.received == CHUNK);
+    CHECK(d.ended && d.end.status == VSR_IO_OK && d.written_count == 1);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    engine_forget(a);
+    engine_forget(b);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = argc > 1 ? strtoull(argv[1], NULL, 10) : 4242;
@@ -3822,6 +3863,7 @@ int main(int argc, char **argv)
     test_review_full_ring();
     test_review_stale_ids();
     test_review_closing_and_dial();
+    test_review_engine_slot();
     test_random(seed);
     test_random(seed + 1);
     printf("stream: ok\n");

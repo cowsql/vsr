@@ -1027,7 +1027,14 @@ int vsr_io_streams_write(struct vsr_io *io,
         if (total != write->buffers.size) {
             return VSR_EINVAL;
         }
-    } else if (write->kind != VSR_IO_WRITE_FILE) {
+    } else if (write->kind != VSR_IO_WRITE_FILE ||
+               (stream->owner == VSR_IO_STREAM_CALLER &&
+                write->slot >= io->options.file_slot_base &&
+                write->slot - io->options.file_slot_base <
+                    io->options.limits.file_slots)) {
+        /* A caller's range reads a slot of the caller's: an engine slot
+         * (a socket, the store's log) would stream the engine's own bytes
+         * to the peer (decision B6). The library reads engine slots. */
         return VSR_EINVAL;
     }
     if (stream->writes_count == window) {
