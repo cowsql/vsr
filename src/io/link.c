@@ -1475,13 +1475,15 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
     link->inflight = 0;
     if (cqe->result < 0) {
         /* A rejected zero-copy send completes once, without MORE
-         * (decision 62); an accepted one still gets its NOTIF. */
+         * (decision 62); an accepted one still gets its NOTIF. The entry
+         * is released like at a NOTIF: the link may be closing already
+         * (a demotion, a caller's close), when nothing else would
+         * complete the retiring messages its sends covered. */
         link->vec_count = 0;
         if (send->zero_copy && (cqe->flags & VSR_IO_CQE_MORE) != 0) {
             send->state = SEND_NOTIF;
         } else {
-            send->state = SEND_FREE;
-            link_send_floor(link);
+            link_send_release(io, link, send);
         }
         link_close(io, link_index(io, link), cqe->result);
         return;

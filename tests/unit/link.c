@@ -4896,6 +4896,41 @@ static void test_review_own_node(void)
 }
 
 
+/* A send that fails without MORE on a link that is already closing (a
+ * demotion, a caller's close, a node change) still completes the messages
+ * its stream carried: nothing else releases them once the link is gone. */
+static void test_review_failed_send_closing(void)
+{
+    struct pair p;
+    const struct vsr_io_link *out;
+
+    pair_open(&p, 43, 4, PAGE);
+    out = carrier_of(p.a, 2);
+    world.reject_send = 1;
+    CHECK(send_fresh(p.a, 0, 1, 16, 2) == VSR_OK);
+    engine_step(p.a); /* The send goes out and is refused; its result
+                         is queued for the next step. */
+    CHECK(world.reject_send == 0);
+    CHECK(p.a->cq_count > 0);
+    vsr_io_links_close(p.a->io, (uint32_t)(out - p.a->io->links.links),
+                       -ECONNABORTED);
+    CHECK(out->state == VSR_IO_LINK_CLOSING);
+    CHECK(p.ra->completions_count == 0); /* Still on the wire. */
+    world_settle();
+    expect_completion(p.ra, 1, VSR_IO_RETRY);
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->links.nodes[0].queue_count == 0);
+    CHECK(p.a->io->stats.messages_retried == 1);
+    check_quiet(p.a);
+    CHECK(pool_refs(p.a) == 0);
+    world_settle();
+    check_quiet(p.b);
+    CHECK(pool_refs(p.b) == 0);
+    engine_forget(p.a);
+    engine_forget(p.b);
+}
+
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 0x5EED2u;
@@ -4930,6 +4965,7 @@ int main(int argc, char **argv)
     test_stream();
     test_send_random(seed);
     test_review_own_node();
+    test_review_failed_send_closing();
     printf("link: ok\n");
     return 0;
 }
