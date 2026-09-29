@@ -1502,8 +1502,8 @@ of `docs/io-design.md`:
 | `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | 72, 73 |
 | `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | 75, 76 |
 | `store.h` | `VSR_IO_SEGMENT_FREEING`; `vsr_io_load_ref` and `load_refs`, the pending load's resolved records and read state, `cold_slab`; `reindexed`, `restored`, the `base_*` fields and `base_slot`; the client entry's `next_offset`; a LOAD completion's lease carries every OK result; `release` only unpins | 77, 78, 79, 80 |
-| `store.h` | `vsr_io_segment.run` (the header's run, for the successor rule); `vsr_io_recovery` reshaped for the scan (the pool slab and executor slot of the read in flight, the superblock copy, the chunk's offset and the position judged, the sweep mode, the resume offset); the base-load kinds include the recovery's; a LOAD slot's `sub` tells a recovery read from a cold load's | S9, S10, S11 |
-| `codec.h` | `vsr_io_codec_load_region` also holds the recovered row's manifest bytes, copied into the region | S12 |
+| `store.h` | `vsr_io_segment.run` (the header's run, for the successor rule); `vsr_io_recovery` reshaped for the scan (the pool slab and executor slot of the read in flight, the superblock copy, the chunk's offset and the position judged, the sweep mode, the resume offset); the base-load kinds include the recovery's; a LOAD slot's `sub` tells a recovery read from a cold load's | 88, 89, 90 |
+| `codec.h` | `vsr_io_codec_load_region` also holds the recovered row's manifest bytes, copied into the region | 91 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1516,7 +1516,7 @@ of `docs/io-design.md`:
   of that bound.
 - Whether NEW and JOIN should refuse a directory that holds stray
   `clients-*` files, or ignore them; the executor has no directory
-  listing, so the store refuses only through the log (decision S13).
+  listing, so the store refuses only through the log (decision 92).
 - A freed slot becomes reusable when the superblock naming the new start
   segment *completed*; in FDATASYNC mode that write may still be in the
   page cache when the slot is rewritten, so a crash before the next flush

@@ -2357,7 +2357,7 @@ static void file_done(struct vsr_io_store *store, uint32_t op, uint64_t cookie,
             /* An existing log is recovered under every start mode: NEW
              * and JOIN get the recovered row, which the core rejects
              * itself, or NOT_FOUND for an empty log (decision 71).
-             * TODO(snapshot module, decision S13): the executor has no
+             * TODO(snapshot module, decision 92): the executor has no
              * directory listing, so stray clients-* files neither make
              * NEW and JOIN refuse the directory nor are unlinked by
              * RECOVER (decision 57); once a listing exists, the snapshot
