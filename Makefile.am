@@ -24,7 +24,8 @@ src_libvsr_a_SOURCES = \
 # world under src/sim; the client bookkeeping under src/client.
 src_libvsr_a_SOURCES += src/io/crc32c.c src/io/crc32c.h src/io/cursor.c \
   src/io/codec.c src/io/pool.c src/io/slots.c src/io/deadline.c \
-  src/io/link.c src/io/stream.c src/io/engine.c src/client/client.c \
+  src/io/link.c src/io/stream.c src/io/store.c src/io/engine.c \
+  src/client/client.c \
   src/io/uring.c src/sim/world.c src/sim/net.c src/sim/disk.c \
   src/sim/exec.c
 # Private headers of the I/O layer: the interface specification every
