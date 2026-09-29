@@ -1144,6 +1144,12 @@ int vsr_io_streams_data_done(struct vsr_io *io, uint64_t op)
     }
     unit_release(io, stream, unit);
     units_trim(io, stream);
+    /* A caller call re-arms the clock (decision 97): the poll after this
+     * completion drains deadlines before the link retries the frame the
+     * window held. Once ENDING the requester waits untimed. */
+    if (stream->state == VSR_IO_STREAM_REQUESTED) {
+        stream_touch(io, stream);
+    }
     return VSR_OK;
 }
 

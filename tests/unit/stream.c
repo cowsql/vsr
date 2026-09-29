@@ -3280,6 +3280,58 @@ static void test_review_shutdown_order(void)
     engine_forget(b);
 }
 
+/* A DATA completion is a caller call, which re-arms the inactivity timer
+ * (decision 97): a caller that frees its window just before the deadline
+ * keeps the stream, even when the poll after its completion comes after
+ * the deadline (the poll drains deadlines before the links retry the
+ * held frame, whose delivery would re-arm it). */
+static void test_review_data_done_rearms(void)
+{
+    const unsigned char *bytes = pattern(23);
+    struct engine *a;
+    struct engine *b;
+    struct sink k;
+    struct feed d;
+    uint32_t index = NONE;
+    const struct vsr_io_stream *s;
+
+    world_reset(23);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    open_stream(&k, &d, 1, NULL, 0, &index);
+    s = stream_at(a, index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    k.hold = true;
+    CHECK(feed_write_buffers(&d, 1, bytes, 4 * CHUNK, 0) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    settle();
+    sink_drain(&k);
+    feed_drain(&d);
+    /* The source sent everything and lingers; the requester's window is
+     * full, its link holds the rest. */
+    CHECK(k.held_count == WINDOW && s->state == VSR_IO_STREAM_REQUESTED);
+    CHECK(d.ended && d.end.status == VSR_IO_OK);
+    world_advance(HANDSHAKE_NS - 1);
+    settle();
+    sink_drain(&k);
+    CHECK(!k.ended && s->state == VSR_IO_STREAM_REQUESTED);
+    sink_complete(&k, 1);
+    world_advance(2);
+    k.hold = false;
+    sink_complete(&k, k.held_count);
+    pump(&k, &d);
+    CHECK(k.ended && k.end.status == VSR_IO_OK && k.received == 4 * CHUNK);
+    CHECK(memcmp(k.bytes, bytes, k.received) == 0);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    engine_forget(a);
+    engine_forget(b);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = argc > 1 ? strtoull(argv[1], NULL, 10) : 4242;
@@ -3295,6 +3347,7 @@ int main(int argc, char **argv)
     test_timeout();
     test_shutdown();
     test_review_shutdown_order();
+    test_review_data_done_rearms();
     test_random(seed);
     test_random(seed + 1);
     printf("stream: ok\n");
