@@ -12,6 +12,8 @@
 #include "io/stream.h"
 
 #include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -301,15 +303,18 @@ static uint32_t dial_handle(const struct vsr_io *io, uint32_t node_index)
     return io->links.links_count + node_index;
 }
 
-/* A node that needs a link and has none in progress is dialed now, or once
- * its backoff expires, by the next poll. */
+static uint32_t node_peer_pending(const struct vsr_io *io, uint32_t node_index);
+
+/* A node that needs a peer link and has none in progress is dialed now, or
+ * once its backoff expires, by the next poll. Stream links count for
+ * nothing here: they never carry the node's sends. */
 static void node_want_dial(struct vsr_io *io, uint32_t index)
 {
     struct vsr_io_node *node = &io->links.nodes[index];
 
     if (io->links.closing || !node->wanted || node->dialing ||
-        node->established > 0 || node->pending > 0 || node->due ||
-        node->id == io->options.node) {
+        node->carrier != LINK_NONE || node->due ||
+        node->id == io->options.node || node_peer_pending(io, index) > 0) {
         return;
     }
     if (node->next_dial_ns == VSR_NO_DEADLINE ||
@@ -323,12 +328,12 @@ static void node_want_dial(struct vsr_io *io, uint32_t index)
 }
 
 /* A replica authorizing the node, or a SEND toward it, wants a link when
- * none is established. */
+ * no peer link is established. */
 static void node_want(struct vsr_io *io, uint32_t index)
 {
     struct vsr_io_node *node = &io->links.nodes[index];
 
-    if (node->established == 0) {
+    if (node->carrier == LINK_NONE) {
         node->wanted = true;
     }
     node_want_dial(io, index);
@@ -351,9 +356,14 @@ static void node_backoff(struct vsr_io *io, uint32_t index, int32_t error)
 }
 
 static void link_close(struct vsr_io *io, uint32_t index, int32_t error);
+static bool link_send_slab(struct vsr_io *io, struct vsr_io_link *link);
+static void node_queue_drop(struct vsr_io *io, uint32_t node_index, bool all);
+static void node_queue_ready(struct vsr_io *io, uint32_t node_index);
+static void node_queue_review(struct vsr_io *io, uint32_t node_index,
+                              uint32_t old_carrier);
 
-/* Closes every link of the node; a queued SEND completes RETRY (phase 3:
- * the queue is drained here). */
+/* Closes every link of the node; the carrier's loss retries its queued
+ * sends (node_queue_review). */
 static void node_close_links(struct vsr_io *io, uint32_t index, int32_t error)
 {
     for (uint32_t i = 0; i < io->links.links_count; ++i) {
@@ -428,6 +438,7 @@ int vsr_io_links_node_clear(struct vsr_io *io, uint64_t node)
     }
     entry = &links->nodes[index];
     node_close_links(io, index, -ECONNABORTED);
+    node_queue_drop(io, index, true); /* Nothing waits for an unknown node. */
     /* A cleared node is unknown, so nothing may act as it (decision 73). */
     for (uint32_t i = 0; i < links->authorizations_count; ++i) {
         if (links->authorizations[i].node == node) {
@@ -564,6 +575,25 @@ static bool link_pending_state(uint32_t state)
            state == VSR_IO_LINK_HELLO;
 }
 
+/* Pending peer links (CONNECTING, EXTERNAL, HELLO) known to be the node's:
+ * its outbound dials, and an EXTERNAL inbound link once identified. */
+static uint32_t node_peer_pending(const struct vsr_io *io, uint32_t node_index)
+{
+    const struct vsr_io_links *links = &io->links;
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < links->links_count; ++i) {
+        const struct vsr_io_link *link = &links->links[i];
+
+        if (link->node_index == node_index &&
+            link->purpose == VSR_IO_PURPOSE_PEER &&
+            link_pending_state(link->state)) {
+            count++;
+        }
+    }
+    return count;
+}
+
 /* Takes a FREE link for a node (or LINK_NONE when unidentified yet);
  * LINK_NONE when the table is full. Pending and established counts follow
  * the state transitions below. */
@@ -680,23 +710,29 @@ static void link_establish(struct vsr_io *io, struct vsr_io_link *link)
         node->linked_since_ns = io->now;
     }
     node->established++;
-    node->attempts = 0;
-    node->next_dial_ns = VSR_NO_DEADLINE;
-    node->last_error = 0;
-    node->dialing = false;
-    vsr_io_deadlines_arm(&io->deadlines, dial_handle(io, link->node_index),
-                         VSR_NO_DEADLINE);
-    if (node->due) {
-        node->due = false;
-        io->links.dials_due--;
-    }
     if (link->purpose == VSR_IO_PURPOSE_PEER) {
+        uint32_t old = node->carrier;
+
+        node->attempts = 0;
+        node->next_dial_ns = VSR_NO_DEADLINE;
+        node->last_error = 0;
+        node->dialing = false;
+        vsr_io_deadlines_arm(&io->deadlines, dial_handle(io, link->node_index),
+                             VSR_NO_DEADLINE);
+        if (node->due) {
+            node->due = false;
+            io->links.dials_due--;
+        }
         node->wanted = false;
         node_elect(io, link->node_index);
-    } else if (link->stream != LINK_NONE) {
-        vsr_io_streams_link_up(io, link->stream);
+        node_queue_review(io, link->node_index, old);
     }
     link_arm_idle(io, link);
+    /* Best effort: a send without a slab retries the pool at prepare. */
+    (void)link_send_slab(io, link);
+    if (link->purpose == VSR_IO_PURPOSE_STREAM && link->stream != LINK_NONE) {
+        vsr_io_streams_link_up(io, link->stream);
+    }
 }
 
 static void link_set_retry(struct vsr_io *io, struct vsr_io_link *link,
@@ -786,8 +822,10 @@ static void link_close(struct vsr_io *io, uint32_t index, int32_t error)
         }
         /* A dial that never reached ESTABLISHED, whichever step failed,
          * waits out the backoff before the next; an accepted link's
-         * failure is the dialer's to schedule. */
-        if (node != NULL && link->direction == VSR_IO_OUTBOUND) {
+         * failure is the dialer's to schedule, a stream dial's is the
+         * stream's. */
+        if (node != NULL && link->direction == VSR_IO_OUTBOUND &&
+            link->purpose == VSR_IO_PURPOSE_PEER) {
             node_backoff(io, link->node_index, error);
         }
     } else {
@@ -804,14 +842,24 @@ static void link_close(struct vsr_io *io, uint32_t index, int32_t error)
     vsr_io_deadlines_arm(&io->deadlines, link->deadline, VSR_NO_DEADLINE);
     link_release_partial(io, link);
     if (node != NULL && link->purpose == VSR_IO_PURPOSE_PEER) {
+        uint32_t old = node->carrier;
+
         if (state == VSR_IO_LINK_ESTABLISHED) {
             node_elect(io, link->node_index);
         }
+        node_queue_review(io, link->node_index, old);
         node_want_dial(io, link->node_index);
     } else if (link->purpose == VSR_IO_PURPOSE_STREAM &&
                link->stream != LINK_NONE) {
         vsr_io_streams_link_lost(io, link->stream, error);
     }
+    /* The build is dropped; a send in flight completes on its own. */
+    if (link->inflight == 0) {
+        link->vec_count = 0;
+        link->build_bytes = 0;
+    }
+    link->encoding = LINK_NONE;
+    link->encoder.message = NULL;
     /* Nothing to close and nothing that could still produce a descriptor
      * (a SOCKET in flight): gone at once. */
     if (link->fd < 0 && link->raw_fd < 0 && link->handshake_op == 0 &&
@@ -829,23 +877,67 @@ void vsr_io_links_close(struct vsr_io *io, uint32_t link, int32_t error)
 }
 
 /* -------------------------------------------------------------------------
- * Send slab: control bytes (preamble, HELLO) and the send records
+ * Send side: the send-slab ring, the build and the send records
  *
- * Phase 1 sends only control bytes, written into the send slab and sent as
- * one vector per send. Phase 3 adds the coalescing of queued messages
- * through the encoder (vecs, budget, VSR_IO_SEND_VECTORS) on top of the
- * same send entries, offsets and flag rule. The slab is used linearly and
- * rewound when no send is live, which suffices for the handshake's bytes;
- * the ring of the header comment is phase 3's.
+ * Every byte a link sends belongs to one stream that `stream_offset`
+ * counts. The BUILD is the send under construction: `vec_count` vectors
+ * in `vecs` covering the `build_bytes` bytes below `stream_offset`;
+ * control bytes, encoded messages and stream frames all append to it.
+ * Header bytes (frame headers, control bytes, inline copies, padding) are
+ * written into the send slab used as a ring addressed by unwrapped
+ * counters: `header_tail` is the write position, `header_sent` where the
+ * build's header bytes start and `header_head` the floor below which every
+ * byte is reusable (the oldest live send's `header_begin`). A record goes
+ * out from the build when nothing is in flight and a send entry is free;
+ * a short result leaves the unsent tail of its vectors in place as the
+ * next build, so stream offsets never rewind. A plain send's completion,
+ * or a zero-copy send's NOTIF, releases its entry, recomputes the floor
+ * and `notified_offset` (the oldest live send's `begin`, so NOTIFs may
+ * arrive in any order) and completes the queued messages the carrier has
+ * sent up to there.
  * ---------------------------------------------------------------------- */
 
-/* Appends bytes to the link's send slab; false when no slab is free or the
- * slab is full, in which case the caller retries at the next prepare. */
-static bool link_write_control(struct vsr_io *io, struct vsr_io_link *link,
-                               const unsigned char *bytes, uint32_t length)
-{
-    unsigned char *slab;
+/* A writer area below this many bytes at the slab's end is skipped when
+ * the front holds more: a frame header and one inline copy fit. */
+#define LINK_RING_MIN (VSR_IO_FRAME_HEADER_BYTES + VSR_IO_INLINE_BYTES)
 
+static unsigned char *link_ring_base(const struct vsr_io *io,
+                                     const struct vsr_io_link *link,
+                                     uint64_t position)
+{
+    return vsr_io_pool_slab(&io->pool, link->send_slab) +
+           (uint32_t)(position % io->pool.slab_bytes);
+}
+
+static uint64_t link_ring_free(const struct vsr_io *io,
+                               const struct vsr_io_link *link)
+{
+    LINKS_ASSERT(link->header_tail - link->header_head <= io->pool.slab_bytes);
+    return io->pool.slab_bytes - (link->header_tail - link->header_head);
+}
+
+/* The contiguous area at the write position: its base and capacity (0
+ * when the ring is full). The tail skips to the slab's start when the
+ * space before its end is small and the front holds more. */
+static uint32_t link_ring_area(struct vsr_io *io, struct vsr_io_link *link,
+                               unsigned char **base)
+{
+    uint64_t free = link_ring_free(io, link);
+    uint32_t to_end = io->pool.slab_bytes -
+                      (uint32_t)(link->header_tail % io->pool.slab_bytes);
+
+    if (to_end < LINK_RING_MIN && free > to_end) {
+        link->header_tail += to_end;
+        free -= to_end;
+        to_end = io->pool.slab_bytes;
+    }
+    *base = link_ring_base(io, link, link->header_tail);
+    return free < to_end ? (uint32_t)free : to_end;
+}
+
+/* Takes the send slab on first use; false while the pool has none. */
+static bool link_send_slab(struct vsr_io *io, struct vsr_io_link *link)
+{
     if (link->send_slab == LINK_NONE) {
         link->send_slab = vsr_io_pool_acquire(&io->pool, false);
         if (link->send_slab == LINK_NONE) {
@@ -855,18 +947,62 @@ static bool link_write_control(struct vsr_io *io, struct vsr_io_link *link,
         link->header_tail = 0;
         link->header_sent = 0;
     }
-    if (link->header_head == link->header_tail &&
-        link->header_sent == link->header_tail) {
-        link->header_head = 0;
-        link->header_tail = 0;
-        link->header_sent = 0;
+    return true;
+}
+
+/* Merges the build's vector at `index` into the one before it when the
+ * two are contiguous in memory (a frame's padding and the next frame's
+ * header, say), shifting the later ones down. */
+static void link_build_merge(struct vsr_io_link *link, uint32_t index)
+{
+    struct vsr_io_vec *previous;
+    struct vsr_io_vec *vec;
+
+    if (index == 0 || index >= link->vec_count) {
+        return;
     }
-    if (length > io->pool.slab_bytes - link->header_tail) {
+    previous = &link->vecs[index - 1];
+    vec = &link->vecs[index];
+    if ((const unsigned char *)previous->base + previous->length != vec->base) {
+        return;
+    }
+    previous->length += vec->length;
+    memmove(vec, vec + 1, (link->vec_count - index - 1) * sizeof(*vec));
+    link->vec_count--;
+}
+
+/* Appends one vector to the build; the caller checked the room. */
+static void link_build_append(struct vsr_io_link *link, const void *base,
+                              size_t length)
+{
+    LINKS_ASSERT(link->inflight == 0 && link->vec_count < VSR_IO_SEND_VECTORS);
+    /* vsr_io_vec is the executor's descriptor and is not const-qualified;
+     * a send never writes through it. */
+    /* NOLINTNEXTLINE(performance-no-int-to-ptr) */
+    link->vecs[link->vec_count].base = (void *)(uintptr_t)base;
+    link->vecs[link->vec_count].length = length;
+    link->vec_count++;
+    link->build_bytes += length;
+    link->stream_offset += length;
+    link_build_merge(link, link->vec_count - 1);
+}
+
+/* Writes control bytes into the ring as one build vector; false when the
+ * send slab is missing, the ring has no contiguous room, no vector is
+ * free or a send is in flight (the vectors are its), in which case the
+ * caller retries at the next prepare. */
+static bool link_write_control(struct vsr_io *io, struct vsr_io_link *link,
+                               const unsigned char *bytes, uint32_t length)
+{
+    unsigned char *base;
+
+    if (link->inflight != 0 || link->vec_count == VSR_IO_SEND_VECTORS ||
+        !link_send_slab(io, link) || link_ring_area(io, link, &base) < length) {
         return false;
     }
-    slab = vsr_io_pool_slab(&io->pool, link->send_slab);
-    memcpy(slab + link->header_tail, bytes, length);
+    memcpy(base, bytes, length);
     link->header_tail += length;
+    link_build_append(link, base, length);
     return true;
 }
 
@@ -937,18 +1073,266 @@ static void link_send_flags(const struct vsr_io *io, struct vsr_io_send *send,
     }
 }
 
-/* One send of the control bytes not yet handed to a send, when nothing is
- * in flight and a send entry is free; true when a record was emitted. */
+/* Position `position` of a node's send queue (0 is the oldest). */
+static struct vsr_io_queued_send *node_queue_at(struct vsr_io_links *links,
+                                                uint32_t node_index,
+                                                uint32_t position)
+{
+    const struct vsr_io_node *node = &links->nodes[node_index];
+    uint32_t slot = (node->queue_head + position) % links->link_queue;
+
+    return &links->queue[(size_t)node_index * links->link_queue + slot];
+}
+
+/* The queue position of the first message not yet handed to the carrier's
+ * stream (the started ones are a prefix), or the count when none. */
+static uint32_t node_queue_unstarted(struct vsr_io_links *links,
+                                     uint32_t node_index)
+{
+    const struct vsr_io_node *node = &links->nodes[node_index];
+    uint32_t position = 0;
+
+    while (position < node->queue_count &&
+           node_queue_at(links, node_index, position)->end != 0) {
+        position++;
+    }
+    return position;
+}
+
+/* Completes a queued SEND op to its replica. */
+static void queued_complete(struct vsr_io *io,
+                            const struct vsr_io_queued_send *queued,
+                            int32_t status)
+{
+    struct vsr_io_completion completion = {queued->op, status, LINK_NONE, NULL};
+
+    vsr_io_engine_complete_core(&io->replicas[queued->replica], &completion);
+    if (status == VSR_IO_OK) {
+        io->stats.messages_sent++;
+    } else if (status == VSR_IO_RETRY) {
+        io->stats.messages_retried++;
+    }
+}
+
+/* Removes the message at `position`, completing it with `status`; the
+ * later ones move up, and the carrier's encoder follows the message it is
+ * on (never the removed one). */
+static void node_queue_remove(struct vsr_io *io, uint32_t node_index,
+                              uint32_t position, int32_t status)
+{
+    struct vsr_io_links *links = &io->links;
+    struct vsr_io_node *node = &links->nodes[node_index];
+    uint32_t base = node_index * links->link_queue;
+
+    LINKS_ASSERT(position < node->queue_count);
+    queued_complete(io, node_queue_at(links, node_index, position), status);
+    if (node->carrier != LINK_NONE &&
+        links->links[node->carrier].encoding != LINK_NONE) {
+        struct vsr_io_link *carrier = &links->links[node->carrier];
+        uint32_t at =
+            (carrier->encoding - base + links->link_queue - node->queue_head) %
+            links->link_queue;
+
+        LINKS_ASSERT(at != position && at < node->queue_count);
+        if (at > position) {
+            carrier->encoding =
+                base + (node->queue_head + at - 1) % links->link_queue;
+        }
+    }
+    for (uint32_t i = position; i + 1 < node->queue_count; ++i) {
+        *node_queue_at(links, node_index, i) =
+            *node_queue_at(links, node_index, i + 1);
+    }
+    node->queue_count--;
+}
+
+/* The status of a message that will not be delivered: RETRY, or CANCELLED
+ * once the engine is closing. */
+static int32_t links_fail_status(const struct vsr_io_links *links)
+{
+    return links->closing != 0 ? VSR_IO_CANCELLED : VSR_IO_RETRY;
+}
+
+/* Sends of a link still in flight or awaiting their NOTIF. */
+static uint32_t link_live_sends(const struct vsr_io_link *link)
+{
+    uint32_t count = 0;
+
+    for (uint32_t i = 0; i < VSR_IO_LINK_SENDS; ++i) {
+        count += link->sends[i].state != SEND_FREE ? 1 : 0;
+    }
+    return count;
+}
+
+/* Completes the messages nobody reads any more: a retiring one once its
+ * link's notified offset passed it or that link has no live send (RETRY),
+ * the carrier's once its notified offset passed it (OK). They form the
+ * queue's prefix, in that order; the walk stops at the first unstarted
+ * message. */
+static void node_queue_ready(struct vsr_io *io, uint32_t node_index)
+{
+    struct vsr_io_links *links = &io->links;
+    struct vsr_io_node *node = &links->nodes[node_index];
+    uint32_t position = 0;
+
+    while (position < node->queue_count) {
+        const struct vsr_io_queued_send *queued =
+            node_queue_at(links, node_index, position);
+        const struct vsr_io_link *link;
+
+        if (queued->end == 0) {
+            return;
+        }
+        if (queued->retiring != 0) {
+            link = &links->links[queued->retiring - 1];
+            if (queued->end <= link->notified_offset ||
+                link_live_sends(link) == 0) {
+                node_queue_remove(io, node_index, position,
+                                  links_fail_status(links));
+                continue;
+            }
+        } else if (node->carrier != LINK_NONE) {
+            link = &links->links[node->carrier];
+            if (queued->end <= link->notified_offset) {
+                node_queue_remove(io, node_index, position, VSR_IO_OK);
+                continue;
+            }
+        }
+        position++;
+    }
+}
+
+/* Drops the messages not yet on any wire (the queue's tail), or every
+ * message, retiring ones included, each completing with the failure
+ * status; the latter only when the node or the engine goes away, when a
+ * zero-copy send of a closing link may still read the bytes for the
+ * NOTIF's short while. */
+static void node_queue_drop(struct vsr_io *io, uint32_t node_index, bool all)
+{
+    struct vsr_io_links *links = &io->links;
+    struct vsr_io_node *node = &links->nodes[node_index];
+    int32_t status = links_fail_status(links);
+
+    while (
+        node->queue_count > 0 &&
+        (all ||
+         node_queue_at(links, node_index, node->queue_count - 1)->end == 0)) {
+        node_queue_remove(io, node_index, node->queue_count - 1, status);
+    }
+}
+
+/* After an election, or a dial's failure: the messages the previous
+ * carrier had put on its stream retire (RETRY once its sends no longer
+ * read them), a demoted link with a frame half sent or a build pending is
+ * closed rather than left to corrupt its stream, and an unlinked node's
+ * waiting messages are retried at once. */
+static void node_queue_review(struct vsr_io *io, uint32_t node_index,
+                              uint32_t old_carrier)
+{
+    struct vsr_io_links *links = &io->links;
+    struct vsr_io_node *node = &links->nodes[node_index];
+
+    if (old_carrier != LINK_NONE && old_carrier != node->carrier) {
+        struct vsr_io_link *old = &links->links[old_carrier];
+        bool torn = old->encoding != LINK_NONE || old->vec_count > 0;
+
+        for (uint32_t i = 0; i < node->queue_count; ++i) {
+            struct vsr_io_queued_send *queued =
+                node_queue_at(links, node_index, i);
+
+            if (queued->end == 0) {
+                break;
+            }
+            if (queued->retiring == 0) {
+                queued->retiring = old_carrier + 1;
+            }
+        }
+        old->encoding = LINK_NONE;
+        old->encoder.message = NULL;
+        if (torn && old->state == VSR_IO_LINK_ESTABLISHED) {
+            link_close(io, old_carrier, -ECANCELED);
+        }
+    }
+    if (node->carrier == LINK_NONE && node_peer_pending(io, node_index) == 0) {
+        node_queue_drop(io, node_index, false);
+    }
+    node_queue_ready(io, node_index);
+}
+
+/* Encodes queued messages into the build, in order, while the coalesce
+ * budget, the vectors and the ring allow; a message continues in the next
+ * build (the encoder keeps its position). Only the node's carrier builds. */
+static void link_build_messages(struct vsr_io *io, struct vsr_io_link *link)
+{
+    struct vsr_io_links *links = &io->links;
+    uint64_t budget = io->options.send_coalesce_bytes;
+
+    while (link->build_bytes < budget &&
+           link->vec_count < VSR_IO_SEND_VECTORS) {
+        struct vsr_io_writer writer;
+        uint64_t before;
+        uint64_t emitted;
+        uint32_t count = 0;
+        bool done = false;
+        int rc;
+
+        if (link->encoding == LINK_NONE) {
+            uint32_t position = node_queue_unstarted(links, link->node_index);
+            struct vsr_io_queued_send *queued;
+
+            if (position == links->nodes[link->node_index].queue_count ||
+                !link_send_slab(io, link)) {
+                return;
+            }
+            queued = node_queue_at(links, link->node_index, position);
+            vsr_io_encoder_begin(&link->encoder, queued->message,
+                                 queued->length, queued->crc);
+            queued->end = link->stream_offset + VSR_IO_FRAME_HEADER_BYTES +
+                          queued->length;
+            link->encoding = (uint32_t)(queued - links->queue);
+        }
+        writer.capacity = link_ring_area(io, link, &writer.base);
+        writer.used = 0;
+        before = link->encoder.offset;
+        rc = vsr_io_encoder_emit(&link->encoder, &writer,
+                                 link->vecs + link->vec_count,
+                                 VSR_IO_SEND_VECTORS - link->vec_count, &count,
+                                 budget - link->build_bytes, &done);
+        emitted = link->encoder.offset - before;
+        link->header_tail += writer.used;
+        link->vec_count += count;
+        link->build_bytes += emitted;
+        link->stream_offset += emitted;
+        if (count > 0) {
+            link_build_merge(link, link->vec_count - count);
+        }
+        if (rc != VSR_OK) {
+            /* The graph changed since its digest: the core broke the pin
+             * rule of vsr.h. The frame cannot be completed; the link
+             * closes and the message completes RETRY with the prefix. */
+            LINKS_ASSERT(false);
+            link_close(io, link_index(io, link), -EBADMSG);
+            return;
+        }
+        if (done) {
+            link->encoding = LINK_NONE;
+        } else if (emitted == 0) {
+            return; /* No room: the ring, the vectors or the budget. */
+        }
+    }
+}
+
+/* One send from the build when nothing is in flight and a send entry is
+ * free; the carrier of a node first extends the build with queued
+ * messages. True when a record was emitted. */
 static bool link_prepare_send(struct vsr_io *io, struct vsr_io_link *link,
                               struct vsr_io_sqe *sqe)
 {
     struct vsr_io_send *send = NULL;
-    uint32_t pending;
     uint32_t entry = 0;
     uint32_t slot;
 
-    if (link->inflight != 0 || link->send_slab == LINK_NONE ||
-        link->header_sent == link->header_tail) {
+    if (link->inflight != 0) {
         return false;
     }
     for (entry = 0; entry < VSR_IO_LINK_SENDS; ++entry) {
@@ -960,32 +1344,40 @@ static bool link_prepare_send(struct vsr_io *io, struct vsr_io_link *link,
     if (send == NULL) {
         return false;
     }
-    pending = link->header_tail - link->header_sent;
-    link->vecs[0].base =
-        vsr_io_pool_slab(&io->pool, link->send_slab) + link->header_sent;
-    link->vecs[0].length = pending;
-    memset(sqe, 0, sizeof(*sqe));
+    if (link->state == VSR_IO_LINK_ESTABLISHED &&
+        link->purpose == VSR_IO_PURPOSE_PEER &&
+        io->links.nodes[link->node_index].carrier == link_index(io, link)) {
+        link_build_messages(io, link);
+        if (link->state != VSR_IO_LINK_ESTABLISHED) {
+            return false;
+        }
+    }
+    if (link->vec_count == 0) {
+        return false;
+    }
+    LINKS_ASSERT(link->build_bytes > 0 && link->send_slab != LINK_NONE);
     sqe->opcode = VSR_IO_SQE_SEND;
     link_sqe_fd(link, sqe);
-    link_send_flags(io, send, link->vecs, 1, sqe);
+    link_send_flags(io, send, link->vecs, link->vec_count, sqe);
     slot = vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_SEND,
                               send->zero_copy ? 2 : 1, link_index(io, link),
                               entry, 0);
     if (slot == LINK_NONE) {
+        sqe->flags = 0;
         return false;
     }
     send->slot = slot;
     send->state = SEND_INFLIGHT;
     send->header_begin = link->header_sent;
     send->header_end = link->header_tail;
-    send->begin = link->stream_offset;
-    send->end = link->stream_offset + pending;
+    send->begin = link->stream_offset - link->build_bytes;
+    send->end = link->stream_offset;
     link->header_sent = link->header_tail;
-    link->stream_offset = send->end;
+    link->build_bytes = 0;
     link->inflight = 1;
     sqe->user_data = vsr_io_slots_user_data(&io->slots, slot);
     sqe->addr = link->vecs;
-    sqe->length = 1;
+    sqe->length = link->vec_count;
     io->stats.sends++;
     if (send->zero_copy) {
         io->stats.sends_zero_copy++;
@@ -993,44 +1385,90 @@ static bool link_prepare_send(struct vsr_io *io, struct vsr_io_link *link,
     return true;
 }
 
-/* The slab bytes below every live send's range are reusable. */
+/* The ring floor and the notified offset follow the oldest live send: the
+ * slab bytes below every live send's range are reusable, and the stream
+ * bytes below every live send's begin are no longer read. */
 static void link_send_floor(struct vsr_io_link *link)
 {
-    uint32_t floor = link->header_sent;
+    uint64_t floor = link->header_sent;
+    uint64_t notified = link->sent_offset;
 
     for (uint32_t i = 0; i < VSR_IO_LINK_SENDS; ++i) {
         const struct vsr_io_send *send = &link->sends[i];
 
-        if (send->state != SEND_FREE && send->header_begin < floor) {
+        if (send->state == SEND_FREE) {
+            continue;
+        }
+        if (send->header_begin < floor) {
             floor = send->header_begin;
+        }
+        if (send->begin < notified) {
+            notified = send->begin;
         }
     }
     link->header_head = floor;
+    link->notified_offset = notified;
+}
+
+/* Send progress reaches its consumers: a peer link's node completes the
+ * queued messages nobody reads any more (a closing link's NOTIFs release
+ * retiring ones), a stream link tells its stream. */
+static void link_send_progress(struct vsr_io *io, struct vsr_io_link *link)
+{
+    if (link->node_index == LINK_NONE) {
+        return;
+    }
+    if (link->purpose == VSR_IO_PURPOSE_PEER) {
+        node_queue_ready(io, link->node_index);
+    } else if (link->stream != LINK_NONE &&
+               link->state == VSR_IO_LINK_ESTABLISHED) {
+        vsr_io_streams_sent(io, link->stream, link->notified_offset);
+    }
 }
 
 /* The entry's bytes are no longer read; its slot is consumed by the
  * dispatcher, which clears `slot` once the table freed it. */
-static void link_send_release(struct vsr_io_link *link,
+static void link_send_release(struct vsr_io *io, struct vsr_io_link *link,
                               struct vsr_io_send *send)
 {
-    if (send->end > link->notified_offset) {
-        link->notified_offset = send->end;
-    }
     send->state = SEND_FREE;
     link_send_floor(link);
+    link_send_progress(io, link);
+}
+
+/* A short result: the first `sent` bytes leave the vectors, the rest stay
+ * as the build. */
+static void link_send_remainder(struct vsr_io_link *link, uint64_t sent)
+{
+    uint32_t first = 0;
+
+    while (first < link->vec_count && sent >= link->vecs[first].length) {
+        sent -= link->vecs[first].length;
+        first++;
+    }
+    LINKS_ASSERT(first < link->vec_count);
+    if (sent > 0) {
+        link->vecs[first].base = (unsigned char *)link->vecs[first].base + sent;
+        link->vecs[first].length -= (size_t)sent;
+    }
+    memmove(link->vecs, link->vecs + first,
+            (link->vec_count - first) * sizeof(link->vecs[0]));
+    link->vec_count -= first;
 }
 
 /* The result completion of a send: a failure closes the link; a short
- * result hands the rest back to the next send; the NOTIF (or a plain
- * send's completion) releases the entry. */
+ * result hands the rest back to the build; the NOTIF (or a plain send's
+ * completion) releases the entry. */
 static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
                                uint32_t entry, const struct vsr_io_cqe *cqe)
 {
     struct vsr_io_send *send = &link->sends[entry];
+    uint64_t total = send->end - send->begin;
+    uint64_t sent;
 
     if ((cqe->flags & VSR_IO_CQE_NOTIF) != 0) {
         LINKS_ASSERT(send->state == SEND_NOTIF);
-        link_send_release(link, send);
+        link_send_release(io, link, send);
         return;
     }
     LINKS_ASSERT(send->state == SEND_INFLIGHT && link->inflight != 0);
@@ -1038,28 +1476,36 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
     if (cqe->result < 0) {
         /* A rejected zero-copy send completes once, without MORE
          * (decision 62); an accepted one still gets its NOTIF. */
+        link->vec_count = 0;
         if (send->zero_copy && (cqe->flags & VSR_IO_CQE_MORE) != 0) {
             send->state = SEND_NOTIF;
         } else {
-            link_send_release(link, send);
+            send->state = SEND_FREE;
+            link_send_floor(link);
         }
         link_close(io, link_index(io, link), cqe->result);
         return;
     }
-    if ((uint64_t)cqe->result < send->end - send->begin) {
-        /* Short: the bytes after the result go into the next send. */
-        send->end = send->begin + (uint64_t)cqe->result;
-        send->header_end = send->header_begin + (uint32_t)cqe->result;
-        link->header_sent = send->header_end;
-        link->stream_offset = send->end;
+    sent = (uint64_t)cqe->result < total ? (uint64_t)cqe->result : total;
+    if (sent < total) {
+        /* Short: the unsent tail of the vectors is the next build, its
+         * header bytes reserved from the send's own until it goes out. */
+        link_send_remainder(link, sent);
+        send->end = send->begin + sent;
+        link->build_bytes = total - sent;
+        link->header_sent = send->header_begin;
+    } else {
+        link->vec_count = 0;
     }
     link->sent_offset = send->end;
     link->last_active_ns = io->now;
-    io->stats.bytes_sent += (uint64_t)cqe->result;
+    io->stats.bytes_sent += sent;
     if (send->zero_copy) {
         send->state = SEND_NOTIF;
+        link_send_floor(link);
+        link_send_progress(io, link);
     } else {
-        link_send_release(link, send);
+        link_send_release(io, link, send);
     }
 }
 
@@ -1303,9 +1749,9 @@ static bool link_message(struct vsr_io *io, struct vsr_io_link *link,
 }
 
 /* Frame dispatch: HELLO drives the handshake, MESSAGE is delivered to its
- * replica, the stream kinds are phase 3 work. False when the frame could
- * not be consumed yet (a MESSAGE without a region); the caller keeps its
- * bytes and retries at poll. */
+ * replica, the stream kinds go to the stream module. False when the frame
+ * could not be consumed yet (a MESSAGE without a region, a stream without
+ * a unit); the caller keeps its bytes and retries at poll. */
 static bool link_frame(struct vsr_io *io, struct vsr_io_link *link,
                        const struct vsr_io_wire_frame *frame,
                        const struct vsr_io_cursor *body)
@@ -1331,11 +1777,20 @@ static bool link_frame(struct vsr_io *io, struct vsr_io_link *link,
         }
         return link_message(io, link, body);
     default:
-        /* PHASE 3: vsr_io_streams_frame for STREAM links. */
         if (link->state != VSR_IO_LINK_ESTABLISHED ||
-            link->purpose != VSR_IO_PURPOSE_STREAM) {
+            link->purpose != VSR_IO_PURPOSE_STREAM ||
+            frame->kind < VSR_IO_FRAME_STREAM_REQUEST ||
+            frame->kind > VSR_IO_FRAME_STREAM_END) {
             io->stats.frames_rejected++;
             link_close(io, link_index(io, link), -EPROTO);
+            return true;
+        }
+        if (!vsr_io_streams_frame(io, link_index(io, link), frame->kind, body,
+                                  link->partial_slab)) {
+            return false;
+        }
+        if (link->node_index != LINK_NONE) {
+            io->links.nodes[link->node_index].last_received_ns = io->now;
         }
         return true;
     }
@@ -1712,45 +2167,95 @@ int vsr_io_links_adopt(struct vsr_io *io, int fd, uint64_t node, uint32_t flags)
 }
 
 /* -------------------------------------------------------------------------
- * Sends from the core and streams (phase 3)
+ * Sends from the core and streams
  * ---------------------------------------------------------------------- */
 
 int vsr_io_links_send(struct vsr_io *io, uint32_t replica, uint64_t op,
                       const struct vsr_message *message, uint64_t member)
 {
+    struct vsr_io_links *links = &io->links;
     struct vsr_io_replica *entry;
-    uint64_t node;
+    struct vsr_io_node *node;
+    struct vsr_io_queued_send *queued;
+    uint64_t node_id;
     uint32_t node_index;
+    uint32_t length = 0;
+    uint32_t crc = 0;
+    int rc;
 
-    (void)op;
-    if (replica >= io->options.limits.replicas || message == NULL) {
+    if (replica >= io->options.limits.replicas || message == NULL ||
+        io->replicas[replica].state == VSR_IO_REPLICA_FREE || links->closing) {
+        io->stats.messages_retried++;
         return VSR_IO_RETRY;
     }
     entry = &io->replicas[replica];
-    node = vsr_io_links_lookup(&io->links, entry->options.cluster, member);
-    node_index = vsr_io_links_node_index(&io->links, node);
-    if (node_index == LINK_NONE) {
-        return VSR_IO_RETRY; /* Unknown or unauthorized destination. */
+    node_id = vsr_io_links_lookup(links, entry->options.cluster, member);
+    node_index = vsr_io_links_node_index(links, node_id);
+    if (node_index == LINK_NONE || node_id == io->options.node) {
+        /* Unknown, unauthorized or own destination. */
+        io->stats.messages_retried++;
+        return VSR_IO_RETRY;
     }
-    /* A SEND wants a link to its node. */
-    node_want(io, node_index);
-    /* PHASE 3: digest the message, queue it in the node's ring (RETRY the
-     * oldest when full) and let prepare coalesce it. Until then every SEND
-     * completes RETRY at once. */
-    return VSR_IO_RETRY;
+    node = &links->nodes[node_index];
+    node_want(io, node_index); /* A SEND wants a link to its node. */
+    rc = vsr_io_codec_message_digest(message, &entry->options.limits, &length,
+                                     &crc);
+    if (rc != VSR_OK) {
+        /* Malformed or beyond the limits: the core retries its protocol
+         * work on any SEND failure, so RETRY says it all. */
+        io->stats.messages_retried++;
+        return VSR_IO_RETRY;
+    }
+    if (node->queue_count == links->link_queue) {
+        /* Full: the oldest message not on the wire yields, or this one. */
+        uint32_t position = node_queue_unstarted(links, node_index);
+
+        if (position == node->queue_count) {
+            io->stats.messages_retried++;
+            return VSR_IO_RETRY;
+        }
+        node_queue_remove(io, node_index, position, VSR_IO_RETRY);
+    }
+    queued = node_queue_at(links, node_index, node->queue_count);
+    queued->op = op;
+    queued->replica = replica;
+    queued->retiring = 0;
+    queued->message = message;
+    queued->length = length;
+    queued->crc = crc;
+    queued->end = 0;
+    node->queue_count++;
+    return VSR_OK;
 }
 
 int vsr_io_links_open_stream(struct vsr_io *io, uint64_t node, uint32_t stream,
                              uint32_t *link)
 {
-    /* PHASE 3: dial `node` with STREAM purpose for stream `stream`. */
-    (void)io;
-    (void)node;
-    (void)stream;
-    if (link != NULL) {
-        *link = LINK_NONE;
+    struct vsr_io_links *links = &io->links;
+    uint32_t node_index = vsr_io_links_node_index(links, node);
+    struct vsr_io_link *entry;
+    uint32_t index;
+
+    if (link == NULL) {
+        return VSR_EINVAL;
     }
-    return VSR_ELIMIT;
+    *link = LINK_NONE;
+    if (node_index == LINK_NONE || !links->nodes[node_index].has_address ||
+        node == io->options.node || links->closing) {
+        return VSR_EINVAL;
+    }
+    index = link_alloc(io, VSR_IO_PURPOSE_STREAM, VSR_IO_OUTBOUND, node_index,
+                       node);
+    if (index == LINK_NONE) {
+        return VSR_ELIMIT;
+    }
+    entry = &links->links[index];
+    entry->stream = stream;
+    entry->peer = links->nodes[node_index].address;
+    entry->stage = VSR_IO_STAGE_SOCKET;
+    link_enter_pending(io, entry, VSR_IO_LINK_CONNECTING);
+    *link = index;
+    return VSR_OK;
 }
 
 int vsr_io_links_send_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
@@ -1758,19 +2263,86 @@ int vsr_io_links_send_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
                             const struct vsr_io_vec *payload, uint32_t count,
                             uint32_t body_crc, uint64_t *end)
 {
-    /* PHASE 3: raw stream frames through the send slab and vectors. */
-    (void)io;
-    (void)link;
-    (void)kind;
-    (void)header;
-    (void)header_bytes;
-    (void)payload;
-    (void)count;
-    (void)body_crc;
-    if (end != NULL) {
-        *end = 0;
+    static const unsigned char zeros[8];
+    struct vsr_io_link *entry;
+    unsigned char *base;
+    uint64_t total = header_bytes;
+    uint32_t vectors = 1; /* The header run; payload runs and a pad. */
+    uint32_t pad;
+    uint32_t need;
+    bool entry_free = false;
+
+    if (end == NULL) {
+        return VSR_EINVAL;
     }
-    return VSR_EBUSY;
+    *end = 0;
+    if (link >= io->links.links_count || (header == NULL && header_bytes > 0) ||
+        (payload == NULL && count > 0) ||
+        (kind != VSR_IO_FRAME_STREAM_REQUEST &&
+         kind != VSR_IO_FRAME_STREAM_CHUNK &&
+         kind != VSR_IO_FRAME_STREAM_END)) {
+        return VSR_EINVAL;
+    }
+    entry = &io->links.links[link];
+    if (entry->state != VSR_IO_LINK_ESTABLISHED ||
+        entry->purpose != VSR_IO_PURPOSE_STREAM) {
+        return VSR_EINVAL;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        total += payload[i].length;
+        if (payload[i].length > 0) {
+            vectors++;
+        }
+    }
+    if (total > io->links.frame_limit - VSR_IO_FRAME_HEADER_BYTES) {
+        return VSR_ELIMIT;
+    }
+    pad = (uint32_t)((8 - total % 8) % 8);
+    if (pad > 0 && vectors > 1) {
+        vectors++; /* The pad follows the payload, from the ring. */
+    }
+    if (total + pad > io->links.frame_limit - VSR_IO_FRAME_HEADER_BYTES) {
+        return VSR_ELIMIT;
+    }
+    for (uint32_t i = 0; i < VSR_IO_LINK_SENDS; ++i) {
+        entry_free = entry_free || entry->sends[i].state == SEND_FREE;
+    }
+    if (entry->inflight != 0 || !entry_free ||
+        (entry->build_bytes > 0 &&
+         entry->build_bytes + VSR_IO_FRAME_HEADER_BYTES + total + pad >
+             io->options.send_coalesce_bytes) ||
+        entry->vec_count + vectors > VSR_IO_SEND_VECTORS ||
+        !link_send_slab(io, entry)) {
+        return VSR_EBUSY;
+    }
+    need = VSR_IO_FRAME_HEADER_BYTES + (uint32_t)header_bytes + pad;
+    if (link_ring_area(io, entry, &base) < need) {
+        return VSR_EBUSY;
+    }
+    if (pad > 0) {
+        body_crc = vsr_io_crc32c(body_crc, zeros, pad);
+    }
+    vsr_io_codec_put_frame(base, kind, (uint32_t)(total + pad), body_crc);
+    memcpy(base + VSR_IO_FRAME_HEADER_BYTES, header, header_bytes);
+    memset(base + VSR_IO_FRAME_HEADER_BYTES + header_bytes, 0, pad);
+    entry->header_tail += need;
+    if (vectors == 1) {
+        link_build_append(entry, base, need);
+    } else {
+        link_build_append(entry, base,
+                          VSR_IO_FRAME_HEADER_BYTES + header_bytes);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (payload[i].length > 0) {
+                link_build_append(entry, payload[i].base, payload[i].length);
+            }
+        }
+        if (pad > 0) {
+            link_build_append(
+                entry, base + VSR_IO_FRAME_HEADER_BYTES + header_bytes, pad);
+        }
+    }
+    *end = entry->stream_offset;
+    return VSR_OK;
 }
 
 /* -------------------------------------------------------------------------
@@ -1792,8 +2364,8 @@ void vsr_io_links_poll(struct vsr_io *io, uint64_t now)
             }
             node->due = false;
             links->dials_due--;
-            if (links->closing || !node->wanted || node->established > 0 ||
-                node->pending > 0 || node->dialing) {
+            if (links->closing || !node->wanted || node->carrier != LINK_NONE ||
+                node->dialing || node_peer_pending(io, i) > 0) {
                 continue;
             }
             if (node->has_address) {
@@ -1841,8 +2413,11 @@ void vsr_io_links_deadline(struct vsr_io *io, uint16_t kind, uint32_t index,
             return;
         }
         node = &links->nodes[index];
-        if (node->pending == 0) {
+        if (node_peer_pending(io, index) == 0) {
             node->dialing = false; /* A LINK_WANTED's wait is over. */
+            if (!node->has_address && node->carrier == LINK_NONE) {
+                node_queue_drop(io, index, true); /* Unanswered. */
+            }
         }
         node_want_dial(io, index);
         return;
@@ -1855,7 +2430,9 @@ void vsr_io_links_deadline(struct vsr_io *io, uint16_t kind, uint32_t index,
         } else if (link->state == VSR_IO_LINK_ESTABLISHED) {
             uint64_t idle = io->options.idle_timeout_ns;
 
-            if (idle == 0) {
+            /* A link bound to a stream lives as long as its stream. */
+            if (idle == 0 || (link->purpose == VSR_IO_PURPOSE_STREAM &&
+                              link->stream != LINK_NONE)) {
                 return;
             }
             if (now - link->last_active_ns < idle) {
@@ -2172,6 +2749,45 @@ static bool link_prepare_preamble_recv(struct vsr_io *io,
 /* The multishot receive of an installed link, armed once and after every
  * termination while the link is open; after -ENOBUFS only once the pool
  * reported a buffer again. */
+static const int link_nodelay_on = 1;
+
+/* TCP_NODELAY on a taken-over socket (options.nodelay): one record on the
+ * connect slot, idle by then, whose result is ignored, so a socket without
+ * the option is simply left as it is. Known AF_UNIX peers skip it. */
+static bool link_prepare_nodelay(struct vsr_io *io, struct vsr_io_link *link,
+                                 struct batch *batch)
+{
+    struct vsr_io_sqe *sqe;
+
+    if (link->nodelay_set || link->fd < 0 || link->connect_slot != LINK_NONE) {
+        return true;
+    }
+    if (io->options.nodelay == 0 || link->peer.sockaddr.ss_family == AF_UNIX) {
+        link->nodelay_set = true;
+        return true;
+    }
+    sqe = batch_next(batch);
+    if (sqe == NULL) {
+        return false;
+    }
+    link->connect_slot =
+        vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_CONNECT, 1,
+                           link_index(io, link), VSR_IO_STAGE_NODELAY, 0);
+    if (link->connect_slot == LINK_NONE) {
+        return false;
+    }
+    sqe->opcode = VSR_IO_SQE_SETSOCKOPT;
+    sqe->flags = VSR_IO_SQE_FIXED_FILE;
+    sqe->fd = link->fd;
+    sqe->op_flags = ((uint32_t)IPPROTO_TCP << 16) | TCP_NODELAY;
+    sqe->addr = &link_nodelay_on;
+    sqe->length = sizeof(link_nodelay_on);
+    sqe->user_data = vsr_io_slots_user_data(&io->slots, link->connect_slot);
+    batch->count++;
+    link->nodelay_set = true;
+    return true;
+}
+
 static bool link_prepare_recv(struct vsr_io *io, struct vsr_io_link *link,
                               struct batch *batch)
 {
@@ -2291,7 +2907,8 @@ static bool link_prepare(struct vsr_io *io, struct vsr_io_link *link,
                 link->hello_sent = link_write_hello(io, link, true, true);
             }
         }
-        if (!link_prepare_recv(io, link, batch)) {
+        if (!link_prepare_nodelay(io, link, batch) ||
+            !link_prepare_recv(io, link, batch)) {
             return false;
         }
         break;
@@ -2299,7 +2916,8 @@ static bool link_prepare(struct vsr_io *io, struct vsr_io_link *link,
         if (!link->hello_sent) {
             link->hello_sent = link_write_hello(io, link, false, true);
         }
-        if (!link_prepare_recv(io, link, batch)) {
+        if (!link_prepare_nodelay(io, link, batch) ||
+            !link_prepare_recv(io, link, batch)) {
             return false;
         }
         break;
@@ -2395,6 +3013,9 @@ static void link_connect_complete(struct vsr_io *io, struct vsr_io_link *link,
     uint32_t index = link_index(io, link);
 
     link->connect_slot = LINK_NONE;
+    if (stage == VSR_IO_STAGE_NODELAY) {
+        return; /* Best effort: the result is not even looked at. */
+    }
     if (link->state == VSR_IO_LINK_CLOSING) {
         if (stage == VSR_IO_STAGE_SOCKET && cqe->result >= 0) {
             link->raw_fd = cqe->result; /* Closed by the teardown. */
@@ -2586,6 +3207,7 @@ void vsr_io_links_shutdown(struct vsr_io *io)
     for (uint32_t i = 0; i < links->nodes_count; ++i) {
         struct vsr_io_node *node = &links->nodes[i];
 
+        node_queue_drop(io, i, true); /* CANCELLED: closing is set. */
         if (node->due) {
             node->due = false;
             links->dials_due--;

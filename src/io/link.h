@@ -26,14 +26,37 @@
  *
  * Sends are queued per NODE (vsr_io_limits.link_queue entries): a SEND op
  * waits while the node is pending and completes with RETRY when the node
- * becomes unlinked, is unknown or unauthorized, or when the queue is full
- * (the oldest is retried). One kernel send is in flight per link at a time,
- * because two sends on one socket may complete out of order; a send covers
- * as many queued messages as send_coalesce_bytes, VSR_IO_SEND_VECTORS and
- * the send slab allow, and a message may continue in the next send. Header
- * bytes of a send live in the link's SEND SLAB, a pool slab used as a ring
- * whose floor advances as zero-copy NOTIFs arrive; VSR_IO_LINK_SENDS sends
- * may await their NOTIF.
+ * becomes unlinked (no carrier and no peer dial in progress: a failed dial,
+ * a lost carrier, an unanswered LINK_WANTED), is unknown or unauthorized,
+ * or when the queue is full (the oldest message not yet on the wire is
+ * retried, or the new one when every queued message is). A message
+ * completes OK once the carrier's kernel no longer reads its bytes; the
+ * messages handed to a carrier's stream are a prefix of the queue, and a
+ * carrier change retires that prefix: each message completes RETRY once
+ * the old link's kernel no longer reads its bytes (its NOTIF), so
+ * completions can leave the queue out of order (bytes on a lost or
+ * demoted link are not delivered by the next one; a demoted link with a
+ * message half sent or a build pending is closed). One kernel send is in
+ * flight per link at a time, because two
+ * sends on one socket may complete out of order; a send covers as many
+ * queued messages as send_coalesce_bytes, VSR_IO_SEND_VECTORS and the send
+ * slab allow, and a message may continue in the next send. Header bytes of
+ * a send live in the link's SEND SLAB, a pool slab used as a ring whose
+ * floor advances as zero-copy NOTIFs arrive; VSR_IO_LINK_SENDS sends may
+ * await their NOTIF, and a short result re-sends the unsent tail of its
+ * vectors first. With options.nodelay every taken-over socket gets one
+ * TCP_NODELAY record whose result is ignored.
+ *
+ * Stream links: vsr_io_links_open_stream dials a STREAM-purpose link that
+ * the stream module owns from then on: it is told link_up/link_lost, gets
+ * every stream frame received on it (vsr_io_streams_frame, which retains
+ * the slab if it keeps the bytes and returns false to have the frame kept
+ * and retried at poll), queues raw frames with vsr_io_links_send_frame and
+ * hears vsr_io_streams_sent at every send completion and NOTIF of the link.
+ * An inbound STREAM link is bound to a stream when the module sets
+ * `link->stream` at the request frame. A link bound to a stream is never
+ * idle-closed (the stream module closes it); a stream dial's failure
+ * schedules nothing for the node.
  *
  * The send flags rule (docs/io-design.md decision 38): every vector inside
  * the pool region -> SEND | ZERO_COPY | VECTORED | FIXED_BUFFER on the pool
@@ -119,15 +142,22 @@ struct vsr_io_authorization {
     uint64_t node;
 };
 
-/* One queued core SEND op. */
+/* One queued core SEND op. The messages handed to a link's stream (`end`
+ * assigned when their encoding starts) are a prefix of the queue: first
+ * the RETIRING ones, whose link lost the carrier role or closed and which
+ * complete RETRY once that link's kernel no longer reads their bytes,
+ * then the carrier's, which complete OK at its NOTIF; the unstarted ones
+ * follow. */
 struct vsr_io_queued_send {
-    uint64_t op;      /* Core op id. */
-    uint32_t replica; /* Replica index. */
-    uint32_t reserved;
+    uint64_t op;       /* Core op id. */
+    uint32_t replica;  /* Replica index. */
+    uint32_t retiring; /* 0, or 1 + the index of the link whose sends still
+                          cover the message: RETRY once they are notified. */
     const struct vsr_message *message;
     uint32_t length; /* Body length from the digest. */
     uint32_t crc;
-    uint64_t end; /* Stream offset after this message, once assigned. */
+    uint64_t end; /* Link stream offset after this message once its
+                     encoding started, else 0. */
 };
 
 /* A contiguous run of delivered, unconsumed bytes in one slab, holding
@@ -141,8 +171,9 @@ struct vsr_io_run {
 struct vsr_io_send {
     uint32_t slot;         /* Slot table index; INDEX_NONE when unused. */
     uint32_t state;        /* 0 free, 1 in flight, 2 sent awaiting NOTIF. */
-    uint32_t header_begin; /* Send-slab ring range of its header bytes. */
-    uint32_t header_end;
+    uint64_t header_begin; /* Send-slab ring range of its header bytes,
+                              as unwrapped ring counters. */
+    uint64_t header_end;
     uint64_t begin; /* Stream offsets covered. */
     uint64_t end;
     bool zero_copy;
@@ -157,8 +188,9 @@ enum vsr_io_link_stage {
     VSR_IO_STAGE_CONNECT,       /* CONNECTING: CONNECT to issue or in flight. */
     VSR_IO_STAGE_PREAMBLE_SEND, /* EXTERNAL dialer: preamble send pending. */
     VSR_IO_STAGE_PREAMBLE_RECV, /* EXTERNAL acceptor: 8-byte RECV pending. */
-    VSR_IO_STAGE_HANDSHAKE      /* EXTERNAL: op emitted, or to emit when
+    VSR_IO_STAGE_HANDSHAKE,     /* EXTERNAL: op emitted, or to emit when
                                    handshake_op is 0. */
+    VSR_IO_STAGE_NODELAY        /* Tag of the TCP_NODELAY record's slot. */
 };
 
 struct vsr_io_link {
@@ -182,6 +214,7 @@ struct vsr_io_link {
     bool hello_seen;       /* Peer's HELLO accepted. */
     bool torn_down;        /* CLOSING: the teardown records were emitted. */
     bool recv_starved;     /* RECV ended -ENOBUFS; re-arm once provided. */
+    bool nodelay_set;      /* TCP_NODELAY record issued (or not wanted). */
     int32_t error;         /* Reason for closing, or 0. */
     unsigned char preamble[VSR_IO_PREAMBLE_BYTES]; /* EXTERNAL acceptor's
                                                        8-byte receive. */
@@ -199,22 +232,28 @@ struct vsr_io_link {
                                  holds (no region, no reassembly slab);
                                  poll retries. */
     struct vsr_io_run held[VSR_IO_LINK_HELD];
-    /* Send side. */
+    /* Send side. The send slab is a ring addressed by unwrapped 64-bit
+     * counters (offset = counter % slab_bytes). */
     uint32_t send_slab;   /* Pool slab holding header bytes; INDEX_NONE. */
-    uint32_t header_head; /* Ring over the send slab. */
-    uint32_t header_tail;
-    uint32_t header_sent;     /* First header byte not yet covered by a send. */
-    uint64_t stream_offset;   /* Bytes handed to sends. */
+    uint32_t vec_count;   /* Vectors of the build, or of the send in flight. */
+    uint64_t header_head; /* Floor: the oldest live send's header_begin. */
+    uint64_t header_tail; /* Write position. */
+    uint64_t header_sent; /* Where the build's header bytes start. */
+    uint64_t stream_offset;   /* Bytes assigned to sends, the build included. */
+    uint64_t build_bytes;     /* Bytes of the build: the send under
+                                 construction, below stream_offset. */
     uint64_t sent_offset;     /* Bytes whose send completed. */
-    uint64_t notified_offset; /* Bytes released by NOTIF (or by a plain
-                                 send's completion). */
+    uint64_t notified_offset; /* Bytes no longer read by the kernel: the
+                                 oldest live send's begin. */
     struct vsr_io_send sends[VSR_IO_LINK_SENDS];
     struct vsr_io_encoder encoder; /* Position in the message being sent. */
-    uint32_t encoding;             /* Queue index being encoded, or NONE. */
+    uint32_t encoding;             /* Index into links.queue of the message
+                                      being encoded, or NONE. */
     uint32_t inflight;             /* 1 while a send is in flight. */
     uint32_t deadline;             /* Deadline handle. */
     uint32_t shutdown_slot;
-    struct vsr_io_vec *vecs; /* [VSR_IO_SEND_VECTORS] for the in-flight send */
+    struct vsr_io_vec *vecs; /* [VSR_IO_SEND_VECTORS]: the build's vectors,
+                                the in-flight send's while inflight. */
 };
 
 enum vsr_io_listener_state {
@@ -291,20 +330,34 @@ int vsr_io_links_adopt(struct vsr_io *io, int fd, uint64_t node,
 
 /*
  * Core SEND op from a replica: digests the message, resolves the member to
- * a node through the authorizations and queues it. Returns OK when queued,
- * or VSR_IO_RETRY when the op must be completed with RETRY at once (unknown
- * or unauthorized destination, queue full after retrying the oldest).
+ * a node through the authorizations and queues it. Returns OK when queued
+ * (the message stays the core's, pinned until the completion), or
+ * VSR_IO_RETRY when the engine must complete it with RETRY at once: an
+ * unknown, unauthorized or own destination, a message the codec cannot
+ * digest, a queue full of messages on the wire, a closing engine, an
+ * unattached replica. A SEND wants a link to its node even then.
+ * messages_sent and messages_retried count every outcome, the returned
+ * RETRY included.
  */
 int vsr_io_links_send(struct vsr_io *io, uint32_t replica, uint64_t op,
                       const struct vsr_message *message, uint64_t member);
-/* Streams open their own links: dial `node` with STREAM purpose; the link
- * index is returned and the stream module is told when it is established
- * or fails. */
+/* Streams open their own links: dials `node` (EINVAL when unknown or
+ * caller-dialed) with STREAM purpose for stream `stream`; the link index
+ * is returned (ELIMIT when no link entry is free) and the stream module is
+ * told when it is established or fails, whatever the node's backoff. */
 int vsr_io_links_open_stream(struct vsr_io *io, uint64_t node, uint32_t stream,
                              uint32_t *link);
-/* Queues raw frames on a stream link (request, chunk, end): bytes in the
- * send slab and payload vectors. Returns EBUSY when the link cannot take
- * more, the stream module then waits for a send completion. */
+/* Queues one raw frame on an established stream link: `kind` is
+ * STREAM_REQUEST, STREAM_CHUNK or STREAM_END, `header` the body's fixed
+ * part (put by the codec), `payload` the bytes that follow it, referenced
+ * in place (they stay pinned until notified_offset passes *end), body_crc
+ * the CRC32C over header then payload (the link pads the body to 8 with
+ * zeros from its send slab and extends the CRC). *end is the link's
+ * stream offset after the frame. EBUSY when the link cannot take it now:
+ * a send in flight, every send entry awaiting its NOTIF, the coalesce
+ * budget, the vectors or the ring full; the stream module then retries at
+ * the next vsr_io_streams_sent. ELIMIT for a body beyond the frame limit,
+ * EINVAL for a link that is not an established stream link. */
 int vsr_io_links_send_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
                             const unsigned char *header, size_t header_bytes,
                             const struct vsr_io_vec *payload, uint32_t count,
