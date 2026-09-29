@@ -84,7 +84,8 @@ void *vsr_io_bump_alloc(struct vsr_io_bump *bump, size_t size,
  */
 int vsr_io_codec_message_region(const struct vsr_limits *limits, size_t *bytes);
 /* Bytes of the host graph of the largest LOAD result: a vsr_loaded plus a
- * recovered row with hard state, epoch and anchor, or batch_entries entries,
+ * recovered row with hard state, epoch, anchor and manifest bytes, or
+ * batch_entries entries,
  * or one client record, each with one span per blob. */
 int vsr_io_codec_load_region(const struct vsr_limits *limits, size_t *bytes);
 /* Largest encoded frame (header included) any message within the limits

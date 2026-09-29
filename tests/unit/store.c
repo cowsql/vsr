@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /*
  * Store unit test, phase 1: layout checks, creation of an empty store,
@@ -90,6 +91,7 @@ struct disk {
     uint32_t flushes;
     uint32_t fallocates;
     uint32_t reads;
+    uint32_t stats;     /* STATX calls. */
     uint64_t base_size; /* The base file image (base_image). */
     int32_t base_slot;
     uint8_t once[DISK_BLOCKS];  /* A segment block written already. */
@@ -103,17 +105,63 @@ struct disk {
     int32_t fail_flush;
     int32_t fail_read;   /* The next READ completes with this errno. */
     uint32_t short_read; /* The next READ returns only this many bytes. */
+    uint32_t flip_armed; /* The next READ of the log covering flip_offset
+                            returns that byte inverted (a transient error
+                            the re-read of decision 50 gets past). */
+    uint64_t flip_offset;
 };
 
 static struct disk disk;
 static unsigned char base_image[65536];
+/* The image as of the last flush: what a crash is sure to keep. */
+static unsigned char disk_flushed[DISK_BYTES];
 
 static void disk_reset(void)
 {
     memset(&disk, 0, sizeof(disk));
     memset(disk_image, 0, sizeof(disk_image));
+    memset(disk_flushed, 0, sizeof(disk_flushed));
     disk.slot = -1;
     disk.base_slot = -1;
+}
+
+/* A crash: the instance is abandoned (the next harness_open_keep starts
+ * a fresh one over the same image), every block persists, or only the
+ * flushed ones when `lose_dirty` (an unflushed block reverts to its
+ * content as of the last flush; O_DSYNC writes count as flushed). */
+static void disk_crash(bool lose_dirty)
+{
+    if (lose_dirty) {
+        for (uint64_t at = 0; at < DISK_BLOCKS; ++at) {
+            if (disk.dirty[at] != 0) {
+                memcpy(disk_image + at * BLOCK, disk_flushed + at * BLOCK,
+                       BLOCK);
+            }
+        }
+    }
+    memset(disk.dirty, 0, sizeof(disk.dirty));
+    disk.slot = -1;
+    disk.flags = 0;
+    disk.base_slot = -1;
+    disk.writes = 0;
+    disk.flushes = 0;
+    disk.fallocates = 0;
+    disk.reads = 0;
+    disk.stats = 0;
+    disk.tear_armed = 0;
+    disk.fail_write = 0;
+    disk.fail_flush = 0;
+    disk.fail_read = 0;
+    disk.short_read = 0;
+    disk.flip_armed = 0;
+}
+
+/* One block written since the last flush did not persist. */
+static void disk_lose_block(uint64_t at)
+{
+    CHECK(disk.dirty[at] != 0);
+    memcpy(disk_image + at * BLOCK, disk_flushed + at * BLOCK, BLOCK);
+    disk.dirty[at] = 0;
 }
 
 /* A freed slot may be rewritten: the model forgets its blocks when the
@@ -391,7 +439,9 @@ static struct config base_config(void)
     return c;
 }
 
-static void harness_open(const struct config *c)
+/* A fresh instance over the engine tables; `keep` leaves the disk image
+ * and the transaction table as they are (a restart after a crash). */
+static void harness_open_keep(const struct config *c, bool keep)
 {
     struct vsr_io_options options = engine_options();
     struct vsr_io_layout layout;
@@ -403,8 +453,10 @@ static void harness_open(const struct config *c)
 
     memset(&h, 0, sizeof(h));
     memset(&fake, 0, sizeof(fake));
-    txns_reset();
-    disk_reset();
+    if (!keep) {
+        txns_reset();
+        disk_reset();
+    }
     h.now = 1000;
     h.next_op = 1;
     derive(&h.header_bytes, &h.max_record);
@@ -453,6 +505,11 @@ static void harness_open(const struct config *c)
     CHECK(h.store->max_record_bytes == h.max_record);
 }
 
+static void harness_open(const struct config *c)
+{
+    harness_open_keep(c, false);
+}
+
 static void harness_close(void)
 {
     CHECK(vsr_io_close(h.io) == VSR_OK);
@@ -464,12 +521,25 @@ static uint64_t next_op(void)
     return h.next_op++;
 }
 
+/* The model's rule for slot reuse: a slot's never-rewrite bits are
+ * forgotten once the store freed it (FREEING observed before the
+ * superblock write that lets it be reused), never for a live slot. */
+static void disk_track_freeing(void)
+{
+    for (uint32_t slot = 0; slot < h.store->slots; ++slot) {
+        if (h.store->segments[slot].phase == VSR_IO_SEGMENT_FREEING) {
+            disk_forget_slot(slot, h.options.segment_bytes);
+        }
+    }
+}
+
 /* Collects the SQEs of one prepare into the pending table. */
 static uint32_t harness_prepare(void)
 {
     struct vsr_io_sqe sqes[PENDING_MAX];
     uint32_t count = 0;
 
+    disk_track_freeing();
     vsr_io_store_prepare(h.io, REPLICA, sqes, PENDING_MAX, &count);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t at = NONE;
@@ -605,6 +675,9 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
                    (const unsigned char *)sqe->addr + (from - sqe->offset),
                    to - from);
             disk.dirty[at] = (disk.flags & O_DSYNC) == 0 ? 1 : 0;
+            if ((disk.flags & O_DSYNC) != 0) {
+                memcpy(disk_flushed + from, disk_image + from, to - from);
+            }
         }
         disk.writes++;
         if (disk.tear_armed != 0) {
@@ -624,8 +697,27 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
             return true;
         }
         memset(disk.dirty, 0, sizeof(disk.dirty));
+        memcpy(disk_flushed, disk_image, sizeof(disk_flushed));
         *result = 0;
         return true;
+    case VSR_IO_SQE_STATX: {
+        struct statx *out;
+
+        CHECK(sqe->fd == AT_FDCWD && sqe->flags == 0);
+        CHECK(strcmp(sqe->addr, DIRECTORY "/log") == 0);
+        CHECK((sqe->length & STATX_SIZE) != 0 && sqe->addr2 != NULL);
+        out = (struct statx *)(void *)writable(sqe->addr2, sizeof(*out));
+        if (!disk.exists) {
+            *result = -ENOENT;
+            return true;
+        }
+        memset(out, 0, sizeof(*out));
+        out->stx_mask = STATX_SIZE;
+        out->stx_size = disk.size;
+        disk.stats++;
+        *result = 0;
+        return true;
+    }
     case VSR_IO_SQE_READ: {
         const unsigned char *image = disk_image;
         uint64_t size = disk.size;
@@ -661,6 +753,12 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         }
         memcpy(writable(sqe->addr, sqe->length), image + sqe->offset,
                end - sqe->offset);
+        if (disk.flip_armed != 0 && image == disk_image &&
+            disk.flip_offset >= sqe->offset && disk.flip_offset < end) {
+            writable(sqe->addr, sqe->length)[disk.flip_offset - sqe->offset] ^=
+                0xFF;
+            disk.flip_armed = 0;
+        }
         *result = (int32_t)(end - sqe->offset);
         return true;
     }
@@ -682,6 +780,7 @@ static void harness_complete(uint32_t at)
     CHECK(p->state == 1);
     p->state = 0;
     h.pending_count--;
+    disk_track_freeing();
     if (!disk_apply(&p->sqe, &result)) {
         return; /* Lost: the completion never arrives. */
     }
@@ -818,14 +917,18 @@ struct txn {
     struct vsr_span manifest;
     unsigned char manifest_bytes[16];
     struct vsr_store_identity identity;
-    size_t bytes; /* Encoded record bytes. */
+    size_t bytes;         /* Encoded record bytes. */
+    uint64_t file_offset; /* Where it was packed, when submit saw it. */
 };
 
 static struct txn txns[TXN_MAX];
 
+static void feeds_reset(void);
+
 static void txns_reset(void)
 {
     memset(txns, 0, sizeof(txns));
+    feeds_reset();
 }
 
 /* The log end after the transactions below `sequence`: APPENDs extend
@@ -1091,6 +1194,10 @@ static uint64_t submit(const struct txn *t)
     uint64_t op = next_op();
 
     CHECK(vsr_io_store_store(h.store, op, &t->store) == VSR_OK);
+    if (h.store->readable == t->store.sequence) {
+        /* Packed at once: its file offset for the tests that damage it. */
+        txns[t->store.sequence].file_offset = h.store->file_head - t->bytes;
+    }
     return op;
 }
 
@@ -1325,6 +1432,550 @@ static void check_ring_record(uint64_t sequence, uint64_t flushed)
     CHECK(header.sequence == sequence);
     CHECK(header.flushed == flushed);
     CHECK(header.length == t->bytes);
+}
+
+/* -------------------------------------------------------------------------
+ * Recovery harness: the base file the snapshot module would load, the
+ * restart, index snapshots compared after recovery, and the script that
+ * builds a log image (phase 4's drivers start from these).
+ * ---------------------------------------------------------------------- */
+
+/* The clients files as the snapshot module would feed them at a base
+ * load: per snapshot id, the records of its capture (or a file the test
+ * composed) with their offsets; a wanted id without a file is CORRUPT,
+ * as a missing file is. `feed` records the last load. */
+#define FEEDS 4u
+
+struct base_feed {
+    struct vsr_id id; /* Zero: free. */
+    struct vsr_client_record records[16];
+    uint64_t offsets[16];
+    uint32_t count;
+};
+
+static struct base_feed feeds[FEEDS];
+static struct {
+    bool fed; /* A load was wanted and fed since the last recover. */
+    int32_t status;
+    struct vsr_id id;
+    uint64_t sequence;
+} feed;
+
+static void feeds_reset(void)
+{
+    memset(feeds, 0, sizeof(feeds));
+    memset(&feed, 0, sizeof(feed));
+}
+
+static struct base_feed *feed_of(struct vsr_id id, bool create)
+{
+    for (uint32_t i = 0; i < FEEDS; ++i) {
+        if (feeds[i].id.hi == id.hi && feeds[i].id.lo == id.lo) {
+            return &feeds[i];
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    for (uint32_t i = 0; i < FEEDS; ++i) {
+        if (feeds[i].id.hi == 0 && feeds[i].id.lo == 0) {
+            feeds[i].id = id;
+            return &feeds[i];
+        }
+    }
+    CHECK(false);
+    return NULL;
+}
+
+/* Acts as the snapshot module for the base load the store wants. */
+static void feed_base(void)
+{
+    const struct base_feed *file;
+
+    CHECK(vsr_io_store_base_wanted(h.store, &feed.id, &feed.sequence));
+    feed.fed = true;
+    file = feed_of(feed.id, false);
+    feed.status = file == NULL ? VSR_IO_CORRUPT : VSR_IO_OK;
+    if (feed.status != VSR_IO_OK) {
+        vsr_io_store_base_resume(h.store, feed.status);
+        return;
+    }
+    vsr_io_store_base_begin(h.store);
+    for (uint32_t i = 0; i < file->count; ++i) {
+        const struct vsr_client_record *record = &file->records[i];
+        struct vsr_io_wire_client_record wire;
+
+        memset(&wire, 0, sizeof(wire));
+        wire.client_hi = record->request.client.hi;
+        wire.client_lo = record->request.client.lo;
+        wire.number = record->request.number;
+        wire.op = record->op;
+        wire.length = (uint32_t)record->result.data.size;
+        CHECK(vsr_io_store_base_record(h.store, &wire, file->offsets[i]) ==
+              VSR_OK);
+    }
+    vsr_io_store_base_end(h.store, feed.id, feed.sequence);
+    vsr_io_store_base_resume(h.store, VSR_IO_OK);
+}
+
+/* A capture of the table at the current sequence under snapshot `id`, as
+ * the snapshot module does it: every completed record goes to the base
+ * file and to the feed, each entry learns its offset. */
+static void harness_capture(struct vsr_id id)
+{
+    struct vsr_io_client_snapshot out[16];
+    struct base_feed *file = feed_of(id, true);
+    uint32_t count = vsr_io_store_snapshot_clients(h.store, out, 16);
+    uint32_t n = 0;
+
+    CHECK(count <= 16);
+    for (uint32_t i = 0; i < count; ++i) {
+        const struct vsr_io_client_version *record = &out[i].record;
+        const struct base_feed *previous;
+
+        if (record->number == 0) {
+            continue;
+        }
+        if (record->sequence != 0) {
+            file->records[n] = txns[record->sequence].records[record->index];
+        } else {
+            bool found = false;
+
+            /* Only the current base file has it. */
+            previous = feed_of(h.store->client_base_id, false);
+            CHECK(previous != NULL);
+            for (uint32_t j = 0; j < previous->count; ++j) {
+                if (previous->records[j].request.client.hi == out[i].id.hi &&
+                    previous->records[j].request.client.lo == out[i].id.lo) {
+                    file->records[n] = previous->records[j];
+                    found = true;
+                }
+            }
+            CHECK(found);
+        }
+        CHECK(file->records[n].request.number == record->number);
+        n++;
+    }
+    file->count = n;
+    base_file_write(file->records, n, file->offsets);
+    for (uint32_t i = 0; i < n; ++i) {
+        vsr_io_store_capture_offset(h.store, file->records[i].request.client,
+                                    file->offsets[i]);
+    }
+    vsr_io_store_capture_end(h.store, id, h.store->readable);
+}
+
+/* The disk model after a recovery: the blocks the store may write again
+ * lose their never-rewrite bit (every free slot; the current slot from
+ * where writing resumes), every other block of a live slot keeps it. */
+static void disk_after_recovery(void)
+{
+    memset(disk.once, 0, sizeof(disk.once));
+    for (uint32_t slot = 0; slot < h.store->slots; ++slot) {
+        const struct vsr_io_segment *segment = &h.store->segments[slot];
+        uint64_t first = slot_offset(slot) / BLOCK;
+        uint64_t count = h.options.segment_bytes / BLOCK;
+
+        if (segment->number == 0) {
+            continue;
+        }
+        if (slot == h.store->current) {
+            CHECK(h.store->file_head >= slot_offset(slot) + h.header_bytes);
+            count = (h.store->file_head - slot_offset(slot)) / BLOCK;
+        }
+        memset(disk.once + first, 1, count);
+    }
+}
+
+/* Opens the log under `mode` and drives the recovery to its completion,
+ * standing in for the snapshot module when the anchor's file is wanted.
+ * Returns the RECOVERY load's status, with the row and its lease when
+ * OK. */
+static int32_t harness_recover(uint32_t mode, const struct vsr_loaded **loaded,
+                               uint32_t *lease)
+{
+    struct vsr_store_read read;
+    struct vsr_io_completion completion;
+    uint64_t op = next_op();
+
+    memset(&read, 0, sizeof(read));
+    read.type = VSR_LOAD_RECOVERY;
+    feed.fed = false;
+    vsr_io_store_open(h.store, mode, op, &read);
+    CHECK(h.store->state == VSR_IO_STORE_OPENING);
+    harness_run();
+    if (vsr_io_store_base_wanted(h.store, NULL, NULL)) {
+        feed_base();
+        harness_run();
+    }
+    CHECK(next_completion(&completion));
+    CHECK(completion.op == op);
+    *loaded = NULL;
+    *lease = NONE;
+    if (completion.status == VSR_IO_OK) {
+        CHECK(completion.lease < REGIONS && completion.data != NULL);
+        *loaded = completion.data;
+        *lease = completion.lease;
+    } else {
+        CHECK(completion.lease == NONE && completion.data == NULL);
+    }
+    expect_no_completion();
+    if (h.store->state == VSR_IO_STORE_READY) {
+        disk_after_recovery();
+    } else {
+        CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    }
+    return completion.status;
+}
+
+/* An index snapshot, taken after every scripted sequence and compared
+ * with the state recovered at that sequence. */
+#define SNAP_OPS 256u
+#define SNAP_VERSIONS 64u
+#define SNAP_CLIENTS 16u
+#define SNAPSHOTS 128u
+
+struct snap_client {
+    struct vsr_id id;
+    uint64_t number;
+    uint64_t op;
+    uint64_t retained;
+};
+
+struct snapshot {
+    uint64_t log_begin;
+    uint64_t log_end;
+    uint64_t clients_sequence;
+    uint64_t anchor_op;
+    uint64_t hard_view;
+    uint64_t hard_committed;
+    struct vsr_id anchor_id;
+    struct vsr_id client_base_id;
+    struct vsr_store_identity identity;
+    struct snap_client clients[SNAP_CLIENTS];
+    struct vsr_io_version versions[SNAP_VERSIONS];
+    struct vsr_io_op_ref ops[SNAP_OPS]; /* [log_begin, log_end) */
+    uint32_t hard_role;
+    uint32_t manifest_size;
+    uint32_t ops_count;
+    uint32_t versions_count;
+    uint32_t clients_count;
+    bool taken;
+    bool identity_set;
+    unsigned char manifest[64];
+};
+
+static struct snapshot snapshots[SNAPSHOTS];
+
+static const struct vsr_io_op_ref *op_ref(uint64_t op);
+static const struct vsr_io_client *client_of(struct vsr_id id);
+
+static void snapshot_take(void)
+{
+    struct snapshot *s;
+
+    CHECK(h.store->readable < SNAPSHOTS);
+    s = &snapshots[h.store->readable];
+    memset(s, 0, sizeof(*s));
+    s->taken = true;
+    s->identity_set = h.store->identity_set;
+    s->identity = h.store->identity;
+    s->log_begin = h.store->log_begin;
+    s->log_end = h.store->log_end;
+    s->clients_sequence = h.store->clients_sequence;
+    s->anchor_id = h.store->anchor.id;
+    s->anchor_op = h.store->anchor.op;
+    s->client_base_id = h.store->client_base_id;
+    s->hard_view = h.store->hard.view;
+    s->hard_committed = h.store->hard.committed;
+    s->hard_role = h.store->hard.role;
+    s->manifest_size = (uint32_t)h.store->anchor.manifest.size;
+    CHECK(s->manifest_size <= sizeof(s->manifest));
+    for (uint32_t i = 0; i < h.store->anchor.manifest.count; ++i) {
+        memcpy(s->manifest, h.store->anchor.manifest.spans[i].data,
+               h.store->anchor.manifest.spans[i].size);
+    }
+    CHECK(s->log_end - s->log_begin <= SNAP_OPS);
+    for (uint64_t op = s->log_begin; op < s->log_end; ++op) {
+        const struct vsr_io_op_ref *ref = op_ref(op);
+
+        if (ref->op == op) {
+            s->ops[s->ops_count] = *ref;
+        } else {
+            memset(&s->ops[s->ops_count], 0, sizeof(s->ops[0]));
+        }
+        s->ops_count++;
+    }
+    CHECK(h.store->versions_count <= SNAP_VERSIONS);
+    s->versions_count = h.store->versions_count;
+    memcpy(s->versions, h.store->versions,
+           s->versions_count * sizeof(s->versions[0]));
+    for (uint32_t i = 0; i < h.store->clients_capacity; ++i) {
+        const struct vsr_io_client *entry = &h.store->clients[i];
+        struct snap_client *c;
+
+        if (entry->id.hi == 0 && entry->id.lo == 0) {
+            continue;
+        }
+        CHECK(s->clients_count < SNAP_CLIENTS);
+        c = &s->clients[s->clients_count++];
+        c->id = entry->id;
+        c->number = entry->current.number;
+        c->op = entry->current.op;
+        c->retained = entry->retained;
+    }
+}
+
+/* The recovered indexes must agree with the snapshot of `sequence` on
+ * the live log, its versions (a superset when RECLAIM had deleted some
+ * before the crash), every client's record and retained entry, and the
+ * logical state; the client base must honour its invariant. */
+static void snapshot_check(uint64_t sequence)
+{
+    const struct snapshot *s = &snapshots[sequence];
+
+    CHECK(s->taken && h.store->readable == sequence);
+    CHECK(h.store->identity_set == s->identity_set);
+    CHECK(memcmp(&h.store->identity, &s->identity, sizeof(s->identity)) == 0);
+    CHECK(h.store->log_begin == s->log_begin);
+    CHECK(h.store->log_end == s->log_end);
+    CHECK(h.store->retained_begin <= s->log_begin);
+    CHECK(h.store->clients_sequence <= s->clients_sequence);
+    CHECK(h.store->anchor.id.hi == s->anchor_id.hi &&
+          h.store->anchor.id.lo == s->anchor_id.lo);
+    CHECK(h.store->anchor.op == s->anchor_op);
+    CHECK(h.store->anchor.manifest.size == s->manifest_size);
+    if (s->manifest_size > 0) {
+        CHECK(h.store->anchor.manifest.count == 1 &&
+              memcmp(h.store->anchor.manifest.spans[0].data, s->manifest,
+                     s->manifest_size) == 0);
+    }
+    CHECK(h.store->client_base_id.hi == s->client_base_id.hi &&
+          h.store->client_base_id.lo == s->client_base_id.lo);
+    CHECK(h.store->hard.view == s->hard_view &&
+          h.store->hard.committed == s->hard_committed &&
+          h.store->hard.role == s->hard_role);
+    CHECK((h.store->hard.epoch != NULL) == s->identity_set);
+    for (uint32_t i = 0; i < s->ops_count; ++i) {
+        const struct vsr_io_op_ref *expected = &s->ops[i];
+        const struct vsr_io_op_ref *ref = op_ref(s->log_begin + i);
+
+        if (expected->op == 0) {
+            CHECK(ref->op != s->log_begin + i);
+            continue;
+        }
+        CHECK(ref->op == expected->op && ref->sequence == expected->sequence);
+        CHECK(ref->offset == expected->offset &&
+              ref->length == expected->length);
+        CHECK(ref->change == expected->change && ref->index == expected->index);
+        CHECK(ref->client.hi == expected->client.hi &&
+              ref->client.lo == expected->client.lo);
+    }
+    for (uint32_t i = 0; i < s->versions_count; ++i) {
+        const struct vsr_io_version *expected = &s->versions[i];
+        bool found = false;
+
+        for (uint32_t j = 0; j < h.store->versions_count; ++j) {
+            const struct vsr_io_version *v = &h.store->versions[j];
+
+            if (v->op == expected->op && v->appended == expected->appended &&
+                v->truncated == expected->truncated &&
+                v->offset == expected->offset &&
+                v->length == expected->length) {
+                found = true;
+            }
+        }
+        CHECK(found);
+    }
+    for (uint32_t i = 0; i < s->clients_count; ++i) {
+        const struct snap_client *expected = &s->clients[i];
+        const struct vsr_io_client *entry = client_of(expected->id);
+
+        if (expected->number == 0 && expected->retained == 0) {
+            continue; /* An in-flight entry: the crash forgot it. */
+        }
+        CHECK(entry != NULL);
+        CHECK(entry->current.number == expected->number &&
+              entry->current.op == expected->op);
+        CHECK(entry->retained == expected->retained);
+    }
+    for (uint32_t i = 0; i < h.store->clients_capacity; ++i) {
+        const struct vsr_io_client *entry = &h.store->clients[i];
+        bool found = false;
+
+        if (entry->id.hi == 0 && entry->id.lo == 0) {
+            continue;
+        }
+        for (uint32_t j = 0; j < s->clients_count; ++j) {
+            if (s->clients[j].id.hi == entry->id.hi &&
+                s->clients[j].id.lo == entry->id.lo) {
+                found = true;
+            }
+        }
+        CHECK(found && entry->inflight == 0);
+        /* The base invariant: a record at or below the base is in the
+         * file. */
+        if (entry->current.number != 0 &&
+            entry->current.sequence <= h.store->client_base) {
+            CHECK(entry->base_offset != UINT64_MAX);
+        }
+    }
+}
+
+/* The script: a deterministic transaction per sequence covering every
+ * change type at a fixed cadence (a TRUNCATE at 0, a TRIM at 3, CLIENTS
+ * at 5, HARD_STATE at 7, a client's APPEND at 8, plain APPENDs
+ * otherwise), with an own capture at 1 before the PUBLISH at 2 of every
+ * ten sequences from 12. Phase 4's drivers may run it to any length to
+ * build a log image. */
+#define SCRIPT_LENGTH 44u
+
+static const struct vsr_id script_a = {0xA, 1};
+static const struct vsr_id script_b = {0xB, 1};
+
+static struct vsr_id script_snapshot(uint64_t publish_sequence)
+{
+    struct vsr_id id = {0x50 + publish_sequence / 10, 1};
+
+    return id;
+}
+
+/* The log begin after the transactions below `sequence`. */
+static uint64_t log_begin_before(uint64_t sequence)
+{
+    uint64_t begin = 1;
+
+    for (uint64_t q = 1; q < sequence; ++q) {
+        const struct txn *t = &txns[q];
+
+        for (uint32_t i = 0; i < t->store.count; ++i) {
+            const struct vsr_change *change = &t->store.changes[i];
+
+            if (change->type == VSR_STORE_TRIM) {
+                begin = change->first;
+            } else if (change->type == VSR_STORE_RESTORE_CHECKPOINT) {
+                begin = t->checkpoint.op + 1;
+            }
+        }
+    }
+    return begin;
+}
+
+static const struct txn *script_txn(uint64_t sequence)
+{
+    uint64_t begin = log_begin_before(sequence);
+    uint64_t end = log_end_before(sequence);
+    struct vsr_id ids[2];
+    uint64_t numbers[2] = {sequence, sequence};
+    uint64_t ops[2] = {end > 1 ? end - 1 : 1, end > 1 ? end - 1 : 1};
+
+    ids[0] = (sequence / 10) % 2 == 0 ? script_a : script_b;
+    ids[1] = script_b;
+    if (sequence == 1) {
+        return txn_identity(1, VSR_MEMBER_FULL);
+    }
+    if (sequence == 2) {
+        numbers[0] = 1;
+        numbers[1] = 1;
+        ids[0] = script_a;
+        return txn_clients(2, 2, ids, numbers, ops, 8);
+    }
+    if (sequence % 10 == 2 && sequence >= 12) {
+        return txn_publish(sequence, script_snapshot(sequence), end - 1);
+    }
+    switch (sequence % 10) {
+    case 0:
+        if (end - 1 > begin) {
+            return txn_truncate(sequence, end - 1, 1, 24);
+        }
+        break;
+    case 3:
+        if (end > begin + 1) {
+            return txn_trim(sequence, end - 1);
+        }
+        break;
+    case 5:
+        return txn_clients(sequence, 1, ids, numbers, ops, 16);
+    case 7:
+        return txn_hard(sequence, VSR_MEMBER_FULL);
+    case 8:
+        return txn_append_client(sequence, 1 + (uint32_t)(sequence % 3), 32,
+                                 ids[0], sequence * 4);
+    default:
+        break;
+    }
+    return txn_append(sequence, 1 + (uint32_t)(sequence % 4),
+                      (size_t)(sequence * 37 % 200));
+}
+
+/* Runs the script from `from` to `to`: each transaction submitted and
+ * driven to completion, writes included (a base load fed when wanted); a
+ * SYNC every fourth sequence; RECLAIM of the sequence after each (so
+ * slots free); the capture before a PUBLISH; an index snapshot after
+ * each. */
+static void script_run(uint64_t from, uint64_t to)
+{
+    for (uint64_t sequence = from; sequence <= to; ++sequence) {
+        uint64_t op;
+
+        if (sequence % 10 == 1 && sequence >= 11) {
+            harness_capture(script_snapshot(sequence + 1));
+        }
+        op = submit(script_txn(sequence));
+        harness_run();
+        if (vsr_io_store_base_wanted(h.store, NULL, NULL)) {
+            /* A PUBLISH after a restart: the capture is not remembered,
+             * so the file is loaded as the snapshot module would. */
+            feed_base();
+            harness_run();
+        }
+        expect_completion(op, VSR_IO_OK);
+        CHECK(h.store->readable == sequence);
+        if (sequence % 4 == 0) {
+            op = submit_sync(sequence);
+            harness_run();
+            expect_completion(op, VSR_IO_OK);
+        }
+        op = submit_reclaim(sequence);
+        expect_completion(op, VSR_IO_OK);
+        harness_run();
+        expect_no_completion();
+        snapshot_take();
+    }
+}
+
+/* The configuration the script runs in: slots of a few records (each
+ * written on its own, so padded to a block), three of them at most (one
+ * by growth), a ring that wraps every few records, a write-behind hold
+ * of two blocks. */
+static struct config script_config(uint8_t sync_mode)
+{
+    struct config c = base_config();
+    uint64_t header_bytes;
+    uint64_t max_record;
+
+    derive(&header_bytes, &max_record);
+    c.segment_bytes = round_up(header_bytes + 2 * max_record, BLOCK);
+    c.segments = 2;
+    c.max_segments = 3;
+    c.write_behind_bytes = 2 * BLOCK;
+    c.cache_bytes =
+        round_up(c.write_behind_bytes + limits.pinned_payload_bytes +
+                     2 * max_record + 2 * header_bytes + BLOCK,
+                 BLOCK);
+    c.sync_mode = sync_mode;
+    return c;
+}
+
+/* The snapshot id of the latest PUBLISH at or below `sequence`, or zero. */
+static struct vsr_id script_anchor(uint64_t sequence)
+{
+    struct vsr_id none = {0, 0};
+
+    if (sequence < 12) {
+        return none;
+    }
+    return script_snapshot((sequence - 12) / 10 * 10 + 12);
 }
 
 /* -------------------------------------------------------------------------
@@ -1591,8 +2242,9 @@ static void test_recover_missing(void)
     harness_close();
 }
 
-/* An existing log routes to recovery, which phase 3 delivers; until then
- * the open fails, and NEW over stray state is refused either way. */
+/* An existing log routes to recovery under every start mode (NEW over
+ * stray state is refused through the recovered row, decision 57); a file
+ * without a valid superblock is CORRUPT, which fences. */
 static void test_open_existing(void)
 {
     struct config c = base_config();
@@ -1608,9 +2260,14 @@ static void test_open_existing(void)
     vsr_io_store_open(h.store, VSR_START_NEW, op, &read);
     CHECK(harness_prepare() == 1);
     harness_complete(pending_of(VSR_IO_SQE_OPENAT));
-    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
     CHECK(h.store->log_slot == (int32_t)FILE_SLOT_BASE);
-    expect_completion(op, VSR_IO_FAILED);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_STATX));
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_READ));
+    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    expect_completion(op, VSR_IO_CORRUPT);
     expect_no_completion();
     /* Every later op fails at once. */
     CHECK(vsr_io_store_store(h.store, 77, &txn_append(1, 1, 8)->store) ==
@@ -3229,6 +3886,739 @@ static void test_bad_descriptor(void)
     harness_close();
 }
 
+/* -------------------------------------------------------------------------
+ * Recovery
+ * ---------------------------------------------------------------------- */
+
+/* A configuration without holds: a submitted record is packed at once
+ * (its offset known), a write covers everything packed since the last. */
+static struct config plain_config(void)
+{
+    struct config c = base_config();
+
+    c.write_behind_bytes = c.segment_bytes;
+    c.cache_bytes += c.segment_bytes;
+    return c;
+}
+
+/* Submits a transaction and drives it to completion (writes, growth or
+ * a wanted base load included), then snapshots the indexes. */
+static void store_run(const struct txn *t)
+{
+    uint64_t op = submit(t);
+
+    harness_run();
+    if (vsr_io_store_base_wanted(h.store, NULL, NULL)) {
+        feed_base();
+        harness_run();
+    }
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->readable == t->store.sequence);
+    snapshot_take();
+}
+
+/* Transaction 1 then plain appends up to `count`, each written before the
+ * next, a SYNC at `sync_at` (0: none), a snapshot after each. */
+static void plain_run(uint64_t count, uint64_t sync_at)
+{
+    for (uint64_t sequence = 1; sequence <= count; ++sequence) {
+        const struct txn *t = sequence == 1 ? txn_identity(1, VSR_MEMBER_FULL)
+                                            : txn_append(sequence, 2, 100);
+
+        store_run(t);
+        if (sequence == sync_at) {
+            uint64_t op = submit_sync(sequence);
+
+            harness_run();
+            expect_completion(op, VSR_IO_OK);
+        }
+    }
+}
+
+/* Recovers after a crash that kept every block and expects `sequence`
+ * with the indexes of its snapshot; the row's lease is released. */
+static void expect_recovered(const struct config *c, uint64_t sequence)
+{
+    const struct vsr_loaded *loaded = NULL;
+    uint32_t lease = NONE;
+
+    disk_crash(false);
+    harness_open_keep(c, true);
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == sequence && loaded->count == 1);
+    CHECK(((const struct vsr_recovered *)loaded->items)->sequence == sequence);
+    release_lease(lease);
+    snapshot_check(sequence);
+}
+
+static void expect_corrupt(const struct config *c)
+{
+    const struct vsr_loaded *loaded = NULL;
+    uint32_t lease = NONE;
+
+    disk_crash(false);
+    harness_open_keep(c, true);
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) ==
+          VSR_IO_CORRUPT);
+    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+}
+
+/* Both CRCs of the record at `offset` made good again after an edit. */
+static void image_fix_record(uint64_t offset)
+{
+    unsigned char *record = disk_image + offset;
+    uint32_t length = vsr_io_get_u32(record + 4);
+
+    vsr_io_put_u32(record + 40, vsr_io_crc32c(0, record + 48, length - 48));
+    vsr_io_put_u32(record + 44, vsr_io_crc32c(0, record, 44));
+}
+
+/* Every prefix of the script: the crash after sequence n (every block
+ * kept) recovers exactly n with the indexes, the state and the base of
+ * its snapshot, in a superblock with run + 1 and the floor n; the script
+ * then continues over the recovered log (the never-rewrite model checks
+ * every write) and a second crash finds all of it. Segments seal, the
+ * ring wraps, the third slot grows and slots free along the way. */
+static void recover_prefixes(uint8_t sync_mode)
+{
+    struct config c = script_config(sync_mode);
+    bool reused = false;
+
+    for (uint64_t n = 1; n <= SCRIPT_LENGTH; ++n) {
+        const struct vsr_loaded *loaded = NULL;
+        const struct vsr_recovered *row;
+        struct vsr_io_wire_superblock superblock;
+        struct vsr_id anchor = script_anchor(n);
+        uint32_t lease = NONE;
+        uint32_t run;
+        uint64_t revision;
+
+        harness_open(&c);
+        harness_start(VSR_START_NEW);
+        script_run(1, n);
+        run = h.store->run;
+        revision = h.store->superblock_revision;
+        reused = reused || h.store->next_segment > c.max_segments + 1;
+        disk_crash(false);
+        harness_open_keep(&c, true);
+        CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+        row = loaded->items;
+        CHECK(loaded->count == 1 && loaded->sequence == n);
+        CHECK(row->sequence == n);
+        CHECK(row->identity.cluster.hi == 0x77 && row->identity.replica == 3);
+        CHECK(row->log_begin == snapshots[n].log_begin &&
+              row->log_end == snapshots[n].log_end);
+        CHECK(row->hard.role == VSR_MEMBER_FULL && row->hard.view == 1);
+        CHECK(row->hard.epoch != NULL && row->hard.epoch->current != NULL &&
+              row->hard.epoch->current->count == 1 &&
+              row->hard.epoch->current->members[0].id == 1);
+        if (anchor.hi == 0) {
+            CHECK(row->checkpoint == NULL && !feed.fed);
+        } else {
+            uint64_t published = (n - 12) / 10 * 10 + 12;
+
+            CHECK(row->checkpoint != NULL &&
+                  row->checkpoint->id.hi == anchor.hi);
+            CHECK(row->checkpoint->manifest.size == 16 &&
+                  memcmp(row->checkpoint->manifest.spans[0].data,
+                         txns[published].manifest_bytes, 16) == 0);
+            CHECK(feed.fed && feed.id.hi == anchor.hi);
+            CHECK(h.store->client_base_id.hi == anchor.hi);
+        }
+        release_lease(lease);
+        snapshot_check(n);
+        CHECK(h.store->run == run + 1 && h.store->durable == n);
+        CHECK(h.store->written == n && h.store->flushed == n);
+        CHECK(h.store->superblock_floor == n && h.store->reclaim == 0);
+        CHECK(h.store->superblock_revision == revision + 1);
+        read_superblock(h.store->superblock_next == 0 ? 1 : 0, &superblock);
+        CHECK(superblock.run == run + 1 && superblock.durable_floor == n);
+        CHECK(superblock.slots == h.store->slots &&
+              superblock.revision == revision + 1);
+        CHECK(superblock.cluster_hi == 0x77 && superblock.replica == 3);
+        CHECK(disk.flushes == (sync_mode == VSR_IO_SYNC_FDATASYNC ? 2u : 0u));
+        CHECK(h.store->head == 0 && h.store->file_head % BLOCK == 0);
+        CHECK(h.store->segments[h.store->current].phase == VSR_IO_SEGMENT_OPEN);
+        /* Writing resumes; the second crash finds the continuation. */
+        script_run(n + 1, n + 3);
+        expect_recovered(&c, n + 3);
+        harness_close();
+    }
+    CHECK(reused);
+}
+
+static void test_recover_prefixes(void)
+{
+    recover_prefixes(VSR_IO_SYNC_FDATASYNC);
+}
+
+static void test_recover_prefixes_dsync(void)
+{
+    recover_prefixes(VSR_IO_SYNC_DSYNC);
+}
+
+/* The torn tail: the last write, of three records over several blocks,
+ * persists only its first `tear` blocks; the records complete within
+ * them are recovered, the rest is the tail, and writing resumes at the
+ * block after the last valid record. Then a lost middle block with the
+ * later block persisted, and the run rule: a persisted block of a torn
+ * write behind a block rewritten by a later run is rejected. */
+static void test_recover_torn(void)
+{
+    struct config c = plain_config();
+    uint32_t at;
+    uint64_t expected = 5;
+
+    for (uint32_t tear = 0;; ++tear) {
+        uint64_t write_offset;
+        uint64_t blocks;
+        uint64_t resume;
+
+        expected = 5;
+
+        harness_open(&c);
+        harness_start(VSR_START_NEW);
+        plain_run(5, 5);
+        for (uint64_t sequence = 6; sequence <= 8; ++sequence) {
+            expect_completion(submit(txn_append(sequence, 3, 100)), VSR_IO_OK);
+            snapshot_take();
+        }
+        CHECK(harness_prepare() == 1);
+        at = pending_of(VSR_IO_SQE_WRITE);
+        write_offset = h.pending[at].sqe.offset;
+        blocks = (h.pending[at].sqe.length + BLOCK - 1) / BLOCK;
+        CHECK(write_offset == txns[6].file_offset && blocks >= 3);
+        for (uint64_t sequence = 6; sequence <= 8; ++sequence) {
+            if (txns[sequence].file_offset + txns[sequence].bytes <=
+                write_offset + tear * BLOCK) {
+                expected = sequence;
+            }
+        }
+        disk.tear_armed = 1;
+        disk.tear_blocks = tear;
+        harness_complete(at); /* Lost. */
+        expect_recovered(&c, expected);
+        /* Records 6 to 8 carry the floor 5; none of 1 to 5 does. */
+        CHECK(h.store->recovery.durable_floor == (expected > 5 ? 5u : 0u));
+        resume = h.store->file_head;
+        CHECK(
+            resume ==
+            round_up(txns[expected].file_offset + txns[expected].bytes, BLOCK));
+        /* The next record goes to that block; the model would trap a
+         * rewrite below it. */
+        expect_completion(submit(txn_append(expected + 1, 1, 8)), VSR_IO_OK);
+        harness_run();
+        CHECK(txns[expected + 1].file_offset == resume);
+        harness_close();
+        if (tear == blocks) {
+            CHECK(expected == 8);
+            break;
+        }
+        CHECK(expected < 8);
+    }
+    /* A lost middle block: the record straddling it ends the log, the
+     * later block's records are the tail and their flushed floors count
+     * (the sweep) but stay below the recovered sequence. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(5, 5);
+    for (uint64_t sequence = 6; sequence <= 8; ++sequence) {
+        expect_completion(submit(txn_append(sequence, 3, 100)), VSR_IO_OK);
+        snapshot_take();
+    }
+    harness_run();
+    CHECK(h.store->written == 8);
+    at = (uint32_t)((txns[7].file_offset + 8) / BLOCK);
+    disk_lose_block(at);
+    CHECK(txns[8].file_offset >= (at + 1) * BLOCK); /* 8 survives whole. */
+    for (uint64_t sequence = 5; sequence <= 8; ++sequence) {
+        if (txns[sequence].file_offset + txns[sequence].bytes <= at * BLOCK) {
+            expected = sequence;
+        }
+    }
+    CHECK(expected < 8);
+    expect_recovered(&c, expected);
+    CHECK(h.store->recovery.durable_floor == 5); /* Record 8, swept. */
+    harness_close();
+    /* The run rule: record 2 (run 1) fills block b exactly, record 3
+     * (run 1) starts at b + 1; block b is lost, 2' (run 2) rewrites it
+     * within the block; the next recovery must not take the old 3. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(1, 1);
+    expect_completion(submit(txn_truncate(2, 1, 2, 144)), VSR_IO_OK);
+    CHECK(txns[2].bytes == BLOCK && txns[2].file_offset % BLOCK == 0);
+    snapshot_take();
+    expect_completion(submit(txn_append(3, 1, 8)), VSR_IO_OK);
+    snapshot_take();
+    CHECK(txns[3].file_offset == txns[2].file_offset + BLOCK);
+    harness_run();
+    disk_lose_block(txns[2].file_offset / BLOCK);
+    expect_recovered(&c, 1);
+    CHECK(h.store->file_head == txns[2].file_offset);
+    expect_completion(submit(txn_append(2, 1, 8)), VSR_IO_OK);
+    CHECK(txns[2].bytes < BLOCK);
+    harness_run();
+    snapshot_take();
+    CHECK(h.store->run == 2);
+    expect_recovered(&c, 2);
+    CHECK(h.store->run == 3 && h.store->log_end == 2);
+    harness_close();
+}
+
+/* The durable floor (decision 50): a bad record above F is the torn
+ * tail, at or below F it is CORRUPT, F being carried by a later valid
+ * record's flushed alone (the superblock still says 0); a PAD whose
+ * length does not reach the block's end is a bad range too. */
+static void test_recover_floor(void)
+{
+    struct config c = plain_config();
+    struct vsr_io_wire_superblock superblock;
+    uint64_t pad;
+
+    /* Record 9 damaged: above F = 6 (records 7 to 10 carry it). */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(10, 6);
+    read_superblock(0, &superblock);
+    CHECK(superblock.durable_floor == 0);
+    disk_image[txns[9].file_offset + 60] ^= 0xFF;
+    expect_recovered(&c, 8);
+    CHECK(h.store->recovery.durable_floor == 6);
+    harness_close();
+    /* Record 7 damaged: the first above F. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(10, 6);
+    disk_image[txns[7].file_offset + 60] ^= 0xFF;
+    expect_recovered(&c, 6);
+    harness_close();
+    /* Record 5 damaged: at or below F, which only record 7's flushed
+     * carries, found by the sweep behind the bad one. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(10, 6);
+    disk_image[txns[5].file_offset + 60] ^= 0xFF;
+    expect_corrupt(&c);
+    CHECK(h.store->recovery.durable_floor == 6);
+    CHECK(h.store->recovery.sequence == 4);
+    harness_close();
+    /* The floor from the superblock alone (an idle write persisted it):
+     * record 6 damaged is CORRUPT even with no record after it. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(6, 6);
+    h.now += 200000000;
+    harness_run(); /* The idle superblock write. */
+    read_superblock(h.store->superblock_next == 0 ? 1 : 0, &superblock);
+    CHECK(superblock.durable_floor == 6);
+    disk_image[txns[6].file_offset + 60] ^= 0xFF;
+    expect_corrupt(&c);
+    harness_close();
+    /* A bad PAD after record 8 cuts at 8; after record 4 it is CORRUPT. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(10, 6);
+    pad = txns[8].file_offset + txns[8].bytes;
+    CHECK(pad % BLOCK != 0 &&
+          vsr_io_get_u32(disk_image + pad) == VSR_IO_PAD_MAGIC);
+    vsr_io_put_u32(disk_image + pad + 4, BLOCK); /* Past the block. */
+    expect_recovered(&c, 8);
+    harness_close();
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(10, 6);
+    pad = txns[4].file_offset + txns[4].bytes;
+    CHECK(pad % BLOCK != 0);
+    vsr_io_put_u32(disk_image + pad + 4, 8); /* Short of the block. */
+    expect_corrupt(&c);
+    harness_close();
+    /* CRC-valid bytes whose content contradicts the log (an APPEND not
+     * at the log end) are CORRUPT wherever they lie. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(10, 6);
+    vsr_io_put_u64(disk_image + txns[9].file_offset + 48 + 8, 1000);
+    image_fix_record(txns[9].file_offset);
+    expect_corrupt(&c);
+    harness_close();
+}
+
+/* Stale headers (decision 48): a successor whose records were all lost
+ * is abandoned and its slot freed, writing resumes in the segment
+ * holding the last record; the new segment then taking that slot loses
+ * its header write while its records persist, and the old header, which
+ * names the same sequence, still leads to them; a reused slot whose new
+ * header is lost under an old header naming another sequence makes its
+ * records the tail. */
+static void test_recover_stale(void)
+{
+    struct config c = script_config(VSR_IO_SYNC_FDATASYNC);
+    struct vsr_id x = {0x51, 1};
+    uint64_t sequence = 2;
+    uint64_t sealed_at;
+    uint64_t before;
+
+    c.write_behind_bytes = c.segment_bytes;
+    c.cache_bytes += c.segment_bytes;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(1, 1);
+    while (h.store->current == 0) {
+        store_run(txn_append(sequence, 2, 100));
+        sequence++;
+    }
+    sealed_at = h.store->segments[0].last_sequence;
+    CHECK(sealed_at == sequence - 2 && h.store->segments[1].number == 2);
+    /* Segment 2's records lost, its header kept: abandoned. */
+    for (uint64_t at = (slot_offset(1) + h.header_bytes) / BLOCK;
+         at < h.store->file_head / BLOCK; ++at) {
+        disk_lose_block(at);
+    }
+    expect_recovered(&c, sealed_at);
+    CHECK(h.store->current == 0 && h.store->segments[1].number == 0);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_OPEN);
+    CHECK(h.store->next_segment == 3);
+    /* A record that does not fit seals segment 1 again: segment 3 takes
+     * slot 1 over the abandoned header, whose write is then lost while
+     * the record persists: header 2 names sealed_at too, so the record
+     * is found under it. */
+    store_run(txn_append(sealed_at + 1, 4, 250));
+    CHECK(h.store->current == 1 && h.store->segments[1].number == 3);
+    CHECK(disk.dirty[slot_offset(1) / BLOCK] != 0);
+    disk_lose_block(slot_offset(1) / BLOCK);
+    CHECK(vsr_io_get_u64(disk_image + slot_offset(1) + 16) == 2);
+    expect_recovered(&c, sealed_at + 1);
+    CHECK(h.store->segments[1].number == 2 && h.store->current == 1);
+    CHECK(h.store->next_segment == 3 && h.store->segments[1].run == 1);
+    /* Fill slot 1, grow into slot 2 (segment 3 again: 3 was never
+     * durable), recover once more. */
+    sequence = sealed_at + 2;
+    while (h.store->current == 1) {
+        store_run(txn_append(sequence, 2, 100));
+        sequence++;
+    }
+    CHECK(h.store->current == 2 && h.store->segments[2].number == 3);
+    store_run(txn_append(sequence, 1, 8));
+    expect_recovered(&c, sequence);
+    CHECK(h.store->segments[2].number == 3 && h.store->current == 2);
+    sequence++;
+    /* Free slot 0's segment and reuse it as segment 4: its header write
+     * is lost but its records persist; the old header names sequence 0,
+     * so they are the tail and the slot is free again. */
+    store_run(txn_trim(sequence, h.store->log_end));
+    sequence++;
+    harness_capture(x); /* A base above the records frees their slots. */
+    store_run(txn_publish(sequence, x, h.store->log_end - 1));
+    expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+    harness_run();
+    sequence++;
+    while (h.store->current == 2) {
+        store_run(txn_append(sequence, 2, 100));
+        sequence++;
+    }
+    before = h.store->segments[2].last_sequence;
+    CHECK(h.store->current == 0 && h.store->segments[0].number == 4);
+    CHECK(before == sequence - 2 && disk.dirty[slot_offset(0) / BLOCK] != 0);
+    disk_lose_block(slot_offset(0) / BLOCK);
+    CHECK(vsr_io_get_u64(disk_image + slot_offset(0) + 16) == 1);
+    expect_recovered(&c, before);
+    CHECK(h.store->current == 2 && h.store->segments[0].number == 0);
+    CHECK(h.store->next_segment == 4);
+    harness_close();
+}
+
+/* The superblocks: the newer valid copy wins, a damaged copy leaves the
+ * other, both damaged is CORRUPT, and a growth whose superblock write was
+ * lost is recovered from the file's size; the geometry must match. */
+static void test_recover_superblocks(void)
+{
+    struct config c = plain_config();
+    struct vsr_io_wire_superblock superblock;
+    uint64_t sequence = 2;
+    uint64_t held;
+
+    c.segments = 2;
+    c.max_segments = 3;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(1, 1);
+    while (h.store->slots < 3) {
+        store_run(txn_append(sequence, 4, 128));
+        sequence++;
+    }
+    /* Creation wrote revision 1 to both, the identity 2 to copy 0, the
+     * growth 3 to copy 1. */
+    read_superblock(0, &superblock);
+    CHECK(superblock.revision == 2 && superblock.slots == 2);
+    read_superblock(1, &superblock);
+    CHECK(superblock.revision == 3 && superblock.slots == 3);
+    /* The newer copy damaged: the older, naming two slots, with a file
+     * of three; the recovery rewrites the damaged copy. */
+    memset(disk_image + BLOCK, 0, BLOCK);
+    expect_recovered(&c, sequence - 1);
+    CHECK(h.store->recovery.copy == 0 && h.store->slots == 3);
+    read_superblock(1, &superblock);
+    CHECK(superblock.revision == 3 && superblock.slots == 3);
+    /* Both valid: copy 1 wins; the recovery writes copy 0. */
+    expect_recovered(&c, sequence - 1);
+    CHECK(h.store->recovery.copy == 1);
+    read_superblock(0, &superblock);
+    CHECK(superblock.revision == 4 && superblock.slots == 3);
+    /* Both damaged. */
+    memset(disk_image, 0, 2 * BLOCK);
+    expect_corrupt(&c);
+    harness_close();
+    /* A crash between the growth's FALLOCATE and its superblock. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(1, 1);
+    sequence = 2;
+    while (h.store->growth == 0) {
+        uint64_t op = submit(txn_append(sequence, 4, 128));
+
+        if (h.store->growth == 0) {
+            expect_completion(op, VSR_IO_OK);
+            harness_run();
+            snapshot_take();
+        } else {
+            held = op;
+        }
+        sequence++;
+    }
+    (void)held;
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_FALLOCATE));
+    CHECK(harness_prepare() == 1);
+    {
+        uint32_t at = pending_of(VSR_IO_SQE_WRITE);
+
+        CHECK(h.pending[at].sqe.offset ==
+              BLOCK); /* Copy 1: the identity took 0. */
+        harness_complete(at);
+    }
+    disk_lose_block(1);
+    expect_recovered(&c, sequence - 2);
+    CHECK(h.store->slots == 3 && h.store->file_size == disk.size);
+    read_superblock(1, &superblock);
+    CHECK(superblock.slots == 3 && superblock.revision == 3);
+    /* The third slot is there: no FALLOCATE for the next segment. */
+    store_run(txn_append(sequence - 1, 4, 128));
+    CHECK(h.store->current == 2 && disk.fallocates == 0);
+    /* The geometry must match the options. */
+    c.segment_bytes += BLOCK;
+    c.cache_bytes += BLOCK;
+    expect_corrupt(&c);
+    harness_close();
+}
+
+/* Restarts and drives the recovery until the first chunk read of the
+ * start segment is pending; returns its pending index. */
+static uint32_t recover_until_chunk(const struct config *c, uint64_t *op)
+{
+    struct vsr_store_read read;
+
+    disk_crash(false);
+    harness_open_keep(c, true);
+    memset(&read, 0, sizeof(read));
+    read.type = VSR_LOAD_RECOVERY;
+    *op = next_op();
+    vsr_io_store_open(h.store, VSR_START_RECOVER, *op, &read);
+    for (;;) {
+        uint32_t at;
+
+        CHECK(harness_prepare() == 1);
+        at = pending_first();
+        if (h.pending[at].sqe.opcode == VSR_IO_SQE_READ &&
+            h.pending[at].sqe.offset == slot_offset(0) + h.header_bytes) {
+            return at;
+        }
+        harness_complete(at);
+    }
+}
+
+/* The one re-read of a bad range (decision 50): a read error, a flipped
+ * byte and a short read on the first attempt all pass on the second, on
+ * the superblocks as on a chunk; a record whose header straddles a
+ * chunk's end is read again from its block. */
+static void test_recover_reread(void)
+{
+    struct config c = plain_config();
+    const struct vsr_loaded *loaded = NULL;
+    uint32_t lease = NONE;
+    uint64_t op;
+    uint64_t reads;
+    uint64_t end;
+    uint64_t body;
+    uint64_t sequence;
+    uint32_t at;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(8, 8);
+    /* The superblocks: a read error, then a short read. */
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    disk.fail_read = -EIO;
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == 8);
+    release_lease(lease);
+    reads = disk.reads;
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    disk.short_read = BLOCK;
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == 8 && disk.reads == reads);
+    release_lease(lease);
+    /* A chunk: a read error, then a short read. */
+    at = recover_until_chunk(&c, &op);
+    CHECK(vsr_io_store_close(h.store) == VSR_EBUSY);
+    disk.fail_read = -EIO;
+    harness_complete(at);
+    CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
+    harness_run();
+    expect_loaded(op, VSR_IO_OK, &lease);
+    release_lease(lease);
+    CHECK(h.store->readable == 8 && disk.reads == reads);
+    disk_after_recovery();
+    at = recover_until_chunk(&c, &op);
+    disk.short_read = BLOCK;
+    harness_complete(at);
+    harness_run();
+    expect_loaded(op, VSR_IO_OK, &lease);
+    release_lease(lease);
+    CHECK(h.store->readable == 8);
+    disk_after_recovery();
+    /* A flipped byte on the first read of record 5. */
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    disk.flip_armed = 1;
+    disk.flip_offset = txns[5].file_offset + 60;
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == 8 && disk.flip_armed == 0);
+    release_lease(lease);
+    snapshot_check(8);
+    harness_close();
+    /* A record ending 40 bytes before the chunk's end (the chunk is the
+     * slab, 4096 bytes from the data start): the next header is short in
+     * the chunk and read again from its block. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(1, 1);
+    end = slot_offset(0) + h.header_bytes + PAGE - 40;
+    sequence = 2;
+    for (;;) {
+        uint64_t gap = end - h.store->file_head;
+
+        /* A one-entry APPEND is 136 bytes plus its body. */
+        if (gap >= 136 && gap <= 136 + 256) {
+            break; /* One record of a body in range ends there. */
+        }
+        if (gap < 136) {
+            end += PAGE; /* The next chunk's end. */
+            continue;
+        }
+        expect_completion(submit(txn_append(sequence, 1, 200)), VSR_IO_OK);
+        snapshot_take();
+        sequence++;
+    }
+    body = end - h.store->file_head - 136;
+    expect_completion(submit(txn_append(sequence, 1, (size_t)body)), VSR_IO_OK);
+    snapshot_take();
+    sequence++;
+    CHECK(h.store->file_head == end);
+    expect_completion(submit(txn_append(sequence, 2, 100)), VSR_IO_OK);
+    snapshot_take();
+    harness_run(); /* One write: the records lie back to back. */
+    expect_recovered(&c, sequence);
+    harness_close();
+}
+
+/* Start modes and the base: NEW and JOIN over an empty log proceed with
+ * it, over records they get the row; a witness loads no file; a missing
+ * file is CORRUPT; a foreign RESTORE's file is wanted again at recovery;
+ * an identity the superblock contradicts is CORRUPT. */
+static void test_recover_modes(void)
+{
+    struct config c = script_config(VSR_IO_SYNC_FDATASYNC);
+    struct vsr_io_wire_superblock superblock;
+    const struct vsr_loaded *loaded = NULL;
+    struct vsr_id x = {0x51, 1};
+    struct vsr_id z = {0x53, 1};
+    struct base_feed *file;
+    uint32_t lease = NONE;
+
+    /* An empty log under NEW, JOIN and RECOVER: NOT_FOUND, then usable. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    for (uint32_t mode = VSR_START_NEW; mode <= VSR_START_RECOVER; ++mode) {
+        disk_crash(false);
+        harness_open_keep(&c, true);
+        CHECK(harness_recover(mode, &loaded, &lease) == VSR_IO_NOT_FOUND);
+        CHECK(h.store->state == VSR_IO_STORE_READY && h.store->run == 2 + mode);
+        CHECK(h.store->current == 0 && h.store->readable == 0);
+    }
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    expect_recovered(&c, 1);
+    /* Records under NEW: the row (the core refuses it, decision 57). */
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    CHECK(harness_recover(VSR_START_NEW, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == 1);
+    release_lease(lease);
+    harness_close();
+    /* A witness with an anchor loads no file. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_WITNESS));
+    store_run(txn_publish(2, x, 1));
+    store_run(txn_append(3, 2, 50));
+    CHECK(h.store->client_base == 2 && h.store->client_base_id.hi == 0x51);
+    expect_recovered(&c, 3);
+    CHECK(!feed.fed && h.store->hard.role == VSR_MEMBER_WITNESS);
+    CHECK(h.store->anchor.id.hi == 0x51 && h.store->client_base == 2);
+    harness_close();
+    /* A FULL replica whose anchor's file is missing. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    script_run(1, 14);
+    feeds_reset();
+    expect_corrupt(&c);
+    CHECK(feed.fed && feed.status == VSR_IO_CORRUPT);
+    harness_close();
+    /* A foreign RESTORE: its file is wanted at the STORE and again at
+     * recovery, at the RESTORE's sequence. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    script_run(1, 6);
+    file = feed_of(z, true);
+    file->count = 1;
+    file->records[0] = txns[5].records[0];
+    file->records[0].request.number = 100;
+    file->records[0].op = 3;
+    file->offsets[0] = 64;
+    store_run(txn_restore(7, z, 2, VSR_MEMBER_FULL));
+    CHECK(feed.fed && h.store->log_begin == 3 && h.store->client_base == 7);
+    CHECK(client_of(txns[5].records[0].request.client)->current.number == 100);
+    store_run(txn_append(8, 2, 60));
+    expect_recovered(&c, 8);
+    CHECK(feed.fed && feed.id.hi == 0x53 && feed.sequence == 7);
+    CHECK(h.store->restored == 7 && h.store->log_begin == 3);
+    harness_close();
+    /* The superblock carries another replica's identity. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    script_run(1, 4);
+    read_superblock(0, &superblock);
+    CHECK(superblock.replica == 3);
+    superblock.replica = 4;
+    vsr_io_codec_put_superblock(&superblock, disk_image, BLOCK);
+    superblock.revision++;
+    vsr_io_codec_put_superblock(&superblock, disk_image + BLOCK, BLOCK);
+    expect_corrupt(&c);
+    harness_close();
+}
+
 /* Names the test that fails. */
 #define RUN(test)                                                              \
     do {                                                                       \
@@ -3272,6 +4662,14 @@ int main(void)
     RUN(test_capture_base);
     RUN(test_state_headers);
     RUN(test_bad_descriptor);
+    RUN(test_recover_prefixes);
+    RUN(test_recover_prefixes_dsync);
+    RUN(test_recover_torn);
+    RUN(test_recover_floor);
+    RUN(test_recover_stale);
+    RUN(test_recover_superblocks);
+    RUN(test_recover_reread);
+    RUN(test_recover_modes);
     printf("store: ok\n");
     return 0;
 }

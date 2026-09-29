@@ -909,7 +909,11 @@ than this is impossible for a core within its limits; a STORE that
 nevertheless is fails with `FAILED`.
 
 PAD: `{magic "PAD1", u32 length}` runs to the block end; fewer than 8
-bytes left in a block are zero and skipped implicitly.
+bytes left in a block are zero and skipped implicitly. The gap between the
+descriptors and the first payload, the gaps between payloads and the
+record's tail padding are CRC-covered but not verified zero when a record
+is read back: they are never interpreted, so a nonzero gap in a CRC-valid
+record is harmless.
 
 ### 5.4 Clients file (`clients-<32 hex>`)
 
@@ -917,9 +921,11 @@ Header (64 bytes): magic "CLT1", format, cluster hi/lo, snapshot hi/lo, op,
 sequence (the writer's), count, crc (over the preceding bytes). Records:
 `vsr_io_wire_client_record`, result bytes padded to 8, then `u32 crc` of
 the record and bytes. Trailer (8 bytes): magic, count. A reader verifies
-every CRC and both counts; anything else is `CORRUPT`. Files are written
-once, sequentially, and never modified; the fetch path writes
-`clients-<id>.tmp` and renames.
+every CRC and both counts; anything else is `CORRUPT`. A reader bounds a
+record's `length` by the bytes left before the trailer before it calls
+`vsr_io_codec_get_clients_record`, which checksums the padded bytes before
+it checks the limit. Files are written once, sequentially, and never
+modified; the fetch path writes `clients-<id>.tmp` and renames.
 
 ## 6. Store internals
 
@@ -1094,77 +1100,131 @@ indexing (APPEND clears it too).
 ### 6.4 Recovery
 
 `vsr_io_store_open` runs these steps, each an executor record whose
-completion advances `recovery.stage`:
+completion advances `recovery.stage` (`prepare_recovery` issues one
+record at a time and moves through the stages that need none):
 
-1. `OPENAT` the directory (kept in a slot for fsync) and `log`
-   (`O_RDWR | O_DIRECT` when `direct_io`, `O_DSYNC` in DSYNC mode, DIRECT
-   into an engine slot). `ENOENT`: NEW/JOIN create (`OPENAT` with
-   `O_CREAT | O_EXCL`, `FALLOCATE` of `2 * block_bytes + segments *
-   segment_bytes`, superblocks with `generation` from `random`, `run = 1`,
-   `start_segment = 1`, `slots = segments`, then the first segment's
-   header with STATE clear; the RECOVERY load completes `NOT_FOUND` once
-   the header write completed, which is what the core expects for an empty
-   store); RECOVER completes `NOT_FOUND` at once and creates the empty
-   log the same way, holding the STOREs of a warm-up until the header
-   write completed (decision 71). An existing file under NEW/JOIN is
-   recovered like RECOVER; the core rejects the recovered row itself.
-2. `STATX` for the size; `READ` both superblocks; keep the valid one with
+1. `OPENAT` `log` (`O_RDWR | O_DIRECT` when `direct_io`, `O_DSYNC` in
+   DSYNC mode, DIRECT into an engine slot). `ENOENT`: NEW/JOIN create
+   (`OPENAT` with `O_CREAT | O_EXCL`, `FALLOCATE` of `2 * block_bytes +
+   segments * segment_bytes`, superblocks with `generation` from
+   `random`, `run = 1`, `start_segment = 1`, `slots = segments`, then the
+   first segment's header with STATE clear; the RECOVERY load completes
+   `NOT_FOUND` once the header write completed, which is what the core
+   expects for an empty store); RECOVER completes `NOT_FOUND` at once and
+   creates the empty log the same way, holding the STOREs of a warm-up
+   until the header write completed (decision 71). An existing file under
+   NEW/JOIN is recovered like RECOVER; the core rejects the recovered row
+   itself, and an empty log (no record) is `NOT_FOUND` under every mode,
+   the store READY over it.
+2. `STATX` for the size (into the ring, scratch until the scan is over);
+   `READ` both superblocks into their tail blocks; keep the valid one with
    the greater revision; none valid is `CORRUPT`. Geometry must match the
-   options (`block_bytes`, `segment_bytes`, `header_blocks`) and identity
-   the replica's, else `CORRUPT` (identity mismatch is left to the core:
-   the row is returned and the core fences with `IDENTITY`).
-3. For every slot, `READ` its header blocks; validate magic, format,
-   generation and CRC; a slot with a valid header gets its `number`,
-   `last_sequence` and `run` into the segment table; anything else is a
-   free slot. The start segment must be present in `start_slot`, else
-   `CORRUPT`.
+   options (`block_bytes`, `segment_bytes`, `header_blocks`), else
+   `CORRUPT`. `slots` is the file's, `(size - 2 * block_bytes) /
+   segment_bytes`: a growth that crashed between its `FALLOCATE` and its
+   superblock leaves one more slot than the superblock names, whose
+   header is not valid and which is therefore free; fewer slots than the
+   superblock names is `CORRUPT`, more than `max_segments` is `FAILED`.
+   `run` becomes the superblock's plus one; the next superblock goes to
+   the copy not chosen.
+3. For every slot, `READ` its header blocks into a pool slab (decoded
+   into the ring as scratch); validate magic, format, generation and CRC;
+   a slot with a valid header is a candidate segment: its `number`, the
+   header's `last_sequence` (the sequence before it) and `run` go into the
+   segment table; anything else is a free slot. Every valid header's
+   `durable_floor` raises F. The start segment must be present in
+   `start_slot`, else `CORRUPT`. `next_segment` is the greatest number
+   seen plus one.
 4. Load the start segment's state into `identity`, `hard`, `anchor`,
-   `log_begin`, `log_end`, `client_base`; `sequence = last_sequence`;
+   `log_begin`, `log_end`, `client_base` (the anchor's id is the base
+   id); `sequence = last_sequence`, `run` the header's;
    `F = max(superblock.durable_floor, header.durable_floor)`, raised by
-   every later segment header's floor and every valid record's `flushed`
-   as the scan proceeds (decision 50).
-5. Scan the segment's data in slab-sized `READ`s: for each record header
-   (`vsr_io_codec_get_record`): PAD skips; END or a bad header, wrong
-   generation, `sequence != last + 1` or `run < last run` ends the scan;
-   a header valid but payload CRC bad ends it too. Before a range is
-   judged bad it is read once more (`retried`): a transient bit flip or
-   read error passes on the re-read and only a second failure ends the
-   scan. A record that ends the scan with `sequence <= F` is `CORRUPT`;
-   above `F` it is the torn tail. A record that
-   straddles the chunk end is re-read from its start (a record fits a
-   slab). Each valid record is applied to the indexes exactly as a STORE
-   is (section 6.3), through the same code.
-   CLIENTS records with `sequence <= client_base` still update
-   `current`; the base file load in step 7 then re-points entries at the
-   file, which is consistent because every record after the base is in
-   the scan.
-6. At the segment's end (a record does not fit, or data exhausted), pick
-   the successor (decision 48): among headers with `last_sequence ==
-   sequence` and `run >= last run`, the greatest `number`; none ends the
-   scan. Headers with `last_sequence < sequence` are stale: their slots are
-   freed. Repeat from step 5.
-7. If `hard.role == FULL` and `anchor.id` is nonzero, load
-   `clients-<anchor id>` as the base at `client_base` (a missing file is
-   `CORRUPT`); WITNESS skips it. Then walk `[log_begin, log_end)` to set
-   every client's `retained`.
-8. Rewrite the superblock with `run + 1` and the current start segment
-   (the oldest slot whose `last_sequence >=` the freeing floor, computed
-   with the reclaim floor at 0), wait for its completion, set `head` to
-   the block after the last valid record (the ring starts empty; the
-   current segment is the one holding that record, OPEN), and complete the
-   RECOVERY load with `vsr_recovered{identity, sequence, log_begin,
-   log_end, hard, anchor or NULL}` in a load region.
+   every valid header's floor and every CRC-valid record's `flushed` as
+   the scan proceeds (decision 50).
+5. Scan the segment's data in slab-sized `READ`s (a chunk is the slab
+   rounded down to blocks, cut at the segment's end): for each record
+   header (`vsr_io_codec_get_record`): a PAD skips when its length, which
+   no CRC covers, runs exactly to its block's end; END (zero fill, a
+   foreign magic, or a RECORD magic with fewer than 48 bytes left) or a
+   bad header, wrong generation, `sequence != last + 1` or `run < last
+   run` ends the chain; a header valid but payload CRC bad ends it too. A
+   record that straddles the chunk's end (its header short, or its length
+   past the chunk) is read again from its block, provided that makes
+   progress and the segment has the bytes; a read that fails or comes
+   back short is a bad range. Before a range is judged bad it is read once
+   more (`retried`, `retry_offset`): a transient bit flip or read error
+   passes on the re-read and only a second failure at the same position
+   ends the chain there. Each valid record is applied to the indexes
+   exactly as a STORE is (section 6.3), through the same code: valid bytes
+   whose content contradicts the log are `CORRUPT` wherever they lie.
+   CLIENTS records with `sequence <= client_base` still update `current`;
+   the base file load in step 7 then re-points entries at the file, which
+   is consistent because every record after the base is in the scan. A
+   replayed PUBLISH of an id other than the current base makes it the base
+   at the PUBLISH's sequence; the file's merge lowers that below any
+   record the file does not cover, as at runtime.
+6. Where the chain ends in a slot (a bad range judged twice, or data
+   exhausted) the rest of that slot is swept for floors only: PAD and
+   record headers are tried at every aligned position and every CRC-valid
+   record of the generation, whatever its sequence or run, raises F by its
+   `flushed`, so a record behind a torn one still carries its floor. Then
+   the successor (decision 48): among candidates not yet visited whose
+   header names `sequence` with `run >= last run`, the greatest `number`;
+   the current run becomes the header's when greater. Repeat from step 5.
+   When none, every slot the chain never visited is swept the same way,
+   which also counts records in stale segments and freed slots (a floor a
+   persisted record carries was acknowledged whenever it was written).
+   Then: `sequence < F` is `CORRUPT`; a log with records but no identity
+   or hard state, or one whose superblock carries an identity other than
+   the replayed one, is `CORRUPT` too. Stale headers (never visited) and
+   abandoned successors (visited after the last record, so still naming
+   it) free their slots; the rest of the chain is SEALED but for the
+   segment holding the last valid record, which is OPEN with `used` at the
+   block after it. `readable = written = flushed = durable = sequence`,
+   the ring starts empty (`head = issued = 0`) with one extent at
+   `file_head = resume`, so the next write starts there: no block below
+   the recovered prefix is ever rewritten (the tail's persisted blocks
+   above it are).
+7. If `hard.role == FULL` and `anchor.id` is nonzero, the store wants the
+   anchor's file as the base at `client_base` (`base_wanted`, kind
+   RECOVERY): the snapshot module loads `clients-<anchor id>` through
+   `base_begin`, `base_record` and `base_end`, which applies the merge at
+   once, then `base_resume(status)`; OK rebuilds every client's `retained`
+   over `[log_begin, log_end)`, any other status (a missing file is
+   `CORRUPT`) ends the recovery with it. WITNESS skips it.
+8. In FDATASYNC mode, `FSYNC | DATASYNC` (the records read may still be
+   in the page cache after a process crash: the recovered sequence is
+   reported durable to the core, so it is made durable first); rewrite the
+   superblock with `run + 1`, the file's `slots`, the current start
+   segment (unchanged: with the RECLAIM floor at 0 nothing frees) and
+   `durable_floor = sequence`, wait for its completion; in FDATASYNC mode
+   flush again, so the new run is on media before a record carries it
+   (the run rule of decision 34 needs that); then READY, and the RECOVERY
+   load completes with `vsr_recovered{identity, sequence, log_begin,
+   log_end, hard, anchor or NULL}` built in a load region, the hard
+   state's epoch and the anchor with its manifest bytes copied there (the
+   core retains the checkpoint under the lease while later records
+   replace the store's copies). A read in flight makes `close` EBUSY; a
+   fence during recovery releases the slab at that read's completion.
 
-Torn-tail cases the tests synthesize: a lost last block; a lost middle
-block of a multi-block write with the later block persisted; a persisted
-block from a torn write behind a block rewritten by a later run (rejected
-by the run rule); a stale header of a segment whose records were torn; a
-bad record at or below the durable floor (`CORRUPT`), including a floor
-that only a later valid record's `flushed` carries; a bad record above the
-floor followed by a valid later record (still the torn tail); a block that
-reads bad once and clean on the re-read (passes); both superblocks
-valid with different revisions; one superblock corrupt; the start slot
-holding another segment (`CORRUPT`).
+Torn-tail cases the tests synthesize (`tests/unit/store`): a lost last
+block; a lost middle block of a multi-block write with the later block
+persisted; a persisted block from a torn write behind a block rewritten
+by a later run (rejected by the run rule); a stale header of a segment
+whose records were torn (an abandoned successor); a new segment's header
+lost while its records persisted, under an old header naming the same
+sequence (found) or another (the tail); a bad record at or below the
+durable floor (`CORRUPT`), including a floor that only a later valid
+record's `flushed` carries, and one the idle superblock write persisted; a
+bad record above the floor followed by a valid later record (still the
+torn tail); a PAD whose length misses its block's end; a block that
+reads bad once and clean on the re-read (passes), a read error and a
+short read; a record header straddling a chunk's end; both superblocks
+valid with different revisions; one superblock corrupt; both corrupt; a
+growth whose superblock write was lost; the start slot holding another
+segment (`CORRUPT`); recovery after every prefix of a scripted log with
+segments, wraps, growth and freeing, compared with the pre-crash indexes,
+then more STOREs and a second recovery.
 
 ### 6.5 Freeing
 
@@ -1539,6 +1599,8 @@ of `docs/io-design.md`:
 | `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | 75, 76 |
 | `store.h` | `VSR_IO_SEGMENT_FREEING`; `vsr_io_load_ref` and `load_refs`, the pending load's resolved records and read state, `cold_slab`; `reindexed`, `restored`, the `base_*` fields and `base_slot`; the client entry's `next_offset`; a LOAD completion's lease carries every OK result; `release` only unpins | 77, 78, 79, 80 |
 | `link.h`, `stream.h` (internal) | Send side of `vsr_io_link`: unwrapped 64-bit ring counters (`header_*`, `vsr_io_send.header_*`), the build (`vec_count`, `build_bytes`), `nodelay_set`, `VSR_IO_STAGE_NODELAY`; `vsr_io_links_send` contract (RETRY only when the engine completes at once); `vsr_io_links_open_stream` and `vsr_io_links_send_frame` contracts; `vsr_io_streams_frame` returns whether the frame was consumed; `vsr_io_streams_sent` at every send result and NOTIF | 82, 83, 84, 85 |
+| `store.h` | `vsr_io_segment.run` (the header's run, for the successor rule); `vsr_io_recovery` reshaped for the scan (the pool slab and executor slot of the read in flight, the superblock copy, the chunk's offset and the position judged, the sweep mode, the resume offset); the base-load kinds include the recovery's; a LOAD slot's `sub` tells a recovery read from a cold load's | 88, 89, 90 |
+| `codec.h` | `vsr_io_codec_load_region` also holds the recovered row's manifest bytes, copied into the region | 91 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1550,4 +1612,12 @@ of `docs/io-design.md`:
   bound tied to the core's uncommitted suffix needs a core-side statement
   of that bound.
 - Whether NEW and JOIN should refuse a directory that holds stray
-  `clients-*` files, or ignore them.
+  `clients-*` files, or ignore them; the executor has no directory
+  listing, so the store refuses only through the log (decision 92).
+- A freed slot becomes reusable when the superblock naming the new start
+  segment *completed*; in FDATASYNC mode that write may still be in the
+  page cache when the slot is rewritten, so a crash before the next flush
+  can leave the older superblock naming a start slot that now holds
+  another segment, which recovery reports as `CORRUPT` although nothing
+  acknowledged was lost. Converting FREEING to FREE at the flush that
+  covers the superblock write (or flushing after it) would close it.

@@ -291,10 +291,13 @@ int vsr_io_codec_load_region(const struct vsr_limits *limits, size_t *bytes)
         !checkpoint_graph_max(limits, &checkpoint)) {
         return VSR_ELIMIT;
     }
-    /* A recovered row: the hard state's epoch and the anchor. */
+    /* A recovered row: the hard state's epoch and the anchor with its
+     * manifest bytes, copied since the core retains the row's checkpoint
+     * under the lease while the store's own copy moves on. */
     recovered = sizeof(struct vsr_recovered);
     if (!add64(recovered, epoch, &recovered) ||
-        !add64(recovered, checkpoint, &recovered)) {
+        !add64(recovered, checkpoint, &recovered) ||
+        !add64(recovered, limits->manifest_bytes, &recovered)) {
         return VSR_ELIMIT;
     }
     total = VSR_IO_WIRE_ALIGN + sizeof(struct vsr_loaded);
