@@ -1251,7 +1251,7 @@ static void scenario_skip_success(struct fixture *f)
     struct vsr_io_cqe cqe;
     unsigned char *ring_memory = page_alloc(4096);
     struct vsr_io_region memory;
-    unsigned char bytes[16];
+    unsigned char bytes[16] = {0};
 
     r = rec(VSR_IO_SQE_NOP, UD(1));
     r.flags = VSR_IO_SQE_SKIP_SUCCESS;
@@ -1293,7 +1293,7 @@ static void scenario_link_chains(struct fixture *f)
     struct vsr_io_sqe chain[3];
     struct vsr_io_cqe cqe;
     struct link l;
-    char buffer[64];
+    char buffer[64] = {0};
     int32_t fd = open_at(f, f->dir, "chain", O_CREAT | O_RDWR, UD(1));
 
     CHECK(fd >= 0);

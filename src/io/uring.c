@@ -322,7 +322,7 @@ static unsigned setup_flags(const struct vsr_io_uring_options *options)
 }
 
 static int plan(const struct vsr_io_uring_options *options,
-                struct uring_plan *plan)
+                struct uring_plan *out)
 {
     size_t offset;
 
@@ -336,29 +336,29 @@ static int plan(const struct vsr_io_uring_options *options,
         options->buffer_regions > MAX_BUFFER_REGIONS) {
         return VSR_ELIMIT;
     }
-    memset(plan, 0, sizeof(*plan));
-    plan->page = page_size();
-    plan->setup = setup_flags(options);
-    plan->sq_ring = round_pow2(options->sq_entries);
-    plan->cq_ring = round_pow2(options->cq_entries);
+    memset(out, 0, sizeof(*out));
+    out->page = page_size();
+    out->setup = setup_flags(options);
+    out->sq_ring = round_pow2(options->sq_entries);
+    out->cq_ring = round_pow2(options->cq_entries);
 
     offset = sizeof(struct vsr_io_uring);
     if (!reserve(&offset, options->buffer_regions,
                  sizeof(struct vsr_io_uring_region),
-                 alignof(struct vsr_io_uring_region), &plan->buffers) ||
+                 alignof(struct vsr_io_uring_region), &out->buffers) ||
         !reserve(&offset, VSR_IO_URING_GROUPS,
                  sizeof(struct vsr_io_uring_group),
-                 alignof(struct vsr_io_uring_group), &plan->groups) ||
+                 alignof(struct vsr_io_uring_group), &out->groups) ||
         !reserve(&offset, options->cq_entries,
                  sizeof(struct vsr_io_uring_direct),
-                 alignof(struct vsr_io_uring_direct), &plan->directs) ||
-        !reserve(&offset, plan->sq_ring, sizeof(struct __kernel_timespec),
-                 alignof(struct __kernel_timespec), &plan->timespecs) ||
-        !reserve(&offset, plan->sq_ring, sizeof(struct msghdr),
-                 alignof(struct msghdr), &plan->msghdrs)) {
+                 alignof(struct vsr_io_uring_direct), &out->directs) ||
+        !reserve(&offset, out->sq_ring, sizeof(struct __kernel_timespec),
+                 alignof(struct __kernel_timespec), &out->timespecs) ||
+        !reserve(&offset, out->sq_ring, sizeof(struct msghdr),
+                 alignof(struct msghdr), &out->msghdrs)) {
         return VSR_ELIMIT;
     }
-    plan->total = offset;
+    out->total = offset;
     return VSR_OK;
 }
 
@@ -540,7 +540,6 @@ static int translate_recv(const struct vsr_io_uring *uring,
     bool multishot = (record->op_flags & VSR_IO_RECV_MULTISHOT) != 0;
     bool select = (record->flags & VSR_IO_SQE_BUFFER_SELECT) != 0;
     uint32_t msg_flags = 0;
-    int rc;
 
     if ((record->op_flags & ~known) != 0) {
         return -EINVAL;
@@ -559,7 +558,8 @@ static int translate_recv(const struct vsr_io_uring *uring,
         fill(sqe, IORING_OP_RECV, record->fd, NULL, record->length, 0);
     } else {
         if (record->flags & VSR_IO_SQE_FIXED_BUFFER) {
-            rc = check_region(uring, record);
+            int rc = check_region(uring, record);
+
             if (rc != 0) {
                 return rc;
             }
@@ -1199,7 +1199,7 @@ static uint32_t uring_reap(void *ctx, struct vsr_io_cqe *cqes,
         do {
             rc = ring_enter(ring, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0);
         } while (rc == -EINTR);
-        if (rc < 0 && rc != -EAGAIN && rc != -EBUSY && uring->failure == 0) {
+        if (rc < 0 && rc != -EAGAIN && rc != -EBUSY) {
             uring->failure = rc;
         }
     }

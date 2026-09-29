@@ -1495,11 +1495,11 @@ static void test_variant(void)
 {
     struct vsr_io_uring_options o = options();
     struct fixture f;
-    struct vsr_io_sqe r;
 
     CHECK(open_fixture(&f, &o) == 0);
     if (variant.sqpoll_idle_ms > 0) {
         struct timespec idle = {0, 50 * 1000000L};
+        struct vsr_io_sqe r;
 
         submit1(&f, rec(VSR_IO_SQE_NOP, 400));
         CHECK(take(&f, 400).result == 0);
