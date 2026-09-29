@@ -5051,6 +5051,46 @@ static void test_review_teardown_cancel(void)
 }
 
 
+/* An EXTERNAL link that closes while its HANDSHAKE op waits for room in
+ * the forwarded ring leaves nothing due behind. */
+static void test_review_handshakes_due(void)
+{
+    struct engine *a;
+    uint32_t peer;
+    unsigned char bytes[16];
+    size_t n;
+
+    world_reset(46);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_EXTERNAL);
+    /* Caller-dialed nodes fill the forwarded ring with LINK_WANTED ops
+     * nobody takes. */
+    for (uint64_t node = 2; node <= 5; ++node) {
+        CHECK(vsr_io_links_node_set(a->io, node, NULL) == VSR_OK);
+        CHECK(vsr_io_links_authorize(a->io, cluster, node, node) == VSR_OK);
+    }
+    for (uint32_t i = 0; i < 8 && a->io->forwarded_count <
+                                      a->io->options.limits.ops;
+         ++i) {
+        world_advance(BACKOFF_NS << i);
+        world_settle();
+    }
+    CHECK(a->io->forwarded_count == a->io->options.limits.ops);
+    peer = peer_connect(a);
+    n = put_preamble(bytes);
+    peer_write(peer, bytes, n);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_EXTERNAL) == 1);
+    CHECK(a->io->links.handshakes_due == 1);
+    CHECK(forwarded_count(a, VSR_IO_OP_HANDSHAKE) == 0);
+    world_advance(HANDSHAKE_NS);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_EXTERNAL) == 0);
+    CHECK(a->io->links.handshakes_due == 0);
+    CHECK(peer_eof(peer));
+    peer_close(peer);
+    engine_forget(a);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 0x5EED2u;
@@ -5088,6 +5128,7 @@ int main(int argc, char **argv)
     test_review_failed_send_closing();
     test_review_link_wanted_retiring();
     test_review_teardown_cancel();
+    test_review_handshakes_due();
     printf("link: ok\n");
     return 0;
 }

@@ -836,6 +836,10 @@ static void link_close(struct vsr_io *io, uint32_t index, int32_t error)
             node->linked_since_ns = 0;
         }
     }
+    if (state == VSR_IO_LINK_EXTERNAL &&
+        link->stage == VSR_IO_STAGE_HANDSHAKE && link->handshake_op == 0) {
+        io->links.handshakes_due--; /* Its op never found ring room. */
+    }
     link->state = VSR_IO_LINK_CLOSING;
     link->error = error;
     link->stage = VSR_IO_STAGE_NONE;
