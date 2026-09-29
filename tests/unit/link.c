@@ -4234,28 +4234,76 @@ static void test_send_reject(void)
 /* Stream links: dialed for a stream, raw frames queued under the flag
  * rule, EBUSY when the send side is full, the idle exemption of a bound
  * link, an orderly close, a failed dial and refusals. */
+/* A test-owned listener at the address tagged `tag`: connections queue in
+ * its backlog for peer_accept. The stream module at a real engine would
+ * refuse the frames this test sends (a chunk at a source), so the sink of
+ * the stream link is a raw peer, which also speaks the handshake. */
+static uint32_t peer_listen(char tag, struct vsr_io_address *address)
+{
+    uint32_t index = sock_alloc(TEST_OWNER);
+
+    address_of(address, tag);
+    world.socks[index].listening = true;
+    world.socks[index].address = *address;
+    return index;
+}
+
+static uint32_t peer_accept(uint32_t listener)
+{
+    struct sock *sock = &world.socks[listener];
+    uint32_t child;
+
+    CHECK(sock->backlog_count > 0);
+    child = sock->backlog[0];
+    memmove(sock->backlog, sock->backlog + 1,
+            (sock->backlog_count - 1) * sizeof(sock->backlog[0]));
+    sock->backlog_count--;
+    return child;
+}
+
+/* Completes the TRUSTED handshake of a link dialed to a test listener:
+ * reads the dialer's preamble and HELLO, answers with a HELLO (the
+ * acceptor sends no preamble). */
+static uint32_t peer_handshake(uint32_t listener, uint32_t purpose,
+                               uint64_t node)
+{
+    unsigned char bytes[VSR_IO_PREAMBLE_BYTES + HELLO_BYTES];
+    uint32_t peer;
+    size_t n;
+
+    world_settle(); /* The CONNECT goes out at the next prepare. */
+    peer = peer_accept(listener);
+    CHECK(peer_read(peer, bytes, sizeof(bytes)) == sizeof(bytes));
+    n = put_hello(bytes, VSR_IO_HANDSHAKE_TRUSTED, purpose, node, 5);
+    peer_write(peer, bytes, n);
+    world_settle();
+    return peer;
+}
+
 static void test_stream(void)
 {
     static unsigned char bytes[PAGE];
+    static unsigned char scratch[PAGE + 64];
     static unsigned char hello[12] = "hello world!";
     struct engine *a;
-    struct engine *b;
+    struct vsr_io_address address;
     const struct vsr_io_link *link;
-    const struct vsr_io_link *in;
     const struct record_log *record;
     struct vsr_io_vec vecs[VSR_IO_SEND_VECTORS];
     unsigned char header[16];
     uint64_t end = 0;
-    uint64_t before;
     uint32_t index = 0;
     uint32_t slab;
     uint32_t crc;
     uint32_t peer;
+    uint32_t listener;
+    uint32_t sink;
 
     world_reset(29);
-    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
-    a = &world.engines[0];
-    b = &world.engines[1];
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_TRUSTED);
+    listener = peer_listen('B', &address);
+    CHECK(vsr_io_links_node_set(a->io, 2, &address) == VSR_OK);
+    CHECK(vsr_io_links_node_set(a->io, 1, NULL) == VSR_OK);
     world_settle();
     for (uint32_t i = 0; i < PAGE; ++i) {
         bytes[i] = (unsigned char)(i * 7 + 3);
@@ -4267,34 +4315,30 @@ static void test_stream(void)
     CHECK(vsr_io_links_open_stream(a->io, 3, 0, &index) == VSR_EINVAL);
     CHECK(vsr_io_links_open_stream(a->io, 1, 0, &index) == VSR_EINVAL);
     CHECK(vsr_io_links_open_stream(a->io, 2, 0, NULL) == VSR_EINVAL);
-    /* The dial: a STREAM link at both ends, no carrier, the node LINKED,
-     * and a peer link still dialed when wanted. */
+    /* The dial: a STREAM link, no carrier, the node LINKED, and a peer
+     * link still dialed when wanted. Stream 0 of a is free: the module
+     * ignores link_up and link_lost for it. */
     CHECK(vsr_io_links_open_stream(a->io, 2, 0, &index) == VSR_OK);
     CHECK(index != NONE);
     link = &a->io->links.links[index];
     CHECK(link->state == VSR_IO_LINK_CONNECTING);
     CHECK(link->purpose == VSR_IO_PURPOSE_STREAM && link->stream == 0);
-    world_settle();
+    sink = peer_handshake(listener, VSR_IO_PURPOSE_STREAM, 2);
     CHECK(link->state == VSR_IO_LINK_ESTABLISHED);
     CHECK(a->io->links.nodes[0].carrier == NONE);
-    in = link_to(b, 1, VSR_IO_INBOUND, VSR_IO_LINK_ESTABLISHED);
-    CHECK(in != NULL && in->purpose == VSR_IO_PURPOSE_STREAM);
-    CHECK(in->stream == NONE && b->io->links.nodes[0].carrier == NONE);
     CHECK(node_state(a, 2) == VSR_IO_NODE_LINKED);
-    CHECK(node_state(b, 1) == VSR_IO_NODE_LINKED);
     CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
     world_settle();
+    (void)peer_handshake(listener, VSR_IO_PURPOSE_PEER, 2);
     CHECK(carrier_of(a, 2)->purpose == VSR_IO_PURPOSE_PEER);
     CHECK(links_in_state(a, VSR_IO_LINK_ESTABLISHED) == 2);
     /* A request with a 12-byte payload from test memory: header run,
-     * payload and pad, a plain vectored send; the stream module (a stub
-     * here) consumes it at b, nothing rejected. */
+     * payload and pad, a plain vectored send; 48 bytes reach the sink. */
     vsr_io_codec_put_stream_request(header, 12);
     vecs[0].base = hello;
     vecs[0].length = 12;
     crc = vsr_io_crc32c(vsr_io_crc32c(0, header, 8), hello, 12);
     log_clear(a);
-    before = b->io->stats.bytes_received;
     CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_REQUEST,
                                   header, 8, vecs, 1, crc, &end) == VSR_OK);
     CHECK(end == link->stream_offset);
@@ -4302,10 +4346,8 @@ static void test_stream(void)
     world_settle();
     record = log_last(a, VSR_IO_SQE_SEND);
     CHECK(record->op_flags == VSR_IO_SEND_VECTORED && record->length == 3);
-    CHECK(b->io->stats.bytes_received == before + 48);
-    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    CHECK(peer_read(sink, scratch, sizeof(scratch)) == 48);
     CHECK(link->notified_offset == end);
-    CHECK(b->io->links.nodes[0].last_received_ns == world.now);
     /* A chunk from a pool slab: fixed, header run and payload. */
     slab = vsr_io_pool_acquire(&a->io->pool, false);
     CHECK(slab != NONE);
@@ -4315,7 +4357,6 @@ static void test_stream(void)
     vecs[0].length = 1000;
     crc = vsr_io_crc32c(vsr_io_crc32c(0, header, 16), bytes, 1000);
     log_clear(a);
-    before = b->io->stats.bytes_received;
     CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_CHUNK,
                                   header, 16, vecs, 1, crc, &end) == VSR_OK);
     world_settle();
@@ -4323,8 +4364,8 @@ static void test_stream(void)
     CHECK(record->op_flags == (VSR_IO_SEND_ZERO_COPY | VSR_IO_SEND_VECTORED));
     CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) != 0 &&
           record->length == 2);
-    CHECK(b->io->stats.bytes_received == before + 24 + 16 + 1000);
-    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    CHECK(peer_read(sink, scratch, sizeof(scratch)) == 24 + 16 + 1000);
+    CHECK(memcmp(scratch + 40, bytes, 1000) == 0);
     CHECK(link->notified_offset == end);
     vsr_io_pool_release(&a->io->pool, slab);
     /* END: the header alone, one ring run. */
@@ -4337,7 +4378,7 @@ static void test_stream(void)
     record = log_last(a, VSR_IO_SQE_SEND);
     CHECK((record->flags & VSR_IO_SQE_FIXED_BUFFER) != 0 &&
           record->length == 1);
-    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    CHECK(peer_read(sink, scratch, sizeof(scratch)) == 40);
     /* EBUSY while a send is in flight; queued again once its result is
      * in, and coalesced with what follows. */
     vsr_io_codec_put_stream_request(header, 0);
@@ -4359,6 +4400,7 @@ static void test_stream(void)
     CHECK(log_count(a, VSR_IO_SQE_SEND) == 1);
     CHECK(log_last(a, VSR_IO_SQE_SEND)->length == 1); /* Contiguous. */
     CHECK(link->notified_offset == end && link->vec_count == 0);
+    CHECK(peer_read(sink, scratch, sizeof(scratch)) == 96); /* 3 * 32 */
     /* Every entry awaiting its NOTIF. */
     world.hold_notifs = true;
     for (uint32_t i = 0; i < VSR_IO_LINK_SENDS; ++i) {
@@ -4378,6 +4420,7 @@ static void test_stream(void)
     world_release_notifs();
     world_settle();
     CHECK(link->notified_offset == end && end == link->stream_offset);
+    CHECK(peer_read(sink, scratch, sizeof(scratch)) == 160); /* 5 * 32 */
     /* The vectors: 100 one-byte payload runs (every other byte, so that
      * none merges with its neighbour) take 102 (header, runs, pad); 30
      * more would overflow the array until that send is out. */
@@ -4407,7 +4450,7 @@ static void test_stream(void)
                                   header, 16, vecs, 30, crc, &end) == VSR_OK);
     world_settle();
     CHECK(log_last(a, VSR_IO_SQE_SEND)->length == 32);
-    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    CHECK(peer_read(sink, scratch, sizeof(scratch)) == 40 + 104 + 40 + 32);
     /* The coalesce budget: the third 48-byte frame waits for the send. */
     a->io->options.send_coalesce_bytes = 100;
     vsr_io_codec_put_stream_request(header, 12);
@@ -4425,7 +4468,7 @@ static void test_stream(void)
                                   header, 8, vecs, 1, crc, &end) == VSR_OK);
     world_settle();
     a->io->options.send_coalesce_bytes = 65536;
-    CHECK(b->io->stats.frames_rejected == 0 && in->partial_length == 0);
+    CHECK(peer_read(sink, scratch, sizeof(scratch)) == 144); /* 3 * 48 */
     /* ELIMIT beyond the frame limit; EINVAL for a peer link, a bad kind,
      * a bad index. */
     vsr_io_codec_put_stream_chunk(header, 0, PAGE);
@@ -4443,25 +4486,23 @@ static void test_stream(void)
                                   16, NULL, 0, 0, &end) == VSR_EINVAL);
     CHECK(vsr_io_links_send_frame(a->io, index, VSR_IO_FRAME_STREAM_END, header,
                                   16, NULL, 0, 0, NULL) == VSR_EINVAL);
-    /* Idle: links bound to a stream (b's as the stream module binds it at
-     * the request) live through the idle timeout; the idle peer link
-     * goes. */
-    b->io->links.links[in - b->io->links.links].stream = 1;
+    /* Idle: the link bound to a stream lives through the idle timeout;
+     * the idle peer link goes. */
     world_advance(IDLE_NS * 3);
     world_settle();
     CHECK(link->state == VSR_IO_LINK_ESTABLISHED);
-    CHECK(in->state == VSR_IO_LINK_ESTABLISHED);
     CHECK(links_in_state(a, VSR_IO_LINK_ESTABLISHED) == 1);
-    /* The stream module closes its link: orderly at both ends. */
+    /* The stream module closes its link: orderly, the sink reads EOF. */
     vsr_io_links_close(a->io, index, 0);
     world_settle();
-    CHECK(link->state == VSR_IO_LINK_FREE && in->state == VSR_IO_LINK_FREE);
+    CHECK(link->state == VSR_IO_LINK_FREE);
+    CHECK(peer_eof(sink));
+    peer_close(sink);
     check_quiet(a);
-    check_quiet(b);
-    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    CHECK(pool_refs(a) == 0);
     /* A stream dial that fails (nobody listens) schedules nothing for
-     * the node; the stream module hears link_lost (a stub here). */
-    engine_forget(b);
+     * the node; the stream module hears link_lost for its free stream. */
+    world.socks[listener].listening = false;
     CHECK(vsr_io_links_open_stream(a->io, 2, 0, &index) == VSR_OK);
     world_settle();
     CHECK(a->io->links.links[index].state == VSR_IO_LINK_FREE);
@@ -4477,18 +4518,18 @@ static void test_stream(void)
     check_quiet(a);
     /* A stream frame on a peer link closes it. */
     peer = peer_link(a, 2);
-    before = a->io->stats.frames_rejected;
-    vsr_io_codec_put_stream_end(header, 0, VSR_IO_OK);
     {
+        uint64_t before = a->io->stats.frames_rejected;
         unsigned char frame[24 + 16];
 
+        vsr_io_codec_put_stream_end(header, 0, VSR_IO_OK);
         vsr_io_codec_put_frame(frame, VSR_IO_FRAME_STREAM_END, 16,
                                vsr_io_crc32c(0, header, 16));
         memcpy(frame + 24, header, 16);
         peer_write(peer, frame, sizeof(frame));
+        world_settle();
+        CHECK(a->io->stats.frames_rejected == before + 1);
     }
-    world_settle();
-    CHECK(a->io->stats.frames_rejected == before + 1);
     CHECK(peer_eof(peer));
     check_quiet(a);
     peer_close(peer);
