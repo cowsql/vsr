@@ -3617,8 +3617,7 @@ static void test_review_full_ring(void)
     CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
     /* Four one-chunk writes: DATA ops and WRITTEN ops one at a time. */
     for (uint64_t w = 0; w < 4; ++w) {
-        CHECK(feed_write_buffers(&d, w, bytes + w * CHUNK, CHUNK, 0) ==
-              VSR_OK);
+        CHECK(feed_write_buffers(&d, w, bytes + w * CHUNK, CHUNK, 0) == VSR_OK);
     }
     CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
     settle();
@@ -3718,7 +3717,8 @@ static void test_review_stale_ids(void)
     open_stream(&k, &d, 2, NULL, 0, &index);
     settle();
     CHECK(index == first && feed_take_serve(&d));
-    CHECK((d.handle & 0xFFFF) == (old_handle & 0xFFFF) && d.handle != old_handle);
+    CHECK((d.handle & 0xFFFF) == (old_handle & 0xFFFF) &&
+          d.handle != old_handle);
     CHECK(vsr_io_streams_served(b->io, old_serve, VSR_IO_OK) == VSR_EINVAL);
     CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
     CHECK(vsr_io_streams_close(b->io, old_handle, VSR_IO_OK) == VSR_EINVAL);
