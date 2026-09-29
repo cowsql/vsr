@@ -699,11 +699,30 @@ static void link_establish(struct vsr_io *io, struct vsr_io_link *link)
     link_arm_idle(io, link);
 }
 
-/* Drops the receive-side slab references a link holds. */
+static void link_set_retry(struct vsr_io *io, struct vsr_io_link *link,
+                           bool retry)
+{
+    if (link->retry == retry) {
+        return;
+    }
+    link->retry = retry;
+    if (retry) {
+        io->links.retries_due++;
+    } else {
+        io->links.retries_due--;
+    }
+}
+
+/* Drops the receive-side slab references a link holds: the partial run
+ * (whose reference is the reassembly slab's own once the run lives there)
+ * and every held run. */
 static void link_release_partial(struct vsr_io *io, struct vsr_io_link *link)
 {
     if (link->partial_slab != LINK_NONE) {
         vsr_io_pool_release(&io->pool, link->partial_slab);
+        if (link->reassembly_slab == link->partial_slab) {
+            link->reassembly_slab = LINK_NONE;
+        }
         link->partial_slab = LINK_NONE;
     }
     link->partial_length = 0;
@@ -711,6 +730,11 @@ static void link_release_partial(struct vsr_io *io, struct vsr_io_link *link)
         vsr_io_pool_release(&io->pool, link->reassembly_slab);
         link->reassembly_slab = LINK_NONE;
     }
+    for (uint32_t i = 0; i < link->held_count; ++i) {
+        vsr_io_pool_release(&io->pool, link->held[i].slab);
+    }
+    link->held_count = 0;
+    link_set_retry(io, link, false);
 }
 
 /* A CLOSING link is FREE once its teardown records went out and every
@@ -1232,9 +1256,57 @@ int vsr_io_links_handshake_done(struct vsr_io *io, uint64_t op, int32_t status,
  * Receive path: preamble and frames
  * ---------------------------------------------------------------------- */
 
-/* Frame dispatch. HELLO drives the handshake; MESSAGE and the stream kinds
- * are phase 2 and 3 work and are dropped here. */
-static void link_frame(struct vsr_io *io, struct vsr_io_link *link,
+/* The envelope's cluster and sender, read without decoding the body. */
+static bool link_envelope(const struct vsr_io_cursor *body,
+                          struct vsr_id *cluster, uint64_t *from)
+{
+    struct vsr_io_cursor cursor = *body;
+    uint64_t skip;
+
+    return vsr_io_cursor_u64(&cursor, &cluster->hi) &&
+           vsr_io_cursor_u64(&cursor, &cluster->lo) &&
+           vsr_io_cursor_u64(&cursor, &skip) &&
+           vsr_io_cursor_u64(&cursor, &skip) &&
+           vsr_io_cursor_u64(&cursor, from);
+}
+
+/*
+ * A MESSAGE on an established peer link (decision 67): the sender named
+ * by the envelope must be the replica the link's node is authorized for
+ * in the envelope's cluster, and the cluster must be one of this engine's
+ * replicas; either failure, like a body too short for its envelope, drops
+ * the frame and counts it, since the stream itself is intact. False when
+ * the replica has no free region: the bytes stay in place for a retry.
+ */
+static bool link_message(struct vsr_io *io, struct vsr_io_link *link,
+                         const struct vsr_io_cursor *body)
+{
+    struct vsr_id cluster;
+    uint64_t from = 0;
+    struct vsr_io_replica *replica;
+
+    if (!link_envelope(body, &cluster, &from)) {
+        io->stats.frames_rejected++;
+        return true;
+    }
+    replica = vsr_io_engine_replica(io, cluster);
+    if (replica == NULL ||
+        vsr_io_links_lookup(&io->links, cluster, from) != link->node) {
+        io->stats.frames_rejected++;
+        return true;
+    }
+    if (!vsr_io_engine_deliver(io, replica, body, link->partial_slab)) {
+        return false;
+    }
+    io->links.nodes[link->node_index].last_received_ns = io->now;
+    return true;
+}
+
+/* Frame dispatch: HELLO drives the handshake, MESSAGE is delivered to its
+ * replica, the stream kinds are phase 3 work. False when the frame could
+ * not be consumed yet (a MESSAGE without a region); the caller keeps its
+ * bytes and retries at poll. */
+static bool link_frame(struct vsr_io *io, struct vsr_io_link *link,
                        const struct vsr_io_wire_frame *frame,
                        const struct vsr_io_cursor *body)
 {
@@ -1246,18 +1318,18 @@ static void link_frame(struct vsr_io *io, struct vsr_io_link *link,
         if (vsr_io_codec_get_hello(&cursor, &hello) != VSR_OK) {
             io->stats.frames_rejected++;
             link_close(io, link_index(io, link), -EBADMSG);
-            return;
+            return true;
         }
         link_hello(io, link, &hello);
-        return;
+        return true;
     case VSR_IO_FRAME_MESSAGE:
-        /* PHASE 2: authorization of message.from for link->node, then
-         * vsr_io_engine_deliver into the replica of message.cluster. */
-        if (link->state != VSR_IO_LINK_ESTABLISHED) {
+        if (link->state != VSR_IO_LINK_ESTABLISHED ||
+            link->purpose != VSR_IO_PURPOSE_PEER) {
             io->stats.frames_rejected++;
             link_close(io, link_index(io, link), -EPROTO);
+            return true;
         }
-        return;
+        return link_message(io, link, body);
     default:
         /* PHASE 3: vsr_io_streams_frame for STREAM links. */
         if (link->state != VSR_IO_LINK_ESTABLISHED ||
@@ -1265,24 +1337,32 @@ static void link_frame(struct vsr_io *io, struct vsr_io_link *link,
             io->stats.frames_rejected++;
             link_close(io, link_index(io, link), -EPROTO);
         }
-        return;
+        return true;
     }
 }
+
+enum carve_result {
+    CARVE_EMPTY,      /* Every byte of the partial run was consumed. */
+    CARVE_INCOMPLETE, /* A frame needs more bytes than the run holds. */
+    CARVE_BLOCKED,    /* A whole frame could not be delivered yet. */
+    CARVE_CLOSED      /* The link was closed; nothing is held. */
+};
 
 /*
  * Carves the bytes held in the link's partial run (one slab, contiguous):
  * the preamble while one is expected, then whole frames, each decoded only
  * when its header and body are both present. Bytes of an incomplete frame
  * stay in place with the slab referenced; the next delivery continues them
- * when it lands right after them in the same slab.
+ * when it lands right after them in the same slab, or is copied behind
+ * them in a reassembly slab otherwise (link_drain).
  */
-static void link_carve(struct vsr_io *io, struct vsr_io_link *link)
+static enum carve_result link_carve(struct vsr_io *io, struct vsr_io_link *link)
 {
     uint32_t index = link_index(io, link);
     unsigned char preamble[VSR_IO_PREAMBLE_BYTES];
 
     put_preamble(preamble);
-    while (link->partial_length > 0 && link->state != VSR_IO_LINK_CLOSING) {
+    while (link->partial_length > 0) {
         const unsigned char *bytes =
             vsr_io_pool_slab(&io->pool, link->partial_slab) +
             link->partial_offset;
@@ -1295,13 +1375,13 @@ static void link_carve(struct vsr_io *io, struct vsr_io_link *link)
             if (bytes[0] != preamble[link->preamble_seen]) {
                 io->stats.frames_rejected++;
                 link_close(io, index, -EPROTO);
-                return;
+                return CARVE_CLOSED;
             }
             link->preamble_seen++;
             consumed = 1;
         } else {
             if (link->partial_length < VSR_IO_FRAME_HEADER_BYTES) {
-                return;
+                return CARVE_INCOMPLETE;
             }
             vsr_io_cursor_init_one(&cursor, bytes, link->partial_length);
             if (vsr_io_codec_get_frame(&cursor,
@@ -1310,10 +1390,10 @@ static void link_carve(struct vsr_io *io, struct vsr_io_link *link)
                                        &frame) != VSR_OK) {
                 io->stats.frames_rejected++;
                 link_close(io, index, -EBADMSG);
-                return;
+                return CARVE_CLOSED;
             }
             if (vsr_io_cursor_remaining(&cursor) < frame.length) {
-                return; /* The body is still arriving. */
+                return CARVE_INCOMPLETE; /* The body is still arriving. */
             }
             vsr_io_cursor_init_one(&cursor, bytes + VSR_IO_FRAME_HEADER_BYTES,
                                    frame.length);
@@ -1321,20 +1401,150 @@ static void link_carve(struct vsr_io *io, struct vsr_io_link *link)
                 crc != frame.body_crc) {
                 io->stats.frames_rejected++;
                 link_close(io, index, -EBADMSG);
-                return;
+                return CARVE_CLOSED;
             }
-            link_frame(io, link, &frame, &cursor);
+            if (!link_frame(io, link, &frame, &cursor)) {
+                return CARVE_BLOCKED;
+            }
             consumed = VSR_IO_FRAME_HEADER_BYTES + frame.length;
         }
         if (link->state == VSR_IO_LINK_CLOSING) {
-            return; /* link_close released the partial. */
+            return CARVE_CLOSED; /* link_close released the partial. */
         }
         link->partial_offset += consumed;
         link->partial_length -= consumed;
     }
-    if (link->partial_length == 0 && link->partial_slab != LINK_NONE) {
+    if (link->partial_slab != LINK_NONE) {
         vsr_io_pool_release(&io->pool, link->partial_slab);
+        if (link->reassembly_slab == link->partial_slab) {
+            link->reassembly_slab = LINK_NONE;
+        }
         link->partial_slab = LINK_NONE;
+    }
+    return CARVE_EMPTY;
+}
+
+/* Bytes the partial run's frame still lacks: those of its header first,
+ * then of the body the header announces. */
+static uint32_t link_frame_missing(const struct vsr_io *io,
+                                   const struct vsr_io_link *link)
+{
+    const unsigned char *bytes =
+        vsr_io_pool_slab(&io->pool, link->partial_slab) + link->partial_offset;
+    struct vsr_io_cursor cursor;
+    struct vsr_io_wire_frame frame;
+    uint32_t whole;
+
+    if (link->partial_length < VSR_IO_FRAME_HEADER_BYTES) {
+        return VSR_IO_FRAME_HEADER_BYTES - link->partial_length;
+    }
+    vsr_io_cursor_init_one(&cursor, bytes, link->partial_length);
+    if (vsr_io_codec_get_frame(
+            &cursor,
+            (uint32_t)(io->links.frame_limit - VSR_IO_FRAME_HEADER_BYTES),
+            &frame) != VSR_OK) {
+        return 0; /* Carving rejects it. */
+    }
+    whole = VSR_IO_FRAME_HEADER_BYTES + frame.length;
+    return whole > link->partial_length ? whole - link->partial_length : 0;
+}
+
+/*
+ * Continues the partial run's incomplete frame with the first held run:
+ * the partial bytes move into a reassembly slab acquired for the frame
+ * (once), then the frame's missing bytes are copied behind them from the
+ * held run, header first so that its length is known, never past the
+ * frame's end, so the bytes that follow stay in place for zero-copy
+ * carving. A frame fits one slab (frame_limit <= slab_bytes) and the run
+ * starts at offset 0 of a fresh slab, so the copy always fits. False when
+ * no slab is free: the runs stay held and poll retries.
+ */
+static bool link_reassemble(struct vsr_io *io, struct vsr_io_link *link)
+{
+    struct vsr_io_run *run = &link->held[0];
+    unsigned char *target;
+    uint32_t missing;
+
+    LINKS_ASSERT(link->partial_length > 0 && link->held_count > 0);
+    if (link->reassembly_slab == LINK_NONE) {
+        uint32_t slab = vsr_io_pool_acquire(&io->pool, false);
+
+        if (slab == LINK_NONE) {
+            return false;
+        }
+        memcpy(vsr_io_pool_slab(&io->pool, slab),
+               vsr_io_pool_slab(&io->pool, link->partial_slab) +
+                   link->partial_offset,
+               link->partial_length);
+        vsr_io_pool_release(&io->pool, link->partial_slab);
+        link->reassembly_slab = slab;
+        link->partial_slab = slab;
+        link->partial_offset = 0;
+        io->links.reassembled++;
+    }
+    LINKS_ASSERT(link->partial_slab == link->reassembly_slab &&
+                 link->partial_offset == 0);
+    missing = link_frame_missing(io, link);
+    if (missing > run->length) {
+        missing = run->length;
+    }
+    LINKS_ASSERT(link->partial_length + missing <= io->pool.slab_bytes);
+    target =
+        vsr_io_pool_slab(&io->pool, link->partial_slab) + link->partial_length;
+    memcpy(target, vsr_io_pool_slab(&io->pool, run->slab) + run->offset,
+           missing);
+    link->partial_length += missing;
+    run->offset += missing;
+    run->length -= missing;
+    if (run->length == 0) {
+        vsr_io_pool_release(&io->pool, run->slab);
+        link->held_count--;
+        memmove(&link->held[0], &link->held[1],
+                link->held_count * sizeof(link->held[0]));
+    }
+    return true;
+}
+
+/*
+ * Carves everything the link holds: the partial run, then each held run in
+ * turn once the partial is consumed, reassembling a frame that straddles
+ * runs. Stops, with `retry` set for poll, when a frame cannot be delivered
+ * or reassembled yet.
+ */
+static void link_drain(struct vsr_io *io, struct vsr_io_link *link)
+{
+    for (;;) {
+        enum carve_result result = link_carve(io, link);
+
+        if (result == CARVE_CLOSED) {
+            return;
+        }
+        if (result == CARVE_EMPTY) {
+            if (link->held_count == 0) {
+                link_set_retry(io, link, false);
+                return;
+            }
+            link->partial_slab = link->held[0].slab;
+            link->partial_offset = link->held[0].offset;
+            link->partial_length = link->held[0].length;
+            link->held_count--;
+            memmove(&link->held[0], &link->held[1],
+                    link->held_count * sizeof(link->held[0]));
+            continue;
+        }
+        if (result == CARVE_BLOCKED) {
+            link_set_retry(io, link, true);
+            return;
+        }
+        LINKS_ASSERT(result == CARVE_INCOMPLETE);
+        if (link->held_count == 0) {
+            link_set_retry(io, link, false);
+            return; /* The rest is still to arrive. */
+        }
+        if (!link_reassemble(io, link)) {
+            link_set_retry(io, link, true);
+            return;
+        }
     }
 }
 
@@ -1343,32 +1553,39 @@ static void link_received(struct vsr_io *io, struct vsr_io_link *link,
                           uint16_t slab, uint32_t bytes)
 {
     uint32_t offset = vsr_io_pool_recv_begin(&io->pool, slab, bytes);
+    struct vsr_io_run *last =
+        link->held_count > 0 ? &link->held[link->held_count - 1] : NULL;
 
     io->stats.bytes_received += bytes;
     link->last_active_ns = io->now;
     if (link->partial_length == 0) {
-        if (link->partial_slab != LINK_NONE) {
-            vsr_io_pool_release(&io->pool, link->partial_slab);
-        }
+        LINKS_ASSERT(link->partial_slab == LINK_NONE && link->held_count == 0);
         link->partial_slab = slab;
         link->partial_offset = offset;
         link->partial_length = bytes;
-    } else if (link->partial_slab == slab &&
+    } else if (last == NULL && link->partial_slab == slab &&
                link->partial_offset + link->partial_length == offset) {
-        /* Continues the held run in the same slab: one reference keeps
+        /* Continues the partial run in the same slab: one reference keeps
          * the slab, the delivery's own is dropped. */
         link->partial_length += bytes;
         vsr_io_pool_release(&io->pool, slab);
-    } else {
-        /* PHASE 2: the held bytes and this delivery are copied into a
-         * fresh reassembly slab until the frame is complete. Until then a
-         * frame split across slabs ends the link. */
+    } else if (last != NULL && last->slab == slab &&
+               last->offset + last->length == offset) {
+        last->length += bytes;
         vsr_io_pool_release(&io->pool, slab);
-        io->stats.frames_rejected++;
-        link_close(io, link_index(io, link), -EPROTO);
+    } else if (link->held_count < VSR_IO_LINK_HELD) {
+        last = &link->held[link->held_count++];
+        last->slab = slab;
+        last->offset = offset;
+        last->length = bytes;
+    } else {
+        /* Every held run is a slab the pool could not replace: the stream
+         * cannot be kept intact without unbounded memory. */
+        vsr_io_pool_release(&io->pool, slab);
+        link_close(io, link_index(io, link), -ENOBUFS);
         return;
     }
-    link_carve(io, link);
+    link_drain(io, link);
 }
 
 /* -------------------------------------------------------------------------
@@ -1595,6 +1812,17 @@ void vsr_io_links_poll(struct vsr_io *io, uint64_t now)
                 link->stage == VSR_IO_STAGE_HANDSHAKE &&
                 link->handshake_op == 0) {
                 link_forward_handshake(io, link);
+            }
+        }
+    }
+    if (links->retries_due > 0) {
+        /* Held bytes whose carving stopped short: a region or a slab may
+         * have been freed since. */
+        for (uint32_t i = 0; i < links->links_count; ++i) {
+            struct vsr_io_link *link = &links->links[i];
+
+            if (link->retry) {
+                link_drain(io, link);
             }
         }
     }
