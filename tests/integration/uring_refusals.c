@@ -133,6 +133,7 @@ static bool is_socket_opcode(uint32_t op)
 static void answer_setup(const struct seccomp_notif *req,
                          struct seccomp_notif_resp *resp)
 {
+    /* NOLINTNEXTLINE(performance-no-int-to-ptr): a syscall's pointer */
     struct io_uring_params *params = (void *)(uintptr_t)req->data.args[1];
     struct io_uring_params copy = *params;
     long fd;
@@ -156,6 +157,7 @@ static void answer_setup(const struct seccomp_notif *req,
 static void answer_probe(const struct seccomp_notif *req,
                          struct seccomp_notif_resp *resp)
 {
+    /* NOLINTNEXTLINE(performance-no-int-to-ptr): a syscall's pointer */
     unsigned char *memory = (void *)(uintptr_t)req->data.args[2];
     uint32_t count = (uint32_t)req->data.args[3];
     struct io_uring_probe probe;
