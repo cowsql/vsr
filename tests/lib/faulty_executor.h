@@ -26,11 +26,15 @@
  *   same inner batch by a CANCEL record targeting its user_data, so it
  *   completes -ECANCELED unless it completes first.
  *
- * It never alters bytes, user_data or completion flags, never reorders the
- * completions of one user_data (the NOTIF of a zero-copy send stays behind
- * its result, a multishot record's terminal completion stays last), and
- * never touches records of a LINK chain, whose success rule a rewritten or
- * shortened result would break. Result faults need the record's opcode,
+ * It never alters bytes, user_data or completion flags, and never reorders
+ * the completions the caller relies on the order of: those of one user_data
+ * (the NOTIF of a zero-copy send stays behind its result, a multishot
+ * record's terminal completion stays last), those naming one provided
+ * buffer, whose position in an incremental buffer follows from their order
+ * across every receive on the ring, and those of LINK chains. It never
+ * faults or delays records of a LINK chain, whose success rule a rewritten
+ * or shortened result would break (a chained record that outlives the map
+ * below may be delayed). Result faults need the record's opcode,
  * which a map filled at submission provides; a completion whose record the
  * map no longer holds is only ever delayed. With every rate zero the wrapper
  * is transparent. While it holds completions its submit_and_wait never
@@ -80,8 +84,8 @@ struct faulty_executor_record {
 
 struct faulty_executor_held {
     struct vsr_io_cqe cqe;
-    uint32_t reaps; /* Reaps left before it may be delivered. */
-    uint32_t reserved;
+    uint32_t reaps;   /* Reaps left before it may be delivered. */
+    uint32_t chained; /* Of a LINK chain's record. */
 };
 
 struct faulty_executor {

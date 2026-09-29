@@ -813,8 +813,13 @@ static void test_reserved(void)
  * chains, capacities
  * --------------------------------------------------------------------- */
 
+#define GROUP 3u
+#define BUFFER_ID 5u
+#define RECV_BASE UINT64_C(0x40)
 #define NOPS 1600u
 
+static _Alignas(4096) unsigned char ring_memory[4096];
+static unsigned char pool_bytes[256];
 static uint8_t nop_seen[NOPS];
 
 static struct faulty_executor_options rates(void)
@@ -874,6 +879,152 @@ static void send_exact(struct world *w, int32_t client, const void *bytes,
     sqe.addr = bytes;
     sqe.length = size;
     CHECK(run(w, 0, &sqe).result == (int32_t)size);
+}
+
+/* One BUFFER completion of the two multishot receives sharing the
+ * incremental buffer: its bytes lie at the buffer's consumed offset, as
+ * the completion order tells the caller (the engine's pool does exactly
+ * this), and they are the ones its own peer sent. */
+static void take_buffer(const struct vsr_io_cqe *cqe, uint32_t *consumed,
+                        uint32_t got[2], const char letters[2])
+{
+    uint64_t which = cqe->user_data - RECV_BASE;
+
+    CHECK(which < 2);
+    CHECK(cqe->result > 0);
+    CHECK((cqe->flags & VSR_IO_CQE_BUFFER) != 0);
+    CHECK((cqe->flags & VSR_IO_CQE_MORE) != 0);
+    CHECK(cqe->buffer_id == BUFFER_ID);
+    CHECK(*consumed + (uint32_t)cqe->result <= sizeof(pool_bytes));
+    for (int32_t i = 0; i < cqe->result; ++i) {
+        CHECK(pool_bytes[*consumed + (uint32_t)i] ==
+              (unsigned char)letters[which]);
+    }
+    *consumed += (uint32_t)cqe->result;
+    got[which] += (uint32_t)cqe->result;
+}
+
+static void test_buffer_order(void)
+{
+    struct faulty_executor_options quiet = rates();
+    struct faulty_executor_options slow = rates();
+    struct faulty_executor_stats stats;
+    struct vsr_io_region memory;
+    struct vsr_io_buffer buffer;
+    struct vsr_io_sqe sqe;
+    struct world w;
+    int32_t listener;
+    int32_t clients[2];
+    int32_t servers[2];
+    uint32_t consumed = 0;
+    uint32_t got[2] = {0, 0};
+    bool ended[2] = {false, false};
+    uint32_t cancels = 0;
+
+    open_world(&w, &traces[0], &quiet);
+    listener = listen_on(&w, 0x20);
+    connect_pair(&w, listener, 0x30, &clients[0], &servers[0]);
+    connect_pair(&w, listener, 0x38, &clients[1], &servers[1]);
+    memory.base = ring_memory;
+    memory.size = sizeof(ring_memory);
+    CHECK(w.ex[1].ops->buffer_ring(w.ex[1].ctx, GROUP, 1,
+                                   VSR_IO_BUFFER_RING_INCREMENTAL,
+                                   &memory) == 0);
+    memset(&buffer, 0, sizeof(buffer));
+    buffer.base = pool_bytes;
+    buffer.length = sizeof(pool_bytes);
+    buffer.id = BUFFER_ID;
+    CHECK(w.ex[1].ops->provide(w.ex[1].ctx, GROUP, &buffer, 1) == 0);
+    for (uint32_t i = 0; i < 2; ++i) {
+        sqe = make_sqe(VSR_IO_SQE_RECV, servers[i], RECV_BASE + i);
+        sqe.flags = VSR_IO_SQE_BUFFER_SELECT;
+        sqe.buffer_group = GROUP;
+        sqe.op_flags = VSR_IO_RECV_MULTISHOT;
+        submit(&w, 1, &sqe, 1);
+    }
+
+    /* The first receive's delivery is held for a long time... */
+    slow.delay_ppm = PPM;
+    slow.delay_reaps_max = 1000;
+    set_rates(&w, 1, &slow);
+    send_exact(&w, clients[0], "AAAA", 4, 0x50);
+    for (uint32_t spin = 0;; ++spin) {
+        struct vsr_io_cqe cqes[4];
+
+        CHECK(spin < SPIN_MAX);
+        CHECK(reap(&w, 1, cqes, 4) == 0);
+        faulty_executor_stats(w.faulty[1], &stats);
+        if (stats.delayed == 1) {
+            break;
+        }
+        (void)vsr_sim_advance(w.sim);
+    }
+    /* ...while the second receive's delivery, later into the same buffer,
+     * is not: it must still reach the caller after the first. */
+    set_rates(&w, 1, &quiet);
+    send_exact(&w, clients[1], "BBBB", 4, 0x51);
+    for (uint32_t spin = 0; got[0] + got[1] < 8; ++spin) {
+        struct vsr_io_cqe cqes[4];
+        uint32_t count;
+
+        CHECK(spin < SPIN_MAX);
+        count = reap(&w, 1, cqes, 4);
+        for (uint32_t i = 0; i < count; ++i) {
+            take_buffer(&cqes[i], &consumed, got, "AB");
+        }
+        if (count == 0) {
+            (void)vsr_sim_advance(w.sim);
+        }
+    }
+    CHECK(got[0] == 4 && got[1] == 4);
+
+    /* Every delivery delayed: each receive's completions keep their order
+     * and the cancelled multishot ends with MORE clear, last. */
+    slow.delay_reaps_max = 3;
+    set_rates(&w, 1, &slow);
+    send_exact(&w, clients[0], "CCCC", 4, 0x52);
+    send_exact(&w, clients[1], "DDDD", 4, 0x53);
+    for (uint32_t spin = 0; got[0] + got[1] < 16; ++spin) {
+        struct vsr_io_cqe cqes[4];
+        uint32_t count;
+
+        CHECK(spin < SPIN_MAX);
+        count = reap(&w, 1, cqes, 4);
+        for (uint32_t i = 0; i < count; ++i) {
+            take_buffer(&cqes[i], &consumed, got, "CD");
+        }
+        if (count == 0) {
+            (void)vsr_sim_advance(w.sim);
+        }
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        sqe = make_sqe(VSR_IO_SQE_CANCEL, -1, 0x60 + i);
+        sqe.offset = RECV_BASE + i;
+        submit(&w, 1, &sqe, 1);
+    }
+    for (uint32_t spin = 0; !ended[0] || !ended[1] || cancels < 2; ++spin) {
+        struct vsr_io_cqe cqes[4];
+        uint32_t count;
+
+        CHECK(spin < SPIN_MAX);
+        count = reap(&w, 1, cqes, 4);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint64_t which = cqes[i].user_data - RECV_BASE;
+
+            if (cqes[i].user_data == 0x60 || cqes[i].user_data == 0x61) {
+                CHECK(cqes[i].result == 0 && cqes[i].flags == 0);
+                ++cancels;
+                continue;
+            }
+            CHECK(which < 2 && !ended[which]);
+            CHECK(cqes[i].result == -ECANCELED && cqes[i].flags == 0);
+            ended[which] = true;
+        }
+        if (count == 0) {
+            (void)vsr_sim_advance(w.sim);
+        }
+    }
+    close_world(&w);
 }
 
 /* Records of a LINK chain get no fault, and a batch whose last record is
@@ -1109,6 +1260,93 @@ static void test_cancel_held(void)
     close_world(&w);
 }
 
+/* A chained receive held behind an earlier delivery into its buffer keeps
+ * its chain's order: the successor's completion comes after it. */
+static void test_chain_buffer(void)
+{
+    struct faulty_executor_options quiet = rates();
+    struct faulty_executor_options slow = rates();
+    struct faulty_executor_stats stats;
+    struct vsr_io_region memory;
+    struct vsr_io_buffer buffer;
+    struct vsr_io_sqe batch[2];
+    struct world w;
+    int32_t listener;
+    int32_t clients[2];
+    int32_t servers[2];
+    uint64_t order[3];
+    uint32_t count = 0;
+
+    open_world(&w, &traces[0], &quiet);
+    listener = listen_on(&w, 0x20);
+    connect_pair(&w, listener, 0x30, &clients[0], &servers[0]);
+    connect_pair(&w, listener, 0x38, &clients[1], &servers[1]);
+    memory.base = ring_memory;
+    memory.size = sizeof(ring_memory);
+    CHECK(w.ex[1].ops->buffer_ring(w.ex[1].ctx, GROUP, 1,
+                                   VSR_IO_BUFFER_RING_INCREMENTAL,
+                                   &memory) == 0);
+    memset(&buffer, 0, sizeof(buffer));
+    buffer.base = pool_bytes;
+    buffer.length = sizeof(pool_bytes);
+    buffer.id = BUFFER_ID;
+    CHECK(w.ex[1].ops->provide(w.ex[1].ctx, GROUP, &buffer, 1) == 0);
+    batch[0] = make_sqe(VSR_IO_SQE_RECV, servers[0], RECV_BASE);
+    batch[0].flags = VSR_IO_SQE_BUFFER_SELECT;
+    batch[0].buffer_group = GROUP;
+    batch[0].op_flags = VSR_IO_RECV_MULTISHOT;
+    submit(&w, 1, batch, 1);
+    slow.delay_ppm = PPM;
+    slow.delay_reaps_max = 1000;
+    set_rates(&w, 1, &slow);
+    send_exact(&w, clients[0], "AAAA", 4, 0x50);
+    for (uint32_t spin = 0;; ++spin) {
+        struct vsr_io_cqe cqe;
+
+        CHECK(spin < SPIN_MAX);
+        CHECK(reap(&w, 1, &cqe, 1) == 0);
+        faulty_executor_stats(w.faulty[1], &stats);
+        if (stats.delayed == 1) {
+            break;
+        }
+        (void)vsr_sim_advance(w.sim);
+    }
+    /* A receive of exactly four bytes into the same buffer, linked to a
+     * NOP that runs once it succeeded. */
+    set_rates(&w, 1, &quiet);
+    batch[0] = make_sqe(VSR_IO_SQE_RECV, servers[1], RECV_BASE + 1);
+    batch[0].flags = VSR_IO_SQE_BUFFER_SELECT | VSR_IO_SQE_LINK;
+    batch[0].buffer_group = GROUP;
+    batch[0].length = 4;
+    batch[1] = make_sqe(VSR_IO_SQE_NOP, -1, 0x70);
+    submit(&w, 1, batch, 2);
+    send_exact(&w, clients[1], "BBBB", 4, 0x51);
+    for (uint32_t spin = 0; count < 3; ++spin) {
+        struct vsr_io_cqe cqes[4];
+        uint32_t got;
+
+        CHECK(spin < SPIN_MAX);
+        got = reap(&w, 1, cqes, 4);
+        for (uint32_t i = 0; i < got; ++i) {
+            CHECK(count < 3);
+            order[count++] = cqes[i].user_data;
+            if (cqes[i].user_data == 0x70) {
+                CHECK(cqes[i].result == 0 && cqes[i].flags == 0);
+                continue;
+            }
+            CHECK(cqes[i].result == 4 && cqes[i].buffer_id == BUFFER_ID);
+            CHECK((cqes[i].flags & VSR_IO_CQE_BUFFER) != 0);
+        }
+        if (got == 0) {
+            (void)vsr_sim_advance(w.sim);
+        }
+    }
+    CHECK(order[0] == RECV_BASE && order[1] == RECV_BASE + 1 &&
+          order[2] == 0x70);
+    CHECK(memcmp(pool_bytes, "AAAABBBB", 8) == 0);
+    close_world(&w);
+}
+
 /* A completion is held for 1..delay_reaps_max reaps (0 counting as 1). */
 static void test_delay_bounds(void)
 {
@@ -1235,6 +1473,8 @@ static const struct unit units[] = {
     {"capacity", test_capacity},
     {"map", test_map},
     {"cancel_held", test_cancel_held},
+    {"buffer_order", test_buffer_order},
+    {"chain_buffer", test_chain_buffer},
     {"delay_bounds", test_delay_bounds},
     {"batches", test_batches},
     {"saturated", test_saturated},
