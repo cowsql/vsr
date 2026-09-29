@@ -14,13 +14,17 @@
  * - eio_ppm: a READ, WRITE, READV, WRITEV or FSYNC completion with a
  *   non-negative result completes -EIO instead (the operation itself ran).
  * - short_ppm: a positive READ or WRITE result becomes a smaller positive
- *   count; a plain SEND (not zero-copy, not vectored) or a plain RECV (no
- *   BUFFER_SELECT, not multishot) of length > 1 is submitted with a shorter
- *   length, so the inner executor returns a genuinely short count. Stream
- *   records are shortened at submission because rewriting their results
- *   would lose received bytes or resend sent ones; file records are
- *   shortened at completion because the caller repeats the rest at an
- *   explicit offset.
+ *   count in whole units of the largest power of two dividing the
+ *   request's offset and length, so the rest stays as aligned as the
+ *   request was (an O_DIRECT or whole-block transfer is shortened by whole
+ *   blocks, and one of a single unit is never shortened). A plain SEND
+ *   (not zero-copy, not vectored) or a plain RECV (no BUFFER_SELECT, not
+ *   multishot) of length > 1 is submitted with a shorter length, so the
+ *   inner executor returns a genuinely short count. Stream records are
+ *   shortened at submission because rewriting their results would lose
+ *   received bytes or resend sent ones; file records are shortened at
+ *   completion because the caller repeats the rest at an explicit
+ *   offset.
  * - delay_ppm: a completion is held for 1..delay_reaps_max reaps.
  * - cancel_recv_ppm: a RECV record (multishot or not) is followed in the
  *   same inner batch by a CANCEL record targeting its user_data, so it
@@ -77,8 +81,9 @@ struct faulty_executor_stats {
 struct faulty_executor_record {
     uint64_t user_data;
     uint8_t opcode;
-    uint8_t flags; /* Private. */
-    uint16_t reserved16;
+    uint8_t flags;       /* Private. */
+    uint8_t align_shift; /* READ, WRITE: log2 of the request's alignment. */
+    uint8_t reserved8;
     uint32_t reserved;
 };
 

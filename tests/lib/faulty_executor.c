@@ -29,6 +29,21 @@ static bool chance(struct faulty_executor *faulty, uint32_t ppm)
     return test_random_bounded(&faulty->random, PPM) < ppm;
 }
 
+/* The largest power of two dividing a request's offset and length, as a
+ * shift: a count in whole units of it keeps the request's alignment, so
+ * the rest of a short O_DIRECT or whole-block transfer stays aligned. */
+static uint8_t align_shift(uint64_t offset, uint32_t length)
+{
+    uint64_t bits = offset | length;
+    uint8_t shift = 0;
+
+    while (shift < 31u && (bits & 1u) == 0) {
+        bits >>= 1;
+        ++shift;
+    }
+    return shift;
+}
+
 /* Uniform in [1, value - 1]; value must be > 1. */
 static uint32_t shorter(struct faulty_executor *faulty, uint32_t value)
 {
@@ -53,6 +68,7 @@ static void remember(struct faulty_executor *faulty,
     record->user_data = sqe->user_data;
     record->opcode = sqe->opcode;
     record->flags = flags;
+    record->align_shift = align_shift(sqe->offset, sqe->length);
     faulty->record_next = (faulty->record_next + 1u) % FAULTY_EXECUTOR_RECORDS;
 }
 
@@ -161,19 +177,26 @@ static void admit(struct faulty_executor *faulty, const struct vsr_io_cqe *cqe)
     if (record != NULL && !chained) {
         uint16_t special = VSR_IO_CQE_BUFFER | VSR_IO_CQE_BUFFER_MORE |
                            VSR_IO_CQE_MORE | VSR_IO_CQE_NOTIF;
+        uint32_t units;
 
         if (eio_eligible(record->opcode) && held->cqe.result >= 0 &&
             chance(faulty, options->eio_ppm)) {
             held->cqe.result = -EIO;
             ++faulty->stats.eio;
         }
+        /* In whole units of the request's alignment: a file's rest is
+         * issued again at its offset, which O_DIRECT (and the store's
+         * whole-block writes) need aligned. */
+        units = held->cqe.result > 0
+                    ? (uint32_t)held->cqe.result >> record->align_shift
+                    : 0;
         if ((record->opcode == VSR_IO_SQE_READ ||
              record->opcode == VSR_IO_SQE_WRITE) &&
-            held->cqe.result > 1 && (held->cqe.flags & special) == 0 &&
+            units > 1 && (held->cqe.flags & special) == 0 &&
             (record->flags & RECORD_ZERO_COPY) == 0 &&
             chance(faulty, options->short_ppm)) {
             held->cqe.result =
-                (int32_t)shorter(faulty, (uint32_t)held->cqe.result);
+                (int32_t)(shorter(faulty, units) << record->align_shift);
             ++faulty->stats.shortened;
         }
     }

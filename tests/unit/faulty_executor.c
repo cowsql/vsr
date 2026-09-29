@@ -820,6 +820,8 @@ static void test_reserved(void)
 
 static _Alignas(4096) unsigned char ring_memory[4096];
 static unsigned char pool_bytes[256];
+static _Alignas(4096) unsigned char direct_source[4 * BLOCK];
+static _Alignas(4096) unsigned char direct_check[4 * BLOCK];
 static uint8_t nop_seen[NOPS];
 
 static struct faulty_executor_options rates(void)
@@ -1024,6 +1026,74 @@ static void test_buffer_order(void)
             (void)vsr_sim_advance(w.sim);
         }
     }
+    close_world(&w);
+}
+
+/* Transfers [offset, offset + length) of an O_DIRECT file the way the
+ * contract tells callers to: the rest of a short count is issued again at
+ * its explicit offset. Returns how many results were short. */
+static uint32_t direct_transfer(struct world *w, uint8_t opcode, int32_t fd,
+                                unsigned char *bytes, uint64_t offset,
+                                uint32_t length, uint64_t *user_data)
+{
+    uint32_t shorts = 0;
+
+    while (length > 0) {
+        struct vsr_io_sqe sqe = make_sqe(opcode, fd, (*user_data)++);
+        int32_t result;
+
+        sqe.addr = bytes;
+        sqe.length = length;
+        sqe.offset = offset;
+        result = run(w, 0, &sqe).result;
+        CHECK(result > 0 && (uint32_t)result <= length);
+        CHECK((uint32_t)result % BLOCK == 0);
+        if ((uint32_t)result < length) {
+            ++shorts;
+        }
+        bytes += result;
+        offset += (uint32_t)result;
+        length -= (uint32_t)result;
+    }
+    return shorts;
+}
+
+static void test_direct_short(void)
+{
+    struct faulty_executor_options options = rates();
+    struct faulty_executor_stats stats;
+    struct vsr_io_sqe sqe;
+    struct world w;
+    uint64_t user_data = 0x100;
+    uint32_t shorts;
+    int32_t fd;
+
+    for (uint32_t i = 0; i < sizeof(direct_source); ++i) {
+        direct_source[i] = (unsigned char)(i * 13u + 7u);
+    }
+    memset(direct_check, 0, sizeof(direct_check));
+    options.short_ppm = PPM;
+    open_world(&w, &traces[0], &options);
+    sqe = make_sqe(VSR_IO_SQE_OPENAT, VSR_SIM_ROOT, 0x10);
+    sqe.addr = "direct";
+    sqe.op_flags = O_CREAT | O_RDWR | O_DIRECT;
+    sqe.length = 0600;
+    fd = run(&w, 0, &sqe).result;
+    CHECK(fd >= 0);
+    /* Three blocks from block 1: shortened to whole blocks, so the rest
+     * stays block-aligned as O_DIRECT (and the store's whole-block rule)
+     * requires. */
+    shorts = direct_transfer(&w, VSR_IO_SQE_WRITE, fd, direct_source + BLOCK,
+                             BLOCK, 3 * BLOCK, &user_data);
+    shorts += direct_transfer(&w, VSR_IO_SQE_READ, fd, direct_check + BLOCK,
+                              BLOCK, 3 * BLOCK, &user_data);
+    CHECK(memcmp(direct_source + BLOCK, direct_check + BLOCK,
+                 (size_t)3 * BLOCK) == 0);
+    CHECK(shorts >= 2);
+    faulty_executor_stats(w.faulty[0], &stats);
+    CHECK(stats.shortened == shorts);
+    sqe = make_sqe(VSR_IO_SQE_CLOSE, fd, 0x11);
+    CHECK(run(&w, 0, &sqe).result == 0);
     close_world(&w);
 }
 
@@ -1473,6 +1543,7 @@ static const struct unit units[] = {
     {"capacity", test_capacity},
     {"map", test_map},
     {"cancel_held", test_cancel_held},
+    {"direct_short", test_direct_short},
     {"buffer_order", test_buffer_order},
     {"chain_buffer", test_chain_buffer},
     {"delay_bounds", test_delay_bounds},
