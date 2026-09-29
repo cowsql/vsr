@@ -419,6 +419,15 @@ static const struct dfile *dfile_named(const struct engine *e, const char *name)
     return i < 0 ? NULL : &e->files[i];
 }
 
+/* The store's log file, which must exist. */
+static const struct dfile *log_file(const struct engine *e)
+{
+    const struct dfile *f = dfile_named(e, DIRECTORY "/log");
+
+    CHECK(f != NULL);
+    return f;
+}
+
 static bool in_pool(const struct engine *e, const void *addr, size_t length)
 {
     return vsr_io_pool_contains(&e->io->pool, addr, length);
@@ -2529,7 +2538,7 @@ static void test_capture(void)
             release_lease(a, lease);
             /* A capture now: b's record is cold in the log, a's too; the
              * writer reads them with block-aligned reads of the log. */
-            reads = dfile_named(a, DIRECTORY "/log")->reads;
+            reads = log_file(a)->reads;
             {
                 struct vsr_id third = capture(a);
 
@@ -2537,7 +2546,7 @@ static void test_capture(void)
                 CHECK(file != NULL);
                 n = file_parse(file->data, file->size, third, records, 8);
                 CHECK(n == 2);
-                CHECK(dfile_named(a, DIRECTORY "/log")->reads >= reads + 1);
+                CHECK(log_file(a)->reads >= reads + 1);
                 for (uint32_t i = 0; i < n; ++i) {
                     const struct txn *t = &txns[0][2];
                     uint32_t r = records[i].wire.client_hi == 0xA ? 0 : 1;
