@@ -13,6 +13,10 @@
  * capacity, socket buffer sizes). Everything else is one code path over
  * executor records.
  *
+ * Two more factories run the same bodies through the fault-injecting
+ * wrapper (tests/lib/faulty_executor.c) at rate zero over each executor:
+ * with every rate zero the wrapper must be transparent.
+ *
  * Every scenario runs in a forked child with a fresh fixture, so an abort
  * (a CHECK, a sanitizer report, the simulation's ownership checks) fails
  * that scenario alone. The driver prints `factory: scenario: PASS|FAIL|
@@ -23,6 +27,7 @@
 #include "config.h"
 
 #include "lib/check.h"
+#include "lib/faulty_executor.h"
 #include "vsr-io.h"
 #include "vsr-sim.h"
 
@@ -68,6 +73,7 @@ struct fixture;
 struct factory {
     const char *name;
     bool temp_directory; /* The driver makes and removes fixture.dir_path. */
+    bool ring;           /* Skipped entirely when no ring can be created. */
     /* 0, or a negative errno; -ENOSYS/-EPERM mean no such executor here. */
     int (*create)(struct fixture *f);
     void (*destroy)(struct fixture *f);
@@ -117,6 +123,10 @@ struct fixture {
     uint16_t next_port;
     uint16_t bound_port;
     uint64_t peer_sequence;
+    /* The wrapper at rate zero (NULL: none) and the executor it wraps,
+     * which the factory's own functions use. */
+    struct faulty_executor *faulty;
+    struct vsr_io_executor inner;
     /* Ring. */
     void *memory;
     char dir_path[64];
@@ -801,6 +811,9 @@ static int ring_open(struct fixture *f)
 
 static void ring_close(struct fixture *f)
 {
+    if (f->faulty != NULL) {
+        f->ex = f->inner;
+    }
     vsr_io_uring_deinit(&f->ex);
     free(f->memory);
     f->memory = NULL;
@@ -1105,6 +1118,7 @@ static int ring_peer_close(struct fixture *f, int peer, bool reset)
 static const struct factory ring_factory = {
     .name = "uring",
     .temp_directory = true,
+    .ring = true,
     .create = ring_create,
     .destroy = ring_destroy,
     .wait = ring_wait,
@@ -1137,9 +1151,16 @@ static void scenario_nop(struct fixture *f)
     struct vsr_io_sqe batch[8];
 
     for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+        struct vsr_io_sqe r = rec(VSR_IO_SQE_NOP, values[i]);
         struct vsr_io_cqe cqe;
 
-        submit1(f, rec(VSR_IO_SQE_NOP, values[i]));
+        if (f->faulty != NULL && values[i] == FAULTY_EXECUTOR_USER_DATA) {
+            /* The wrapper's one reserved value, for its own CANCELs. */
+            CHECK(f->ex.ops->submit_and_wait(f->ex.ctx, &r, 1, 0, 0, 0) ==
+                  -EINVAL);
+            continue;
+        }
+        submit1(f, r);
         cqe = take(f, values[i]);
         CHECK(cqe.user_data == values[i]);
         CHECK(cqe.result == 0 && cqe.flags == 0 && cqe.buffer_id == 0);
@@ -2929,6 +2950,119 @@ static void scenario_unix_socket(struct fixture *f)
 }
 
 /* ------------------------------------------------------------------------
+ * Factories: the wrapper at rate zero over each executor
+ * --------------------------------------------------------------------- */
+
+static void faulty_wrap(struct fixture *f)
+{
+    struct faulty_executor_options options;
+
+    memset(&options, 0, sizeof(options));
+    options.seed = 1;
+    options.delay_reaps_max = 4;
+    f->faulty = calloc(1, sizeof(*f->faulty));
+    CHECK(f->faulty != NULL);
+    f->inner = f->ex;
+    faulty_executor_init(f->faulty, &f->inner, &options);
+    f->ex = faulty_executor_handle(f->faulty);
+}
+
+/* At rate zero nothing was injected. */
+static void faulty_check_quiet(const struct fixture *f)
+{
+    struct faulty_executor_stats stats;
+
+    faulty_executor_stats(f->faulty, &stats);
+    CHECK(stats.eio == 0 && stats.shortened == 0 && stats.delayed == 0 &&
+          stats.cancelled == 0);
+}
+
+static void faulty_unwrap(struct fixture *f)
+{
+    faulty_check_quiet(f);
+    f->ex = f->inner;
+    free(f->faulty);
+    f->faulty = NULL;
+}
+
+static int faulty_sim_create(struct fixture *f)
+{
+    CHECK(sim_create(f) == 0);
+    faulty_wrap(f);
+    return 0;
+}
+
+static void faulty_sim_destroy(struct fixture *f)
+{
+    faulty_unwrap(f);
+    sim_destroy(f);
+}
+
+static int faulty_ring_create(struct fixture *f)
+{
+    int rc = ring_create(f);
+
+    if (rc == 0) {
+        faulty_wrap(f);
+    }
+    return rc;
+}
+
+static void faulty_ring_destroy(struct fixture *f)
+{
+    struct faulty_executor *faulty = f->faulty;
+
+    faulty_check_quiet(f);
+    ring_destroy(f); /* ring_close unwraps to deinit the ring. */
+    f->faulty = NULL;
+    free(faulty);
+}
+
+static const struct factory faulty_sim_factory = {
+    .name = "faulty-sim",
+    .create = faulty_sim_create,
+    .destroy = faulty_sim_destroy,
+    .wait = sim_wait,
+    .wake_elsewhere = sim_wake_elsewhere,
+    .direct_alignment = sim_direct_alignment,
+    .partition = sim_partition,
+    .bind_address = sim_bind_address,
+    .dial_address = sim_dial_address,
+    .unused_address = sim_unused_address,
+    .shrink_send_buffer = sim_shrink_send_buffer,
+    .peer_listen = sim_peer_listen,
+    .peer_accept = sim_peer_accept,
+    .peer_connect = sim_peer_connect,
+    .peer_send = sim_peer_send,
+    .peer_recv = sim_peer_recv,
+    .peer_shutdown = sim_peer_shutdown,
+    .peer_close = sim_peer_close,
+};
+
+static const struct factory faulty_ring_factory = {
+    .name = "faulty-uring",
+    .temp_directory = true,
+    .ring = true,
+    .create = faulty_ring_create,
+    .destroy = faulty_ring_destroy,
+    .wait = ring_wait,
+    .wake_elsewhere = ring_wake_elsewhere,
+    .direct_alignment = ring_direct_alignment,
+    .partition = ring_partition,
+    .bind_address = ring_bind_address,
+    .dial_address = ring_dial_address,
+    .unused_address = ring_unused_address,
+    .shrink_send_buffer = ring_shrink_send_buffer,
+    .peer_listen = ring_peer_listen,
+    .peer_accept = ring_peer_accept,
+    .peer_connect = ring_peer_connect,
+    .peer_send = ring_peer_send,
+    .peer_recv = ring_peer_recv,
+    .peer_shutdown = ring_peer_shutdown,
+    .peer_close = ring_peer_close,
+};
+
+/* ------------------------------------------------------------------------
  * Driver
  * --------------------------------------------------------------------- */
 
@@ -2975,7 +3109,8 @@ static const struct scenario scenarios[] = {
     {"unix_socket", scenario_unix_socket},
 };
 
-static const struct factory *const factories[] = {&sim_factory, &ring_factory};
+static const struct factory *const factories[] = {
+    &sim_factory, &ring_factory, &faulty_sim_factory, &faulty_ring_factory};
 
 enum outcome { PASS, FAIL, SKIP };
 
@@ -3097,7 +3232,7 @@ int main(void)
         unsigned failures = 0;
         unsigned skipped = 0;
 
-        if (factory == &ring_factory) {
+        if (factory->ring) {
             struct fixture *probe = calloc(1, sizeof(*probe));
             int rc;
 

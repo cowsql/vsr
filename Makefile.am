@@ -132,7 +132,8 @@ tests_integration_uring_smoke_LDADD = $(LIBVSR)
 tests_integration_uring_smoke_CFLAGS = $(AM_CFLAGS) -pthread
 tests_integration_uring_smoke_LDFLAGS = $(AM_LDFLAGS) -pthread
 tests_integration_executor_conformance_SOURCES = \
-  tests/integration/executor_conformance.c
+  tests/integration/executor_conformance.c tests/lib/faulty_executor.c \
+  tests/lib/faulty_executor.h tests/lib/random.c tests/lib/random.h
 tests_integration_executor_conformance_LDADD = $(LIBVSR)
 tests_integration_executor_conformance_CFLAGS = $(AM_CFLAGS) -pthread
 tests_integration_executor_conformance_LDFLAGS = $(AM_LDFLAGS) -pthread
