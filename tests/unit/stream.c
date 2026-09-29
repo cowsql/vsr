@@ -3400,6 +3400,94 @@ static void test_review_close(void)
     engine_forget(b);
 }
 
+/* A FILE read still in flight when the source aborts (a shutdown, a read
+ * failure of an earlier chunk) is dropped at its completion: its bytes are
+ * never sent, the stream ends, its slab and slot are released. */
+static void test_review_read_in_flight(void)
+{
+    const unsigned char *bytes = pattern(27);
+    struct engine *a;
+    struct engine *b;
+    struct sink k;
+    struct feed d;
+    uint32_t index = NONE;
+    const struct vsr_io_stream *t;
+
+    world_reset(27);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    b->files[0].bytes = bytes;
+    b->files[0].size = BYTES_MAX;
+    /* Shutdown between the READs' issue and their completions. */
+    open_stream(&k, &d, 1, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    t = stream_at(b, (uint32_t)(d.handle & 0xFFFF));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    CHECK(feed_write_file(&d, 1, FILE_FD_BASE, 0, 3 * CHUNK) == VSR_OK);
+    engine_step(b);
+    CHECK(t->units_used == WINDOW && b->cq_count == WINDOW);
+    for (uint32_t n = 0; n < WINDOW; ++n) {
+        CHECK(t->units[n].state == VSR_IO_UNIT_READING &&
+              t->units[n].slot != NONE);
+    }
+    vsr_io_streams_shutdown(b->io);
+    CHECK(t->units_used == WINDOW); /* The reads complete first. */
+    pump(&k, &d);
+    CHECK(d.ended && d.end.status == VSR_IO_CANCELLED && d.end.bytes == 0);
+    CHECK(d.written_count == 1 && b->io->streams.active == 0);
+    CHECK(k.ended && k.end.status == VSR_IO_RETRY && k.received == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    CHECK(b->io->slots.free_count == b->io->slots.count - 1);
+    engine_forget(a);
+    engine_forget(b);
+    /* The first read fails while the second is in flight: the second's
+     * bytes are dropped, END(FAILED) announces none, and the requester
+     * sees no chunk (one at offset CHUNK would be a protocol error). */
+    world_reset(28);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    b->files[0].bytes = bytes;
+    b->files[0].size = BYTES_MAX;
+    open_stream(&k, &d, 1, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    world.fail_read = 1;
+    CHECK(feed_write_file(&d, 1, FILE_FD_BASE, 0, 3 * CHUNK) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    pump(&k, &d);
+    CHECK(world.fail_read == 0);
+    CHECK(k.ended && k.end.status == VSR_IO_FAILED && k.received == 0);
+    CHECK(a->io->stats.frames_rejected == 0);
+    CHECK(d.ended && d.end.status == VSR_IO_FAILED && d.end.bytes == 0);
+    CHECK(d.written_count == 1);
+    /* A failed read after sent chunks, with no chunk behind it: the END
+     * counts the sent chunks only. */
+    open_stream(&k, &d, 2, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    CHECK(feed_write_file(&d, 1, FILE_FD_BASE, 0, CHUNK) == VSR_OK);
+    pump(&k, &d);
+    CHECK(k.received == CHUNK && d.written_count == 1);
+    world.fail_read = 1;
+    CHECK(feed_write_file(&d, 2, FILE_FD_BASE, CHUNK, CHUNK) == VSR_OK);
+    pump(&k, &d);
+    CHECK(world.fail_read == 0);
+    CHECK(k.ended && k.end.status == VSR_IO_FAILED && k.received == CHUNK);
+    CHECK(d.ended && d.end.status == VSR_IO_FAILED && d.end.bytes == CHUNK);
+    CHECK(d.written_count == 2 && a->io->stats.frames_rejected == 0);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    engine_forget(a);
+    engine_forget(b);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = argc > 1 ? strtoull(argv[1], NULL, 10) : 4242;
@@ -3417,6 +3505,7 @@ int main(int argc, char **argv)
     test_review_shutdown_order();
     test_review_data_done_rearms();
     test_review_close();
+    test_review_read_in_flight();
     test_random(seed);
     test_random(seed + 1);
     printf("stream: ok\n");

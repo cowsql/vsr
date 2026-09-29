@@ -1513,10 +1513,12 @@ void vsr_io_streams_complete(struct vsr_io *io, uint32_t slot,
     }
     if (cqe->result <= 0 ||
         (uint32_t)cqe->result > unit->length - unit->filled) {
-        /* A read error, or the file ends inside the write's range. */
-        unit_release(io, stream, unit);
-        units_trim(io, stream);
+        /* A read error, or the file ends inside the write's range. The
+         * unit stays in the ring for the abort: the END's byte count stops
+         * at the first chunk the link never took, which may be this one
+         * (decision B5); the abort releases it (its slot is NONE). */
         source_fail(io, stream, VSR_IO_FAILED);
+        STREAMS_ASSERT(unit->state == VSR_IO_UNIT_FREE);
         stream_drive(io, stream);
         return;
     }
