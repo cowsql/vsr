@@ -81,8 +81,12 @@ enum vsr_io_segment_phase {
     VSR_IO_SEGMENT_HEADER, /* Header packed; its write not yet complete. */
     VSR_IO_SEGMENT_OPEN,   /* Records may be packed into it. */
     VSR_IO_SEGMENT_SEALED, /* Full; records only read. */
-    VSR_IO_SEGMENT_FREEING /* Freed; reused only once the superblock
-                              naming the new start segment is on disk. */
+    VSR_IO_SEGMENT_FREEING, /* Freed; reused only once the superblock
+                               naming the new start segment is on disk. */
+    VSR_IO_SEGMENT_FLUSHING /* That superblock write completed; in
+                               FDATASYNC mode a flush issued since must
+                               complete before the slot is reused
+                               (decision S15). */
 };
 
 struct vsr_io_segment {
@@ -261,6 +265,9 @@ struct vsr_io_recovery {
                                floors and every valid record's flushed. */
     uint64_t resume;        /* File offset of the block after the last
                                valid record: where writing resumes. */
+    uint64_t chain_resume;  /* While sweeping the dead tail of a block
+                               (decision S14): the block boundary at which
+                               the chain resumes; 0 when not. */
     uint64_t load_op;       /* The RECOVERY load op to complete. */
 };
 
@@ -293,7 +300,15 @@ struct vsr_io_store {
     uint64_t durable;     /* Last sequence acknowledged by SYNC. */
     uint64_t flushed;     /* Last sequence covered by a completed flush. */
     uint64_t reclaim;     /* RECLAIM floor: oldest revision still needed. */
+    uint64_t reclaimed;   /* The part of it applied: a crash brings back
+                             any revision from the sequence on media on,
+                             so RECLAIM applies as far as that sequence
+                             (decision S16). */
     uint64_t client_base; /* Sequence of the current base file. */
+    uint64_t client_base_floor;   /* The client base as of the sequence
+                                     on media: the floor's base term. */
+    uint64_t client_base_pending; /* Revision that set client_base while
+                                     above the media sequence; 0 none. */
     struct vsr_id client_base_id;
     uint64_t clients_sequence;  /* Last CLIENTS change applied. */
     struct vsr_id last_capture; /* Snapshot whose offsets capture_offset
@@ -351,6 +366,8 @@ struct vsr_io_store {
     uint32_t flush_pending;    /* 1 when a flush must be issued; 2 when a
                                   SYNC asked for one and poll has yet to
                                   apply sync_delay_ns to it. */
+    uint32_t freeing_flush;    /* FLUSHING slots wait for a flush: 1 one
+                                  is wanted, 2 one issued since is out. */
     uint64_t flush_target;     /* Sequence the pending flush must cover. */
     uint64_t flush_deadline;   /* sync_delay / flush_interval expiry. */
     uint64_t superblock_floor; /* durable_floor of the newest superblock. */

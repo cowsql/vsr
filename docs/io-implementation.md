@@ -1147,7 +1147,15 @@ record at a time and moves through the stages that need none):
    no CRC covers, runs exactly to its block's end; END (zero fill, a
    foreign magic, or a RECORD magic with fewer than 48 bytes left) or a
    bad header, wrong generation, `sequence != last + 1` or `run < last
-   run` ends the chain; a header valid but payload CRC bad ends it too. A
+   run` ends the chain, as does a header valid but payload CRC bad, when
+   it lies at a block boundary. Inside a block such a verdict ends only
+   the block: the bytes after the last valid record of a block are dead
+   once writing resumed at the block after it (step 6), so they are
+   swept for floors and the chain resumes at that boundary with a record
+   of the next sequence and a run at or above the last one, when one is
+   there (decision S14: neither a bad PAD, whose length no CRC covers,
+   nor the head of a record torn at the following block hides the
+   records written after a recovery). A
    record that straddles the chunk's end (its header short, or its length
    past the chunk) is read again from its block, provided that makes
    progress and the segment has the bytes; a read that fails or comes
@@ -1217,7 +1225,10 @@ sequence (found) or another (the tail); a bad record at or below the
 durable floor (`CORRUPT`), including a floor that only a later valid
 record's `flushed` carries, and one the idle superblock write persisted; a
 bad record above the floor followed by a valid later record (still the
-torn tail); a PAD whose length misses its block's end; a block that
+torn tail); a PAD whose length misses its block's end (a dead tail: the
+chain resumes at the next block) and one at a block boundary (the end);
+the record after a torn straddling one, written at the next block and
+found by the next recovery; a block that
 reads bad once and clean on the re-read (passes), a read error and a
 short read; a record header straddling a chunk's end; both superblocks
 valid with different revisions; one superblock corrupt; both corrupt; a
@@ -1231,7 +1242,15 @@ then more STOREs and a second recovery.
 `vsr_io_store_free_floor` = min(the sequence of the first live op from
 `retained_begin` (or `readable + 1` when the log is empty; sequences never
 decrease along the ring), the `appended` of every kept version,
-`reclaim`, `client_base + 1`, `capture_floor`). A SEALED slot whose
+`reclaimed`, `client_base_floor + 1`, `capture_floor`). A crash brings
+back any revision from the sequence on media (`flushed`, or `written` in
+DSYNC mode) on, and the recovered row must serve it whole, so the RECLAIM
+revision applies as far as that sequence (`reclaimed`; `trims_reclaim`
+and `versions_reclaim` follow it, LOADs are still refused below
+`reclaim`), the rest as flushes or O_DSYNC writes advance it
+(`reclaim_apply`), and the base term is the client base as of that
+sequence (`client_base_floor`, with `client_base_pending` the revision of
+a change above it; decision S16). A SEALED slot whose
 `last_sequence < floor`, whose bytes are all written (nothing of it
 planned or in flight) and from which no queued load still reads is freed:
 its extents die (`segment = NONE`, so `vsr_io_store_hot` no longer answers
@@ -1239,11 +1258,17 @@ for its file range) and the new start is the live slot with the smallest
 number, with a superblock write planned. A freed slot is `FREEING` until a
 superblock write issued after the free completed (a superblock always
 names a present segment; a slot freed after the write was issued waits for
-the next one); in memory-only mode it is free at once. A STORE that needs
-a slot frees first, then grows, then waits while a slot is `FREEING`, and
-fails with `FAILED` when nothing can free (section 6.1). RECLAIM, a
-capture's end and `base_set` retry held STOREs. Growth also rewrites the
-superblock after the `FALLOCATE` completes.
+the next one), then, in FDATASYNC mode, `FLUSHING` until a flush issued
+after that completion completed, which the store asks for itself
+(`freeing_flush`, `flush_request`), since the write may still be in the
+page cache (decision S15); an O_DSYNC write is on media at its completion,
+and in memory-only mode the slot is free at once. A STORE that needs a
+slot frees first, then grows, then waits while a slot is `FREEING` or
+`FLUSHING` or while a RECLAIM or a base change waits for the media (it
+asks for the flush), and fails with `FAILED` when nothing can free
+(section 6.1). RECLAIM, a capture's end, `base_set`, a superblock write
+and a flush retry held STOREs. Growth also rewrites the superblock after
+the `FALLOCATE` completes.
 
 Base files (decision 43): `store_pack` holds a RESTORE, or a PUBLISH of a
 snapshot that is neither the latest capture nor the current base, before
@@ -1601,6 +1626,7 @@ of `docs/io-design.md`:
 | `link.h`, `stream.h` (internal) | Send side of `vsr_io_link`: unwrapped 64-bit ring counters (`header_*`, `vsr_io_send.header_*`), the build (`vec_count`, `build_bytes`), `nodelay_set`, `VSR_IO_STAGE_NODELAY`; `vsr_io_links_send` contract (RETRY only when the engine completes at once); `vsr_io_links_open_stream` and `vsr_io_links_send_frame` contracts; `vsr_io_streams_frame` returns whether the frame was consumed; `vsr_io_streams_sent` at every send result and NOTIF | 82, 83, 84, 85 |
 | `store.h` | `vsr_io_segment.run` (the header's run, for the successor rule); `vsr_io_recovery` reshaped for the scan (the pool slab and executor slot of the read in flight, the superblock copy, the chunk's offset and the position judged, the sweep mode, the resume offset); the base-load kinds include the recovery's; a LOAD slot's `sub` tells a recovery read from a cold load's | 88, 89, 90 |
 | `codec.h` | `vsr_io_codec_load_region` also holds the recovered row's manifest bytes, copied into the region | 91 |
+| `store.h` | `vsr_io_recovery.chain_resume` (the boundary at which the chain resumes past a block's dead tail); `VSR_IO_SEGMENT_FLUSHING` and `freeing_flush` (a freed slot waits for the flush after its superblock write); `reclaimed`, `client_base_floor` and `client_base_pending` (the floor terms bounded by the sequence on media) | S14, S15, S16 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1614,10 +1640,7 @@ of `docs/io-design.md`:
 - Whether NEW and JOIN should refuse a directory that holds stray
   `clients-*` files, or ignore them; the executor has no directory
   listing, so the store refuses only through the log (decision 92).
-- A freed slot becomes reusable when the superblock naming the new start
-  segment *completed*; in FDATASYNC mode that write may still be in the
-  page cache when the slot is rewritten, so a crash before the next flush
-  can leave the older superblock naming a start slot that now holds
-  another segment, which recovery reports as `CORRUPT` although nothing
-  acknowledged was lost. Converting FREEING to FREE at the flush that
-  covers the superblock write (or flushing after it) would close it.
+- A RECLAIM above the sequence on media takes effect only as flushes
+  advance it (decision S16); a core that reclaims far ahead of its SYNCs
+  in FDATASYNC mode makes the store flush on its own when it runs out of
+  slots, which is correct but not the cheapest cadence.

@@ -526,7 +526,10 @@ checkpoint.
 - Torn-tail rule: records must be contiguous by sequence, CRC-clean and
   non-decreasing in their run counter. The first record that is short,
   fails its CRC, does not carry the expected next sequence, or carries a
-  run below its predecessor's ends the log. A range is read once more
+  run below its predecessor's ends the log when it lies at a block
+  boundary; inside a block it ends only that block, whose remaining bytes
+  are dead once writing resumed at the block after it, where the chain
+  continues if the next record is there (decision S14). A range is read once more
   before it is judged bad, since reads can fail transiently; a bad record
   at or below the durable floor, the greatest acknowledged durable
   sequence carried by any superblock, segment header or valid record, is
@@ -635,7 +638,9 @@ All indexes are fixed-capacity arrays from the replica's metadata region.
 - A segment slot is freed only when every record in it is below all of: the
   record holding the oldest retained entry, the RECLAIM revision, the client
   base sequence plus one, and any capture still reading result bytes from
-  it (decision 35). The client index is recovered from `clients-<anchor>`
+  it (decision 35); the RECLAIM revision and the client base count as of
+  the sequence on media, since a crash brings back any revision from there
+  on (decision S16). The client index is recovered from `clients-<anchor>`
   plus the CLIENTS records after the client base sequence.
 - A cold LOAD reads the covering record range into one pool slab with a
   fixed-buffer read (a record fits a slab by construction, decision 37),
@@ -993,6 +998,9 @@ In the order the decisions were taken.
 | 90 | The anchor's clients file is loaded at recovery by the snapshot module through `base_wanted` (kind RECOVERY) and `base_begin/record/end`, which applies the merge at once, then `base_resume`; a replayed PUBLISH (or a witness's) of an id other than the current base makes it the base at the PUBLISH's sequence, which the merge lowers below the records the file does not cover; a log with records but no identity or hard state, or a superblock whose identity contradicts the replayed one, is `CORRUPT` | The snapshot module owns the file and its reader (decision 43), so recovery asks for the file the way a held RESTORE does; the log carries no capture sequence for a published snapshot, and the merge's lowering rule makes the PUBLISH's own sequence safe; the core cannot use a row without an epoch | Reading the file in the store; recording the capture sequence in the PUBLISH record |
 | 91 | The load region also holds the recovered row's manifest bytes: the row's hard state, epoch and anchor are deep copies in the lease region | The core retains the recovered checkpoint under the lease (`vsr_checkpoint_recover`) while later PUBLISH and RESTORE records replace the store's own copies | Spans into the store's state copies |
 | 92 | Decision 57's directory work is deferred: the executor has no directory listing, so NEW and JOIN refuse a directory only through its `log` (the recovered row), and the unlink of `clients-*` files the recovered log does not reference is the snapshot module's, once a listing exists (a `getdents` opcode in the executor, or the module's own at attach). Amends 57 | No executor opcode lists a directory today, and inventing a synchronous listing in the store would bypass the simulation | Listing through a synchronous `readdir` in the store |
+| S14 | A chain that ends inside a block skips the rest of that block: the bytes after the last valid record of a block are dead once writing resumed at the block after it (89), so recovery sweeps them for floors and continues with a record of the next sequence and a run at or above the last one found at that boundary; only a verdict at a block boundary ends the chain. Amends 89 | The store never rewrites a block below the recovered prefix, so the head of a record torn at the following block, or a PAD whose uncovered length was damaged, stays behind the last valid record forever; a scan that stopped there would never see the records written after the recovery and, once their floor is on media, would report the log CORRUPT | Rewriting the last valid block with a PAD (a torn rewrite could take the last valid record with it); resuming in a fresh segment (the alternative 89 rejected) |
+| S15 | A freed slot is reused only once the superblock naming the new start segment is on media: after its write's completion in DSYNC mode, and in FDATASYNC mode after a flush issued since that completion completed (`FLUSHING`), which the store requests itself; a STORE needing the slot waits. Amends 78 | In FDATASYNC mode the completed write may still be in the page cache; a crash that loses it while the reused slot's new header persisted leaves the older superblock naming a start slot that holds another segment, a `CORRUPT` with nothing acknowledged lost | Converting at the write's completion; a flush after every superblock write |
+| S16 | The freeing floor counts the RECLAIM revision and the client base as of the sequence on media (`flushed`, or `written` in DSYNC mode): a RECLAIM above it applies as far as it and the rest as flushes advance it, a base change above it keeps the older base in the floor until then, and a STORE that finds nothing to free while such a term waits holds and asks for a flush rather than failing. Amends 35 and 78 | A crash brings back any revision from the sequence on media on, and the recovered row must serve its whole log and every client's record; a RECLAIM or a PUBLISH above that sequence would otherwise free the records of a revision the recovery can still return | Requiring the core to RECLAIM at or below its durable sequence; a base history |
 
 ## 11. Open items and implementation order
 

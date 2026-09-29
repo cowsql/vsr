@@ -301,7 +301,7 @@ tests_integration_libheader_a_SOURCES = tests/integration/header.c
 
 if FUZZING
 noinst_PROGRAMS += tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz \
-  tests/fuzzy/frame
+  tests/fuzzy/frame tests/fuzzy/recovery
 tests_fuzzy_checked_SOURCES = tests/fuzzy/checked.c
 tests_fuzzy_checked_LDADD = $(LIBVSR)
 tests_fuzzy_checked_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
@@ -314,6 +314,10 @@ tests_fuzzy_cluster_fuzz_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 tests_fuzzy_frame_SOURCES = tests/fuzzy/frame.c
 tests_fuzzy_frame_LDADD = $(LIBVSR)
 tests_fuzzy_frame_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
+# The recovery harness includes the store unit test for its harness.
+tests_fuzzy_recovery_SOURCES = tests/fuzzy/recovery.c
+tests_fuzzy_recovery_LDADD = $(LIBVSR)
+tests_fuzzy_recovery_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 endif
 
 EXTRA_DIST = \
@@ -422,12 +426,15 @@ endif
 
 if FUZZING
 # The codec unit test seeds the frame corpus with valid encodings of every
-# frame, record, superblock, segment header and clients file it builds.
+# frame, record, superblock, segment header and clients file it builds;
+# the store unit test seeds the recovery corpus with its default walks.
 fuzz: tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz \
-  tests/fuzzy/frame tests/unit/codec
+  tests/fuzzy/frame tests/fuzzy/recovery tests/unit/codec tests/unit/store
 	$(MKDIR_P) tests/fuzzy/corpus/checked tests/fuzzy/corpus/validation \
-	  tests/fuzzy/corpus/cluster tests/fuzzy/corpus/frame tests/fuzzy/artifacts
+	  tests/fuzzy/corpus/cluster tests/fuzzy/corpus/frame \
+	  tests/fuzzy/corpus/recovery tests/fuzzy/artifacts
 	VSR_CODEC_CORPUS=tests/fuzzy/corpus/frame ./tests/unit/codec
+	VSR_RECOVERY_CORPUS=tests/fuzzy/corpus/recovery ./tests/unit/store
 	./tests/fuzzy/checked -runs=$(FUZZ_RUNS) -max_len=64 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/checked
 	./tests/fuzzy/validation -runs=$(FUZZ_RUNS) -max_len=256 \
@@ -436,6 +443,8 @@ fuzz: tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/cluster
 	./tests/fuzzy/frame -runs=$(FUZZ_RUNS) -max_len=4096 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/frame
+	./tests/fuzzy/recovery -runs=$(FUZZ_RUNS) -max_len=4096 \
+	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/recovery
 else
 fuzz:
 	@echo 'Configure a separate build with --enable-fuzzing first.' >&2; exit 1
