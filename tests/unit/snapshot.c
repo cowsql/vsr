@@ -2446,13 +2446,39 @@ static void expect_no_core(struct engine *e)
     CHECK(!core_take(e, &event));
 }
 
-/* The forwarded CORE op of `type` for op `id`, or NULL. */
+/* The next `count` core completions are ops[] in any order, each once,
+ * with `status`, no data and no lease. */
+static void expect_cores(struct engine *e, const uint64_t *ops, uint32_t count,
+                         int32_t status)
+{
+    bool seen[8] = {false};
+
+    CHECK(count <= 8);
+    for (uint32_t n = 0; n < count; ++n) {
+        struct vsr_event event;
+        bool found = false;
+
+        CHECK(core_take(e, &event));
+        CHECK(event.type == VSR_EVENT_COMPLETE && event.status == status &&
+              event.data == NULL && event.lease == 0);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (!seen[i] && ops[i] == event.id) {
+                seen[i] = true;
+                found = true;
+                break;
+            }
+        }
+        CHECK(found);
+    }
+}
+
+/* The next forwarded CORE op, which must be of `type` for op `id`, or
+ * NULL when none is queued. */
 static const struct vsr_op *forwarded_core(struct engine *e, uint32_t type,
                                            uint64_t id)
 {
     const struct vsr_io_forwarded *f;
 
-    CHECK(forwarded_count(e, VSR_IO_OP_CORE) <= 1);
     f = forwarded_take(e, VSR_IO_OP_CORE);
     if (f == NULL) {
         return NULL;
@@ -2980,6 +3006,75 @@ static struct vsr_id capture_stepped(struct engine *e, struct task_holder *h,
     forwarded = forwarded_core(e, VSR_OP_SNAPSHOT_CAPTURE, *op);
     CHECK(forwarded != NULL);
     return ((const struct vsr_snapshot_task *)forwarded->data)->checkpoint->id;
+}
+
+/* Two engines; a's store holds `clients` clients with 64-byte results
+ * and a capture of them (returned); b's store is new with an identity. */
+static struct vsr_id fetch_setup(uint64_t seed, uint32_t clients)
+{
+    struct engine *a;
+    struct engine *b;
+
+    world_reset(seed);
+    two_engines();
+    a = &world.engines[0];
+    b = &world.engines[1];
+    expect_store(a, store_start(a, VSR_START_NEW), VSR_IO_NOT_FOUND);
+    store_run(a, txn_identity(a, 1, VSR_MEMBER_FULL));
+    if (clients > 0) {
+        store_clients(a, 2, clients, 64);
+    }
+    expect_store(b, store_start(b, VSR_START_NEW), VSR_IO_NOT_FOUND);
+    store_run(b, txn_identity(b, 1, VSR_MEMBER_FULL));
+    return capture(a);
+}
+
+/* A writable view of a registry entry (a test reaching into the module). */
+static struct vsr_io_snapshot *entry_mutable(const struct engine *e,
+                                             struct vsr_id id)
+{
+    const struct vsr_io_snapshot *entry = entry_of(e, id);
+
+    CHECK(entry != NULL);
+    return mutable_of(entry);
+}
+
+/* A FETCH of `id` from replica 1 that fails with `status` before the
+ * caller sees it: no file, no temporary file, no entry, nothing held on
+ * either side. */
+static void fetch_fails(struct engine *b, struct vsr_id id, int32_t status)
+{
+    struct task_holder h;
+    uint64_t op;
+
+    CHECK(fetch_start(b, &h, id, 1, &op) == VSR_OK);
+    settle();
+    CHECK(forwarded_count(b, VSR_IO_OP_CORE) == 0);
+    expect_core(b, op, status);
+    expect_no_core(b);
+    CHECK(clients_file(b, id, false) == NULL &&
+          clients_file(b, id, true) == NULL && entry_of(b, id) == NULL);
+    expect_idle(b);
+    if (world.engines[0].snapshots->capture == NONE) {
+        expect_idle(&world.engines[0]);
+    }
+    for (uint32_t i = 0; i < STREAMS; ++i) {
+        CHECK(world.engines[0].snapshots->serves[i].state == 0);
+    }
+    CHECK(b->io->streams.active == 0 &&
+          world.engines[0].io->streams.active == 0);
+}
+
+/* The link of b's fetch stream. */
+static const struct vsr_io_link *fetch_link(const struct engine *b)
+{
+    uint32_t stream = b->snapshots->reader.stream;
+    uint32_t link;
+
+    CHECK(stream != NONE);
+    link = b->io->streams.streams[stream].link;
+    CHECK(link < LINKS);
+    return &b->io->links.links[link];
 }
 
 /* -------------------------------------------------------------------------
@@ -3668,26 +3763,537 @@ static void test_drop(void)
     engine_crash(a);
 }
 
+/* The requester side's failures. A file the source serves wrongly (a bad
+ * record CRC, a record longer than result_bytes, a header naming another
+ * snapshot, a file cut before its trailer) is CORRUPT; a source that ends
+ * short or fails to read is FAILED; a lost link RETRY; the requester's own
+ * open, write, short write and rename errors FAILED. In every case the
+ * temporary file is unlinked and never renamed, and the core hears the
+ * status without the caller. */
+static void test_fetch_failures(void)
+{
+    struct engine *a = &world.engines[0];
+    struct engine *b = &world.engines[1];
+    struct vsr_id x;
+    struct dfile *source;
+    struct craft craft;
+
+    for (uint32_t fault = 0; fault < 7; ++fault) {
+        x = fetch_setup(20 + fault, 8);
+        source = dfile_mutable(a, clients_file(a, x, false));
+        switch (fault) {
+        case 0: /* A result byte: the record CRC fails. */
+            source->data[64 + 2 * 108 + 50] ^= 0x01;
+            break;
+        case 1: /* The CRC itself. */
+            source->data[64 + 108 - 1] ^= 0x80;
+            break;
+        case 2: /* A record announcing more than result_bytes, sealed. */
+            craft_file(&craft, x, 3, 128);
+            (void)file_install(a, x, false, craft.bytes, craft.size);
+            entry_mutable(a, x)->bytes = craft.size;
+            break;
+        case 3: /* Another snapshot's header. */
+        {
+            struct vsr_id other = {x.hi, x.lo ^ 1};
+
+            craft_file(&craft, other, 3, 8);
+            (void)file_install(a, x, false, craft.bytes, craft.size);
+            entry_mutable(a, x)->bytes = craft.size;
+            break;
+        }
+        case 4: /* Cut before the trailer, consistently: END OK. */
+            source->size -= 8;
+            entry_mutable(a, x)->bytes = source->size;
+            break;
+        case 5: /* A record length beyond every byte that follows. */
+            craft_file(&craft, x, 3, 8);
+            put_le32(craft.bytes + craft.record_at[2] + 36, 60);
+            craft_seal(&craft, 2);
+            (void)file_install(a, x, false, craft.bytes, craft.size);
+            entry_mutable(a, x)->bytes = craft.size;
+            break;
+        default: /* A count above max_clients. */
+            craft_file(&craft, x, 3, 8);
+            {
+                struct vsr_io_wire_clients_header header;
+                struct vsr_io_cursor cursor;
+
+                vsr_io_cursor_init_one(&cursor, craft.bytes, 64);
+                CHECK(vsr_io_codec_get_clients_header(&cursor, &header) ==
+                      VSR_OK);
+                header.count = 9;
+                vsr_io_codec_put_clients_header(&header, craft.bytes);
+            }
+            (void)file_install(a, x, false, craft.bytes, craft.size);
+            entry_mutable(a, x)->bytes = craft.size;
+            break;
+        }
+        fetch_fails(b, x, VSR_IO_CORRUPT);
+    }
+    /* The source ends short (its file is smaller than the bytes it
+     * serves), or its read fails: END FAILED. The first case delivers a
+     * complete, valid file before the END: still no rename. */
+    for (uint32_t fault = 0; fault < 3; ++fault) {
+        x = fetch_setup(30 + fault, 8);
+        source = dfile_mutable(a, clients_file(a, x, false));
+        if (fault == 0) {
+            entry_mutable(a, x)->bytes = source->size + 100;
+        } else if (fault == 1) {
+            source->size -= 200;
+        } else {
+            a->fail_read = -EIO;
+        }
+        fetch_fails(b, x, VSR_IO_FAILED);
+    }
+    /* The requester's own errors. */
+    for (uint32_t fault = 0; fault < 4; ++fault) {
+        x = fetch_setup(40 + fault, 8);
+        if (fault == 0) {
+            b->fail_open = -EACCES;
+        } else if (fault == 1) {
+            b->fail_write = -ENOSPC;
+        } else if (fault == 2) {
+            b->short_write = true;
+        } else {
+            b->fail_rename = -EXDEV;
+        }
+        fetch_fails(b, x, VSR_IO_FAILED);
+        CHECK(b->snapshots->error != 0);
+    }
+    /* The source has no such file: NOT_FOUND. */
+    x = fetch_setup(50, 2);
+    {
+        struct vsr_id unknown = {x.hi ^ 0xFF, x.lo};
+
+        fetch_fails(b, unknown, VSR_IO_NOT_FOUND);
+    }
+    /* The link is lost mid-transfer: RETRY on both sides. */
+    x = fetch_setup(51, 8);
+    {
+        struct task_holder h;
+        uint64_t op;
+        uint32_t rounds = 0;
+        const struct vsr_io_clients_reader *r = &b->snapshots->reader;
+
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        while (r->file_offset + r->filled == 0) {
+            CHECK(!world_run_checked(1) || rounds < 100);
+            CHECK(++rounds < 200);
+        }
+        CHECK(r->stage != 3 /* DONE */);
+        link_reset(b, fetch_link(b));
+        settle();
+        expect_core(b, op, VSR_IO_RETRY);
+        CHECK(clients_file(b, x, false) == NULL &&
+              clients_file(b, x, true) == NULL && entry_of(b, x) == NULL);
+        expect_idle(b);
+        expect_idle(a);
+        CHECK(entry_of(a, x)->readers == 0);
+    }
+    /* A chunk at another offset than the bytes received (the stream module
+     * never delivers one; the hook checks all the same): FAILED. */
+    x = fetch_setup(52, 8);
+    {
+        struct task_holder h;
+        uint64_t op;
+        uint32_t rounds = 0;
+        const struct vsr_io_clients_reader *r = &b->snapshots->reader;
+        struct vsr_span bytes = {craft.bytes, 16};
+
+        b->hold_pool_writes = true;
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        while (r->file_offset + r->filled == 0) {
+            (void)world_run_checked(1);
+            CHECK(++rounds < 200);
+        }
+        vsr_io_snapshots_stream_data(b->io, REPLICA, r->stream, 0,
+                                     r->file_offset + r->filled + 1, &bytes,
+                                     NONE);
+        CHECK(r->stage == 4 /* FAILED */);
+        b->hold_pool_writes = false;
+        world_release_held(b);
+        settle();
+        expect_core(b, op, VSR_IO_FAILED);
+        CHECK(clients_file(b, x, false) == NULL &&
+              clients_file(b, x, true) == NULL);
+        expect_idle(b);
+    }
+    /* The file is renamed only after the verified END: with the rename
+     * held, the stream is over and only the temporary file exists. */
+    x = fetch_setup(53, 8);
+    {
+        struct task_holder h;
+        uint64_t op;
+
+        b->hold_rename = true;
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        settle();
+        CHECK(b->io->streams.active == 0 && held_count(b) == 1);
+        CHECK(clients_file(b, x, false) == NULL &&
+              clients_file(b, x, true) != NULL);
+        CHECK(files_equal(clients_file(a, x, false), clients_file(b, x, true)));
+        CHECK(forwarded_count(b, VSR_IO_OP_CORE) == 0);
+        b->hold_rename = false;
+        world_release_held(b);
+        settle();
+        CHECK(clients_file(b, x, false) != NULL &&
+              clients_file(b, x, true) == NULL);
+        CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+        /* The caller fails: the private file is removed (vsr.h). */
+        caller_done(b, op, VSR_IO_RETRY, NULL);
+        settle();
+        expect_core(b, op, VSR_IO_RETRY);
+        CHECK(clients_file(b, x, false) == NULL && entry_of(b, x) == NULL);
+        expect_idle(b);
+    }
+    /* Refusals at once: no node authorized for the peer, a fetch already
+     * running, no lease; a FETCH of a held id transfers nothing. */
+    x = fetch_setup(54, 8);
+    {
+        struct task_holder h;
+        struct task_holder h2;
+        uint64_t op;
+        uint64_t op2;
+        struct vsr_id other = {x.hi, x.lo + 1};
+        uint32_t leases[REGIONS];
+        uint32_t count = 0;
+        uint32_t lease;
+        uint32_t links = links_in_state(b, VSR_IO_LINK_ESTABLISHED);
+
+        CHECK(fetch_start(b, &h, x, 9, &op) == VSR_IO_RETRY);
+        b->hold_open = true;
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        CHECK(fetch_start(b, &h2, other, 1, &op2) == VSR_IO_RETRY);
+        CHECK(fetch_start(b, &h2, x, 1, &op2) == VSR_IO_RETRY);
+        b->hold_open = false;
+        world_release_held(b);
+        settle();
+        CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+        task_result(&h, x);
+        caller_done(b, op, VSR_IO_OK, &h.checkpoint);
+        settle();
+        expect_checkpoint(b, op, x, &h);
+        while ((lease = vsr_io_lease_alloc(b->replica, NONE, NONE)) != NONE) {
+            leases[count++] = lease;
+        }
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_IO_RETRY);
+        while (count > 0) {
+            vsr_io_lease_release(b->replica, leases[--count]);
+        }
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        CHECK(b->io->streams.active == 0);
+        settle();
+        CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+        task_result(&h, x);
+        caller_done(b, op, VSR_IO_OK, &h.checkpoint);
+        settle();
+        expect_checkpoint(b, op, x, &h);
+        CHECK(links_in_state(b, VSR_IO_LINK_ESTABLISHED) == links);
+        /* The held file is kept when that caller fails. */
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        settle();
+        CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+        caller_done(b, op, VSR_IO_FAILED, NULL);
+        settle();
+        expect_core(b, op, VSR_IO_FAILED);
+        CHECK(clients_file(b, x, false) == NULL); /* Not adopted: private. */
+        expect_idle(b);
+    }
+}
+
+/* The source side: refusals, the serve's open, its end in every state,
+ * the file-operation bound, DROP under a reader. */
+static void test_serve(void)
+{
+    struct engine *a = &world.engines[0];
+    struct engine *b = &world.engines[1];
+    struct vsr_id x;
+
+    /* Refusals of the request itself (the hook, called directly). */
+    x = fetch_setup(60, 2);
+    {
+        struct vsr_io_wire_library_request request;
+        struct vsr_io_wire_library_request bad;
+
+        memset(&request, 0, sizeof(request));
+        request.magic = VSR_IO_LIBRARY_MAGIC;
+        request.version = VSR_IO_LIBRARY_REQUEST_VERSION;
+        request.kind = VSR_IO_LIBRARY_CLIENTS;
+        request.cluster_hi = 0x77;
+        request.cluster_lo = 0x99;
+        request.replica = 1;
+        request.snapshot_hi = x.hi;
+        request.snapshot_lo = x.lo;
+        CHECK(vsr_io_snapshots_serve(a->io, STREAMS, &request) ==
+              VSR_IO_FAILED);
+        bad = request;
+        bad.version = 2;
+        CHECK(vsr_io_snapshots_serve(a->io, 1, &bad) == VSR_IO_NOT_FOUND);
+        bad = request;
+        bad.kind = 2;
+        CHECK(vsr_io_snapshots_serve(a->io, 1, &bad) == VSR_IO_NOT_FOUND);
+        bad = request;
+        bad.cluster_lo = 0x98;
+        CHECK(vsr_io_snapshots_serve(a->io, 1, &bad) == VSR_IO_NOT_FOUND);
+        bad = request;
+        bad.replica = 2;
+        CHECK(vsr_io_snapshots_serve(a->io, 1, &bad) == VSR_IO_NOT_FOUND);
+        bad = request;
+        bad.snapshot_lo ^= 1;
+        CHECK(vsr_io_snapshots_serve(a->io, 1, &bad) == VSR_IO_NOT_FOUND);
+        CHECK(vsr_io_snapshots_serve(a->io, 1, NULL) == VSR_IO_FAILED);
+        expect_idle(a);
+    }
+    /* A file whose CAPTURE is outstanding is not served; once the core has
+     * it, it is. */
+    {
+        struct task_holder h;
+        uint64_t op;
+        struct vsr_id y = capture_begin(a, &h, &op);
+
+        fetch_fails(b, y, VSR_IO_NOT_FOUND);
+        task_result(&h, y);
+        caller_done(a, op, VSR_IO_OK, &h.checkpoint);
+        settle();
+        expect_checkpoint(a, op, y, &h);
+        fetch(b, y, 1);
+    }
+    /* The serve's open fails: FAILED, or NOT_FOUND for a missing file. */
+    x = fetch_setup(61, 2);
+    a->fail_open = -EMFILE;
+    fetch_fails(b, x, VSR_IO_FAILED);
+    dfile_mutable(a, clients_file(a, x, false))->name[0] = 0;
+    fetch_fails(b, x, VSR_IO_NOT_FOUND);
+    CHECK(entry_of(a, x)->readers == 0);
+
+    /* Every file operation busy at the source: the serve's open waits
+     * (the retry deadline armed) instead of hanging, then proceeds. */
+    x = fetch_setup(62, 8);
+    {
+        struct task_holder hs[3];
+        uint64_t ops[3];
+        struct vsr_id ids[3];
+        struct task_holder hc;
+        uint64_t capture_op;
+        struct vsr_id w;
+        struct task_holder hf;
+        uint64_t fetch_op;
+
+        ids[0] = x;
+        ids[1] = capture(a);
+        ids[2] = capture(a);
+        a->hold_fsync = true;
+        for (uint32_t i = 0; i < 3; ++i) {
+            CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &hs[i], ids[i],
+                              &ops[i]) == VSR_OK);
+        }
+        settle();
+        for (uint32_t i = 0; i < 3; ++i) {
+            CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_SYNC, ops[i]) != NULL);
+        }
+        a->hold_pool_writes = true;
+        w = capture_begin(a, &hc, &capture_op);
+        CHECK(held_count(a) == 4);
+        CHECK(fetch_start(b, &hf, x, 1, &fetch_op) == VSR_OK);
+        settle();
+        CHECK(a->snapshots->serves[0].state != 0 &&
+              a->snapshots->serves[0].fileop == NONE);
+        CHECK(capture_deadline_armed(a));
+        a->hold_fsync = false;
+        a->hold_pool_writes = false;
+        world_release_held(a);
+        settle_retry();
+        CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, fetch_op) != NULL);
+        task_result(&hf, x);
+        caller_done(b, fetch_op, VSR_IO_OK, &hf.checkpoint);
+        settle();
+        expect_checkpoint(b, fetch_op, x, &hf);
+        CHECK(
+            files_equal(clients_file(a, x, false), clients_file(b, x, false)));
+        for (uint32_t i = 0; i < 3; ++i) {
+            caller_done(a, ops[i], VSR_IO_OK, NULL);
+        }
+        task_result(&hc, w);
+        caller_done(a, capture_op, VSR_IO_OK, &hc.checkpoint);
+        settle();
+        expect_cores(a, ops, 3, VSR_IO_OK);
+        expect_checkpoint(a, capture_op, w, &hc);
+        expect_idle(a);
+        expect_idle(b);
+    }
+
+    /* The stream ends while the serve's open is out: the slot is closed
+     * once it completes; with the open never issued, freed at once. */
+    x = fetch_setup(63, 8);
+    {
+        struct task_holder h;
+        uint64_t op;
+        uint32_t rounds = 0;
+
+        a->hold_open = true;
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        while (held_count(a) == 0) {
+            (void)world_run_checked(1);
+            CHECK(++rounds < 200);
+        }
+        CHECK(a->snapshots->serves[0].fileop != NONE);
+        link_reset(b, fetch_link(b));
+        settle();
+        expect_core(b, op, VSR_IO_RETRY);
+        CHECK(a->snapshots->serves[0].ended == 1 &&
+              entry_of(a, x)->readers == 1);
+        a->hold_open = false;
+        world_release_held(a);
+        settle();
+        expect_idle(a);
+        expect_idle(b);
+    }
+    x = fetch_setup(64, 8);
+    {
+        struct task_holder hs[3];
+        uint64_t ops[3];
+        struct vsr_id ids[3];
+        struct task_holder hc;
+        uint64_t capture_op;
+        struct vsr_id w;
+        struct task_holder hf;
+        uint64_t fetch_op;
+
+        ids[0] = x;
+        ids[1] = capture(a);
+        ids[2] = capture(a);
+        a->hold_fsync = true;
+        for (uint32_t i = 0; i < 3; ++i) {
+            CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &hs[i], ids[i],
+                              &ops[i]) == VSR_OK);
+        }
+        settle();
+        for (uint32_t i = 0; i < 3; ++i) {
+            CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_SYNC, ops[i]) != NULL);
+            caller_done(a, ops[i], VSR_IO_OK, NULL);
+        }
+        a->hold_pool_writes = true;
+        w = capture_begin(a, &hc, &capture_op);
+        CHECK(fetch_start(b, &hf, x, 1, &fetch_op) == VSR_OK);
+        settle();
+        CHECK(a->snapshots->serves[0].state != 0 &&
+              a->snapshots->serves[0].fileop == NONE);
+        link_reset(b, fetch_link(b));
+        settle();
+        expect_core(b, fetch_op, VSR_IO_RETRY);
+        CHECK(a->snapshots->serves[0].state == 0 &&
+              entry_of(a, x)->readers == 0);
+        a->hold_fsync = false;
+        a->hold_pool_writes = false;
+        world_release_held(a);
+        settle();
+        task_result(&hc, w);
+        caller_done(a, capture_op, VSR_IO_OK, &hc.checkpoint);
+        settle();
+        expect_cores(a, ops, 3, VSR_IO_OK);
+        expect_checkpoint(a, capture_op, w, &hc);
+        expect_idle(a);
+        expect_idle(b);
+    }
+    /* An open that fails after the stream ended closes nothing: the
+     * stream's index may carry a caller's stream already. */
+    x = fetch_setup(65, 8);
+    {
+        struct task_holder h;
+        uint64_t op;
+        uint32_t rounds = 0;
+        struct vsr_io_stream_open open;
+        unsigned char request[16] = {1, 2, 3};
+        uint32_t index = NONE;
+        const struct vsr_io_forwarded *serve;
+
+        a->hold_open = true;
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        while (held_count(a) == 0) {
+            (void)world_run_checked(1);
+            CHECK(++rounds < 200);
+        }
+        link_reset(b, fetch_link(b));
+        settle();
+        expect_core(b, op, VSR_IO_RETRY);
+        CHECK(a->io->streams.streams[0].state == VSR_IO_STREAM_FREE);
+        memset(&open, 0, sizeof(open));
+        open.node = 1;
+        open.request.data = request;
+        open.request.size = sizeof(request);
+        CHECK(vsr_io_streams_open(b->io, 77, &open, 0, VSR_IO_STREAM_CALLER,
+                                  &index) == VSR_OK);
+        settle();
+        serve = forwarded_take(a, VSR_IO_OP_STREAM_SERVE);
+        CHECK(serve != NULL && (uint32_t)serve->rail.serve.stream == 0);
+        a->hold_open = false;
+        a->fail_open = -EIO;
+        world_release_held(a);
+        settle();
+        CHECK(a->io->streams.streams[0].state == VSR_IO_STREAM_SERVING);
+        CHECK(vsr_io_streams_served(a->io, serve->op.op.id, VSR_IO_NOT_FOUND) ==
+              VSR_OK);
+        settle();
+        CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+        expect_idle(a);
+    }
+
+    /* DROP while a served stream reads the file: the core hears OK at
+     * once, the unlink waits for the stream's end. */
+    x = fetch_setup(66, 8);
+    {
+        struct task_holder h;
+        uint64_t op;
+        struct task_holder hd;
+        uint64_t drop_op;
+        uint32_t rounds = 0;
+
+        a->hold_reads = true;
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        while (held_count(a) == 0) {
+            (void)world_run_checked(1);
+            CHECK(++rounds < 200);
+        }
+        CHECK(entry_of(a, x)->readers == 1);
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &hd, x, &drop_op) == VSR_OK);
+        settle();
+        CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_DROP, drop_op) != NULL);
+        caller_done(a, drop_op, VSR_IO_OK, NULL);
+        settle();
+        expect_core(a, drop_op, VSR_IO_OK);
+        CHECK(clients_file(a, x, false) != NULL &&
+              entry_of(a, x)->state == VSR_IO_SNAPSHOT_DROPPING);
+        a->hold_reads = false;
+        world_release_held(a);
+        settle();
+        CHECK(clients_file(a, x, false) == NULL && entry_of(a, x) == NULL);
+        CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+        task_result(&h, x);
+        caller_done(b, op, VSR_IO_OK, &h.checkpoint);
+        settle();
+        expect_checkpoint(b, op, x, &h);
+        CHECK(clients_file(b, x, false) != NULL);
+        expect_idle(a);
+        expect_idle(b);
+    }
+}
+
 int main(void)
 {
     /* TEMP: helpers of the tests still to come. */
-    (void)held_count;
-    (void)links_in_state;
     (void)link_to;
-    (void)link_reset;
-    (void)two_engines;
     (void)expect_no_store;
     (void)txn_restore;
     (void)submit_sync;
     (void)store_populate;
     (void)expect_no_core;
-    (void)craft_file;
-    (void)craft_seal;
-    (void)file_install;
     test_capture();
     test_fetch();
     test_capture_failures();
     test_sync();
     test_drop();
+    test_fetch_failures();
+    test_serve();
     return 0;
 }
