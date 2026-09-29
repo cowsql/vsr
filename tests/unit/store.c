@@ -3944,10 +3944,18 @@ static void expect_recovered(const struct config *c, uint64_t sequence)
 {
     const struct vsr_loaded *loaded = NULL;
     uint32_t lease = NONE;
+    int32_t status;
 
     disk_crash(false);
     harness_open_keep(c, true);
-    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    status = harness_recover(VSR_START_RECOVER, &loaded, &lease);
+    if (status != VSR_IO_OK || loaded->sequence != sequence) {
+        fprintf(stderr,
+                "recovered: status %d sequence %" PRIu64 ", expected %" PRIu64
+                "\n",
+                status, status == VSR_IO_OK ? loaded->sequence : 0, sequence);
+    }
+    CHECK(status == VSR_IO_OK);
     CHECK(loaded->sequence == sequence && loaded->count == 1);
     CHECK(((const struct vsr_recovered *)loaded->items)->sequence == sequence);
     release_lease(lease);
@@ -4641,7 +4649,6 @@ static void test_recover_modes(void)
     harness_close();
 }
 
-/* Names the test that fails. */
 /* An APPEND at `sequence` of exactly `bytes` record bytes, found over
  * the entry count and body size. */
 static const struct txn *append_of(uint64_t sequence, uint64_t bytes)
@@ -5740,7 +5747,11 @@ static void walk_crash(uint8_t arg)
     walk.corrupting = false;
     walk_housekeep();
     if ((arg & 1) != 0 && !walk.exhausted) {
-        const struct txn *t = walk_txn(walk_byte() % 9, walk_byte());
+        /* Read in order: the order of a call's arguments is the
+         * compiler's, and a walk must replay under both. */
+        uint8_t action = walk_byte();
+        uint8_t shape = walk_byte();
+        const struct txn *t = walk_txn(action % 9, shape);
         uint64_t op = submit(t);
 
         walk_expect(op, WALK_STORE, t->store.sequence);
@@ -5775,10 +5786,10 @@ static void walk_crash(uint8_t arg)
         uint32_t flips = 1 + walk_byte() % 2;
 
         for (uint32_t i = 0; i < flips; ++i) {
-            uint64_t offset = ((uint64_t)walk_byte() << 16 |
-                               (uint64_t)walk_byte() << 8 | walk_byte()) %
-                              disk.size;
+            uint64_t offset = walk_byte();
 
+            offset = offset << 8 | walk_byte();
+            offset = (offset << 8 | walk_byte()) % disk.size;
             disk_image[offset] ^= (unsigned char)(1u << (walk_byte() & 7));
             walk.stats.flips++;
         }
@@ -5956,9 +5967,10 @@ static void walk_seeded(uint64_t seed, size_t size)
         CHECK(file != NULL && fwrite(bytes, 1, size, file) == size);
         CHECK(fclose(file) == 0);
     }
-    printf("store: walk seed %" PRIu64 "\n", seed);
+    /* On stderr, unbuffered: a failing walk names its seed. */
+    fprintf(stderr, "store: walk seed %" PRIu64 "\n", seed);
     walk_run(bytes, size);
-    printf("store: walk seed %" PRIu64 ": %" PRIu64 " steps, %" PRIu64
+    fprintf(stderr, "store: walk seed %" PRIu64 ": %" PRIu64 " steps, %" PRIu64
            " stores (%" PRIu64 " held), %" PRIu64 " syncs, %" PRIu64
            " reclaims, %" PRIu64 " loads (%" PRIu64 " cold), %" PRIu64
            " captures, %" PRIu64 " crashes (%" PRIu64 " torn, %" PRIu64
@@ -5988,10 +6000,16 @@ static void test_walk(void)
     CHECK(total.torn > 0 && total.lost > 0 && total.captures > 0);
 }
 
+/* Names the test that fails; VSR_STORE_TEST in the environment runs
+ * only the test of that name. */
 #define RUN(test)                                                              \
     do {                                                                       \
-        fprintf(stderr, "store: %s\n", #test);                                 \
-        test();                                                                \
+        const char *only = getenv("VSR_STORE_TEST");                           \
+                                                                               \
+        if (only == NULL || strcmp(only, #test) == 0) {                        \
+            fprintf(stderr, "store: %s\n", #test);                             \
+            test();                                                            \
+        }                                                                      \
     } while (0)
 
 /* The recovery fuzzer includes this file and names the entry point
