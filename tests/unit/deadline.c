@@ -97,7 +97,7 @@ static void check_state(const struct vsr_io_deadlines *set, uint32_t capacity,
 static void check_model(const struct vsr_io_deadlines *set)
 {
     check_state(set, CAPACITY, model);
-    for (uint16_t kind = 0; kind < VSR_IO_DEADLINE_KINDS; ++kind) {
+    for (uint16_t kind = 0; kind < (uint16_t)VSR_IO_DEADLINE_KINDS; ++kind) {
         for (uint32_t index = 0; index < kind_count[kind]; ++index) {
             const struct vsr_io_deadline_entry *entry =
                 &set->entries[kind_base[kind] + index];

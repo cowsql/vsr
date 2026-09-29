@@ -293,6 +293,13 @@ static void *page_alloc(size_t size)
     return p;
 }
 
+/* vsr_io_vec.base is not const-qualified; a write or send only reads it. */
+static void *readable(const char *text)
+{
+    /* NOLINTNEXTLINE(performance-no-int-to-ptr): only drops const */
+    return (void *)(uintptr_t)text;
+}
+
 static int peer_alloc(struct fixture *f, int value)
 {
     for (uint32_t i = 0; i < PEERS; ++i) {
@@ -1443,9 +1450,9 @@ static void scenario_file_io(struct fixture *f)
     CHECK(memcmp(buffer, "rld", 3) == 0);
     CHECK(io(f, VSR_IO_SQE_READ, fd, buffer, 8, 100, UD(5)) == 0);
 
-    vecs[0].base = (void *)(uintptr_t) "abc";
+    vecs[0].base = readable("abc");
     vecs[0].length = 3;
-    vecs[1].base = (void *)(uintptr_t) "defgh";
+    vecs[1].base = readable("defgh");
     vecs[1].length = 5;
     CHECK(io(f, VSR_IO_SQE_WRITEV, fd, vecs, 2, 20, UD(6)) == 8);
     memset(buffer, 0, sizeof(buffer));
@@ -1511,7 +1518,7 @@ static int32_t open_direct(struct fixture *f, unsigned char **page)
         skip("O_DIRECT unsupported by the directory's filesystem");
     }
     CHECK(fd >= 0);
-    *page = page_alloc(3 * ALIGNED);
+    *page = page_alloc((size_t)3 * ALIGNED);
     memset(*page, 'd', ALIGNED);
     CHECK(io(f, VSR_IO_SQE_WRITE, fd, *page, ALIGNED, 0, UD(2)) == ALIGNED);
     CHECK(io(f, VSR_IO_SQE_READ, fd, *page + ALIGNED, ALIGNED, 0, UD(3)) ==
@@ -1537,7 +1544,7 @@ static void scenario_odirect_alignment(struct fixture *f)
     vecs[0].length = 100;
     CHECK(io(f, VSR_IO_SQE_READV, fd, vecs, 1, 0, UD(8)) == -EINVAL);
     vecs[0].length = ALIGNED;
-    vecs[1].base = page + 2 * ALIGNED;
+    vecs[1].base = page + (size_t)2 * ALIGNED;
     vecs[1].length = ALIGNED;
     CHECK(io(f, VSR_IO_SQE_READV, fd, vecs, 2, 100, UD(9)) == -EINVAL);
     CHECK(io(f, VSR_IO_SQE_READV, fd, vecs, 2, 0, UD(10)) == ALIGNED);
@@ -2506,9 +2513,9 @@ static void scenario_send_plain(struct fixture *f)
     CHECK(run(f, send_record(l.server, false, "hello", 5, UD(1))) == 5);
     peer_receive_exact(f, l.peer, buffer, 5);
     CHECK(memcmp(buffer, "hello", 5) == 0);
-    vecs[0].base = (void *)(uintptr_t) "vec";
+    vecs[0].base = readable("vec");
     vecs[0].length = 3;
-    vecs[1].base = (void *)(uintptr_t) "tored";
+    vecs[1].base = readable("tored");
     vecs[1].length = 5;
     r = send_record(l.server, false, vecs, 2, UD(2));
     r.op_flags = VSR_IO_SEND_VECTORED;
@@ -2598,6 +2605,7 @@ static void scenario_send_zero_copy(struct fixture *f)
     z = zc_send(f, &l, send_record(l.server, false, "zc-data", 7, UD(1)),
                 buffer, 7);
     CHECK(z.result == 7 && memcmp(buffer, "zc-data", 7) == 0);
+    /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): raw bytes */
     memcpy(zc, "fixed-zero-copy", 15);
     r = send_record(l.server, false, zc, 15, UD(2));
     r.flags |= VSR_IO_SQE_FIXED_BUFFER;
@@ -2626,6 +2634,7 @@ static void scenario_send_zero_copy(struct fixture *f)
     cqe = take(f, UD(6));
     CHECK(cqe.result == -EFAULT && cqe.flags == 0);
     CHECK(!arrives(f, UD(6), 30, &cqe));
+    /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): raw bytes */
     memcpy(zc, "plain-fixed", 11);
     r = send_record(l.server, false, zc, 11, UD(7));
     r.flags |= VSR_IO_SQE_FIXED_BUFFER;
@@ -2644,6 +2653,7 @@ static void scenario_send_zero_copy(struct fixture *f)
     CHECK(z.result == -EPIPE || z.result == -ECONNRESET);
     close_link(f, &other);
     /* Vectored from the registered region (decision 53). */
+    /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): raw bytes */
     memcpy(zc, "fixed-zero-copy", 15);
     r = send_record(l.server, false, vecs, 2, UD(3));
     r.flags |= VSR_IO_SQE_FIXED_BUFFER;

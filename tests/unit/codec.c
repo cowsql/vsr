@@ -1131,6 +1131,7 @@ static void test_layout(void)
         switch (i) {
         case 0:
             vsr_io_put_u64(at, 3);
+            /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): raw */
             memcpy(at + 8, "abc\0\0\0\0\0", 8);
             at += 16;
             break;
@@ -1234,6 +1235,7 @@ static void test_frames(void)
             vsr_io_put_u32(copy + 8, 36); /* not a multiple of 8 */
             break;
         default:
+            /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): tag */
             memcpy(copy, "FRM2", 4);
             break;
         }
@@ -1680,6 +1682,7 @@ static void test_scanning(void)
     vsr_io_cursor_init_one(&cursor, bytes, 0);
     CHECK(vsr_io_codec_get_record(&cursor, 4096, &header, &kind) == VSR_OK);
     CHECK(kind == VSR_IO_SCAN_END);
+    /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): tag */
     memcpy(bytes, "SEG1", 4);
     vsr_io_cursor_init_one(&cursor, bytes, sizeof(bytes));
     CHECK(vsr_io_codec_get_record(&cursor, 4096, &header, &kind) == VSR_OK);

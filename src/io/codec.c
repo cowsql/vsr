@@ -1244,7 +1244,9 @@ static bool vector_append(struct vector *vector, const unsigned char *base,
         return false;
     }
     /* vsr_io_vec is the executor's descriptor and is not const-qualified;
-     * a send never writes through it. */
+     * a send never writes through it. The uintptr_t round trip only drops
+     * the qualifier (-Wcast-qual), so there is no provenance to lose. */
+    /* NOLINTNEXTLINE(performance-no-int-to-ptr) */
     vector->vecs[vector->count].base = (void *)(uintptr_t)base;
     vector->vecs[vector->count].length = size;
     vector->count++;
