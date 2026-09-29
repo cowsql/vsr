@@ -214,6 +214,44 @@ static void admit(struct faulty_executor *faulty, const struct vsr_io_cqe *cqe)
     }
 }
 
+/* The wait the inner executor must do for the caller's, given what the
+ * wrapper holds. Completions due now count toward `want` and, being
+ * available, end a batching window as the inner's own would. A delayed one
+ * becomes due only through reaps, so while one is held the wait does not
+ * block: the caller then sees an early return, as after a wake. */
+static void held_wait(const struct faulty_executor *faulty, uint32_t *want,
+                      uint64_t *min_wait_ns, uint64_t *deadline_ns)
+{
+    uint32_t due = faulty->held_count;
+
+    if (due == 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < faulty->held_count; ++i) {
+        if (faulty->held[i].reaps > 0) {
+            due = 0;
+            break;
+        }
+    }
+    if (due == 0 || due >= *want) {
+        *want = 0;
+        *min_wait_ns = 0;
+        *deadline_ns = 0;
+        return;
+    }
+    *want -= due;
+    if (*min_wait_ns > 0) {
+        uint64_t now = faulty->inner.ops->now(faulty->inner.ctx);
+        uint64_t end = *min_wait_ns > VSR_NO_DEADLINE - now
+                           ? VSR_NO_DEADLINE
+                           : now + *min_wait_ns;
+
+        if (end < *deadline_ns) {
+            *deadline_ns = end;
+        }
+    }
+}
+
 static int faulty_submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
                                   uint32_t count, uint32_t want,
                                   uint64_t min_wait_ns, uint64_t deadline_ns)
@@ -263,12 +301,7 @@ static int faulty_submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
             ++faulty->stats.shortened;
         }
     }
-    if (faulty->held_count > 0) {
-        /* Held completions need reaps, not waiting. */
-        want = 0;
-        min_wait_ns = 0;
-        deadline_ns = 0;
-    }
+    held_wait(faulty, &want, &min_wait_ns, &deadline_ns);
     return faulty->inner.ops->submit_and_wait(faulty->inner.ctx, forward, total,
                                               want, min_wait_ns, deadline_ns);
 }

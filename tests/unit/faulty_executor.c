@@ -817,6 +817,7 @@ static void test_reserved(void)
 #define BUFFER_ID 5u
 #define RECV_BASE UINT64_C(0x40)
 #define NOPS 1600u
+#define MS UINT64_C(1000000)
 
 static _Alignas(4096) unsigned char ring_memory[4096];
 static unsigned char pool_bytes[256];
@@ -1094,6 +1095,93 @@ static void test_direct_short(void)
     CHECK(stats.shortened == shorts);
     sqe = make_sqe(VSR_IO_SQE_CLOSE, fd, 0x11);
     CHECK(run(&w, 0, &sqe).result == 0);
+    close_world(&w);
+}
+
+/* Submits `count` NOPs from user_data `first` and reaps one of them, so
+ * the rest stay in the wrapper. */
+static void hold_nops(struct world *w, uint64_t first, uint32_t count)
+{
+    struct vsr_io_sqe nops[4];
+    struct vsr_io_cqe cqe;
+
+    CHECK(count <= 4);
+    for (uint32_t i = 0; i < count; ++i) {
+        nops[i] = make_sqe(VSR_IO_SQE_NOP, -1, first + i);
+    }
+    submit(w, 0, nops, count);
+    CHECK(reap(w, 0, &cqe, 1) == 1);
+    CHECK(cqe.user_data == first && cqe.result == 0);
+}
+
+/* With every rate zero a wait behaves as the bare executor's even when a
+ * reap smaller than what was pulled left completions in the wrapper. */
+static void test_wait(void)
+{
+    struct faulty_executor_options options = rates();
+    struct vsr_io_executor ex;
+    struct vsr_io_sqe sqe;
+    struct vsr_io_cqe cqes[8];
+    struct world w;
+    uint64_t start;
+
+    options.delay_reaps_max = 4;
+    open_world(&w, &traces[0], &options);
+    ex = w.ex[0];
+
+    /* Two available, three wanted: blocks as the bare node would. */
+    hold_nops(&w, 0x70, 3);
+    CHECK(ex.ops->submit_and_wait(ex.ctx, NULL, 0, 3, 0, VSR_NO_DEADLINE) == 0);
+    CHECK(!vsr_sim_ready(w.sim, 0));
+    sqe = make_sqe(VSR_IO_SQE_NOP, -1, 0x73);
+    CHECK(ex.ops->submit_and_wait(ex.ctx, &sqe, 1, 3, 0, VSR_NO_DEADLINE) == 0);
+    CHECK(vsr_sim_ready(w.sim, 0));
+    CHECK(reap(&w, 0, cqes, 8) == 3);
+
+    /* Two available, two wanted: returns at once. */
+    hold_nops(&w, 0x74, 3);
+    CHECK(ex.ops->submit_and_wait(ex.ctx, NULL, 0, 2, 0, VSR_NO_DEADLINE) == 0);
+    CHECK(vsr_sim_ready(w.sim, 0));
+    CHECK(reap(&w, 0, cqes, 8) == 2);
+
+    /* One available, more wanted, a batching window: the wait ends when
+     * the window does, as it would with the completion in the ring. */
+    hold_nops(&w, 0x77, 2);
+    start = ex.ops->now(ex.ctx);
+    CHECK(ex.ops->submit_and_wait(ex.ctx, NULL, 0, 4, 10 * MS,
+                                  VSR_NO_DEADLINE) == 0);
+    CHECK(!vsr_sim_ready(w.sim, 0));
+    for (uint32_t spin = 0; !vsr_sim_ready(w.sim, 0); ++spin) {
+        CHECK(spin < SPIN_MAX);
+        CHECK(vsr_sim_advance(w.sim) >= 0);
+    }
+    CHECK(ex.ops->now(ex.ctx) - start >= 10 * MS);
+    CHECK(reap(&w, 0, cqes, 8) == 1);
+
+    /* One available, more wanted, a deadline: returns at the deadline. */
+    hold_nops(&w, 0x79, 2);
+    start = ex.ops->now(ex.ctx);
+    CHECK(ex.ops->submit_and_wait(ex.ctx, NULL, 0, 3, 0, start + 5 * MS) == 0);
+    CHECK(!vsr_sim_ready(w.sim, 0));
+    for (uint32_t spin = 0; !vsr_sim_ready(w.sim, 0); ++spin) {
+        CHECK(spin < SPIN_MAX);
+        CHECK(vsr_sim_advance(w.sim) >= 0);
+    }
+    CHECK(ex.ops->now(ex.ctx) >= start + 5 * MS);
+    CHECK(reap(&w, 0, cqes, 8) == 1);
+
+    /* A delayed completion needs reaps, so the wait does not block while
+     * one is held, however many are wanted. */
+    options.delay_ppm = PPM;
+    set_rates(&w, 0, &options);
+    sqe = make_sqe(VSR_IO_SQE_NOP, -1, 0x7B);
+    submit(&w, 0, &sqe, 1);
+    CHECK(reap(&w, 0, cqes, 8) == 0);
+    CHECK(ex.ops->submit_and_wait(ex.ctx, NULL, 0, 2, 0, VSR_NO_DEADLINE) == 0);
+    CHECK(vsr_sim_ready(w.sim, 0));
+    for (uint32_t spin = 0; reap(&w, 0, cqes, 8) == 0; ++spin) {
+        CHECK(spin < options.delay_reaps_max);
+    }
     close_world(&w);
 }
 
@@ -1543,6 +1631,7 @@ static const struct unit units[] = {
     {"capacity", test_capacity},
     {"map", test_map},
     {"cancel_held", test_cancel_held},
+    {"wait", test_wait},
     {"direct_short", test_direct_short},
     {"buffer_order", test_buffer_order},
     {"chain_buffer", test_chain_buffer},

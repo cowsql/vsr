@@ -41,8 +41,11 @@
  * below may be delayed). Result faults need the record's opcode,
  * which a map filled at submission provides; a completion whose record the
  * map no longer holds is only ever delayed. With every rate zero the wrapper
- * is transparent. While it holds completions its submit_and_wait never
- * blocks, so the caller keeps reaping until they are delivered.
+ * is transparent. Completions it holds that are due count toward
+ * submit_and_wait's `want` and end a batching window as the inner's own
+ * would; while it holds a delayed one, submit_and_wait does not block (the
+ * caller sees an early return, as after a wake), so the caller keeps
+ * reaping until it is delivered, at most delay_reaps_max reaps later.
  *
  * user_data FAULTY_EXECUTOR_USER_DATA is reserved for the injected CANCEL
  * records, whose completions the wrapper consumes; submit_and_wait refuses
