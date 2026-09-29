@@ -303,7 +303,7 @@ tests_integration_libheader_a_SOURCES = tests/integration/header.c
 
 if FUZZING
 noinst_PROGRAMS += tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz \
-  tests/fuzzy/frame
+  tests/fuzzy/frame tests/fuzzy/entry
 tests_fuzzy_checked_SOURCES = tests/fuzzy/checked.c
 tests_fuzzy_checked_LDADD = $(LIBVSR)
 tests_fuzzy_checked_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
@@ -316,6 +316,9 @@ tests_fuzzy_cluster_fuzz_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 tests_fuzzy_frame_SOURCES = tests/fuzzy/frame.c
 tests_fuzzy_frame_LDADD = $(LIBVSR)
 tests_fuzzy_frame_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
+tests_fuzzy_entry_SOURCES = tests/fuzzy/entry.c
+tests_fuzzy_entry_LDADD = $(LIBVSR)
+tests_fuzzy_entry_LDFLAGS = $(AM_LDFLAGS) -fsanitize=fuzzer
 endif
 
 EXTRA_DIST = \
@@ -381,10 +384,17 @@ compile-commands:
 compile_commands.json:
 	@echo 'Run make compile-commands first.' >&2; exit 1
 
+# Each source once, though many programs list the test libraries and the
+# example host. Every file is checked; the failing ones are named at the end.
+TIDY_FILES = $(sort $(filter %.c,$(SOURCES)))
+
 tidy: compile_commands.json
-	@set -e; for file in $(filter %.c,$(SOURCES)); do \
-	  $(CLANG_TIDY) --quiet -p . $(srcdir)/$$file; \
-	done
+	@failed=; for file in $(TIDY_FILES); do \
+	  $(CLANG_TIDY) --quiet -p . $(srcdir)/$$file || failed="$$failed $$file"; \
+	done; \
+	if test -n "$$failed"; then \
+	  echo "clang-tidy failed:$$failed" >&2; exit 1; \
+	fi
 
 # The const* suggestions are style-only and keep signatures symmetric with
 # callbacks and mutating siblings. Tests mutate objects that stores, graphs
@@ -424,12 +434,15 @@ endif
 
 if FUZZING
 # The codec unit test seeds the frame corpus with valid encodings of every
-# frame, record, superblock, segment header and clients file it builds.
+# frame, record, superblock, segment header and clients file it builds, and
+# the entry corpus with APPEND payloads of every entry type.
 fuzz: tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz \
-  tests/fuzzy/frame tests/unit/codec
+  tests/fuzzy/frame tests/fuzzy/entry tests/unit/codec
 	$(MKDIR_P) tests/fuzzy/corpus/checked tests/fuzzy/corpus/validation \
-	  tests/fuzzy/corpus/cluster tests/fuzzy/corpus/frame tests/fuzzy/artifacts
-	VSR_CODEC_CORPUS=tests/fuzzy/corpus/frame ./tests/unit/codec
+	  tests/fuzzy/corpus/cluster tests/fuzzy/corpus/frame \
+	  tests/fuzzy/corpus/entry tests/fuzzy/artifacts
+	VSR_CODEC_CORPUS=tests/fuzzy/corpus/frame \
+	  VSR_CODEC_ENTRY_CORPUS=tests/fuzzy/corpus/entry ./tests/unit/codec
 	./tests/fuzzy/checked -runs=$(FUZZ_RUNS) -max_len=64 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/checked
 	./tests/fuzzy/validation -runs=$(FUZZ_RUNS) -max_len=256 \
@@ -438,6 +451,8 @@ fuzz: tests/fuzzy/checked tests/fuzzy/validation tests/fuzzy/cluster_fuzz \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/cluster
 	./tests/fuzzy/frame -runs=$(FUZZ_RUNS) -max_len=4096 \
 	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/frame
+	./tests/fuzzy/entry -runs=$(FUZZ_RUNS) -max_len=4096 \
+	  -artifact_prefix=tests/fuzzy/artifacts/ $(FUZZ_ARGS) tests/fuzzy/corpus/entry
 else
 fuzz:
 	@echo 'Configure a separate build with --enable-fuzzing first.' >&2; exit 1

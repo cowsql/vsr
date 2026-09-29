@@ -1313,7 +1313,7 @@ static void check_streams(const struct engine *e)
     CHECK(active == streams->active);
     for (uint32_t i = 0; i < e->io->links.nodes_count; ++i) {
         /* A link is never closed for its held runs: a stream link whose
-         * frame waits pauses its receive instead (decision B1). */
+         * frame waits pauses its receive instead (decision 99). */
         CHECK(e->io->links.nodes[i].last_error != -ENOBUFS);
     }
 }
@@ -2180,7 +2180,7 @@ static uint32_t file_transfer(uint64_t cookie, const unsigned char *file,
  * bound: the link pauses its receive while the stream's window is full,
  * the source's sends back up in the socket (the TCP window closes) and
  * every chunk arrives once the caller catches up; no link is closed with
- * -ENOBUFS and the source's status matches the requester's (B1). */
+ * -ENOBUFS and the source's status matches the requester's (decision 99). */
 static void test_backpressure(void)
 {
     const unsigned char *bytes = pattern(5);
@@ -2458,7 +2458,7 @@ static void test_loss(void)
     CHECK(link != NULL);
     link_reset(a, link);
     pump(&k, &d);
-    /* The requester, paused on its full window (B1), has no receive to
+    /* The requester, paused on its full window (decision 99), has no receive to
      * read the reset with: its stream stays REQUESTED with the frames the
      * link holds until the caller frees the window. The source ends. */
     CHECK(!k.ended && s->state == VSR_IO_STREAM_REQUESTED && !s->link_gone);
