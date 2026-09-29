@@ -5014,6 +5014,43 @@ static void test_review_link_wanted_retiring(void)
 }
 
 
+/* The teardown of a link whose raw descriptor still has a record in
+ * flight that may never complete on its own (the EXTERNAL acceptor's
+ * preamble receive from a silent peer, a CONNECT to a black hole)
+ * cancels it: the handshake timeout frees the entry and the descriptor. */
+static void test_review_teardown_cancel(void)
+{
+    struct engine *a;
+    uint32_t peer;
+
+    world_reset(45);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_EXTERNAL);
+    world_settle();
+    log_clear(a);
+    peer = peer_connect(a);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_EXTERNAL) == 1);
+    CHECK(log_count(a, VSR_IO_SQE_RECV) == 1);
+    log_clear(a);
+    world_advance(HANDSHAKE_NS);
+    world_settle();
+    CHECK(log_count(a, VSR_IO_SQE_CANCEL) == 1);
+    CHECK(log_count(a, VSR_IO_SQE_CLOSE) == 1);
+    CHECK(peer_eof(peer));
+    check_quiet(a);
+    CHECK(a->io->links.pending == 0);
+    /* The listener still accepts. */
+    peer_close(peer);
+    peer = peer_connect(a);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_EXTERNAL) == 1);
+    peer_close(peer);
+    world_settle();
+    check_quiet(a);
+    engine_forget(a);
+}
+
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 0x5EED2u;
@@ -5050,6 +5087,7 @@ int main(int argc, char **argv)
     test_review_own_node();
     test_review_failed_send_closing();
     test_review_link_wanted_retiring();
+    test_review_teardown_cancel();
     printf("link: ok\n");
     return 0;
 }

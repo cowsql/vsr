@@ -2825,21 +2825,34 @@ static bool link_prepare_recv(struct vsr_io *io, struct vsr_io_link *link,
     return true;
 }
 
-/* Teardown of a CLOSING link once the caller returned its descriptor and
- * no dial record is in flight: SHUTDOWN, CANCEL of the receive and CLOSE
- * of the slot, or a plain CLOSE of a raw descriptor, sharing one slot. */
+/* Teardown of a CLOSING link once the caller returned its descriptor:
+ * SHUTDOWN, CANCEL of the receive and CLOSE of the slot, or a plain CLOSE
+ * of a raw descriptor, sharing one slot. A CONNECT or the EXTERNAL
+ * preamble receive still in flight may never complete on its own (a black
+ * hole, a silent peer) and is cancelled first; a SOCKET still owes the
+ * descriptor and a SETSOCKOPT completes at once, so those are waited for. */
 static bool link_prepare_teardown(struct vsr_io *io, struct vsr_io_link *link,
                                   struct batch *batch)
 {
     struct vsr_io_sqe *sqe;
     uint8_t records = 0;
     uint64_t user_data;
+    bool cancel_dial = false;
 
-    if (link->torn_down || link->handshake_op != 0 ||
-        link->connect_slot != LINK_NONE) {
+    if (link->torn_down || link->handshake_op != 0) {
         return true;
     }
+    if (link->connect_slot != LINK_NONE) {
+        uint32_t stage = io->slots.slots[link->connect_slot].sub;
+
+        if (stage != VSR_IO_STAGE_CONNECT &&
+            stage != VSR_IO_STAGE_PREAMBLE_RECV) {
+            return true;
+        }
+        cancel_dial = true;
+    }
     if (link->fd < 0 && link->raw_fd < 0) {
+        LINKS_ASSERT(!cancel_dial);
         link->torn_down = true;
         link_try_free(io, link);
         return true;
@@ -2847,7 +2860,7 @@ static bool link_prepare_teardown(struct vsr_io *io, struct vsr_io_link *link,
     if (link->fd >= 0) {
         records = 2 + (link->recv_slot != LINK_NONE ? 1 : 0);
     } else {
-        records = 1;
+        records = 1 + (cancel_dial ? 1 : 0);
     }
     if (!batch_room(batch, records)) {
         return false;
@@ -2881,6 +2894,14 @@ static bool link_prepare_teardown(struct vsr_io *io, struct vsr_io_link *link,
         sqe->user_data = user_data;
         batch->count++;
     } else {
+        if (cancel_dial) {
+            sqe = batch_next(batch);
+            sqe->opcode = VSR_IO_SQE_CANCEL;
+            sqe->offset =
+                vsr_io_slots_user_data(&io->slots, link->connect_slot);
+            sqe->user_data = user_data;
+            batch->count++;
+        }
         sqe = batch_next(batch);
         sqe->opcode = VSR_IO_SQE_CLOSE;
         sqe->fd = link->raw_fd;
