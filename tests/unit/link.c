@@ -1395,10 +1395,47 @@ static void test_link_wanted(void)
         world.now = emitted_at + delay;
     }
     /* The caller connects and adopts with HANDSHAKE | OUTBOUND: the engine
-     * sends the preamble and HELLO, the peer answers, the node is linked
-     * and no LINK_WANTED follows. */
+     * sends the preamble and HELLO; an answer naming another node, or a
+     * stream purpose, is refused and counts as a failed attempt, and the
+     * op repeats on the schedule. */
     world_settle();
     CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
+    for (uint32_t wrong = 0; wrong < 2; ++wrong) {
+        uint64_t rejected = a->io->stats.frames_rejected;
+        uint32_t attempts = a->io->links.nodes[0].attempts;
+
+        peer = sock_alloc(TEST_OWNER);
+        {
+            uint32_t engine_side = sock_alloc(0);
+
+            world.socks[peer].raw_fd = fd_alloc();
+            world.socks[engine_side].raw_fd = fd_alloc();
+            world.socks[peer].peer = engine_side;
+            world.socks[engine_side].peer = peer;
+            CHECK(vsr_io_links_adopt(a->io, world.socks[engine_side].raw_fd, 2,
+                                     VSR_IO_ADOPT_HANDSHAKE |
+                                         VSR_IO_ADOPT_OUTBOUND) == VSR_OK);
+        }
+        world_settle();
+        n = peer_read(peer, bytes, sizeof(bytes));
+        CHECK(n == VSR_IO_PREAMBLE_BYTES + HELLO_BYTES);
+        n = put_hello(bytes, VSR_IO_HANDSHAKE_TRUSTED,
+                      wrong == 0 ? VSR_IO_PURPOSE_PEER : VSR_IO_PURPOSE_STREAM,
+                      wrong == 0 ? 3 : 2, 77);
+        peer_write(peer, bytes, n);
+        world_settle();
+        CHECK(a->io->stats.frames_rejected == rejected + 1);
+        CHECK(peer_eof(peer));
+        check_quiet(a);
+        CHECK(node_state(a, 2) == VSR_IO_NODE_UNLINKED);
+        CHECK(a->io->links.nodes[0].attempts == attempts + 1);
+        CHECK(a->io->links.nodes[0].last_error == -EPROTO);
+        peer_close(peer);
+        world.now = a->io->links.nodes[0].next_dial_ns;
+        world_settle();
+        CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
+    }
+    /* The right answer links the node and no LINK_WANTED follows. */
     peer = sock_alloc(TEST_OWNER);
     {
         uint32_t engine_side = sock_alloc(0);
