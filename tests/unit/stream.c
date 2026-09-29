@@ -2001,6 +2001,7 @@ static void test_window(void)
     const struct vsr_io_stream *s;
     const struct vsr_io_stream *t;
     const struct vsr_io_link *in;
+    uint64_t first;
 
     world_reset(13);
     two_engines(VSR_IO_HANDSHAKE_TRUSTED);
@@ -2082,6 +2083,44 @@ static void test_window(void)
     pump(&k, &d);
     CHECK(k.ended && d.ended && k.end.bytes == 10 * CHUNK);
     CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    /* DATA op ids name the chunk, not its ring slot: the chunk that
+     * reuses a completed op's slot gets an id of its own, so a repeated
+     * completion of the old id is EINVAL and never frees the live unit
+     * (decision B2). */
+    open_stream(&k, &d, 3, NULL, 0, &index);
+    s = stream_at(a, index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    k.hold = true;
+    CHECK(feed_write_buffers(&d, 1, bytes, 6 * CHUNK, 0) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    settle();
+    sink_drain(&k);
+    CHECK(k.held_count == WINDOW);
+    first = k.held_ops[0];
+    sink_complete(&k, 1);
+    settle();
+    sink_drain(&k);
+    CHECK(k.held_count == WINDOW); /* The next chunk took the slot... */
+    CHECK(k.held_ops[1] != first); /* ...under an id of its own. */
+    CHECK(vsr_io_streams_data_done(a->io, first) == VSR_EINVAL);
+    CHECK(s->units_used == WINDOW && k.held_count == WINDOW);
+    for (uint32_t n = 0; n < WINDOW; ++n) {
+        CHECK(s->units[(s->units_head + n) % WINDOW].state == VSR_IO_UNIT_DATA);
+    }
+    while (!k.ended) {
+        CHECK(k.held_count > 0);
+        sink_complete(&k, 1);
+        settle();
+        sink_drain(&k);
+    }
+    CHECK(k.end.status == VSR_IO_OK && k.received == 6 * CHUNK);
+    CHECK(memcmp(k.bytes, bytes, k.received) == 0);
+    pump(&k, &d);
+    CHECK(d.ended && d.end.status == VSR_IO_OK && d.written_count == 1);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
     engine_forget(a);
     engine_forget(b);
 }

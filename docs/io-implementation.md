@@ -504,9 +504,12 @@ or send at the source) and a ring of `stream_window` queued WRITES (the
 source's `STREAM_WRITE` events). Handles and ids (decision 93): the
 source's handle is `generation << 32 | index`, never reused; SERVE and
 DATA op ids carry their kind in the top two bits (`VSR_IO_STREAM_OP_*`),
-the generation, the unit and the stream, so the engine routes a rail
-COMPLETE by id alone (HANDSHAKE ids have those bits clear) and a stale
-or repeated completion is `EINVAL`.
+the generation, the stream and, for DATA, the chunk's 16-bit sequence in
+the stream (decision B2: the unit is found by the sequence's distance
+from the head unit's, never by a ring slot, which a later chunk reuses),
+so the engine routes a rail COMPLETE by id alone (HANDSHAKE ids have
+those bits clear) and a stale or repeated completion is `EINVAL` (a DATA
+id recurs only 65536 chunks later).
 
 Requester: `STREAM_OPEN` takes a stream and a link (`ELIMIT` when none;
 `EINVAL` for a malformed request, a caller request with the library
@@ -1720,6 +1723,7 @@ of `docs/io-design.md`:
 | `stream.h` (internal) | Units are chunks (`vsr_io_stream_unit` states READING, READY, SENT, DATA), the write queue (`vsr_io_stream_queued_write`, `writes` rings), handles and op ids (`VSR_IO_STREAM_OP_*`, `vsr_io_streams_op_kind`, `vsr_io_streams_handle`), `generation`, `ended`, `aborted`, `link_gone`, `end_*`, `send_end`, `closing`; `vsr_io_streams_deadline`; `vsr_io_streams_size` is ELIMIT beyond 65535 streams or window | 93, 95, 96, 97 |
 | `snapshot.h` (internal) | `vsr_io_snapshots_serve` returns OK to serve or the END status; `vsr_io_snapshots_stream_data` takes the DATA op id; `stream_end` is told for both sides of a library stream; weak stubs in stream.c until snapshot.c | 98 |
 | `link.h` (internal) | `vsr_io_link.recv_paused` and `recv_cancelled`; the shutdown slot also carries a paused receive's CANCEL (the teardown waits for it); a stream link whose frame waits is not closed for its held runs but paused, and its receive's `-ECANCELED` is not a loss | B1 |
+| `stream.h` (internal) | `vsr_io_stream_unit.sequence` (was `reserved`) and `vsr_io_stream.chunks`: a DATA op id's unit field is the chunk's sequence, not its slot; `vsr_io_streams_close` is OK on an ending stream only when it was lost or cancelled under the caller | B2 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

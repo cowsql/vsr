@@ -1118,18 +1118,28 @@ int vsr_io_streams_data_done(struct vsr_io *io, uint64_t op)
 {
     struct vsr_io_stream *stream;
     struct vsr_io_stream_unit *unit;
-    uint32_t index = (uint32_t)((op >> STREAM_INDEX_BITS) & STREAM_INDEX_MAX);
+    uint32_t sequence =
+        (uint32_t)((op >> STREAM_INDEX_BITS) & STREAM_INDEX_MAX);
+    uint32_t position;
 
     if (vsr_io_streams_op_kind(op) != VSR_IO_STREAM_OP_DATA) {
         return VSR_EINVAL;
     }
     stream = stream_resolve(io, op);
-    if (stream == NULL || stream->direction != VSR_IO_OUTBOUND ||
-        index >= io->streams.window) {
+    if (stream == NULL || stream->direction != VSR_IO_OUTBOUND) {
         return VSR_EINVAL;
     }
-    unit = &stream->units[index];
-    if (unit->state != VSR_IO_UNIT_DATA) {
+    /* Units sit behind the head in sequence order (allocation is
+     * sequential, the head moves over freed ones only), so the chunk's
+     * distance from the head unit's sequence is its ring position. */
+    position =
+        (sequence - (stream->chunks - stream->units_used)) & STREAM_INDEX_MAX;
+    if (position >= stream->units_used) {
+        return VSR_EINVAL;
+    }
+    unit = unit_at(stream, io->streams.window, position);
+    if (unit->state != VSR_IO_UNIT_DATA ||
+        (unit->sequence & STREAM_INDEX_MAX) != sequence) {
         return VSR_EINVAL;
     }
     unit_release(io, stream, unit);
@@ -1254,9 +1264,14 @@ static bool requester_chunk(struct vsr_io *io, struct vsr_io_stream *stream,
     unit->slab = slab;
     unit->length = (uint32_t)payload.size;
     unit->offset = offset;
+    unit->sequence = stream->chunks++;
     stream->offset += payload.size;
     stream_touch(io, stream);
-    op = op_id(VSR_IO_STREAM_OP_DATA, stream, at, index);
+    /* The id names the chunk, not its ring slot, so the id of a completed
+     * op does not come back with the chunk that reuses the slot; the ring
+     * holds fewer than 65536 units, so 16 bits tell every live one. */
+    op = op_id(VSR_IO_STREAM_OP_DATA, stream, at,
+               unit->sequence & STREAM_INDEX_MAX);
     if (stream->owner == VSR_IO_STREAM_LIBRARY) {
         vsr_io_snapshots_stream_data(io, (uint32_t)stream->replica, at, op,
                                      offset, &payload, slab);

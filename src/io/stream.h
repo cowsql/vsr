@@ -109,7 +109,9 @@ struct vsr_io_stream_unit {
     uint32_t filled; /* FILE: bytes read so far (a short read resumes). */
     uint32_t write;  /* Source: index of its write in the stream's ring. */
     uint32_t span;   /* BUFFERS: first span of the chunk... */
-    uint32_t reserved;
+    /* Requester: the chunk's number in the stream; its low 16 bits are the
+     * unit field of the DATA op id (decision B2). */
+    uint32_t sequence;
     uint64_t span_offset; /* ...and the offset within it. */
     uint64_t offset;      /* Stream offset of the chunk. */
     uint64_t file_offset; /* FILE: byte offset of the chunk in the file. */
@@ -172,6 +174,8 @@ struct vsr_io_stream {
     uint32_t writes_count;
     uint32_t aborted; /* Source: chunking stopped (loss, failure, shutdown);
                          a read in flight is dropped at its completion. */
+    uint32_t chunks;  /* Requester: chunks taken so far (the next unit's
+                         sequence); the head unit's is chunks - units_used. */
     struct vsr_io_stream_unit *units;          /* [stream_window] */
     struct vsr_io_stream_queued_write *writes; /* [stream_window] */
 };
@@ -207,7 +211,9 @@ uint64_t vsr_io_streams_handle(const struct vsr_io_streams *streams,
  * sets streams[index].replica). write is EINVAL for a handle that is not
  * an OPEN source stream or malformed buffers, AGAIN while stream_window
  * writes are queued (resubmit after a WRITTEN). close is OK for an OPEN
- * stream, and for one already ending whose END op is still to come. */
+ * stream, and for one lost or cancelled under the caller whose END op is
+ * still to come; EINVAL once the END op went out, after a refusal, a
+ * read failure or an earlier close (those decided the END already). */
 int vsr_io_streams_open(struct vsr_io *io, uint64_t cookie,
                         const struct vsr_io_stream_open *open, uint64_t lease,
                         uint32_t owner, uint32_t *index);
