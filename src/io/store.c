@@ -89,6 +89,22 @@ enum flush_state {
     FLUSH_WANTED /* A SYNC asked; poll applies sync_delay_ns. */
 };
 
+enum load_state {
+    LOAD_QUEUED,  /* Records resolved; hot ones wait for a lease. */
+    LOAD_READING, /* The cold read is in flight. */
+    LOAD_READ     /* Read complete; waiting for a lease. */
+};
+
+/* The base file load a held RESTORE or PUBLISH waits for (decision 43). */
+enum base_state {
+    BASE_NONE,
+    BASE_WANTED,  /* base_wanted reports it; the snapshot module starts. */
+    BASE_LOADING, /* base_begin was called. */
+    BASE_LOADED   /* base_end was called; base_resume packs or fails. */
+};
+
+enum base_kind { BASE_PUBLISH, BASE_RESTORE };
+
 /* -------------------------------------------------------------------------
  * Layout
  * ---------------------------------------------------------------------- */
@@ -109,6 +125,7 @@ struct store_plan {
     size_t stores;
     size_t syncs;
     size_t loads;
+    size_t load_refs;
     size_t pins;
     size_t completions;
     size_t state;
@@ -195,20 +212,29 @@ static int store_derive(const struct vsr_io_store_options *options,
 
 /* Bytes of the logical state copies: the hard state's epoch with two
  * memberships, and the anchor with its own epoch and manifest span. */
+/* Bytes of a decoded epoch with two memberships of `members` each. */
+static bool epoch_bytes(const struct vsr_limits *limits, size_t *bytes)
+{
+    size_t members;
+
+    return vsr_size_mul(limits->members, sizeof(struct vsr_member), &members) &&
+           vsr_size_mul(members, 2, &members) &&
+           vsr_size_add(members, sizeof(struct vsr_epoch), bytes) &&
+           vsr_size_add(*bytes, 2 * sizeof(struct vsr_membership), bytes);
+}
+
+/* The logical state copies: the hard state's epoch, then the anchor with
+ * its epoch, the decoder's manifest span, a second span and the manifest
+ * bytes copied out of the record. */
 static bool state_bytes(const struct vsr_limits *limits, size_t *bytes)
 {
     size_t epoch;
-    size_t members;
     size_t manifest;
     size_t total;
 
-    if (!vsr_size_mul(limits->members, sizeof(struct vsr_member), &members) ||
-        !vsr_size_mul(members, 2, &members) ||
-        !vsr_size_add(members, sizeof(struct vsr_epoch), &epoch) ||
-        !vsr_size_add(epoch, 2 * sizeof(struct vsr_membership), &epoch) ||
-        !vsr_size_mul(epoch, 2, &total) ||
+    if (!epoch_bytes(limits, &epoch) || !vsr_size_mul(epoch, 2, &total) ||
         !vsr_size_add(total, sizeof(struct vsr_checkpoint), &total) ||
-        !vsr_size_add(total, sizeof(struct vsr_span), &total) ||
+        !vsr_size_add(total, 2 * sizeof(struct vsr_span), &total) ||
         !to_size(limits->manifest_bytes, &manifest) ||
         !vsr_size_add(total, manifest, &total)) {
         return false;
@@ -291,6 +317,10 @@ static int store_plan(const struct vsr_io_store_options *options,
                       &queue) ||
         !place(&offset, queue, alignof(struct vsr_io_pending_load),
                &plan->loads) ||
+        !vsr_size_mul(limits->operations, limits->batch_entries, &queue) ||
+        !vsr_size_mul(queue, sizeof(struct vsr_io_load_ref), &queue) ||
+        !place(&offset, queue, alignof(struct vsr_io_load_ref),
+               &plan->load_refs) ||
         !vsr_size_mul(regions, sizeof(struct vsr_io_ring_pin), &bytes) ||
         !place(&offset, bytes, alignof(struct vsr_io_ring_pin), &plan->pins) ||
         !vsr_size_mul(limits->operations, 3, &completions) ||
@@ -470,6 +500,9 @@ void vsr_io_store_init(struct vsr_io_store *store, void *metadata,
     store->stores = (struct vsr_io_pending_store *)(void *)(base + plan.stores);
     store->syncs = (struct vsr_io_pending_sync *)(void *)(base + plan.syncs);
     store->loads = (struct vsr_io_pending_load *)(void *)(base + plan.loads);
+    store->load_refs =
+        (struct vsr_io_load_ref *)(void *)(base + plan.load_refs);
+    store->base_slot = -1;
     store->pins = (struct vsr_io_ring_pin *)(void *)(base + plan.pins);
     store->pins_count = regions;
     for (uint32_t i = 0; i < regions; ++i) {
@@ -531,6 +564,16 @@ bool vsr_io_store_next_completion(struct vsr_io_store *store,
     return true;
 }
 
+/* The replica embedding the store: LOAD results need its lease table and
+ * its engine's pool, and the store is only ever a member of a replica
+ * (engine attach, and the unit test's replica 0). */
+static struct vsr_io_replica *store_replica(struct vsr_io_store *store)
+{
+    return (struct vsr_io_replica *)(void *)((unsigned char *)store -
+                                             offsetof(struct vsr_io_replica,
+                                                      store));
+}
+
 static struct vsr_io_pending_store *stores_at(struct vsr_io_store *store,
                                               uint32_t i)
 {
@@ -557,6 +600,37 @@ static void syncs_pop(struct vsr_io_store *store)
     store->syncs_head =
         ring_slot(store->syncs_head, 1, store->limits.operations);
     store->syncs_count--;
+}
+
+static struct vsr_io_pending_load *loads_at(struct vsr_io_store *store,
+                                            uint32_t i)
+{
+    return &store->loads[ring_slot(store->loads_head, i,
+                                   store->limits.operations)];
+}
+
+/* The record references of a queued load: batch_entries per queue slot. */
+static struct vsr_io_load_ref *load_refs(struct vsr_io_store *store,
+                                         const struct vsr_io_pending_load *load)
+{
+    size_t slot = (size_t)(load - store->loads);
+
+    return &store->load_refs[slot * store->limits.batch_entries];
+}
+
+/* Drops the head load, releasing the slab of a cold read that is not
+ * handed to a lease. */
+static void loads_pop(struct vsr_io_store *store, bool release_slab)
+{
+    struct vsr_io_pending_load *load = loads_at(store, 0);
+
+    if (release_slab && load->slab != NONE) {
+        vsr_io_pool_release(&store_replica(store)->io->pool, load->slab);
+    }
+    load->slab = NONE;
+    store->loads_head =
+        ring_slot(store->loads_head, 1, store->limits.operations);
+    store->loads_count--;
 }
 
 /* The sequence the next STORE must carry: after the newest held one. */
@@ -588,7 +662,18 @@ static void store_fail(struct vsr_io_store *store, int32_t status)
         complete(store, syncs_at(store, 0)->op, VSR_IO_FAILED, NONE, NULL);
         syncs_pop(store);
     }
-    /* Phase 2: cold LOADs in flight complete FAILED here too. */
+    /* Queued LOADs too; a read in flight completes into a dropped slot
+     * and is ignored by vsr_io_store_complete. */
+    while (store->loads_count > 0) {
+        struct vsr_io_pending_load *load = loads_at(store, 0);
+
+        complete(store, load->op, VSR_IO_FAILED, NONE, NULL);
+        if (load->state == LOAD_READING) {
+            store->cold_active = 0;
+        }
+        loads_pop(store, true);
+    }
+    store->base_state = BASE_NONE;
     store->flush_pending = FLUSH_NONE;
     store->flush_deadline = VSR_NO_DEADLINE;
     store->idle_deadline = VSR_NO_DEADLINE;
@@ -786,50 +871,61 @@ static uint64_t pack_end(const struct vsr_io_store *store, bool seal,
     return round_up(pos + n, block_bytes(store));
 }
 
-bool vsr_io_store_hot(const struct vsr_io_store *store, uint64_t offset,
-                      uint32_t length, struct vsr_io_piece *piece)
+/* The unwrapped ring offset of the file range [offset, offset + length)
+ * when one live extent mirrors it. An extent of a freed slot (segment
+ * NONE) is dead: the file bytes it names may be rewritten. */
+static bool extent_locate(const struct vsr_io_store *store, uint64_t offset,
+                          uint64_t length, uint64_t *ring)
 {
-    if (store == NULL || piece == NULL) {
-        return false;
-    }
     for (uint32_t i = 0; i < store->extents_count; ++i) {
         const struct vsr_io_extent *extent = extent_at(store, i);
 
-        if (offset >= extent->file_offset &&
+        if (extent->segment != NONE && offset >= extent->file_offset &&
             offset - extent->file_offset <= extent->length &&
             length <= extent->length - (offset - extent->file_offset)) {
-            uint64_t ring =
-                extent->ring_offset + (offset - extent->file_offset);
-
-            piece->base = store->ring + ring % store->ring_size;
-            piece->length = length;
+            *ring = extent->ring_offset + (offset - extent->file_offset);
             return true;
         }
     }
     return false;
 }
 
+bool vsr_io_store_hot(const struct vsr_io_store *store, uint64_t offset,
+                      uint32_t length, struct vsr_io_piece *piece)
+{
+    uint64_t ring;
+
+    if (store == NULL || piece == NULL ||
+        !extent_locate(store, offset, length, &ring)) {
+        return false;
+    }
+    piece->base = store->ring + ring % store->ring_size;
+    piece->length = length;
+    return true;
+}
+
+/* Pins the unwrapped ring range [begin, end) under lease. */
+static void pin_range(struct vsr_io_store *store, uint32_t lease,
+                      uint64_t begin, uint64_t end)
+{
+    struct vsr_io_ring_pin *pin = &store->pins[lease];
+
+    STORE_ASSERT(pin->begin == UINT64_MAX && begin <= end);
+    pin->begin = begin;
+    pin->end = end;
+}
+
 uint32_t vsr_io_store_pin(struct vsr_io_store *store, uint64_t offset,
                           uint32_t length, uint32_t lease)
 {
-    if (store == NULL || lease >= store->pins_count) {
+    uint64_t ring;
+
+    if (store == NULL || lease >= store->pins_count ||
+        !extent_locate(store, offset, length, &ring)) {
         return NONE;
     }
-    for (uint32_t i = 0; i < store->extents_count; ++i) {
-        const struct vsr_io_extent *extent = extent_at(store, i);
-
-        if (offset >= extent->file_offset &&
-            offset - extent->file_offset <= extent->length &&
-            length <= extent->length - (offset - extent->file_offset)) {
-            struct vsr_io_ring_pin *pin = &store->pins[lease];
-
-            STORE_ASSERT(pin->begin == UINT64_MAX);
-            pin->begin = extent->ring_offset + (offset - extent->file_offset);
-            pin->end = pin->begin + length;
-            return lease;
-        }
-    }
-    return NONE;
+    pin_range(store, lease, ring, ring + length);
+    return lease;
 }
 
 void vsr_io_store_unpin(struct vsr_io_store *store, uint32_t pin)
@@ -843,8 +939,8 @@ void vsr_io_store_unpin(struct vsr_io_store *store, uint32_t pin)
 
 void vsr_io_store_release(struct vsr_io_store *store, uint32_t lease)
 {
-    /* Phase 2 also drops the slab reference of a cold LOAD here; the
-     * engine frees the region. */
+    /* A cold LOAD's slab reference belongs to the lease: the engine drops
+     * it with the region. */
     vsr_io_store_unpin(store, lease);
 }
 
@@ -855,7 +951,8 @@ void vsr_io_store_release(struct vsr_io_store *store, uint32_t lease)
 static uint32_t segment_free_slot(const struct vsr_io_store *store)
 {
     for (uint32_t i = 0; i < store->slots; ++i) {
-        if (store->segments[i].number == 0) {
+        if (store->segments[i].number == 0 &&
+            store->segments[i].phase == VSR_IO_SEGMENT_FREE) {
             return i;
         }
     }
@@ -887,6 +984,7 @@ static void segment_open(struct vsr_io_store *store, uint32_t slot)
     struct vsr_io_segment_state state;
     unsigned char *at;
     size_t written = 0;
+    bool logical;
     int rc;
 
     STORE_ASSERT(store->current == NONE && segment->number == 0);
@@ -905,12 +1003,16 @@ static void segment_open(struct vsr_io_store *store, uint32_t slot)
     fixed.generation = store->generation;
     fixed.segment = segment->number;
     fixed.run = store->run;
-    state.identity = store->identity_set ? &store->identity : NULL;
-    state.hard = store->identity_set ? &store->hard : NULL;
-    state.checkpoint = store->identity_set && (store->anchor.id.hi != 0 ||
-                                               store->anchor.id.lo != 0)
-                           ? &store->anchor
-                           : NULL;
+    /* The logical state once transaction 1 set it: the identity and the
+     * hard state come together (the hard state's epoch is what the header
+     * encodes), the anchor once one was published. */
+    logical = store->identity_set && store->hard.epoch != NULL;
+    state.identity = logical ? &store->identity : NULL;
+    state.hard = logical ? &store->hard : NULL;
+    state.checkpoint =
+        logical && (store->anchor.id.hi != 0 || store->anchor.id.lo != 0)
+            ? &store->anchor
+            : NULL;
     state.log_begin = store->log_begin;
     state.log_end = store->log_end;
     state.client_base = store->client_base;
@@ -966,27 +1068,855 @@ static uint32_t file_slots(const struct vsr_io_store *store)
 }
 
 /* -------------------------------------------------------------------------
- * Packing
+ * Client table
+ *
+ * Open addressing with linear probing over clients_capacity buckets (a
+ * power of two of at least 2 * max_clients); a deletion shifts the probe
+ * chain back, so no tombstone ever accumulates. Every live entry counts
+ * against max_clients, in-flight ones included (decision 44).
  * ---------------------------------------------------------------------- */
 
-/* Phase 2: applies a packed transaction to the indexes (section 6.3) and
- * returns false with the status to fail with when an index overflows or
- * the transaction contradicts the store. Phase 1 indexes nothing. */
-static bool index_apply(struct vsr_io_store *store,
-                        const struct vsr_store *transaction, uint64_t offset,
-                        uint32_t length, int32_t *status)
+static bool id_zero(struct vsr_id id)
 {
-    (void)store;
-    (void)transaction;
-    (void)offset;
-    (void)length;
-    *status = VSR_IO_OK;
+    return id.hi == 0 && id.lo == 0;
+}
+
+static bool id_equal(struct vsr_id a, struct vsr_id b)
+{
+    return a.hi == b.hi && a.lo == b.lo;
+}
+
+static uint32_t client_home(const struct vsr_io_store *store, struct vsr_id id)
+{
+    uint64_t h = id.hi * UINT64_C(0x9E3779B97F4A7C15) + id.lo;
+
+    h ^= h >> 29;
+    h *= UINT64_C(0xBF58476D1CE4E5B9);
+    h ^= h >> 32;
+    return (uint32_t)(h & (store->clients_capacity - 1));
+}
+
+static struct vsr_io_client *client_find(const struct vsr_io_store *store,
+                                         struct vsr_id id)
+{
+    uint32_t mask = store->clients_capacity - 1;
+    uint32_t at = client_home(store, id);
+
+    if (id_zero(id)) {
+        return NULL;
+    }
+    for (uint32_t n = 0; n < store->clients_capacity; ++n) {
+        struct vsr_io_client *entry = &store->clients[(at + n) & mask];
+
+        if (id_zero(entry->id)) {
+            return NULL;
+        }
+        if (id_equal(entry->id, id)) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+/* Inserts an empty entry for an id the table does not hold; NULL once
+ * max_clients entries are live. */
+static struct vsr_io_client *client_insert(struct vsr_io_store *store,
+                                           struct vsr_id id)
+{
+    uint32_t mask = store->clients_capacity - 1;
+    uint32_t at = client_home(store, id);
+    struct vsr_io_client *entry;
+
+    if (store->clients_count >= store->options.max_clients) {
+        return NULL;
+    }
+    while (!id_zero(store->clients[at].id)) {
+        at = (at + 1) & mask;
+    }
+    entry = &store->clients[at];
+    memset(entry, 0, sizeof(*entry));
+    entry->id = id;
+    entry->base_offset = UINT64_MAX;
+    entry->capture_offset = UINT64_MAX;
+    entry->next_offset = UINT64_MAX;
+    store->clients_count++;
+    return entry;
+}
+
+/* The entry of id, created when absent; NULL when the table is full. */
+static struct vsr_io_client *client_get(struct vsr_io_store *store,
+                                        struct vsr_id id)
+{
+    struct vsr_io_client *entry = client_find(store, id);
+
+    return entry != NULL ? entry : client_insert(store, id);
+}
+
+static void client_delete(struct vsr_io_store *store,
+                          struct vsr_io_client *entry)
+{
+    uint32_t mask = store->clients_capacity - 1;
+    uint32_t hole = (uint32_t)(entry - store->clients);
+    uint32_t at = hole;
+
+    for (;;) {
+        struct vsr_io_client *candidate;
+        uint32_t home;
+
+        at = (at + 1) & mask;
+        candidate = &store->clients[at];
+        if (id_zero(candidate->id)) {
+            break;
+        }
+        /* Movable when the hole lies on its probe path from home. */
+        home = client_home(store, candidate->id);
+        if (((at - home) & mask) >= ((at - hole) & mask)) {
+            store->clients[hole] = *candidate;
+            hole = at;
+        }
+    }
+    memset(&store->clients[hole], 0, sizeof(store->clients[hole]));
+    store->clients_count--;
+}
+
+/* Deletes an entry holding nothing: no record, no retained entry, not in
+ * flight. */
+static void client_prune(struct vsr_io_store *store,
+                         struct vsr_io_client *entry)
+{
+    if (entry->current.number == 0 && entry->retained == 0 &&
+        entry->inflight == 0) {
+        client_delete(store, entry);
+    }
+}
+
+/* Deletes every entry `keep` rejects. A deletion may move a later entry
+ * into the bucket examined, so the bucket is examined again. */
+static void clients_sweep(struct vsr_io_store *store,
+                          bool (*keep)(const struct vsr_io_client *))
+{
+    for (uint32_t i = 0; i < store->clients_capacity;) {
+        struct vsr_io_client *entry = &store->clients[i];
+
+        if (!id_zero(entry->id) && !keep(entry)) {
+            client_delete(store, entry);
+        } else {
+            i++;
+        }
+    }
+}
+
+static bool keep_nonempty(const struct vsr_io_client *entry)
+{
+    return entry->current.number != 0 || entry->retained != 0 ||
+           entry->inflight != 0;
+}
+
+static bool keep_in_base(const struct vsr_io_client *entry)
+{
+    return entry->next_offset != UINT64_MAX;
+}
+
+static bool keep_none(const struct vsr_io_client *entry)
+{
+    (void)entry;
+    return false;
+}
+
+/* -------------------------------------------------------------------------
+ * Op ring, versions and the trim history (section 6.3)
+ * ---------------------------------------------------------------------- */
+
+static struct vsr_io_op_ref *op_slot(const struct vsr_io_store *store,
+                                     uint64_t op)
+{
+    return &store->ops[op % store->options.max_entries];
+}
+
+/* The current version of op, or NULL. */
+static struct vsr_io_op_ref *op_current(const struct vsr_io_store *store,
+                                        uint64_t op)
+{
+    struct vsr_io_op_ref *ref = op_slot(store, op);
+
+    return op != 0 && ref->op == op ? ref : NULL;
+}
+
+/* Moves a version truncated at `truncated` to the versions table. */
+static bool version_add(struct vsr_io_store *store,
+                        const struct vsr_io_op_ref *ref, uint64_t truncated)
+{
+    struct vsr_io_version *version;
+
+    if (store->versions_count == store->options.max_entries) {
+        return false;
+    }
+    version = &store->versions[store->versions_count++];
+    memset(version, 0, sizeof(*version));
+    version->op = ref->op;
+    version->appended = ref->sequence;
+    version->truncated = truncated;
+    version->offset = ref->offset;
+    version->length = ref->length;
+    version->change = ref->change;
+    version->index = ref->index;
+    version->client = ref->client;
     return true;
 }
 
-/* Tries to pack one held STORE: the segment fit, the slot supply, the
- * pinned-floor and write-behind holds (section 6.1 steps 1 to 4), then the
- * copy (step 5). False when it must stay held. */
+/* The version of op valid at `sequence`, if a truncated one is. */
+static const struct vsr_io_version *version_at(const struct vsr_io_store *store,
+                                               uint64_t op, uint64_t sequence)
+{
+    for (uint32_t i = 0; i < store->versions_count; ++i) {
+        const struct vsr_io_version *version = &store->versions[i];
+
+        if (version->op == op && version->appended <= sequence &&
+            sequence < version->truncated) {
+            return version;
+        }
+    }
+    return NULL;
+}
+
+static void versions_reclaim(struct vsr_io_store *store, uint64_t oldest)
+{
+    for (uint32_t i = 0; i < store->versions_count;) {
+        if (store->versions[i].truncated <= oldest) {
+            store->versions[i] = store->versions[--store->versions_count];
+        } else {
+            i++;
+        }
+    }
+}
+
+/* Records that the transaction at `sequence` moved log_begin to `begin`.
+ * A full history merges the newest event into the new one: the revisions
+ * between the two then report the older begin, which retains more. */
+static void trims_record(struct vsr_io_store *store, uint64_t sequence,
+                         uint64_t begin)
+{
+    struct vsr_io_trim_event *event;
+
+    if (store->trims_count == VSR_IO_TRIM_HISTORY) {
+        event = &store->trims[ring_slot(
+            store->trims_head, store->trims_count - 1, VSR_IO_TRIM_HISTORY)];
+    } else {
+        event = &store->trims[ring_slot(store->trims_head, store->trims_count,
+                                        VSR_IO_TRIM_HISTORY)];
+        store->trims_count++;
+    }
+    event->sequence = sequence;
+    event->log_begin = begin;
+}
+
+/* Advances retained_begin to log_begin as of revision `oldest`, the
+ * oldest one a LOAD may still name, and clears the ring below it. */
+static void trims_reclaim(struct vsr_io_store *store, uint64_t oldest)
+{
+    uint64_t begin = store->retained_begin;
+
+    while (store->trims_count > 0 &&
+           store->trims[store->trims_head].sequence <= oldest) {
+        begin = store->trims[store->trims_head].log_begin;
+        store->trims_head =
+            ring_slot(store->trims_head, 1, VSR_IO_TRIM_HISTORY);
+        store->trims_count--;
+    }
+    for (uint64_t op = store->retained_begin; op < begin; ++op) {
+        struct vsr_io_op_ref *ref = op_current(store, op);
+
+        if (ref != NULL) {
+            memset(ref, 0, sizeof(*ref));
+        }
+    }
+    if (begin > store->retained_begin) {
+        store->retained_begin = begin;
+    }
+}
+
+/* The empty log takes its bounds from the first change that names an op
+ * (the core starts at 1; a recovered log has them from the header). */
+static void log_start(struct vsr_io_store *store, uint64_t op)
+{
+    if (store->log_begin == 0 && store->log_end == 0) {
+        store->log_begin = op;
+        store->log_end = op;
+        store->retained_begin = op;
+    }
+}
+
+/* Recomputes every client's retained entry and the previous links from
+ * the log, deleting the entries left with nothing. */
+static int32_t retained_rebuild(struct vsr_io_store *store)
+{
+    for (uint32_t i = 0; i < store->clients_capacity; ++i) {
+        store->clients[i].retained = 0;
+    }
+    for (uint64_t op = store->log_begin; op < store->log_end; ++op) {
+        struct vsr_io_op_ref *ref = op_current(store, op);
+        struct vsr_io_client *entry;
+
+        if (ref == NULL) {
+            continue;
+        }
+        ref->previous = 0;
+        if (id_zero(ref->client)) {
+            continue;
+        }
+        entry = client_get(store, ref->client);
+        if (entry == NULL) {
+            return VSR_IO_FAILED;
+        }
+        ref->previous = entry->retained;
+        entry->retained = op;
+    }
+    clients_sweep(store, keep_nonempty);
+    return VSR_IO_OK;
+}
+
+/* -------------------------------------------------------------------------
+ * Logical state and the client base
+ * ---------------------------------------------------------------------- */
+
+/* Bump regions over the logical state copies: the hard state's epoch in
+ * the first part, the anchor with its epoch and manifest in the rest. */
+static void state_regions(struct vsr_io_store *store, struct vsr_io_bump *hard,
+                          struct vsr_io_bump *anchor)
+{
+    size_t epoch = 0;
+    size_t total = 0;
+    bool sized = epoch_bytes(&store->limits, &epoch) &&
+                 state_bytes(&store->limits, &total);
+
+    STORE_ASSERT(sized);
+    (void)sized;
+    vsr_io_bump_init(hard, store->state_region, epoch);
+    vsr_io_bump_init(anchor, store->state_region + epoch, total - epoch);
+}
+
+/* Decodes a checkpoint into the anchor's state copy, its manifest bytes
+ * copied out of the record, which the ring will overwrite. */
+static int32_t decode_anchor(struct vsr_io_store *store,
+                             struct vsr_io_cursor *payload,
+                             struct vsr_checkpoint *out)
+{
+    struct vsr_io_bump hard;
+    struct vsr_io_bump region;
+    struct vsr_checkpoint *checkpoint = NULL;
+
+    state_regions(store, &hard, &region);
+    if (vsr_io_codec_get_checkpoint(payload, &store->limits, &region,
+                                    &checkpoint) != VSR_OK) {
+        return VSR_IO_CORRUPT;
+    }
+    if (checkpoint->manifest.size > 0) {
+        size_t size = (size_t)checkpoint->manifest.size;
+        unsigned char *copy = vsr_io_bump_alloc(&region, size, 1);
+        struct vsr_span *span =
+            vsr_io_bump_alloc(&region, sizeof(*span), alignof(struct vsr_span));
+
+        if (copy == NULL || span == NULL) {
+            return VSR_IO_FAILED; /* Sized by state_bytes: impossible. */
+        }
+        memcpy(copy, checkpoint->manifest.spans[0].data, size);
+        span->data = copy;
+        span->size = size;
+        checkpoint->manifest.spans = span;
+        checkpoint->manifest.count = 1;
+    }
+    *out = *checkpoint;
+    return VSR_IO_OK;
+}
+
+enum base_source {
+    BASE_FROM_CAPTURE, /* The latest capture's offsets. */
+    BASE_FROM_FILE,    /* A loaded file's offsets, merged. */
+    BASE_FROM_RESTORE  /* A loaded file, replacing the table. */
+};
+
+/* Makes `id` the client base at `sequence`: the entries the file covers
+ * point at it, and client_base is `sequence` lowered below the record of
+ * any entry it does not cover, so that the floor rule client_base + 1
+ * never frees a record only the log holds. */
+static void base_apply(struct vsr_io_store *store, struct vsr_id id,
+                       uint64_t sequence, enum base_source source)
+{
+    uint64_t base = sequence;
+
+    if (source == BASE_FROM_RESTORE) {
+        clients_sweep(store, keep_in_base);
+    }
+    for (uint32_t i = 0; i < store->clients_capacity; ++i) {
+        struct vsr_io_client *entry = &store->clients[i];
+
+        if (id_zero(entry->id)) {
+            continue;
+        }
+        entry->base_offset = source == BASE_FROM_CAPTURE ? entry->capture_offset
+                                                         : entry->next_offset;
+        if (entry->current.number != 0 && entry->base_offset == UINT64_MAX &&
+            entry->current.sequence <= base) {
+            base =
+                entry->current.sequence > 0 ? entry->current.sequence - 1 : 0;
+        }
+    }
+    store->client_base = base;
+    store->client_base_id = id;
+}
+
+/* -------------------------------------------------------------------------
+ * Index application (section 6.3)
+ * ---------------------------------------------------------------------- */
+
+static int32_t apply_append(struct vsr_io_store *store, uint64_t sequence,
+                            uint64_t offset, uint32_t length, uint32_t index,
+                            const struct vsr_io_wire_change *change,
+                            struct vsr_io_cursor *payload)
+{
+    if (change->count == 0 || change->first == 0) {
+        return VSR_IO_CORRUPT;
+    }
+    log_start(store, change->first);
+    if (change->first != store->log_end) {
+        return VSR_IO_CORRUPT; /* Not at the log end. */
+    }
+    for (uint32_t i = 0; i < change->count; ++i) {
+        struct vsr_io_op_ref *ref;
+        struct vsr_id client;
+        uint64_t op;
+        uint64_t epoch;
+        uint64_t view;
+        uint64_t number;
+        uint32_t type;
+        uint32_t body;
+
+        if (!vsr_io_cursor_u64(payload, &op) ||
+            !vsr_io_cursor_u64(payload, &epoch) ||
+            !vsr_io_cursor_u64(payload, &view) ||
+            !vsr_io_cursor_u64(payload, &client.hi) ||
+            !vsr_io_cursor_u64(payload, &client.lo) ||
+            !vsr_io_cursor_u64(payload, &number) ||
+            !vsr_io_cursor_u32(payload, &type) ||
+            !vsr_io_cursor_u32(payload, &body) ||
+            body % VSR_IO_WIRE_ALIGN != 0 ||
+            !vsr_io_cursor_skip(payload, body) || op != change->first + i ||
+            op != store->log_end) {
+            return VSR_IO_CORRUPT;
+        }
+        ref = op_slot(store, op);
+        if (ref->op != 0 && ref->op != op) {
+            return VSR_IO_FAILED; /* An unreclaimed revision names it. */
+        }
+        memset(ref, 0, sizeof(*ref));
+        ref->op = op;
+        ref->sequence = sequence;
+        ref->offset = offset;
+        ref->length = length;
+        ref->change = index;
+        ref->index = i;
+        ref->client = client;
+        if (!id_zero(client)) {
+            struct vsr_io_client *entry = client_get(store, client);
+
+            if (entry == NULL) {
+                return VSR_IO_FAILED;
+            }
+            ref->previous = entry->retained;
+            entry->retained = op;
+            entry->inflight = 0;
+        }
+        store->log_end = op + 1;
+    }
+    return VSR_IO_OK;
+}
+
+static int32_t apply_truncate(struct vsr_io_store *store, uint64_t sequence,
+                              uint64_t first)
+{
+    if (first == 0 || first < store->log_begin) {
+        return VSR_IO_CORRUPT;
+    }
+    for (uint64_t op = store->log_end; op > first; --op) {
+        struct vsr_io_op_ref *ref = op_current(store, op - 1);
+
+        if (ref == NULL) {
+            continue;
+        }
+        if (!version_add(store, ref, sequence)) {
+            return VSR_IO_FAILED;
+        }
+        if (!id_zero(ref->client)) {
+            struct vsr_io_client *entry = client_find(store, ref->client);
+
+            if (entry != NULL && entry->retained == op - 1) {
+                entry->retained =
+                    ref->previous >= store->log_begin &&
+                            op_current(store, ref->previous) != NULL
+                        ? ref->previous
+                        : 0;
+                client_prune(store, entry);
+            }
+        }
+        memset(ref, 0, sizeof(*ref));
+    }
+    if (first < store->log_end) {
+        store->log_end = first;
+    }
+    store->reindexed = sequence;
+    return VSR_IO_OK;
+}
+
+static int32_t apply_clients(struct vsr_io_store *store, uint64_t sequence,
+                             uint64_t offset, uint32_t length, uint32_t index,
+                             const struct vsr_io_wire_change *change,
+                             struct vsr_io_cursor *payload)
+{
+    if (change->count == 0) {
+        return VSR_IO_CORRUPT;
+    }
+    for (uint32_t i = 0; i < change->count; ++i) {
+        struct vsr_io_wire_client_record wire;
+        struct vsr_io_client *entry;
+        struct vsr_id client;
+
+        if (vsr_io_codec_skip_client_record(payload, &wire) != VSR_OK) {
+            return VSR_IO_CORRUPT;
+        }
+        client.hi = wire.client_hi;
+        client.lo = wire.client_lo;
+        if (id_zero(client) || wire.number == 0) {
+            return VSR_IO_CORRUPT;
+        }
+        entry = client_get(store, client);
+        if (entry == NULL) {
+            return VSR_IO_FAILED;
+        }
+        if (wire.number < entry->current.number) {
+            continue; /* A replayed older result never moves it back. */
+        }
+        if (wire.number == entry->current.number) {
+            if (wire.op != entry->current.op) {
+                return VSR_IO_CORRUPT;
+            }
+            continue;
+        }
+        memset(&entry->current, 0, sizeof(entry->current));
+        entry->current.number = wire.number;
+        entry->current.op = wire.op;
+        entry->current.sequence = sequence;
+        entry->current.offset = offset;
+        entry->current.length = length;
+        entry->current.change = index;
+        entry->current.index = i;
+        entry->inflight = 0;
+    }
+    store->clients_sequence = sequence;
+    return VSR_IO_OK;
+}
+
+static int32_t apply_hard_state(struct vsr_io_store *store,
+                                struct vsr_io_cursor *payload)
+{
+    struct vsr_io_bump region;
+    struct vsr_io_bump anchor;
+    struct vsr_hard_state hard;
+
+    state_regions(store, &region, &anchor);
+    if (vsr_io_codec_get_hard_state(payload, &store->limits, &region, &hard) !=
+        VSR_OK) {
+        return VSR_IO_CORRUPT;
+    }
+    store->hard = hard;
+    return VSR_IO_OK;
+}
+
+static int32_t apply_publish(struct vsr_io_store *store, uint64_t sequence,
+                             struct vsr_io_cursor *payload)
+{
+    struct vsr_checkpoint checkpoint;
+    int32_t status = decode_anchor(store, payload, &checkpoint);
+
+    if (status != VSR_IO_OK) {
+        return status;
+    }
+    store->anchor = checkpoint;
+    if (id_equal(checkpoint.id, store->last_capture)) {
+        base_apply(store, checkpoint.id, store->last_capture_sequence,
+                   BASE_FROM_CAPTURE);
+    } else if (store->base_state == BASE_LOADED &&
+               id_equal(store->base_id, checkpoint.id)) {
+        base_apply(store, checkpoint.id, sequence, BASE_FROM_FILE);
+        store->base_state = BASE_NONE;
+    }
+    /* Else the base is unchanged: a witness, or recovery replaying (it
+     * loads the anchor's file once the scan is done). */
+    return VSR_IO_OK;
+}
+
+static int32_t apply_restore(struct vsr_io_store *store, uint64_t sequence,
+                             struct vsr_io_cursor *payload)
+{
+    struct vsr_checkpoint checkpoint;
+    int32_t status = decode_anchor(store, payload, &checkpoint);
+    uint64_t begin;
+
+    if (status != VSR_IO_OK) {
+        return status;
+    }
+    if (checkpoint.op == UINT64_MAX) {
+        return VSR_IO_CORRUPT;
+    }
+    store->anchor = checkpoint;
+    /* Entries through the checkpoint's op leave the log as by a TRIM;
+     * the ring keeps them for older revisions until RECLAIM. */
+    begin = checkpoint.op + 1;
+    log_start(store, begin);
+    if (begin > store->log_begin) {
+        store->log_begin = begin;
+        if (store->log_end < begin) {
+            store->log_end = begin;
+        }
+        trims_record(store, sequence, begin);
+    }
+    if (store->base_state == BASE_LOADED &&
+        id_equal(store->base_id, checkpoint.id)) {
+        base_apply(store, checkpoint.id, sequence, BASE_FROM_RESTORE);
+        store->base_state = BASE_NONE;
+    } else {
+        /* A witness installs only the anchor and the protocol indexes;
+         * recovery replaying loads the anchor's file after the scan. */
+        clients_sweep(store, keep_none);
+        store->client_base = sequence;
+        store->client_base_id = checkpoint.id;
+    }
+    status = retained_rebuild(store);
+    store->reindexed = sequence;
+    store->restored = sequence;
+    return status;
+}
+
+static int32_t apply_trim(struct vsr_io_store *store, uint64_t sequence,
+                          uint64_t first)
+{
+    if (first == 0) {
+        return VSR_IO_CORRUPT;
+    }
+    log_start(store, first);
+    if (first > store->log_end) {
+        first = store->log_end;
+    }
+    if (first <= store->log_begin) {
+        return VSR_IO_OK;
+    }
+    for (uint64_t op = store->log_begin; op < first; ++op) {
+        const struct vsr_io_op_ref *ref = op_current(store, op);
+        struct vsr_io_client *entry;
+
+        if (ref == NULL || id_zero(ref->client)) {
+            continue;
+        }
+        entry = client_find(store, ref->client);
+        if (entry != NULL && entry->retained == op) {
+            entry->retained = 0;
+            client_prune(store, entry);
+        }
+    }
+    store->log_begin = first;
+    trims_record(store, sequence, first);
+    store->reindexed = sequence;
+    return VSR_IO_OK;
+}
+
+static int32_t apply_identity(struct vsr_io_store *store, uint64_t sequence,
+                              struct vsr_io_cursor *payload)
+{
+    struct vsr_store_identity identity;
+
+    if (sequence != 1 || store->identity_set ||
+        vsr_io_codec_get_identity(payload, &identity) != VSR_OK) {
+        return VSR_IO_CORRUPT;
+    }
+    store->identity = identity;
+    store->identity_set = true;
+    store->superblock_dirty = 1; /* The superblock carries the identity. */
+    return VSR_IO_OK;
+}
+
+static int32_t apply_change(struct vsr_io_store *store, uint64_t sequence,
+                            uint64_t offset, uint32_t length, uint32_t index,
+                            const struct vsr_io_wire_change *change,
+                            struct vsr_io_cursor *payload)
+{
+    switch (change->type) {
+    case VSR_STORE_APPEND:
+        return apply_append(store, sequence, offset, length, index, change,
+                            payload);
+    case VSR_STORE_TRUNCATE:
+        return apply_truncate(store, sequence, change->first);
+    case VSR_STORE_CLIENTS:
+        return apply_clients(store, sequence, offset, length, index, change,
+                             payload);
+    case VSR_STORE_HARD_STATE:
+        return apply_hard_state(store, payload);
+    case VSR_STORE_PUBLISH_CHECKPOINT:
+        return apply_publish(store, sequence, payload);
+    case VSR_STORE_RESTORE_CHECKPOINT:
+        return apply_restore(store, sequence, payload);
+    case VSR_STORE_TRIM:
+        return apply_trim(store, sequence, change->first);
+    case VSR_STORE_IDENTITY:
+        return apply_identity(store, sequence, payload);
+    default:
+        return VSR_IO_CORRUPT;
+    }
+}
+
+/* Reads the record header at `bytes` and its change descriptors, each
+ * checked against the record's length (the codec bounds neither offset +
+ * length nor the descriptors' own bytes). */
+static int32_t record_changes(const unsigned char *bytes, uint32_t length,
+                              struct vsr_io_wire_record *header,
+                              struct vsr_io_wire_change *changes)
+{
+    struct vsr_io_cursor cursor;
+    uint32_t kind = 0;
+    uint64_t descriptors;
+
+    vsr_io_cursor_init_one(&cursor, bytes, length);
+    if (vsr_io_codec_get_record(&cursor, length, header, &kind) != VSR_OK ||
+        kind != VSR_IO_SCAN_RECORD || header->length != length) {
+        return VSR_IO_CORRUPT;
+    }
+    descriptors = sizeof(*header) +
+                  (uint64_t)header->count * sizeof(struct vsr_io_wire_change);
+    for (uint32_t i = 0; i < header->count; ++i) {
+        if (vsr_io_codec_get_change(&cursor, &changes[i]) != VSR_OK ||
+            changes[i].offset < descriptors || changes[i].offset > length ||
+            changes[i].length > length - changes[i].offset) {
+            return VSR_IO_CORRUPT;
+        }
+    }
+    return VSR_IO_OK;
+}
+
+/* Applies one packed record to the indexes (section 6.3) from its bytes:
+ * the ring copy of a STORE, or a recovery slab. False with the status to
+ * fail with: CORRUPT for bytes the codec rejects or a change that
+ * contradicts the log, FAILED for an index at capacity. */
+static bool index_apply(struct vsr_io_store *store, uint64_t offset,
+                        uint32_t length, const unsigned char *bytes,
+                        int32_t *status)
+{
+    struct vsr_io_wire_record header;
+    struct vsr_io_wire_change changes[VSR_MAX_STORE_CHANGES];
+
+    *status = record_changes(bytes, length, &header, changes);
+    if (*status != VSR_IO_OK) {
+        return false;
+    }
+    for (uint32_t i = 0; i < header.count; ++i) {
+        struct vsr_io_cursor payload;
+
+        vsr_io_cursor_init_one(&payload, bytes + changes[i].offset,
+                               changes[i].length);
+        *status = apply_change(store, header.sequence, offset, length, i,
+                               &changes[i], &payload);
+        if (*status != VSR_IO_OK) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A RESTORE, or a PUBLISH of a snapshot other than the latest capture and
+ * the current base, waits for its clients file before it is packed
+ * (decision 43) when the replica's role after the transaction is FULL.
+ * True while `pending` must wait; base_wanted reports the file. */
+static bool base_hold(struct vsr_io_store *store,
+                      const struct vsr_io_pending_store *pending)
+{
+    const struct vsr_store *transaction = pending->transaction;
+    const struct vsr_checkpoint *wanted = NULL;
+    uint32_t role = store->hard.role;
+    uint32_t kind = BASE_PUBLISH;
+
+    if (store->base_state == BASE_LOADED) {
+        return false;
+    }
+    if (store->base_state != BASE_NONE) {
+        return true;
+    }
+    for (uint32_t i = 0; i < transaction->count; ++i) {
+        const struct vsr_change *change = &transaction->changes[i];
+
+        if (change->type == VSR_STORE_HARD_STATE && change->data != NULL) {
+            role = ((const struct vsr_hard_state *)change->data)->role;
+        }
+    }
+    for (uint32_t i = 0; i < transaction->count; ++i) {
+        const struct vsr_change *change = &transaction->changes[i];
+        const struct vsr_checkpoint *checkpoint = change->data;
+
+        if (checkpoint == NULL) {
+            continue;
+        }
+        if (change->type == VSR_STORE_RESTORE_CHECKPOINT) {
+            wanted = checkpoint;
+            kind = BASE_RESTORE;
+        } else if (change->type == VSR_STORE_PUBLISH_CHECKPOINT &&
+                   !id_equal(checkpoint->id, store->last_capture) &&
+                   !id_equal(checkpoint->id, store->client_base_id)) {
+            wanted = checkpoint;
+            kind = BASE_PUBLISH;
+        }
+    }
+    if (wanted == NULL || role != VSR_MEMBER_FULL) {
+        return false;
+    }
+    store->base_state = BASE_WANTED;
+    store->base_kind = kind;
+    store->base_id = wanted->id;
+    store->base_sequence = pending->sequence;
+    store->base_op = pending->op;
+    return true;
+}
+
+/* -------------------------------------------------------------------------
+ * Packing
+ * ---------------------------------------------------------------------- */
+
+/* True while a freed slot waits for the superblock write that lets it be
+ * reused. */
+static bool segment_freeing(const struct vsr_io_store *store)
+{
+    for (uint32_t i = 0; i < store->slots; ++i) {
+        if (store->segments[i].phase == VSR_IO_SEGMENT_FREEING) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Fails the head STORE (which `pending` is) with `status` and fences the
+ * store: a non-OK STORE completion fences the replica (vsr.h). */
+static void store_abort(struct vsr_io_store *store,
+                        const struct vsr_io_pending_store *pending,
+                        int32_t status)
+{
+    uint64_t op = pending->op;
+
+    STORE_ASSERT(pending == stores_at(store, 0));
+    stores_pop(store);
+    complete(store, op, status, NONE, NULL);
+    store_fail(store, status);
+}
+
+/* Tries to pack the head STORE: the base file it may wait for, the
+ * segment fit, the slot supply (freeing, then growth), the pinned-floor
+ * and write-behind holds (section 6.1 steps 1 to 4), then the copy and
+ * the indexes (step 5). False when it must stay held, or when it was
+ * failed and the store fenced. */
 static bool store_pack(struct vsr_io_store *store,
                        struct vsr_io_pending_store *pending)
 {
@@ -1001,18 +1931,27 @@ static bool store_pack(struct vsr_io_store *store,
     int32_t status;
     int rc;
 
+    if (base_hold(store, pending)) {
+        return false;
+    }
     if (seal) {
         slot = segment_free_slot(store);
+        if (slot == NONE) {
+            vsr_io_store_free_segments(store);
+            slot = segment_free_slot(store);
+        }
         if (slot == NONE && memory_only(store) &&
             store->slots < store->options.max_segments) {
             slot = store->slots++; /* A slot of the table, not the file. */
         }
         if (slot == NONE) {
-            /* Phase 2: vsr_io_store_free_segments may free one; a store
-             * whose floors keep every slot fails with FAILED. */
             if (store->growth == GROWTH_NONE &&
                 store->slots < store->options.max_segments) {
                 store->growth = GROWTH_ALLOCATING;
+            } else if (store->growth == GROWTH_NONE &&
+                       !segment_freeing(store)) {
+                /* Every slot is kept by a floor: nothing can free. */
+                store_abort(store, pending, VSR_IO_FAILED);
             }
             return false;
         }
@@ -1039,11 +1978,9 @@ static bool store_pack(struct vsr_io_store *store,
     extent_newest(store)->last_sequence = pending->sequence;
     store->readable = pending->sequence;
     store->packed_since_durable = 1;
-    if (!index_apply(store, pending->transaction, offset, (uint32_t)n,
-                     &status)) {
-        complete(store, pending->op, status, NONE, NULL);
-        store_fail(store, status);
-        return true;
+    if (!index_apply(store, offset, (uint32_t)n, at, &status)) {
+        store_abort(store, pending, status);
+        return false;
     }
     complete(store, pending->op, VSR_IO_OK, NONE, NULL);
     return true;
@@ -1191,7 +2128,8 @@ static struct vsr_io_extent *issue_extent(struct vsr_io_store *store)
     for (uint32_t i = 0; i < store->extents_count; ++i) {
         struct vsr_io_extent *extent = extent_at(store, i);
 
-        if (extent->ring_offset + extent->length > store->issued) {
+        if (extent->segment != NONE &&
+            extent->ring_offset + extent->length > store->issued) {
             if (store->issued < extent->ring_offset) {
                 store->issued = extent->ring_offset;
             }
@@ -1348,6 +2286,18 @@ static void superblock_done(struct vsr_io_store *store, uint64_t floor,
         store->slots = file_slots(store);
         store->growth = GROWTH_NONE;
     }
+    /* The superblock on disk names a present start segment: the slots
+     * freed before this write may be reused (section 6.5). A slot freed
+     * after it was issued set superblock_dirty again and waits for the
+     * next write. */
+    if (store->superblock_dirty != 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < store->slots; ++i) {
+        if (store->segments[i].phase == VSR_IO_SEGMENT_FREEING) {
+            store->segments[i].phase = VSR_IO_SEGMENT_FREE;
+        }
+    }
 }
 
 static void file_done(struct vsr_io_store *store, uint32_t op, uint64_t cookie,
@@ -1419,21 +2369,8 @@ static void file_done(struct vsr_io_store *store, uint32_t op, uint64_t cookie,
 }
 
 /* -------------------------------------------------------------------------
- * Open, poll, prepare, complete
+ * Executor records
  * ---------------------------------------------------------------------- */
-
-void vsr_io_store_open(struct vsr_io_store *store, uint32_t start_mode,
-                       uint64_t load_op, const struct vsr_store_read *read)
-{
-    (void)read;
-    if (store == NULL || store->state != VSR_IO_STORE_CLOSED) {
-        return;
-    }
-    store->start_mode = start_mode;
-    store->recovery.load_op = load_op;
-    store->state = VSR_IO_STORE_OPENING;
-    store->run = 1;
-}
 
 /* Fills `sqe` with a FIXED_FILE operation on the log. */
 static void log_sqe(const struct vsr_io_store *store, struct vsr_io_sqe *sqe,
@@ -1450,6 +2387,614 @@ static uint32_t take_slot(struct vsr_io *io, uint8_t kind, uint32_t replica,
                           uint32_t sub, uint64_t cookie)
 {
     return vsr_io_slots_alloc(&io->slots, kind, 1, replica, sub, cookie);
+}
+
+/* -------------------------------------------------------------------------
+ * Loads
+ *
+ * A LOAD is resolved against the indexes when it is accepted (decision
+ * 51): the records it needs go to load_refs. When every record is hot and
+ * a lease is free the result is built at once, under a ring pin;
+ * otherwise the load queues, a hot one for a lease, a cold one for the
+ * single read in flight per replica (decision 37), which brings the
+ * block-aligned range covering its records into a pool slab whose
+ * reference the lease then holds. Every result, an empty one included,
+ * is a vsr_loaded graph in the lease's region.
+ * ---------------------------------------------------------------------- */
+
+/* The slot a log offset lies in, or NONE for the superblocks. */
+static uint32_t segment_of(const struct vsr_io_store *store, uint64_t offset)
+{
+    uint64_t fixed = STORE_SUPERBLOCKS * block_bytes(store);
+
+    if (offset < fixed) {
+        return NONE;
+    }
+    return (uint32_t)((offset - fixed) / store->options.segment_bytes);
+}
+
+static void ref_set(struct vsr_io_load_ref *ref, uint64_t offset,
+                    uint64_t sequence, uint32_t length, uint32_t change,
+                    uint32_t index)
+{
+    memset(ref, 0, sizeof(*ref));
+    ref->offset = offset;
+    ref->sequence = sequence;
+    ref->length = length;
+    ref->change = change;
+    ref->index = index;
+}
+
+/* LOG: the versions of [first, end) at the read's sequence, up to
+ * max_count of them; the byte bound is applied when they are decoded. */
+static int32_t resolve_log(const struct vsr_io_store *store,
+                           struct vsr_io_pending_load *load,
+                           struct vsr_io_load_ref *refs)
+{
+    const struct vsr_store_read *read = &load->read;
+    uint64_t op = read->first;
+
+    while (op < read->end && load->count < read->max_count) {
+        const struct vsr_io_op_ref *ref = op_current(store, op);
+
+        if (ref != NULL && ref->sequence <= read->sequence) {
+            ref_set(&refs[load->count], ref->offset, ref->sequence, ref->length,
+                    ref->change, ref->index);
+        } else {
+            const struct vsr_io_version *version =
+                version_at(store, op, read->sequence);
+
+            if (version == NULL) {
+                break;
+            }
+            ref_set(&refs[load->count], version->offset, version->appended,
+                    version->length, version->change, version->index);
+        }
+        load->count++;
+        op++;
+    }
+    if (load->count == 0 && read->first < read->end) {
+        return VSR_IO_NOT_FOUND;
+    }
+    return VSR_IO_OK;
+}
+
+/* CLIENT: the entry's completed record when the read's sequence covers
+ * it (decision 51); from the ring when still there, else from the base
+ * file when it holds the record, else from the log. */
+static int32_t resolve_client(const struct vsr_io_store *store,
+                              struct vsr_io_pending_load *load,
+                              struct vsr_io_load_ref *refs)
+{
+    const struct vsr_io_client *entry = client_find(store, load->read.client);
+    const struct vsr_io_client_version *version;
+    uint64_t ring;
+
+    if (entry == NULL || entry->current.number == 0) {
+        return VSR_IO_OK;
+    }
+    if (entry->current.sequence > load->read.sequence ||
+        store->restored > load->read.sequence) {
+        return VSR_IO_RETRY;
+    }
+    version = &entry->current;
+    if (version->sequence != 0 &&
+        extent_locate(store, version->offset, version->length, &ring)) {
+        ref_set(&refs[0], version->offset, version->sequence, version->length,
+                version->change, version->index);
+    } else if (entry->base_offset != UINT64_MAX) {
+        ref_set(&refs[0], entry->base_offset, 0, 0, 0, 0);
+        load->base = 1;
+    } else if (version->sequence != 0) {
+        ref_set(&refs[0], version->offset, version->sequence, version->length,
+                version->change, version->index);
+    } else {
+        return VSR_IO_CORRUPT; /* Only a base file held it, and none does. */
+    }
+    load->count = 1;
+    return VSR_IO_OK;
+}
+
+/* REQUEST: the entry's retained entry at the read's sequence, walking
+ * the previous links over the APPENDs after it. */
+static int32_t resolve_request(const struct vsr_io_store *store,
+                               struct vsr_io_pending_load *load,
+                               struct vsr_io_load_ref *refs)
+{
+    const struct vsr_io_client *entry = client_find(store, load->read.client);
+    const struct vsr_io_op_ref *ref;
+
+    if (entry == NULL || entry->retained == 0) {
+        return VSR_IO_OK;
+    }
+    if (store->reindexed > load->read.sequence) {
+        return VSR_IO_RETRY;
+    }
+    ref = op_current(store, entry->retained);
+    while (ref != NULL && ref->sequence > load->read.sequence) {
+        ref = ref->previous >= store->retained_begin
+                  ? op_current(store, ref->previous)
+                  : NULL;
+    }
+    if (ref == NULL) {
+        return VSR_IO_OK;
+    }
+    ref_set(&refs[0], ref->offset, ref->sequence, ref->length, ref->change,
+            ref->index);
+    load->count = 1;
+    return VSR_IO_OK;
+}
+
+/* True when every record of the load is in the ring; the unwrapped range
+ * covering them is what the lease pins. */
+static bool load_hot(const struct vsr_io_store *store,
+                     const struct vsr_io_pending_load *load,
+                     const struct vsr_io_load_ref *refs, uint64_t *begin,
+                     uint64_t *end)
+{
+    if (load->base != 0) {
+        return false;
+    }
+    *begin = 0;
+    *end = 0;
+    for (uint32_t i = 0; i < load->count; ++i) {
+        uint64_t ring;
+
+        if (!extent_locate(store, refs[i].offset, refs[i].length, &ring)) {
+            return false;
+        }
+        if (i == 0 || ring < *begin) {
+            *begin = ring;
+        }
+        if (ring + refs[i].length > *end) {
+            *end = ring + refs[i].length;
+        }
+    }
+    return true;
+}
+
+/* Where a result's record bytes come from: a slab holding the file range
+ * [offset, offset + length), or the ring when base is NULL. */
+struct load_source {
+    const unsigned char *base;
+    uint64_t offset;
+    uint64_t length;
+};
+
+/* The bytes of [offset, offset + length) of the file, or NULL when the
+ * source does not hold them all (a read short of the record). */
+static const unsigned char *load_bytes(const struct vsr_io_store *store,
+                                       const struct load_source *source,
+                                       uint64_t offset, uint64_t length)
+{
+    struct vsr_io_piece piece;
+
+    if (source->base != NULL) {
+        if (offset < source->offset ||
+            offset - source->offset > source->length ||
+            length > source->length - (offset - source->offset)) {
+            return NULL;
+        }
+        return source->base + (offset - source->offset);
+    }
+    if (length > UINT32_MAX ||
+        !vsr_io_store_hot(store, offset, (uint32_t)length, &piece)) {
+        return NULL;
+    }
+    return piece.base;
+}
+
+/* Positions `payload` at change `change` of the record at `bytes`, whose
+ * header must carry `sequence`; the payload CRC is checked when `check`
+ * (bytes read back from the disk). */
+static int32_t record_payload(const unsigned char *bytes, uint32_t length,
+                              uint64_t sequence, bool check, uint32_t change,
+                              struct vsr_io_cursor *payload)
+{
+    struct vsr_io_cursor cursor;
+    struct vsr_io_wire_record header;
+    struct vsr_io_wire_change changes[VSR_MAX_STORE_CHANGES];
+    int32_t status = record_changes(bytes, length, &header, changes);
+
+    if (status != VSR_IO_OK) {
+        return status;
+    }
+    if (header.sequence != sequence || change >= header.count) {
+        return VSR_IO_CORRUPT;
+    }
+    vsr_io_cursor_init_one(&cursor, bytes, length);
+    if (check && (!vsr_io_cursor_skip(&cursor, sizeof(header)) ||
+                  !vsr_io_codec_check_record(&cursor, &header))) {
+        return VSR_IO_CORRUPT;
+    }
+    vsr_io_cursor_init_one(payload, bytes + changes[change].offset,
+                           changes[change].length);
+    return VSR_IO_OK;
+}
+
+/* Payload bytes of a loaded entry, for the read's byte bound. */
+static uint64_t entry_bytes(const struct vsr_entry *entry)
+{
+    if (entry->type == VSR_REQUEST_COMMAND && entry->body != NULL) {
+        return ((const struct vsr_blob *)entry->body)->size;
+    }
+    return 0;
+}
+
+/* Decodes the resolved entries of a LOG or REQUEST load into an array
+ * from the region, stopping before the entry that would exceed the byte
+ * bound (never before the first). */
+static int32_t build_entries(const struct vsr_io_store *store,
+                             const struct vsr_io_pending_load *load,
+                             const struct vsr_io_load_ref *refs,
+                             const struct load_source *source,
+                             struct vsr_io_bump *region,
+                             struct vsr_loaded *loaded)
+{
+    struct vsr_entry *entries = vsr_io_bump_alloc(
+        region, load->count * sizeof(*entries), alignof(struct vsr_entry));
+    uint64_t bytes = 0;
+    uint32_t n = 0;
+
+    if (entries == NULL) {
+        return VSR_IO_FAILED;
+    }
+    for (; n < load->count; ++n) {
+        const struct vsr_io_load_ref *ref = &refs[n];
+        const unsigned char *at =
+            load_bytes(store, source, ref->offset, ref->length);
+        struct vsr_io_cursor payload;
+        int32_t status;
+        int rc;
+
+        if (at == NULL) {
+            return VSR_IO_CORRUPT;
+        }
+        status = record_payload(at, ref->length, ref->sequence,
+                                source->base != NULL, ref->change, &payload);
+        if (status != VSR_IO_OK) {
+            return status;
+        }
+        rc = vsr_io_codec_get_entry_at(&payload, ref->index, &store->limits,
+                                       region, &entries[n]);
+        if (rc != VSR_OK) {
+            return rc == VSR_ELIMIT ? VSR_IO_FAILED : VSR_IO_CORRUPT;
+        }
+        if (n > 0 && bytes + entry_bytes(&entries[n]) > load->read.max_bytes) {
+            break;
+        }
+        bytes += entry_bytes(&entries[n]);
+    }
+    loaded->items = entries;
+    loaded->count = n;
+    return VSR_IO_OK;
+}
+
+/* Decodes the completed client record of a CLIENT load: from the log
+ * record's CLIENTS change, or from the base file. */
+static int32_t build_client(const struct vsr_io_store *store,
+                            const struct vsr_io_pending_load *load,
+                            const struct vsr_io_load_ref *ref,
+                            const struct load_source *source,
+                            struct vsr_io_bump *region,
+                            struct vsr_loaded *loaded)
+{
+    struct vsr_client_record *record = vsr_io_bump_alloc(
+        region, sizeof(*record), alignof(struct vsr_client_record));
+    struct vsr_io_cursor payload;
+    int rc;
+
+    if (record == NULL) {
+        return VSR_IO_FAILED;
+    }
+    if (load->base != 0) {
+        /* The file record's length is in its header: the read brought
+         * whatever follows the offset, up to a slab. */
+        if (source->base == NULL || ref->offset < source->offset ||
+            ref->offset - source->offset >= source->length) {
+            return VSR_IO_CORRUPT;
+        }
+        vsr_io_cursor_init_one(&payload,
+                               source->base + (ref->offset - source->offset),
+                               source->length - (ref->offset - source->offset));
+        rc = vsr_io_codec_get_clients_record(&payload, &store->limits, region,
+                                             record);
+    } else {
+        const unsigned char *at =
+            load_bytes(store, source, ref->offset, ref->length);
+        int32_t status;
+
+        if (at == NULL) {
+            return VSR_IO_CORRUPT;
+        }
+        status = record_payload(at, ref->length, ref->sequence,
+                                source->base != NULL, ref->change, &payload);
+        if (status != VSR_IO_OK) {
+            return status;
+        }
+        for (uint32_t i = 0; i < ref->index; ++i) {
+            struct vsr_io_wire_client_record skipped;
+
+            if (vsr_io_codec_skip_client_record(&payload, &skipped) != VSR_OK) {
+                return VSR_IO_CORRUPT;
+            }
+        }
+        rc = vsr_io_codec_get_client_record(&payload, &store->limits, region,
+                                            record);
+    }
+    if (rc != VSR_OK) {
+        return rc == VSR_ELIMIT ? VSR_IO_FAILED : VSR_IO_CORRUPT;
+    }
+    if (!id_equal(record->request.client, load->read.client)) {
+        return VSR_IO_CORRUPT;
+    }
+    loaded->items = record;
+    loaded->count = 1;
+    return VSR_IO_OK;
+}
+
+/* Builds the result of the head load from `source` in a fresh lease and
+ * completes it. The lease takes `slab` (a cold read) or, for a hot
+ * result, the pin over [begin, end). */
+static void load_finish(struct vsr_io_store *store,
+                        struct vsr_io_pending_load *load,
+                        const struct vsr_io_load_ref *refs,
+                        const struct load_source *source, uint32_t slab,
+                        uint64_t begin, uint64_t end)
+{
+    struct vsr_io_replica *replica = store_replica(store);
+    uint32_t lease = vsr_io_lease_alloc(replica, slab, NONE);
+    struct vsr_io_bump *region;
+    struct vsr_loaded *loaded;
+    int32_t status = VSR_IO_OK;
+
+    STORE_ASSERT(lease != NONE);
+    region = &replica->leases[lease].region;
+    loaded =
+        vsr_io_bump_alloc(region, sizeof(*loaded), alignof(struct vsr_loaded));
+    if (loaded == NULL) {
+        status = VSR_IO_FAILED;
+    } else {
+        memset(loaded, 0, sizeof(*loaded));
+        loaded->sequence = load->read.sequence;
+        if (load->count == 0) {
+            loaded->next = load->read.type == VSR_LOAD_LOG ? load->read.end : 0;
+        } else if (load->read.type == VSR_LOAD_CLIENT) {
+            status =
+                build_client(store, load, &refs[0], source, region, loaded);
+        } else {
+            status = build_entries(store, load, refs, source, region, loaded);
+            if (load->read.type == VSR_LOAD_LOG) {
+                loaded->next = load->read.first + loaded->count;
+            }
+        }
+    }
+    if (status != VSR_IO_OK) {
+        vsr_io_lease_release(replica, lease); /* Drops the slab too. */
+        complete(store, load->op, status, NONE, NULL);
+        return;
+    }
+    if (slab == NONE && load->count > 0) {
+        pin_range(store, lease, begin, end);
+        replica->leases[lease].pin = lease;
+    }
+    complete(store, load->op, VSR_IO_OK, lease, loaded);
+}
+
+/* Answers queued loads from the head while leases are free: a read one,
+ * a hot one, an empty one; stops at a cold one, which prepare reads. */
+static void loads_drain(struct vsr_io_store *store)
+{
+    struct vsr_io_replica *replica = store_replica(store);
+
+    while (store->loads_count > 0 && store->state != VSR_IO_STORE_FAILED) {
+        struct vsr_io_pending_load *load = loads_at(store, 0);
+        struct vsr_io_load_ref *refs = load_refs(store, load);
+        struct load_source source = {NULL, 0, 0};
+        uint64_t begin = 0;
+        uint64_t end = 0;
+
+        if (load->state == LOAD_READING || replica->leases_free == 0) {
+            return;
+        }
+        if (load->state == LOAD_READ) {
+            source.base = vsr_io_pool_slab(&replica->io->pool, load->slab);
+            source.offset = load->offset;
+            source.length = load->got;
+            load_finish(store, load, refs, &source, load->slab, 0, 0);
+            loads_pop(store, false); /* The lease has the slab. */
+            continue;
+        }
+        if (load->count > 0 && !load_hot(store, load, refs, &begin, &end)) {
+            return;
+        }
+        load_finish(store, load, refs, &source, NONE, begin, end);
+        loads_pop(store, false);
+    }
+}
+
+/* The block-aligned file range covering the records one read brings in
+ * one slab: the batch is cut where the range would exceed the slab or
+ * leave the segment. A base file record's length is not known: the read
+ * takes a slab from its offset and is short at the file's end. */
+static void load_range(const struct vsr_io_store *store,
+                       struct vsr_io_pending_load *load,
+                       const struct vsr_io_load_ref *refs, uint64_t slab_bytes)
+{
+    uint64_t block = block_bytes(store);
+    uint64_t begin = refs[0].offset / block * block;
+    uint64_t end = begin;
+    uint32_t segment = segment_of(store, refs[0].offset);
+    uint32_t n = 0;
+
+    if (load->base != 0) {
+        load->offset = begin;
+        load->length = slab_bytes;
+        return;
+    }
+    for (; n < load->count; ++n) {
+        uint64_t record_end = round_up(refs[n].offset + refs[n].length, block);
+
+        if (n > 0 && (segment_of(store, refs[n].offset) != segment ||
+                      record_end - begin > slab_bytes)) {
+            break;
+        }
+        if (record_end > end) {
+            end = record_end;
+        }
+    }
+    STORE_ASSERT(n > 0 && end - begin <= slab_bytes);
+    load->count = n;
+    load->offset = begin;
+    load->length = end - begin;
+}
+
+/* Issues the cold read of the head load into a slab. */
+static bool prepare_load(struct vsr_io *io, uint32_t replica,
+                         struct vsr_io_store *store, struct vsr_io_sqe *sqe)
+{
+    struct vsr_io_pending_load *load;
+    struct vsr_io_load_ref *refs;
+    uint64_t begin;
+    uint64_t end;
+    uint32_t slab;
+    uint32_t slot;
+    int32_t fd;
+
+    if (store->loads_count == 0 || store->cold_active != 0) {
+        return false;
+    }
+    load = loads_at(store, 0);
+    refs = load_refs(store, load);
+    if (load->state != LOAD_QUEUED || load->count == 0 ||
+        load_hot(store, load, refs, &begin, &end)) {
+        return false; /* Answered from poll. */
+    }
+    fd = load->base != 0 ? store->base_slot : store->log_slot;
+    if (fd < 0) {
+        complete(store, load->op, VSR_IO_FAILED, NONE, NULL);
+        loads_pop(store, true);
+        return false;
+    }
+    slab = vsr_io_pool_acquire(&io->pool, false);
+    if (slab == NONE) {
+        return false;
+    }
+    slot = take_slot(io, VSR_IO_SLOT_LOAD, replica, 0, 0);
+    if (slot == NONE) {
+        vsr_io_pool_release(&io->pool, slab);
+        return false;
+    }
+    load_range(store, load, refs, io->pool.slab_bytes);
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = VSR_IO_SQE_READ;
+    sqe->flags = VSR_IO_SQE_FIXED_FILE | VSR_IO_SQE_FIXED_BUFFER;
+    sqe->fd = fd;
+    sqe->user_data = vsr_io_slots_user_data(&io->slots, slot);
+    sqe->buffer_index = (uint16_t)io->pool.region_index;
+    sqe->addr = vsr_io_pool_slab(&io->pool, slab);
+    sqe->length = (uint32_t)load->length;
+    sqe->offset = load->offset;
+    load->state = LOAD_READING;
+    load->slab = slab;
+    load->slot = slot;
+    store->cold_active = 1;
+    store->cold_slab = slab;
+    return true;
+}
+
+/* The cold read completed: the head load decodes once a lease is free.
+ * When the store was fenced meanwhile the load is gone and the slab is
+ * only now safe to release. */
+static void load_done(struct vsr_io_store *store, int32_t result)
+{
+    struct vsr_io_pending_load *load;
+
+    store->cold_active = 0;
+    if (store->loads_count == 0 || loads_at(store, 0)->state != LOAD_READING) {
+        vsr_io_pool_release(&store_replica(store)->io->pool, store->cold_slab);
+        return;
+    }
+    load = loads_at(store, 0);
+    load->slot = NONE;
+    if (result < 0) {
+        complete(store, load->op, VSR_IO_FAILED, NONE, NULL);
+        loads_pop(store, true);
+        return;
+    }
+    load->got = (uint64_t)result;
+    load->state = LOAD_READ;
+}
+
+int vsr_io_store_load(struct vsr_io_store *store, uint64_t op,
+                      const struct vsr_store_read *read)
+{
+    struct vsr_io_pending_load *load;
+    int32_t status;
+
+    if (store == NULL || op == 0 || read == NULL) {
+        return VSR_EINVAL;
+    }
+    if (store->state == VSR_IO_STORE_FAILED) {
+        complete(store, op, VSR_IO_FAILED, NONE, NULL);
+        return VSR_OK;
+    }
+    if ((store->state != VSR_IO_STORE_READY &&
+         store->state != VSR_IO_STORE_CREATING) ||
+        read->type == VSR_LOAD_RECOVERY || read->type > VSR_LOAD_REQUEST ||
+        read->sequence > store->readable || read->sequence < store->reclaim ||
+        read->max_count == 0 ||
+        store->loads_count == store->limits.operations) {
+        return VSR_EINVAL;
+    }
+    if (read->type == VSR_LOAD_LOG &&
+        (read->first > read->end ||
+         read->max_count > store->limits.batch_entries)) {
+        return VSR_EINVAL;
+    }
+    load = loads_at(store, store->loads_count);
+    store->loads_count++;
+    memset(load, 0, sizeof(*load));
+    load->op = op;
+    load->read = *read;
+    load->state = LOAD_QUEUED;
+    load->slab = NONE;
+    load->slot = NONE;
+    switch (read->type) {
+    case VSR_LOAD_LOG:
+        status = resolve_log(store, load, load_refs(store, load));
+        break;
+    case VSR_LOAD_CLIENT:
+        status = resolve_client(store, load, load_refs(store, load));
+        break;
+    default:
+        status = resolve_request(store, load, load_refs(store, load));
+        break;
+    }
+    if (status != VSR_IO_OK) {
+        store->loads_count--; /* The newest: dropped from the tail. */
+        complete(store, op, status, NONE, NULL);
+        return VSR_OK;
+    }
+    loads_drain(store);
+    return VSR_OK;
+}
+
+/* -------------------------------------------------------------------------
+ * Open, poll, prepare, complete
+ * ---------------------------------------------------------------------- */
+
+void vsr_io_store_open(struct vsr_io_store *store, uint32_t start_mode,
+                       uint64_t load_op, const struct vsr_store_read *read)
+{
+    (void)read;
+    if (store == NULL || store->state != VSR_IO_STORE_CLOSED) {
+        return;
+    }
+    store->start_mode = start_mode;
+    store->recovery.load_op = load_op;
+    store->state = VSR_IO_STORE_OPENING;
+    store->run = 1;
 }
 
 /* One creation step, derived from the state (section 6.4 step 1): the
@@ -1730,9 +3275,9 @@ void vsr_io_store_prepare(struct vsr_io *io, uint32_t replica,
                 issued = wrote = prepare_write(io, replica, store, sqe);
             }
             if (!issued) {
-                issued = prepare_flush(io, replica, store, sqe);
+                issued = prepare_flush(io, replica, store, sqe) ||
+                         prepare_load(io, replica, store, sqe);
             }
-            /* Phase 2: one cold LOAD read. */
             break;
         case VSR_IO_STORE_RECOVERING:
             /* Phase 3: superblock and header reads, the scan. */
@@ -1774,7 +3319,7 @@ void vsr_io_store_complete(struct vsr_io *io, uint32_t replica, uint32_t slot,
         file_done(store, sub, cookie, cqe->result);
         break;
     case VSR_IO_SLOT_LOAD:
-        /* Phase 2: cold LOAD read completion. */
+        load_done(store, cqe->result);
         break;
     default:
         STORE_ASSERT(false);
@@ -1782,6 +3327,7 @@ void vsr_io_store_complete(struct vsr_io *io, uint32_t replica, uint32_t slot,
     }
     if (store->state == VSR_IO_STORE_READY) {
         stores_drain(store);
+        loads_drain(store);
     }
 }
 
@@ -1833,6 +3379,7 @@ void vsr_io_store_poll(struct vsr_io *io, uint32_t replica, uint64_t now)
         stores_drain(store);
         syncs_settle(store);
     }
+    loads_drain(store);
     vsr_io_deadlines_arm(&io->deadlines, owner->deadline_sync,
                          replicated ? VSR_NO_DEADLINE : store->flush_deadline);
     vsr_io_deadlines_arm(&io->deadlines, owner->deadline_flush,
@@ -1896,19 +3443,8 @@ void vsr_io_store_status(const struct vsr_io_store *store,
 }
 
 /* -------------------------------------------------------------------------
- * Phase 2: indexes, LOADs, RECLAIM, freeing, admission, capture, base
- * files. Every entry point below is a stub that refuses or does nothing;
- * the tree builds and the phase-1 behaviour above does not depend on it.
+ * RECLAIM and freeing (section 6.5)
  * ---------------------------------------------------------------------- */
-
-int vsr_io_store_load(struct vsr_io_store *store, uint64_t op,
-                      const struct vsr_store_read *read)
-{
-    (void)store;
-    (void)op;
-    (void)read;
-    return VSR_EINVAL; /* Phase 2. */
-}
 
 int vsr_io_store_reclaim(struct vsr_io_store *store, uint64_t op,
                          uint64_t oldest)
@@ -1916,104 +3452,362 @@ int vsr_io_store_reclaim(struct vsr_io_store *store, uint64_t op,
     if (store == NULL || op == 0) {
         return VSR_EINVAL;
     }
-    (void)oldest;
-    return VSR_EINVAL; /* Phase 2. */
+    if (store->state == VSR_IO_STORE_FAILED) {
+        complete(store, op, VSR_IO_FAILED, NONE, NULL);
+        return VSR_OK;
+    }
+    if (store->state != VSR_IO_STORE_READY || oldest > store->readable + 1) {
+        return VSR_EINVAL;
+    }
+    if (oldest > store->reclaim) {
+        store->reclaim = oldest;
+        trims_reclaim(store, oldest);
+        versions_reclaim(store, oldest);
+        vsr_io_store_free_segments(store);
+    }
+    complete(store, op, VSR_IO_OK, NONE, NULL);
+    stores_drain(store); /* A STORE held for a slot may have one now. */
+    return VSR_OK;
 }
+
+uint64_t vsr_io_store_free_floor(const struct vsr_io_store *store)
+{
+    uint64_t floor;
+
+    if (store == NULL) {
+        return 0;
+    }
+    /* The record of the oldest retained entry: the first live op from
+     * retained_begin (sequences never decrease along the ring), or every
+     * record when the log is empty; then every truncated version kept. */
+    floor = store->readable + 1;
+    for (uint64_t op = store->retained_begin; op < store->log_end; ++op) {
+        const struct vsr_io_op_ref *ref = op_current(store, op);
+
+        if (ref != NULL) {
+            if (ref->sequence < floor) {
+                floor = ref->sequence;
+            }
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < store->versions_count; ++i) {
+        if (store->versions[i].appended < floor) {
+            floor = store->versions[i].appended;
+        }
+    }
+    if (store->reclaim < floor) {
+        floor = store->reclaim;
+    }
+    if (store->client_base + 1 < floor) {
+        floor = store->client_base + 1;
+    }
+    if (store->capture_floor < floor) {
+        floor = store->capture_floor;
+    }
+    return floor;
+}
+
+/* True when every byte packed into the slot was written: nothing of it
+ * is planned, in flight or waiting for a header. */
+static bool segment_quiescent(const struct vsr_io_store *store, uint32_t slot)
+{
+    uint64_t floor = written_floor(store);
+
+    for (uint32_t i = 0; i < store->extents_count; ++i) {
+        const struct vsr_io_extent *extent = extent_at(store, i);
+
+        if (extent->segment == slot &&
+            extent->ring_offset + extent->length > floor) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* True when a queued load still has a record to read from the slot. */
+static bool segment_loading(const struct vsr_io_store *store, uint32_t slot)
+{
+    for (uint32_t i = 0; i < store->loads_count; ++i) {
+        const struct vsr_io_pending_load *load = &store->loads[ring_slot(
+            store->loads_head, i, store->limits.operations)];
+        const struct vsr_io_load_ref *refs =
+            &store->load_refs[(size_t)(load - store->loads) *
+                              store->limits.batch_entries];
+
+        if (load->base != 0) {
+            continue;
+        }
+        for (uint32_t k = 0; k < load->count; ++k) {
+            if (segment_of(store, refs[k].offset) == slot) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void vsr_io_store_free_segments(struct vsr_io_store *store)
+{
+    uint64_t floor;
+    uint32_t start = NONE;
+    bool freed = false;
+
+    if (store == NULL || store->state != VSR_IO_STORE_READY) {
+        return;
+    }
+    floor = vsr_io_store_free_floor(store);
+    for (uint32_t slot = 0; slot < store->slots; ++slot) {
+        struct vsr_io_segment *segment = &store->segments[slot];
+
+        if (segment->number == 0 || segment->phase != VSR_IO_SEGMENT_SEALED ||
+            segment->last_sequence >= floor ||
+            !segment_quiescent(store, slot) || segment_loading(store, slot)) {
+            continue;
+        }
+        /* Its extents die: the file bytes they name may be rewritten. */
+        for (uint32_t i = 0; i < store->extents_count; ++i) {
+            struct vsr_io_extent *extent = extent_at(store, i);
+
+            if (extent->segment == slot) {
+                extent->segment = NONE;
+            }
+        }
+        memset(segment, 0, sizeof(*segment));
+        segment->header_write = NONE;
+        segment->phase =
+            memory_only(store) ? VSR_IO_SEGMENT_FREE : VSR_IO_SEGMENT_FREEING;
+        freed = true;
+    }
+    if (!freed) {
+        return;
+    }
+    /* The start segment: the live one with the smallest number, named by
+     * a superblock write before any freed slot is reused. */
+    for (uint32_t slot = 0; slot < store->slots; ++slot) {
+        if (store->segments[slot].number != 0 &&
+            (start == NONE ||
+             store->segments[slot].number < store->segments[start].number)) {
+            start = slot;
+        }
+    }
+    if (start != NONE) {
+        store->start_segment = store->segments[start].number;
+        store->start_slot = start;
+    }
+    store->superblock_dirty = 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Admission, captures and base files
+ * ---------------------------------------------------------------------- */
 
 bool vsr_io_store_admit(struct vsr_io_store *store, struct vsr_id client)
 {
-    (void)store;
-    (void)client;
-    return false; /* Phase 2. */
+    struct vsr_io_client *entry;
+
+    if (store == NULL || id_zero(client)) {
+        return false;
+    }
+    if (client_find(store, client) != NULL) {
+        return true;
+    }
+    entry = client_insert(store, client);
+    if (entry == NULL) {
+        return false;
+    }
+    entry->inflight = 1;
+    return true;
 }
 
 void vsr_io_store_replied(struct vsr_io_store *store, struct vsr_id client)
 {
-    (void)store;
-    (void)client; /* Phase 2. */
+    struct vsr_io_client *entry;
+
+    if (store == NULL) {
+        return;
+    }
+    entry = client_find(store, client);
+    if (entry != NULL) {
+        entry->inflight = 0;
+        client_prune(store, entry);
+    }
 }
 
 uint32_t vsr_io_store_snapshot_clients(struct vsr_io_store *store,
                                        struct vsr_io_client_snapshot *out,
                                        uint32_t capacity)
 {
-    (void)store;
-    (void)out;
-    (void)capacity;
-    return 0; /* Phase 2. */
+    uint64_t floor = UINT64_MAX;
+    uint32_t n = 0;
+
+    if (store == NULL || out == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < store->clients_capacity; ++i) {
+        struct vsr_io_client *entry = &store->clients[i];
+
+        if (id_zero(entry->id)) {
+            continue;
+        }
+        entry->capture_offset = UINT64_MAX;
+        if (entry->current.number == 0) {
+            continue;
+        }
+        if (n < capacity) {
+            out[n].id = entry->id;
+            out[n].record = entry->current;
+        }
+        if (entry->current.sequence != 0 && entry->current.sequence < floor) {
+            floor = entry->current.sequence;
+        }
+        n++;
+    }
+    store->capture_floor = floor;
+    return n;
 }
 
 void vsr_io_store_capture_offset(struct vsr_io_store *store,
                                  struct vsr_id client, uint64_t offset)
 {
-    (void)store;
-    (void)client;
-    (void)offset; /* Phase 2. */
+    struct vsr_io_client *entry;
+
+    if (store == NULL) {
+        return;
+    }
+    entry = client_find(store, client);
+    if (entry != NULL) {
+        entry->capture_offset = offset;
+    }
 }
 
 void vsr_io_store_capture_end(struct vsr_io_store *store, struct vsr_id id,
                               uint64_t sequence)
 {
-    (void)store;
-    (void)id;
-    (void)sequence; /* Phase 2. */
+    if (store == NULL) {
+        return;
+    }
+    if (!id_zero(id)) {
+        store->last_capture = id;
+        store->last_capture_sequence = sequence;
+    }
+    store->capture_floor = UINT64_MAX;
+    stores_drain(store); /* A STORE held for a slot may free one now. */
 }
 
 void vsr_io_store_base_set(struct vsr_io_store *store, struct vsr_id id,
                            uint64_t sequence)
 {
-    (void)store;
-    (void)id;
-    (void)sequence; /* Phase 2. */
+    if (store == NULL) {
+        return;
+    }
+    base_apply(store, id, sequence,
+               id_equal(id, store->last_capture) ? BASE_FROM_CAPTURE
+                                                 : BASE_FROM_FILE);
+    stores_drain(store);
 }
 
 void vsr_io_store_base_begin(struct vsr_io_store *store)
 {
-    (void)store; /* Phase 2. */
+    if (store == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < store->clients_capacity; ++i) {
+        store->clients[i].next_offset = UINT64_MAX;
+    }
+    if (store->base_state == BASE_WANTED) {
+        store->base_state = BASE_LOADING;
+    }
 }
 
 int vsr_io_store_base_record(struct vsr_io_store *store,
                              const struct vsr_io_wire_client_record *record,
                              uint64_t file_offset)
 {
-    (void)store;
-    (void)record;
-    (void)file_offset;
-    return VSR_EINVAL; /* Phase 2. */
+    struct vsr_io_client *entry;
+    struct vsr_id client;
+
+    if (store == NULL || record == NULL) {
+        return VSR_EINVAL;
+    }
+    client.hi = record->client_hi;
+    client.lo = record->client_lo;
+    if (id_zero(client) || record->number == 0 || file_offset == UINT64_MAX) {
+        return VSR_EINVAL;
+    }
+    entry = client_get(store, client);
+    if (entry == NULL) {
+        return VSR_ELIMIT;
+    }
+    if (record->number < entry->current.number) {
+        return VSR_OK; /* The log holds a later record: not covered. */
+    }
+    if (record->number == entry->current.number) {
+        if (record->op != entry->current.op) {
+            return VSR_EINVAL;
+        }
+    } else {
+        memset(&entry->current, 0, sizeof(entry->current));
+        entry->current.number = record->number;
+        entry->current.op = record->op;
+        entry->current.offset = file_offset;
+        entry->inflight = 0;
+    }
+    entry->next_offset = file_offset;
+    return VSR_OK;
 }
 
 void vsr_io_store_base_end(struct vsr_io_store *store, struct vsr_id id,
                            uint64_t sequence)
 {
-    (void)store;
-    (void)id;
-    (void)sequence; /* Phase 2. */
+    if (store == NULL) {
+        return;
+    }
+    if (store->base_state == BASE_LOADING) {
+        store->base_state = BASE_LOADED; /* Applied when packed. */
+        return;
+    }
+    /* Nothing waits (recovery): the file is the base now. */
+    base_apply(store, id, sequence, BASE_FROM_FILE);
 }
 
 bool vsr_io_store_base_wanted(const struct vsr_io_store *store,
                               struct vsr_id *id, uint64_t *sequence)
 {
-    (void)store;
-    (void)id;
-    (void)sequence;
-    return false; /* Phase 2. */
+    if (store == NULL || store->base_state != BASE_WANTED) {
+        return false;
+    }
+    if (id != NULL) {
+        *id = store->base_id;
+    }
+    if (sequence != NULL) {
+        *sequence = store->base_sequence;
+    }
+    return true;
 }
 
 void vsr_io_store_base_resume(struct vsr_io_store *store, int32_t status)
 {
-    (void)store;
-    (void)status; /* Phase 2. */
-}
+    uint64_t op;
 
-uint64_t vsr_io_store_free_floor(const struct vsr_io_store *store)
-{
-    /* Phase 2: min(record of the oldest retained entry, reclaim, client
-     * base + 1, capture floor). Nothing is freed until then. */
-    (void)store;
-    return 0;
-}
-
-void vsr_io_store_free_segments(struct vsr_io_store *store)
-{
-    (void)store; /* Phase 2. */
+    if (store == NULL || store->base_state == BASE_NONE) {
+        return;
+    }
+    if (status == VSR_IO_OK) {
+        if (store->base_state == BASE_WANTED) {
+            vsr_io_store_base_begin(store); /* Nothing loaded: empty. */
+        }
+        store->base_state = BASE_LOADED;
+        stores_drain(store);
+        return;
+    }
+    /* The held transaction fails with the status, which fences the
+     * replica (vsr.h); the store follows. */
+    op = store->base_op;
+    store->base_state = BASE_NONE;
+    if (store->stores_count > 0 && stores_at(store, 0)->op == op) {
+        stores_pop(store);
+        complete(store, op, status, NONE, NULL);
+    }
+    store_fail(store, VSR_IO_FAILED);
 }

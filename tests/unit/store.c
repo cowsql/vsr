@@ -234,6 +234,8 @@ struct config {
     uint32_t segments;
     uint32_t max_segments;
     uint32_t inflight_writes;
+    uint32_t max_entries;
+    uint32_t max_clients;
     uint8_t sync_mode;
     uint8_t on_write_error;
     uint8_t direct_io;
@@ -260,6 +262,8 @@ struct harness {
 };
 
 static struct harness h;
+
+static void txns_reset(void);
 
 static uint64_t round_up(uint64_t value, uint64_t multiple)
 {
@@ -312,8 +316,8 @@ static struct vsr_io_store_options store_options(const struct config *c)
     o.block_bytes = BLOCK;
     o.segments = c->segments;
     o.max_segments = c->max_segments;
-    o.max_entries = 64;
-    o.max_clients = 8;
+    o.max_entries = c->max_entries;
+    o.max_clients = c->max_clients;
     o.inflight_writes = c->inflight_writes;
     o.segment_bytes = c->segment_bytes;
     o.sync_delay_ns = c->sync_delay_ns;
@@ -355,6 +359,8 @@ static struct config base_config(void)
     c.segments = 2;
     c.max_segments = 4;
     c.inflight_writes = 2;
+    c.max_entries = 4096; /* The write tests never reclaim. */
+    c.max_clients = 8;
     c.sync_mode = VSR_IO_SYNC_FDATASYNC;
     c.on_write_error = VSR_IO_WRITE_ERROR_FENCE;
     c.direct_io = 1;
@@ -374,6 +380,7 @@ static void harness_open(const struct config *c)
 
     memset(&h, 0, sizeof(h));
     memset(&fake, 0, sizeof(fake));
+    txns_reset();
     disk_reset();
     h.now = 1000;
     h.next_op = 1;
@@ -695,6 +702,10 @@ static void expect_completion(uint64_t op, int32_t status)
                 completion.op, completion.status, op);
     }
     CHECK(completion.op == op);
+    if (completion.status != status) {
+        fprintf(stderr, "completion op %" PRIu64 " status %d, expected %d\n",
+                completion.op, completion.status, status);
+    }
     CHECK(completion.status == status);
     CHECK(completion.lease == NONE);
     CHECK(completion.data == NULL);
@@ -739,16 +750,44 @@ struct txn {
 };
 
 static struct txn txns[TXN_MAX];
-static uint64_t next_first_op = 1;
 
-/* An APPEND of `count` COMMAND entries of `body` bytes each at the next
- * sequence, pinned in the static table until the test ends. */
+static void txns_reset(void)
+{
+    memset(txns, 0, sizeof(txns));
+}
+
+/* The log end after the transactions below `sequence`: APPENDs extend
+ * it, a TRUNCATE cuts it; the first op is 1 (the core's genesis). */
+static uint64_t log_end_before(uint64_t sequence)
+{
+    uint64_t end = 1;
+
+    for (uint64_t q = 1; q < sequence; ++q) {
+        const struct txn *t = &txns[q];
+
+        for (uint32_t i = 0; i < t->store.count; ++i) {
+            const struct vsr_change *change = &t->store.changes[i];
+
+            if (change->type == VSR_STORE_APPEND) {
+                end = change->first + change->count;
+            } else if (change->type == VSR_STORE_TRUNCATE) {
+                end = change->first;
+            }
+        }
+    }
+    return end;
+}
+
+/* An APPEND of `count` COMMAND entries of `body` bytes each at the log
+ * end of `sequence`, pinned in the static table until the test ends. */
 static const struct txn *txn_append(uint64_t sequence, uint32_t count,
                                     size_t body)
 {
     struct txn *t;
+    uint64_t first;
 
     CHECK(sequence < TXN_MAX && count >= 1 && count <= 4 && body <= 256);
+    first = log_end_before(sequence);
     t = &txns[sequence];
     memset(t, 0, sizeof(*t));
     for (uint32_t i = 0; i < count; ++i) {
@@ -763,7 +802,7 @@ static const struct txn *txn_append(uint64_t sequence, uint32_t count,
         t->blobs[i].spans = body > 0 ? &t->spans[i] : NULL;
         t->blobs[i].size = body;
         t->blobs[i].count = body > 0 ? 1 : 0;
-        entry->op = next_first_op + i;
+        entry->op = first + i;
         entry->epoch = 0;
         entry->view = 1;
         entry->request.client.hi = 0x1000 + (i % 2);
@@ -774,9 +813,8 @@ static const struct txn *txn_append(uint64_t sequence, uint32_t count,
     }
     t->change.type = VSR_STORE_APPEND;
     t->change.count = count;
-    t->change.first = next_first_op;
+    t->change.first = first;
     t->change.data = t->entries;
-    next_first_op += count;
     t->store.sequence = sequence;
     t->store.changes = &t->change;
     t->store.count = 1;
@@ -1601,20 +1639,22 @@ static void test_growth(void)
     harness_run();
     CHECK(disk.size == 2 * BLOCK + 3 * c.segment_bytes);
     CHECK(h.store->written == sequence - 1);
-    /* No fourth slot: the STORE stays held (phase 2 frees slots). */
-    while (h.store->stores_count == 0) {
+    /* No fourth slot, and no RECLAIM ever: every floor keeps every slot,
+     * so the STORE that needs one fails with FAILED and the store fences
+     * (section 6.1). */
+    while (h.store->state == VSR_IO_STORE_READY) {
         uint64_t op = submit(txn_append(sequence, 4, 128));
 
-        if (h.store->stores_count == 0) {
+        if (h.store->state == VSR_IO_STORE_READY) {
             expect_completion(op, VSR_IO_OK);
             harness_run();
+        } else {
+            expect_completion(op, VSR_IO_FAILED);
         }
         sequence++;
         CHECK(sequence < 128);
     }
-    CHECK(h.store->growth == 0);
-    harness_run();
-    CHECK(h.store->stores_count == 1);
+    CHECK(h.store->growth == 0 && h.store->stores_count == 0);
     expect_no_completion();
     harness_close();
 }
@@ -1888,7 +1928,6 @@ static void test_write_error(void)
     c.write_behind_bytes = 2 * BLOCK;
     harness_open(&c);
     harness_start(VSR_START_NEW);
-    next_first_op = 1;
     expect_completion(submit(txn_append(1, 1, 50)), VSR_IO_OK);
     CHECK(harness_prepare() == 1);
     disk.fail_write = -EIO;
@@ -1966,7 +2005,9 @@ static void test_close(void)
 }
 
 /* The phase-2 and phase-3 entry points refuse until they exist. */
-static void test_stubs(void)
+/* The phase-2 entry points on an empty store: a malformed LOAD is EINVAL,
+ * RECLAIM completes, admission works, nothing waits for a base. */
+static void test_empty_index(void)
 {
     struct config c = base_config();
     struct vsr_store_read read;
@@ -1977,10 +2018,14 @@ static void test_stubs(void)
     memset(&read, 0, sizeof(read));
     read.type = VSR_LOAD_LOG;
     CHECK(vsr_io_store_load(h.store, 50, &read) == VSR_EINVAL);
-    CHECK(vsr_io_store_reclaim(h.store, 51, 1) == VSR_EINVAL);
-    CHECK(!vsr_io_store_admit(h.store, id));
+    CHECK(vsr_io_store_reclaim(h.store, 51, 1) == VSR_OK);
+    expect_completion(51, VSR_IO_OK);
+    CHECK(vsr_io_store_admit(h.store, id));
+    CHECK(h.store->clients_count == 1);
+    vsr_io_store_replied(h.store, id);
+    CHECK(h.store->clients_count == 0);
     CHECK(!vsr_io_store_base_wanted(h.store, &id, NULL));
-    CHECK(vsr_io_store_free_floor(h.store) == 0);
+    CHECK(vsr_io_store_free_floor(h.store) == 1);
     expect_no_completion();
     harness_close();
 }
@@ -2011,7 +2056,7 @@ int main(void)
     test_write_error();
     test_short_write();
     test_close();
-    test_stubs();
+    test_empty_index();
     printf("store: ok\n");
     return 0;
 }

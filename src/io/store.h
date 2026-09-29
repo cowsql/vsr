@@ -80,7 +80,9 @@ enum vsr_io_segment_phase {
     VSR_IO_SEGMENT_FREE,
     VSR_IO_SEGMENT_HEADER, /* Header packed; its write not yet complete. */
     VSR_IO_SEGMENT_OPEN,   /* Records may be packed into it. */
-    VSR_IO_SEGMENT_SEALED  /* Full; records only read. */
+    VSR_IO_SEGMENT_SEALED, /* Full; records only read. */
+    VSR_IO_SEGMENT_FREEING /* Freed; reused only once the superblock
+                              naming the new start segment is on disk. */
 };
 
 struct vsr_io_segment {
@@ -136,7 +138,10 @@ struct vsr_io_client {
     uint64_t base_offset;    /* Record offset in the current base file, or
                                 UINT64_MAX; valid when current.sequence is at
                                 or below the client base. */
-    uint64_t capture_offset; /* Offset written by the latest capture. */
+    uint64_t capture_offset; /* Offset written by the latest capture, or
+                                UINT64_MAX (reset by snapshot_clients). */
+    uint64_t next_offset;    /* Offset in the base file being loaded
+                                (base_begin to base_end), or UINT64_MAX. */
     uint64_t retained;       /* Latest retained entry op; 0 none. */
     uint8_t inflight;        /* Admitted REQUEST, not yet indexed. */
     uint8_t reserved[7];
@@ -181,15 +186,31 @@ struct vsr_io_pending_sync {
     uint64_t sequence;
 };
 
+/* One record a LOAD reads: resolved against the indexes when the LOAD is
+ * accepted (decision 51), decoded when the bytes are at hand. */
+struct vsr_io_load_ref {
+    uint64_t offset;   /* Record offset in the log, or in the base file. */
+    uint64_t sequence; /* Expected record sequence; 0 for a base record. */
+    uint32_t length;   /* Record bytes; 0 for a base record (unknown). */
+    uint32_t change;
+    uint32_t index;
+    uint32_t reserved;
+};
+
+/* A LOAD not yet completed: its records are in load_refs; hot ones wait
+ * only for a lease, cold ones for the one read in flight per replica. */
 struct vsr_io_pending_load {
     uint64_t op;
     struct vsr_store_read read;
-    uint32_t state; /* 0 queued, 1 reading, 2 done. */
+    uint32_t state; /* 0 queued, 1 reading, 2 read, waiting for a lease. */
+    uint32_t count; /* Records resolved (load_refs). */
     uint32_t slab;  /* Cold read slab or NONE. */
-    uint32_t slot;
-    uint32_t region; /* Load region allocated for the result. */
+    uint32_t slot;  /* Its executor slot while reading. */
+    uint32_t base;  /* 1: the record is read from the base file. */
+    uint32_t reserved;
     uint64_t offset; /* Cold read: file range read into the slab. */
     uint64_t length;
+    uint64_t got; /* Bytes the read returned. */
 };
 
 /* A ring range pinned by a LOAD lease. */
@@ -265,6 +286,24 @@ struct vsr_io_store {
                                    holds. */
     uint64_t last_capture_sequence;
     uint64_t capture_floor; /* Lowest record a capture still reads; NONE. */
+    uint64_t reindexed;     /* Sequence of the latest TRUNCATE, TRIM or
+                               RESTORE: a CLIENT or REQUEST load naming an
+                               older sequence completes with RETRY. */
+    uint64_t restored;      /* Sequence of the latest RESTORE. */
+    /* A RESTORE, or a PUBLISH of a snapshot other than the latest capture,
+     * is held before it is packed until its clients file was loaded
+     * (decision 43): base_wanted reports it, base_begin/record/end load
+     * it, base_resume packs it or fails it. */
+    uint32_t base_state; /* Private stage. */
+    uint32_t base_kind;  /* 1 when the held transaction is a RESTORE. */
+    uint64_t base_op;
+    struct vsr_id base_id;
+    uint64_t base_sequence;
+    int32_t base_slot; /* Registered file slot of the current base file,
+                          kept open by the snapshot module, or -1: a CLIENT
+                          load of a record at or below the client base
+                          reads the file. */
+    int32_t reserved_base;
     /* Segments. */
     struct vsr_io_segment *segments; /* [max_segments] */
     uint32_t slots;                  /* Allocated in the file. */
@@ -330,9 +369,13 @@ struct vsr_io_store {
     uint32_t syncs_head;
     uint32_t syncs_count;
     struct vsr_io_pending_load *loads; /* [operations] ring */
+    struct vsr_io_load_ref *load_refs; /* [operations * batch_entries] */
     uint32_t loads_head;
     uint32_t loads_count;
     uint32_t cold_active;         /* 1 while a cold read is in flight. */
+    uint32_t cold_slab;           /* Its slab: released at its completion
+                                     when no lease took it (the store was
+                                     fenced meanwhile). */
     struct vsr_io_ring_pin *pins; /* [regions] by lease index. */
     uint32_t pins_count;
     struct vsr_io_completion *completions; /* [3 * operations] ring */
@@ -398,8 +441,10 @@ int vsr_io_store_sync(struct vsr_io_store *store, uint64_t op,
                       uint64_t sequence);
 int vsr_io_store_reclaim(struct vsr_io_store *store, uint64_t op,
                          uint64_t oldest);
-/* RELEASE of a LOAD lease: unpins its ring range or slab; the engine frees
- * the region and slab reference. */
+/* RELEASE of a LOAD lease: unpins its ring range; the engine frees the
+ * region and drops the slab reference of a cold load, which the lease
+ * holds. A LOAD completion carries the engine lease index holding the
+ * vsr_loaded graph (an empty result too) and the pin or slab. */
 void vsr_io_store_release(struct vsr_io_store *store, uint32_t lease);
 /* Drains queued completions in order; false when none. */
 bool vsr_io_store_next_completion(struct vsr_io_store *store,
@@ -464,7 +509,11 @@ uint32_t vsr_io_store_pin(struct vsr_io_store *store, uint64_t offset,
                           uint32_t length, uint32_t lease);
 void vsr_io_store_unpin(struct vsr_io_store *store, uint32_t pin);
 
-/* Floors and freeing. */
+/* Floors and freeing (section 6.5): the floor is the lowest sequence any
+ * reader still needs; free_segments frees every SEALED slot whose records
+ * are all below it and completely written, marks the freed slots FREEING
+ * until the superblock naming the new start segment completed, and never
+ * frees a slot a queued cold load reads from. */
 uint64_t vsr_io_store_free_floor(const struct vsr_io_store *store);
 void vsr_io_store_free_segments(struct vsr_io_store *store);
 
