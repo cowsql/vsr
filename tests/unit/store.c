@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include "io/codec.h"
+#include "io/crc32c.h"
 #include "io/engine.h"
 #include "io/store.h"
 #include "lib/check.h"
@@ -42,6 +43,8 @@
 #define SLABS 24u
 #define OWNER 0x5Au
 #define FILE_SLOT_BASE 100u
+#define BASE_SLOT                                                              \
+    109 /* The base file's slot, as the snapshot module holds it. */
 #define REGION_BASE 5u
 #define TAIL_REGION (REGION_BASE + 1u)
 #define GROUP 3u
@@ -61,6 +64,10 @@ static _Alignas(4096) unsigned char metadata[1u << 20];
 static _Alignas(4096) unsigned char payload[SLABS * PAGE];
 static _Alignas(4096) unsigned char store_metadata[1u << 20];
 static _Alignas(4096) unsigned char tail_memory[1u << 20];
+/* Replica 0's lease table, as engine part 2's attach sets it up. */
+#define LEASE_BYTES 16384u
+static struct vsr_io_lease leases[REGIONS];
+static _Alignas(16) unsigned char lease_memory[REGIONS * LEASE_BYTES];
 static unsigned char disk_image[DISK_BYTES];
 
 /* members, operations, input_leases, pending_requests, pending_reads,
@@ -82,6 +89,9 @@ struct disk {
     uint32_t writes; /* Applied WRITEs of every kind. */
     uint32_t flushes;
     uint32_t fallocates;
+    uint32_t reads;
+    uint64_t base_size; /* The base file image (base_image). */
+    int32_t base_slot;
     uint8_t once[DISK_BLOCKS];  /* A segment block written already. */
     uint8_t dirty[DISK_BLOCKS]; /* Written since the last flush. */
     /* Faults: the next WRITE persists only `tear_blocks` blocks and its
@@ -91,15 +101,28 @@ struct disk {
     uint32_t tear_blocks;
     int32_t fail_write;
     int32_t fail_flush;
+    int32_t fail_read;   /* The next READ completes with this errno. */
+    uint32_t short_read; /* The next READ returns only this many bytes. */
 };
 
 static struct disk disk;
+static unsigned char base_image[65536];
 
 static void disk_reset(void)
 {
     memset(&disk, 0, sizeof(disk));
     memset(disk_image, 0, sizeof(disk_image));
     disk.slot = -1;
+    disk.base_slot = -1;
+}
+
+/* A freed slot may be rewritten: the model forgets its blocks when the
+ * store has freed the slot, which the tests do only for such a slot. */
+static void disk_forget_slot(uint32_t slot, uint64_t segment_bytes)
+{
+    uint64_t first = (2 * BLOCK + slot * segment_bytes) / BLOCK;
+
+    memset(disk.once + first, 0, segment_bytes / BLOCK);
 }
 
 /* -------------------------------------------------------------------------
@@ -234,6 +257,8 @@ struct config {
     uint32_t segments;
     uint32_t max_segments;
     uint32_t inflight_writes;
+    uint32_t max_entries;
+    uint32_t max_clients;
     uint8_t sync_mode;
     uint8_t on_write_error;
     uint8_t direct_io;
@@ -260,6 +285,8 @@ struct harness {
 };
 
 static struct harness h;
+
+static void txns_reset(void);
 
 static uint64_t round_up(uint64_t value, uint64_t multiple)
 {
@@ -312,8 +339,8 @@ static struct vsr_io_store_options store_options(const struct config *c)
     o.block_bytes = BLOCK;
     o.segments = c->segments;
     o.max_segments = c->max_segments;
-    o.max_entries = 64;
-    o.max_clients = 8;
+    o.max_entries = c->max_entries;
+    o.max_clients = c->max_clients;
     o.inflight_writes = c->inflight_writes;
     o.segment_bytes = c->segment_bytes;
     o.sync_delay_ns = c->sync_delay_ns;
@@ -355,6 +382,8 @@ static struct config base_config(void)
     c.segments = 2;
     c.max_segments = 4;
     c.inflight_writes = 2;
+    c.max_entries = 4096; /* The write tests never reclaim. */
+    c.max_clients = 8;
     c.sync_mode = VSR_IO_SYNC_FDATASYNC;
     c.on_write_error = VSR_IO_WRITE_ERROR_FENCE;
     c.direct_io = 1;
@@ -374,6 +403,7 @@ static void harness_open(const struct config *c)
 
     memset(&h, 0, sizeof(h));
     memset(&fake, 0, sizeof(fake));
+    txns_reset();
     disk_reset();
     h.now = 1000;
     h.next_op = 1;
@@ -392,6 +422,18 @@ static void harness_open(const struct config *c)
     h.replica->options.durability = c->durability;
     h.replica->deadline_flush = DEADLINE_FLUSH;
     h.replica->deadline_sync = DEADLINE_SYNC;
+    CHECK(vsr_io_codec_load_region(&limits, &bytes) == VSR_OK &&
+          bytes <= LEASE_BYTES);
+    memset(leases, 0, sizeof(leases));
+    for (uint32_t i = 0; i < REGIONS; ++i) {
+        leases[i].slab = NONE;
+        leases[i].pin = NONE;
+        vsr_io_bump_init(&leases[i].region,
+                         lease_memory + (size_t)i * LEASE_BYTES, LEASE_BYTES);
+    }
+    h.replica->leases = leases;
+    h.replica->regions_count = REGIONS;
+    h.replica->leases_free = REGIONS;
     h.store = &h.replica->store;
     h.options = store_options(c);
     CHECK(vsr_io_store_check(&h.options, &limits, PAGE) == VSR_OK);
@@ -584,18 +626,44 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         memset(disk.dirty, 0, sizeof(disk.dirty));
         *result = 0;
         return true;
-    case VSR_IO_SQE_READ:
-        CHECK((sqe->flags & VSR_IO_SQE_FIXED_FILE) != 0 &&
-              sqe->fd == disk.slot);
-        CHECK(sqe->offset <= disk.size);
-        end = sqe->offset + sqe->length;
-        if (end > disk.size) {
-            end = disk.size;
+    case VSR_IO_SQE_READ: {
+        const unsigned char *image = disk_image;
+        uint64_t size = disk.size;
+
+        CHECK((sqe->flags & VSR_IO_SQE_FIXED_FILE) != 0);
+        if ((sqe->flags & VSR_IO_SQE_FIXED_BUFFER) != 0 &&
+            in_pool(sqe->addr, sqe->length)) {
+            CHECK(sqe->buffer_index == h.io->pool.region_index);
         }
-        memcpy(writable(sqe->addr, sqe->length), disk_image + sqe->offset,
+        if (sqe->fd == disk.base_slot) {
+            image = base_image;
+            size = disk.base_size;
+        } else {
+            CHECK(sqe->fd == disk.slot);
+            if ((disk.flags & O_DIRECT) != 0) {
+                CHECK(sqe->offset % BLOCK == 0 && sqe->length % BLOCK == 0);
+            }
+        }
+        CHECK(sqe->offset <= size);
+        disk.reads++;
+        if (disk.fail_read != 0) {
+            *result = disk.fail_read;
+            disk.fail_read = 0;
+            return true;
+        }
+        end = sqe->offset + sqe->length;
+        if (end > size) {
+            end = size;
+        }
+        if (disk.short_read != 0) {
+            end = sqe->offset + disk.short_read;
+            disk.short_read = 0;
+        }
+        memcpy(writable(sqe->addr, sqe->length), image + sqe->offset,
                end - sqe->offset);
         *result = (int32_t)(end - sqe->offset);
         return true;
+    }
     default:
         CHECK(false);
         return false;
@@ -695,6 +763,10 @@ static void expect_completion(uint64_t op, int32_t status)
                 completion.op, completion.status, op);
     }
     CHECK(completion.op == op);
+    if (completion.status != status) {
+        fprintf(stderr, "completion op %" PRIu64 " status %d, expected %d\n",
+                completion.op, completion.status, status);
+    }
     CHECK(completion.status == status);
     CHECK(completion.lease == NONE);
     CHECK(completion.data == NULL);
@@ -730,27 +802,96 @@ static uint64_t harness_start(uint32_t mode)
 
 struct txn {
     struct vsr_store store;
-    struct vsr_change change;
+    struct vsr_change changes[3];
     struct vsr_entry entries[4];
     struct vsr_blob blobs[4];
     struct vsr_span spans[4];
     unsigned char bodies[4][256];
+    struct vsr_client_record records[4];
+    struct vsr_span result_spans[4];
+    unsigned char results[4][64];
+    struct vsr_hard_state hard;
+    struct vsr_epoch epoch;
+    struct vsr_membership membership;
+    struct vsr_member members[3];
+    struct vsr_checkpoint checkpoint;
+    struct vsr_span manifest;
+    unsigned char manifest_bytes[16];
+    struct vsr_store_identity identity;
     size_t bytes; /* Encoded record bytes. */
 };
 
 static struct txn txns[TXN_MAX];
-static uint64_t next_first_op = 1;
 
-/* An APPEND of `count` COMMAND entries of `body` bytes each at the next
- * sequence, pinned in the static table until the test ends. */
-static const struct txn *txn_append(uint64_t sequence, uint32_t count,
-                                    size_t body)
+static void txns_reset(void)
+{
+    memset(txns, 0, sizeof(txns));
+}
+
+/* The log end after the transactions below `sequence`: APPENDs extend
+ * it, a TRUNCATE cuts it; the first op is 1 (the core's genesis). */
+static uint64_t log_end_before(uint64_t sequence)
+{
+    uint64_t end = 1;
+
+    for (uint64_t q = 1; q < sequence; ++q) {
+        const struct txn *t = &txns[q];
+
+        for (uint32_t i = 0; i < t->store.count; ++i) {
+            const struct vsr_change *change = &t->store.changes[i];
+
+            if (change->type == VSR_STORE_APPEND) {
+                end = change->first + change->count;
+            } else if (change->type == VSR_STORE_TRUNCATE) {
+                end = change->first;
+            }
+        }
+    }
+    return end;
+}
+
+/* Transactions are built in the static table by sequence and pinned
+ * there until the test ends: begin, add changes, finish. */
+static struct txn *txn_begin(uint64_t sequence)
 {
     struct txn *t;
 
-    CHECK(sequence < TXN_MAX && count >= 1 && count <= 4 && body <= 256);
+    CHECK(sequence >= 1 && sequence < TXN_MAX);
     t = &txns[sequence];
     memset(t, 0, sizeof(*t));
+    t->store.sequence = sequence;
+    t->store.changes = t->changes;
+    return t;
+}
+
+static void txn_add(struct txn *t, uint32_t type, uint64_t first,
+                    uint32_t count, const void *data)
+{
+    struct vsr_change *change;
+
+    CHECK(t->store.count < 3);
+    change = &t->changes[t->store.count++];
+    change->type = type;
+    change->count = count;
+    change->first = first;
+    change->data = data;
+}
+
+static const struct txn *txn_finish(struct txn *t)
+{
+    CHECK(vsr_io_codec_record_bytes(&t->store, &limits, &t->bytes) == VSR_OK);
+    return t;
+}
+
+/* `count` COMMAND entries of `body` bytes each from op `first`, for
+ * `client` (zero: alternating default clients) with request numbers
+ * from `number`. */
+static void txn_entries(struct txn *t, uint64_t first, uint32_t count,
+                        size_t body, struct vsr_id client, uint64_t number)
+{
+    uint64_t sequence = t->store.sequence;
+
+    CHECK(count >= 1 && count <= 4 && body <= 256);
     for (uint32_t i = 0; i < count; ++i) {
         struct vsr_entry *entry = &t->entries[i];
 
@@ -763,44 +904,185 @@ static const struct txn *txn_append(uint64_t sequence, uint32_t count,
         t->blobs[i].spans = body > 0 ? &t->spans[i] : NULL;
         t->blobs[i].size = body;
         t->blobs[i].count = body > 0 ? 1 : 0;
-        entry->op = next_first_op + i;
+        entry->op = first + i;
         entry->epoch = 0;
         entry->view = 1;
-        entry->request.client.hi = 0x1000 + (i % 2);
-        entry->request.client.lo = 1;
-        entry->request.number = sequence;
+        if (client.hi == 0 && client.lo == 0) {
+            entry->request.client.hi = 0x1000 + (i % 2);
+            entry->request.client.lo = 1;
+            entry->request.number = sequence;
+        } else {
+            entry->request.client = client;
+            entry->request.number = number + i;
+        }
         entry->type = VSR_REQUEST_COMMAND;
         entry->body = &t->blobs[i];
     }
-    t->change.type = VSR_STORE_APPEND;
-    t->change.count = count;
-    t->change.first = next_first_op;
-    t->change.data = t->entries;
-    next_first_op += count;
-    t->store.sequence = sequence;
-    t->store.changes = &t->change;
-    t->store.count = 1;
-    CHECK(vsr_io_codec_record_bytes(&t->store, &limits, &t->bytes) == VSR_OK);
-    return t;
+    txn_add(t, VSR_STORE_APPEND, first, count, t->entries);
 }
 
-/* A TRIM: the smallest record (header and one descriptor). */
-static const struct txn *txn_trim(uint64_t sequence)
+/* An APPEND at the log end of `sequence`. */
+static const struct txn *txn_append(uint64_t sequence, uint32_t count,
+                                    size_t body)
 {
-    struct txn *t;
+    struct txn *t = txn_begin(sequence);
+    struct vsr_id none = {0, 0};
 
-    CHECK(sequence < TXN_MAX);
-    t = &txns[sequence];
-    memset(t, 0, sizeof(*t));
-    t->change.type = VSR_STORE_TRIM;
-    t->change.count = 0;
-    t->change.first = 1;
-    t->change.data = NULL;
-    t->store.sequence = sequence;
-    t->store.changes = &t->change;
-    t->store.count = 1;
-    CHECK(vsr_io_codec_record_bytes(&t->store, &limits, &t->bytes) == VSR_OK);
-    return t;
+    txn_entries(t, log_end_before(sequence), count, body, none, 0);
+    return txn_finish(t);
+}
+
+/* An APPEND of entries of one client, numbered from `number`. */
+static const struct txn *txn_append_client(uint64_t sequence, uint32_t count,
+                                           size_t body, struct vsr_id client,
+                                           uint64_t number)
+{
+    struct txn *t = txn_begin(sequence);
+
+    txn_entries(t, log_end_before(sequence), count, body, client, number);
+    return txn_finish(t);
+}
+
+/* A TRUNCATE at `first`, followed by an APPEND of `count` entries there
+ * when count is nonzero. */
+static const struct txn *txn_truncate(uint64_t sequence, uint64_t first,
+                                      uint32_t count, size_t body)
+{
+    struct txn *t = txn_begin(sequence);
+    struct vsr_id none = {0, 0};
+
+    txn_add(t, VSR_STORE_TRUNCATE, first, 0, NULL);
+    if (count > 0) {
+        txn_entries(t, first, count, body, none, 0);
+    }
+    return txn_finish(t);
+}
+
+/* A TRIM to `first`: the smallest record (header and one descriptor). */
+static const struct txn *txn_trim(uint64_t sequence, uint64_t first)
+{
+    struct txn *t = txn_begin(sequence);
+
+    txn_add(t, VSR_STORE_TRIM, first, 0, NULL);
+    return txn_finish(t);
+}
+
+/* CLIENTS records: for each i, client ids[i] completed request
+ * numbers[i] at ops[i] with a result of `result` bytes. */
+static const struct txn *txn_clients(uint64_t sequence, uint32_t count,
+                                     const struct vsr_id *ids,
+                                     const uint64_t *numbers,
+                                     const uint64_t *ops, size_t result)
+{
+    struct txn *t = txn_begin(sequence);
+
+    CHECK(count >= 1 && count <= 4 && result <= 64);
+    for (uint32_t i = 0; i < count; ++i) {
+        struct vsr_client_record *record = &t->records[i];
+
+        for (size_t b = 0; b < result; ++b) {
+            t->results[i][b] = (unsigned char)(numbers[i] * 13u + b);
+        }
+        t->result_spans[i].data = t->results[i];
+        t->result_spans[i].size = result;
+        record->request.client = ids[i];
+        record->request.number = numbers[i];
+        record->op = ops[i];
+        record->result.code = 0;
+        record->result.data.spans = result > 0 ? &t->result_spans[i] : NULL;
+        record->result.data.size = result;
+        record->result.data.count = result > 0 ? 1 : 0;
+    }
+    txn_add(t, VSR_STORE_CLIENTS, 0, count, t->records);
+    return txn_finish(t);
+}
+
+/* One steady epoch of one FULL member. */
+static void txn_epoch(struct txn *t)
+{
+    t->members[0].id = 1;
+    t->members[0].role = VSR_MEMBER_FULL;
+    t->membership.epoch = 0;
+    t->membership.members = t->members;
+    t->membership.count = 1;
+    t->membership.faults = 0;
+    t->epoch.current = &t->membership;
+    t->epoch.previous = NULL;
+    t->epoch.boundary = 0;
+    t->epoch.phase = VSR_EPOCH_STEADY;
+}
+
+static void txn_hard_state(struct txn *t, uint32_t role)
+{
+    txn_epoch(t);
+    t->hard.view = 1;
+    t->hard.last_normal_view = 1;
+    t->hard.committed = 0;
+    t->hard.epoch = &t->epoch;
+    t->hard.state = VSR_HARD_NORMAL;
+    t->hard.role = role;
+    txn_add(t, VSR_STORE_HARD_STATE, 0, 1, &t->hard);
+}
+
+/* Transaction 1 of a new store: IDENTITY then HARD_STATE with `role`. */
+static const struct txn *txn_identity(uint64_t sequence, uint32_t role)
+{
+    struct txn *t = txn_begin(sequence);
+
+    t->identity.cluster.hi = 0x77;
+    t->identity.cluster.lo = 0x99;
+    t->identity.replica = 3;
+    t->identity.durability = VSR_DURABLE;
+    txn_add(t, VSR_STORE_IDENTITY, 0, 1, &t->identity);
+    txn_hard_state(t, role);
+    return txn_finish(t);
+}
+
+static const struct txn *txn_hard(uint64_t sequence, uint32_t role)
+{
+    struct txn *t = txn_begin(sequence);
+
+    txn_hard_state(t, role);
+    return txn_finish(t);
+}
+
+static void txn_checkpoint(struct txn *t, struct vsr_id id, uint64_t op)
+{
+    txn_epoch(t);
+    for (size_t b = 0; b < sizeof(t->manifest_bytes); ++b) {
+        t->manifest_bytes[b] = (unsigned char)(id.lo + b);
+    }
+    t->manifest.data = t->manifest_bytes;
+    t->manifest.size = sizeof(t->manifest_bytes);
+    t->checkpoint.id = id;
+    t->checkpoint.op = op;
+    t->checkpoint.view = 1;
+    t->checkpoint.epoch = &t->epoch;
+    t->checkpoint.manifest.spans = &t->manifest;
+    t->checkpoint.manifest.size = sizeof(t->manifest_bytes);
+    t->checkpoint.manifest.count = 1;
+}
+
+static const struct txn *txn_publish(uint64_t sequence, struct vsr_id id,
+                                     uint64_t op)
+{
+    struct txn *t = txn_begin(sequence);
+
+    txn_checkpoint(t, id, op);
+    txn_add(t, VSR_STORE_PUBLISH_CHECKPOINT, 0, 1, &t->checkpoint);
+    return txn_finish(t);
+}
+
+/* A RESTORE with the HARD_STATE the contract requires beside it. */
+static const struct txn *txn_restore(uint64_t sequence, struct vsr_id id,
+                                     uint64_t op, uint32_t role)
+{
+    struct txn *t = txn_begin(sequence);
+
+    txn_checkpoint(t, id, op);
+    txn_add(t, VSR_STORE_RESTORE_CHECKPOINT, 0, 1, &t->checkpoint);
+    txn_hard_state(t, role);
+    return txn_finish(t);
 }
 
 /* Submits a STORE and returns its op id. */
@@ -818,6 +1100,137 @@ static uint64_t submit_sync(uint64_t sequence)
 
     CHECK(vsr_io_store_sync(h.store, op, sequence) == VSR_OK);
     return op;
+}
+
+static uint64_t submit_reclaim(uint64_t oldest)
+{
+    uint64_t op = next_op();
+
+    CHECK(vsr_io_store_reclaim(h.store, op, oldest) == VSR_OK);
+    return op;
+}
+
+/* -------------------------------------------------------------------------
+ * Loads
+ * ---------------------------------------------------------------------- */
+
+static struct vsr_store_read read_of(uint32_t type, uint64_t sequence,
+                                     struct vsr_id client)
+{
+    struct vsr_store_read read;
+
+    memset(&read, 0, sizeof(read));
+    read.type = type;
+    read.sequence = sequence;
+    read.client = client;
+    read.max_count = 1;
+    read.max_bytes = limits.message_bytes;
+    return read;
+}
+
+static uint64_t load_log(uint64_t sequence, uint64_t first, uint64_t end,
+                         uint32_t max_count, uint64_t max_bytes)
+{
+    struct vsr_id none = {0, 0};
+    struct vsr_store_read read = read_of(VSR_LOAD_LOG, sequence, none);
+    uint64_t op = next_op();
+
+    read.first = first;
+    read.end = end;
+    read.max_count = max_count;
+    read.max_bytes = max_bytes;
+    CHECK(vsr_io_store_load(h.store, op, &read) == VSR_OK);
+    return op;
+}
+
+static uint64_t load_client(uint64_t sequence, struct vsr_id client)
+{
+    struct vsr_store_read read = read_of(VSR_LOAD_CLIENT, sequence, client);
+    uint64_t op = next_op();
+
+    CHECK(vsr_io_store_load(h.store, op, &read) == VSR_OK);
+    return op;
+}
+
+static uint64_t load_request(uint64_t sequence, struct vsr_id client)
+{
+    struct vsr_store_read read = read_of(VSR_LOAD_REQUEST, sequence, client);
+    uint64_t op = next_op();
+
+    CHECK(vsr_io_store_load(h.store, op, &read) == VSR_OK);
+    return op;
+}
+
+/* The next completion must be `op` with `status`; an OK LOAD carries
+ * its graph in a lease, returned; any other has neither. */
+static const struct vsr_loaded *expect_loaded(uint64_t op, int32_t status,
+                                              uint32_t *lease)
+{
+    struct vsr_io_completion completion;
+
+    CHECK(next_completion(&completion));
+    if (completion.op != op || completion.status != status) {
+        fprintf(stderr,
+                "completion op %" PRIu64 " status %d, expected %" PRIu64
+                " status %d\n",
+                completion.op, completion.status, op, status);
+    }
+    CHECK(completion.op == op && completion.status == status);
+    if (status != VSR_IO_OK) {
+        CHECK(completion.lease == NONE && completion.data == NULL);
+        return NULL;
+    }
+    CHECK(completion.lease < REGIONS && completion.data != NULL);
+    CHECK(h.replica->leases[completion.lease].state != 0);
+    *lease = completion.lease;
+    return completion.data;
+}
+
+/* RELEASE of a LOAD lease, as the engine routes it. */
+static void release_lease(uint32_t lease)
+{
+    vsr_io_store_release(h.store, lease);
+    vsr_io_lease_release(h.replica, lease);
+}
+
+/* The entry must be entry `i` of the APPEND of `t`, body included. */
+static void check_entry(const struct vsr_entry *entry, const struct txn *t,
+                        uint32_t i)
+{
+    const struct vsr_entry *expected = &t->entries[i];
+    const struct vsr_blob *body = entry->body;
+
+    CHECK(entry->op == expected->op && entry->type == VSR_REQUEST_COMMAND);
+    CHECK(entry->request.client.hi == expected->request.client.hi &&
+          entry->request.client.lo == expected->request.client.lo &&
+          entry->request.number == expected->request.number);
+    CHECK(body != NULL && body->size == t->blobs[i].size);
+    if (body->size > 0) {
+        CHECK(body->count == 1 && memcmp(body->spans[0].data, t->bodies[i],
+                                         (size_t)body->size) == 0);
+    }
+}
+
+/* The base file image: client records written by the test in place of
+ * the snapshot module, read by the store through the base slot. */
+static void base_file_write(const struct vsr_client_record *records,
+                            uint32_t count, uint64_t *offsets)
+{
+    size_t at = 64; /* Where a header would be. */
+
+    memset(base_image, 0, sizeof(base_image));
+    for (uint32_t i = 0; i < count; ++i) {
+        size_t bytes =
+            vsr_io_codec_clients_record_bytes(records[i].result.data.size);
+
+        CHECK(at + bytes <= sizeof(base_image));
+        vsr_io_codec_put_clients_record(&records[i], base_image + at);
+        offsets[i] = at;
+        at += bytes;
+    }
+    disk.base_size = at;
+    disk.base_slot = BASE_SLOT;
+    h.store->base_slot = BASE_SLOT;
 }
 
 /* -------------------------------------------------------------------------
@@ -1302,7 +1715,7 @@ static void test_write_behind(void)
     expect_no_completion();
     CHECK(h.store->head - h.header_bytes > c.write_behind_bytes);
     /* More STOREs queue behind it, in order. */
-    ops[sequence] = submit(txn_trim(sequence));
+    ops[sequence] = submit(txn_trim(sequence, 1));
     sequence++;
     CHECK(h.store->stores_count == 2);
     expect_no_completion();
@@ -1601,20 +2014,22 @@ static void test_growth(void)
     harness_run();
     CHECK(disk.size == 2 * BLOCK + 3 * c.segment_bytes);
     CHECK(h.store->written == sequence - 1);
-    /* No fourth slot: the STORE stays held (phase 2 frees slots). */
-    while (h.store->stores_count == 0) {
+    /* No fourth slot, and no RECLAIM ever: every floor keeps every slot,
+     * so the STORE that needs one fails with FAILED and the store fences
+     * (section 6.1). */
+    while (h.store->state == VSR_IO_STORE_READY) {
         uint64_t op = submit(txn_append(sequence, 4, 128));
 
-        if (h.store->stores_count == 0) {
+        if (h.store->state == VSR_IO_STORE_READY) {
             expect_completion(op, VSR_IO_OK);
             harness_run();
+        } else {
+            expect_completion(op, VSR_IO_FAILED);
         }
         sequence++;
         CHECK(sequence < 128);
     }
-    CHECK(h.store->growth == 0);
-    harness_run();
-    CHECK(h.store->stores_count == 1);
+    CHECK(h.store->growth == 0 && h.store->stores_count == 0);
     expect_no_completion();
     harness_close();
 }
@@ -1888,7 +2303,6 @@ static void test_write_error(void)
     c.write_behind_bytes = 2 * BLOCK;
     harness_open(&c);
     harness_start(VSR_START_NEW);
-    next_first_op = 1;
     expect_completion(submit(txn_append(1, 1, 50)), VSR_IO_OK);
     CHECK(harness_prepare() == 1);
     disk.fail_write = -EIO;
@@ -1966,7 +2380,9 @@ static void test_close(void)
 }
 
 /* The phase-2 and phase-3 entry points refuse until they exist. */
-static void test_stubs(void)
+/* The phase-2 entry points on an empty store: a malformed LOAD is EINVAL,
+ * RECLAIM completes, admission works, nothing waits for a base. */
+static void test_empty_index(void)
 {
     struct config c = base_config();
     struct vsr_store_read read;
@@ -1977,13 +2393,848 @@ static void test_stubs(void)
     memset(&read, 0, sizeof(read));
     read.type = VSR_LOAD_LOG;
     CHECK(vsr_io_store_load(h.store, 50, &read) == VSR_EINVAL);
-    CHECK(vsr_io_store_reclaim(h.store, 51, 1) == VSR_EINVAL);
-    CHECK(!vsr_io_store_admit(h.store, id));
+    CHECK(vsr_io_store_reclaim(h.store, 51, 1) == VSR_OK);
+    expect_completion(51, VSR_IO_OK);
+    CHECK(vsr_io_store_admit(h.store, id));
+    CHECK(h.store->clients_count == 1);
+    vsr_io_store_replied(h.store, id);
+    CHECK(h.store->clients_count == 0);
     CHECK(!vsr_io_store_base_wanted(h.store, &id, NULL));
-    CHECK(vsr_io_store_free_floor(h.store) == 0);
+    CHECK(vsr_io_store_free_floor(h.store) == 1);
     expect_no_completion();
     harness_close();
 }
+
+/* -------------------------------------------------------------------------
+ * Phase 2: indexes, loads, reclaim, freeing, clients, captures
+ * ---------------------------------------------------------------------- */
+
+static const struct vsr_io_op_ref *op_ref(uint64_t op)
+{
+    return &h.store->ops[op % h.options.max_entries];
+}
+
+static const struct vsr_io_client *client_of(struct vsr_id id)
+{
+    for (uint32_t i = 0; i < h.store->clients_capacity; ++i) {
+        const struct vsr_io_client *entry = &h.store->clients[i];
+
+        if (entry->id.hi == id.hi && entry->id.lo == id.lo) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+/* Appends records (written before the next) until the record of
+ * sequence 1 left the ring. */
+static uint64_t evict_first(uint64_t sequence)
+{
+    struct vsr_io_piece piece;
+    uint64_t first = 2 * BLOCK + h.header_bytes;
+
+    while (vsr_io_store_hot(h.store, first, (uint32_t)txns[1].bytes, &piece)) {
+        expect_completion(submit(txn_append(sequence, 4, 200)), VSR_IO_OK);
+        harness_run();
+        sequence++;
+        CHECK(sequence < 256);
+    }
+    return sequence;
+}
+
+/* The op ring after APPENDs by two clients, LOG and REQUEST loads at the
+ * current and an older sequence, TRUNCATE moving versions and fixing the
+ * retained entries, RETRY for a REQUEST behind a TRUNCATE, RECLAIM
+ * dropping the versions. */
+static void test_index_ops(void)
+{
+    struct config c = base_config();
+    struct vsr_id a = {0xA, 1};
+    struct vsr_id b = {0xB, 1};
+    const struct vsr_loaded *loaded;
+    const struct vsr_entry *entries;
+    struct vsr_store_read read;
+    uint32_t lease = NONE;
+    uint64_t op;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_append_client(1, 2, 20, a, 1)), VSR_IO_OK);
+    expect_completion(submit(txn_append_client(2, 1, 20, b, 10)), VSR_IO_OK);
+    expect_completion(submit(txn_append_client(3, 2, 20, a, 3)), VSR_IO_OK);
+    CHECK(h.store->log_begin == 1 && h.store->log_end == 6);
+    CHECK(h.store->retained_begin == 1 && h.store->clients_count == 2);
+    CHECK(op_ref(5)->op == 5 && op_ref(5)->sequence == 3 &&
+          op_ref(5)->index == 1 && op_ref(5)->previous == 4);
+    CHECK(op_ref(4)->previous == 2 && op_ref(2)->previous == 1 &&
+          op_ref(1)->previous == 0 && op_ref(3)->previous == 0);
+    CHECK(op_ref(3)->client.hi == 0xB && op_ref(3)->change == 0);
+    CHECK(client_of(a)->retained == 5 && client_of(b)->retained == 3);
+    /* REQUEST at the current sequence, and at the one before (decision
+     * 51: the previous link). */
+    op = load_request(3, a);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1 && loaded->sequence == 3 && loaded->next == 0);
+    check_entry(loaded->items, &txns[3], 1);
+    CHECK(h.store->pins[lease].begin != UINT64_MAX);
+    release_lease(lease);
+    CHECK(h.store->pins[lease].begin == UINT64_MAX);
+    op = load_request(2, a);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    check_entry(loaded->items, &txns[1], 1);
+    release_lease(lease);
+    op = load_request(3, b);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    check_entry(loaded->items, &txns[2], 0);
+    release_lease(lease);
+    /* LOG: hot across records, the count and byte bounds, the ends. */
+    op = load_log(3, 1, 6, 4, limits.message_bytes);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 4 && loaded->next == 5);
+    entries = loaded->items;
+    check_entry(&entries[0], &txns[1], 0);
+    check_entry(&entries[1], &txns[1], 1);
+    check_entry(&entries[2], &txns[2], 0);
+    check_entry(&entries[3], &txns[3], 0);
+    release_lease(lease);
+    op = load_log(3, 5, 6, 4, limits.message_bytes);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1 && loaded->next == 6);
+    check_entry(loaded->items, &txns[3], 1);
+    release_lease(lease);
+    op = load_log(3, 1, 6, 4, 30); /* One entry of 20 fits, two do not. */
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1 && loaded->next == 2);
+    release_lease(lease);
+    op = load_log(3, 6, 6, 4, limits.message_bytes); /* Empty range. */
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 0 && loaded->next == 6 && loaded->items == NULL);
+    release_lease(lease);
+    op = load_log(3, 6, 9, 4, limits.message_bytes);
+    expect_loaded(op, VSR_IO_NOT_FOUND, &lease);
+    op = load_log(2, 4, 6, 4, limits.message_bytes); /* Not yet at 2. */
+    expect_loaded(op, VSR_IO_NOT_FOUND, &lease);
+    op = load_log(2, 1, 6, 4, limits.message_bytes);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 3 && loaded->next == 4);
+    release_lease(lease);
+    /* Malformed loads are the caller's bug. */
+    read = read_of(VSR_LOAD_LOG, 4, a);
+    CHECK(vsr_io_store_load(h.store, 70, &read) == VSR_EINVAL); /* > readable */
+    read = read_of(VSR_LOAD_RECOVERY, 3, a);
+    CHECK(vsr_io_store_load(h.store, 70, &read) == VSR_EINVAL);
+    read = read_of(VSR_LOAD_LOG, 3, a);
+    read.first = 5;
+    read.end = 4;
+    CHECK(vsr_io_store_load(h.store, 70, &read) == VSR_EINVAL);
+    read.end = 6;
+    read.max_count = limits.batch_entries + 1;
+    CHECK(vsr_io_store_load(h.store, 70, &read) == VSR_EINVAL);
+    CHECK(vsr_io_store_load(h.store, 0, &read) == VSR_EINVAL);
+    CHECK(vsr_io_store_load(h.store, 70, NULL) == VSR_EINVAL);
+    expect_no_completion();
+    /* TRUNCATE at 4 with a new op 4: the versions of 4 and 5 move to the
+     * table, a's retained entry falls back to 2. */
+    expect_completion(submit(txn_truncate(4, 4, 1, 20)), VSR_IO_OK);
+    CHECK(h.store->log_end == 5 && h.store->versions_count == 2);
+    CHECK(op_ref(4)->sequence == 4 && op_ref(5)->op == 0);
+    CHECK(client_of(a)->retained == 2 && h.store->reindexed == 4);
+    for (uint32_t i = 0; i < 2; ++i) {
+        const struct vsr_io_version *v = &h.store->versions[i];
+
+        CHECK((v->op == 4 || v->op == 5) && v->appended == 3 &&
+              v->truncated == 4 && v->client.hi == 0xA);
+    }
+    op = load_log(3, 4, 6, 4, limits.message_bytes); /* The old versions. */
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 2 && loaded->next == 6);
+    entries = loaded->items;
+    check_entry(&entries[0], &txns[3], 0);
+    check_entry(&entries[1], &txns[3], 1);
+    release_lease(lease);
+    op = load_log(4, 4, 6, 4, limits.message_bytes);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1 && loaded->next == 5);
+    check_entry(loaded->items, &txns[4], 0);
+    release_lease(lease);
+    op = load_request(3, a);
+    expect_loaded(op, VSR_IO_RETRY, &lease);
+    op = load_request(4, a);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    check_entry(loaded->items, &txns[1], 1);
+    release_lease(lease);
+    /* RECLAIM past the truncation drops the versions; revision 3 can no
+     * longer be named. */
+    expect_completion(submit_reclaim(4), VSR_IO_OK);
+    CHECK(h.store->versions_count == 0 && h.store->reclaim == 4);
+    read = read_of(VSR_LOAD_LOG, 3, a);
+    read.end = 6;
+    CHECK(vsr_io_store_load(h.store, 71, &read) == VSR_EINVAL);
+    CHECK(vsr_io_store_reclaim(h.store, 72, 6) == VSR_EINVAL);
+    expect_completion(submit_reclaim(2), VSR_IO_OK); /* Never backwards. */
+    CHECK(h.store->reclaim == 4);
+    expect_no_completion();
+    harness_close();
+}
+
+/* The op ring and the client table at capacity fail the STORE with
+ * FAILED and fence (an invariant, decision 44). */
+static void test_index_full(void)
+{
+    struct config c = base_config();
+    struct vsr_id a = {0xA, 1};
+    struct vsr_id b = {0xB, 1};
+    struct vsr_id d = {0xD, 1};
+    uint64_t op;
+
+    c.max_entries = 8;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_append(1, 4, 8)), VSR_IO_OK);
+    expect_completion(submit(txn_append(2, 4, 8)), VSR_IO_OK);
+    op = submit(txn_append(3, 1, 8));
+    expect_completion(op, VSR_IO_FAILED);
+    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    op = submit(txn_append(4, 1, 8)); /* Fenced: everything fails. */
+    expect_completion(op, VSR_IO_FAILED);
+    harness_close();
+
+    c = base_config();
+    c.max_clients = 2;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_append_client(1, 1, 8, a, 1)), VSR_IO_OK);
+    CHECK(vsr_io_store_admit(h.store, b)); /* In flight counts. */
+    CHECK(!vsr_io_store_admit(h.store, d));
+    CHECK(vsr_io_store_admit(h.store, a)); /* Known. */
+    expect_completion(submit(txn_append_client(2, 1, 8, b, 1)), VSR_IO_OK);
+    CHECK(client_of(b)->inflight == 0 && h.store->clients_count == 2);
+    op = submit(txn_append_client(3, 1, 8, d, 1));
+    expect_completion(op, VSR_IO_FAILED);
+    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    harness_close();
+}
+
+/* Cold LOADs: one read at a time into a pool slab the lease then holds,
+ * the batch cut to a slab, a short read, a read error, a fence with a
+ * read in flight. */
+static void test_load_cold(void)
+{
+    struct config c = base_config();
+    const struct vsr_loaded *loaded;
+    const struct vsr_entry *entries;
+    const struct vsr_blob *body;
+    uint64_t header_bytes;
+    uint64_t max_record;
+    uint64_t sequence;
+    uint64_t data;
+    uint64_t op;
+    uint64_t op2;
+    uint32_t lease = NONE;
+    uint32_t free_slabs;
+    uint32_t at;
+
+    derive(&header_bytes, &max_record);
+    c.segment_bytes = round_up(header_bytes + 64 * max_record, BLOCK);
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    data = 2 * BLOCK + h.header_bytes;
+    expect_completion(submit(txn_append(1, 4, 200)), VSR_IO_OK);
+    harness_run();
+    sequence = evict_first(2);
+    free_slabs = h.io->pool.free_count;
+    /* The read: block aligned, fixed file and buffer, into the pool. */
+    op = load_log(sequence - 1, 1, 5, 4, limits.message_bytes);
+    expect_no_completion();
+    CHECK(h.store->loads_count == 1);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_READ);
+    CHECK(at != NONE && h.pending[at].sqe.fd == disk.slot);
+    CHECK(h.pending[at].sqe.flags ==
+          (VSR_IO_SQE_FIXED_FILE | VSR_IO_SQE_FIXED_BUFFER));
+    CHECK(h.pending[at].sqe.offset == data / BLOCK * BLOCK);
+    CHECK(h.pending[at].sqe.length ==
+          round_up(data + txns[1].bytes, BLOCK) - data / BLOCK * BLOCK);
+    CHECK(in_pool(h.pending[at].sqe.addr, h.pending[at].sqe.length));
+    CHECK(h.io->pool.free_count == free_slabs - 1);
+    CHECK(h.store->cold_active == 1);
+    harness_complete(at);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 4 && loaded->next == 5 &&
+          loaded->sequence == sequence - 1);
+    entries = loaded->items;
+    for (uint32_t i = 0; i < 4; ++i) {
+        check_entry(&entries[i], &txns[1], i);
+    }
+    body = entries[0].body;
+    CHECK(in_pool(body->spans[0].data, (size_t)body->size));
+    CHECK(h.replica->leases[lease].slab != NONE);
+    CHECK(h.store->pins[lease].begin == UINT64_MAX); /* No ring pin. */
+    CHECK(h.io->pool.free_count == free_slabs - 1);
+    release_lease(lease);
+    CHECK(h.io->pool.free_count == free_slabs);
+    /* Two cold loads: the second reads only after the first completed;
+     * a hot one behind them waits its turn. */
+    op = load_log(sequence - 1, 1, 2, 1, limits.message_bytes);
+    op2 = load_log(sequence - 1, 3, 4, 1, limits.message_bytes);
+    CHECK(harness_prepare() == 1);
+    CHECK(harness_prepare() == 0);
+    harness_complete(pending_of(VSR_IO_SQE_READ));
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    check_entry(loaded->items, &txns[1], 0);
+    release_lease(lease);
+    expect_no_completion();
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_READ));
+    loaded = expect_loaded(op2, VSR_IO_OK, &lease);
+    check_entry(loaded->items, &txns[1], 2);
+    release_lease(lease);
+    /* A short read leaves the record incomplete: CORRUPT, slab back. */
+    op = load_log(sequence - 1, 1, 2, 1, limits.message_bytes);
+    CHECK(harness_prepare() == 1);
+    disk.short_read = 8;
+    harness_complete(pending_of(VSR_IO_SQE_READ));
+    expect_loaded(op, VSR_IO_CORRUPT, &lease);
+    CHECK(h.io->pool.free_count == free_slabs);
+    CHECK(h.store->state == VSR_IO_STORE_READY);
+    op = load_log(sequence - 1, 1, 2, 1, limits.message_bytes);
+    CHECK(harness_prepare() == 1);
+    disk.fail_read = -EIO;
+    harness_complete(pending_of(VSR_IO_SQE_READ));
+    expect_loaded(op, VSR_IO_FAILED, &lease);
+    CHECK(h.io->pool.free_count == free_slabs);
+    CHECK(h.store->state == VSR_IO_STORE_READY);
+    /* A fence with the read in flight: the load fails at once and the
+     * slab returns when the read completes. */
+    op = load_log(sequence - 1, 1, 2, 1, limits.message_bytes);
+    expect_completion(submit(txn_append(sequence, 1, 8)), VSR_IO_OK);
+    CHECK(harness_prepare() == 2);
+    disk.fail_write = -EIO;
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    expect_completion(op, VSR_IO_FAILED);
+    CHECK(h.io->pool.free_count == free_slabs - 1);
+    harness_complete(pending_of(VSR_IO_SQE_READ));
+    CHECK(h.io->pool.free_count == free_slabs && h.store->cold_active == 0);
+    harness_close();
+}
+
+/* CLIENTS records and CLIENT loads: the latest completed record, RETRY
+ * for a load behind it (decision 51), older results ignored, admission
+ * and replies, a contradicting record CORRUPT. */
+static void test_clients(void)
+{
+    struct config c = base_config();
+    struct vsr_id ids[4] = {{0xA, 1}, {0xB, 1}, {0xC, 1}, {0xD, 1}};
+    uint64_t numbers[4] = {1, 1, 0, 0};
+    uint64_t ops[4] = {1, 2, 0, 0};
+    const struct vsr_loaded *loaded;
+    const struct vsr_client_record *record;
+    uint32_t lease = NONE;
+    uint64_t op;
+
+    c.max_clients = 3;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_clients(1, 2, ids, numbers, ops, 8)),
+                      VSR_IO_OK);
+    CHECK(h.store->clients_count == 2 && h.store->clients_sequence == 1);
+    CHECK(client_of(ids[0])->current.number == 1 &&
+          client_of(ids[0])->current.sequence == 1 &&
+          client_of(ids[1])->current.index == 1);
+    op = load_client(1, ids[0]);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1 && loaded->next == 0);
+    record = loaded->items;
+    CHECK(record->request.number == 1 && record->op == 1 &&
+          record->result.data.size == 8 &&
+          memcmp(record->result.data.spans[0].data, txns[1].results[0], 8) ==
+              0);
+    release_lease(lease);
+    op = load_client(1, ids[3]); /* Unknown: a count-zero success. */
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 0 && loaded->items == NULL);
+    release_lease(lease);
+    numbers[0] = 2;
+    ops[0] = 3;
+    expect_completion(submit(txn_clients(2, 1, ids, numbers, ops, 8)),
+                      VSR_IO_OK);
+    op = load_client(1, ids[0]);
+    expect_loaded(op, VSR_IO_RETRY, &lease);
+    op = load_client(2, ids[0]);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    record = loaded->items;
+    CHECK(record->request.number == 2 && record->op == 3);
+    release_lease(lease);
+    numbers[0] = 1;
+    ops[0] = 1;
+    expect_completion(submit(txn_clients(3, 1, ids, numbers, ops, 8)),
+                      VSR_IO_OK); /* Replayed: ignored. */
+    CHECK(client_of(ids[0])->current.number == 2);
+    /* Admission: known or room within max_clients; a reply to an
+     * incarnation with nothing else deletes it; an APPEND indexes it. */
+    CHECK(vsr_io_store_admit(h.store, ids[2]));
+    CHECK(client_of(ids[2])->inflight == 1 && h.store->clients_count == 3);
+    CHECK(!vsr_io_store_admit(h.store, ids[3]));
+    vsr_io_store_replied(h.store, ids[2]);
+    CHECK(client_of(ids[2]) == NULL && h.store->clients_count == 2);
+    vsr_io_store_replied(h.store, ids[0]); /* Has a record: stays. */
+    CHECK(client_of(ids[0]) != NULL);
+    CHECK(vsr_io_store_admit(h.store, ids[3]));
+    expect_completion(submit(txn_append_client(4, 1, 8, ids[3], 5)), VSR_IO_OK);
+    CHECK(client_of(ids[3])->inflight == 0 && client_of(ids[3])->retained == 1);
+    /* Same number, another op: CORRUPT, fenced. */
+    numbers[0] = 2;
+    ops[0] = 99;
+    op = submit(txn_clients(5, 1, ids, numbers, ops, 8));
+    expect_completion(op, VSR_IO_CORRUPT);
+    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    op = load_client(5, ids[0]);
+    expect_loaded(op, VSR_IO_FAILED, &lease);
+    harness_close();
+}
+
+/* The freeing floor with each term binding in turn: the oldest retained
+ * record, the RECLAIM revision, the client base, a capture, a kept
+ * version. */
+static void test_floor(void)
+{
+    struct config c = base_config();
+    struct vsr_id a = {0xA, 1};
+    struct vsr_id b = {0xB, 1};
+    struct vsr_id x = {0x51, 1};
+    struct vsr_id y = {0x52, 1};
+    struct vsr_id none = {0, 0};
+    struct vsr_io_client_snapshot out[8];
+    uint64_t numbers[1] = {1};
+    uint64_t ops[1] = {1};
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    CHECK(vsr_io_store_free_floor(h.store) == 0); /* No RECLAIM yet. */
+    expect_completion(submit(txn_append_client(1, 2, 16, a, 1)), VSR_IO_OK);
+    expect_completion(submit(txn_append_client(2, 1, 16, b, 1)), VSR_IO_OK);
+    expect_completion(submit(txn_append_client(3, 1, 16, a, 3)), VSR_IO_OK);
+    expect_completion(submit_reclaim(2), VSR_IO_OK);
+    CHECK(vsr_io_store_free_floor(h.store) == 1); /* Base 0 + 1. */
+    vsr_io_store_base_set(h.store, x, 3); /* No records: nothing lower. */
+    CHECK(h.store->client_base == 3);
+    CHECK(vsr_io_store_free_floor(h.store) == 1); /* Op 1's record. */
+    expect_completion(submit(txn_trim(4, 3)), VSR_IO_OK);
+    CHECK(h.store->log_begin == 3 && h.store->retained_begin == 1);
+    CHECK(client_of(a)->retained == 4 && client_of(b)->retained == 3);
+    CHECK(vsr_io_store_free_floor(h.store) == 1);
+    expect_completion(submit_reclaim(4), VSR_IO_OK);
+    CHECK(h.store->retained_begin == 3 && op_ref(1)->op == 0);
+    CHECK(vsr_io_store_free_floor(h.store) == 2); /* Op 3's record. */
+    expect_completion(submit(txn_trim(5, 5)), VSR_IO_OK);
+    CHECK(client_of(a) == NULL && client_of(b) == NULL);
+    expect_completion(submit_reclaim(6), VSR_IO_OK);
+    CHECK(h.store->log_begin == 5 && h.store->log_end == 5);
+    CHECK(vsr_io_store_free_floor(h.store) == 4); /* Client base 3. */
+    vsr_io_store_base_set(h.store, x, 5);
+    CHECK(vsr_io_store_free_floor(h.store) == 6); /* Everything. */
+    expect_completion(submit(txn_append_client(6, 1, 16, a, 9)), VSR_IO_OK);
+    expect_completion(submit(txn_trim(7, 6)), VSR_IO_OK);
+    CHECK(client_of(a) == NULL); /* Its retained entry was trimmed. */
+    expect_completion(submit_reclaim(7), VSR_IO_OK);
+    vsr_io_store_base_set(h.store, x, 7);
+    CHECK(vsr_io_store_free_floor(h.store) == 7); /* RECLAIM. */
+    /* A capture: its floor is the oldest record it copies. */
+    expect_completion(submit(txn_clients(8, 1, &a, numbers, ops, 8)),
+                      VSR_IO_OK);
+    expect_completion(submit_reclaim(9), VSR_IO_OK);
+    CHECK(vsr_io_store_snapshot_clients(h.store, out, 8) == 1);
+    CHECK(out[0].id.hi == 0xA && out[0].record.sequence == 8);
+    CHECK(h.store->capture_floor == 8);
+    CHECK(vsr_io_store_free_floor(h.store) == 8); /* Base 7 + 1 too. */
+    vsr_io_store_capture_offset(h.store, a, 100);
+    vsr_io_store_capture_end(h.store, y, 8);
+    CHECK(h.store->capture_floor == UINT64_MAX);
+    vsr_io_store_base_set(h.store, y, 9);
+    CHECK(h.store->client_base == 9 && client_of(a)->base_offset == 100);
+    CHECK(vsr_io_store_free_floor(h.store) == 9);
+    CHECK(vsr_io_store_snapshot_clients(h.store, out, 8) == 1);
+    CHECK(vsr_io_store_free_floor(h.store) == 8); /* The capture. */
+    vsr_io_store_capture_end(h.store, none, 0);   /* Abandoned. */
+    CHECK(vsr_io_store_free_floor(h.store) == 9);
+    vsr_io_store_base_set(h.store, x, 9); /* A file not covering a. */
+    CHECK(h.store->client_base == 7);
+    CHECK(vsr_io_store_free_floor(h.store) == 8);
+    /* A kept version binds below everything else. */
+    expect_completion(submit(txn_append(9, 1, 16)), VSR_IO_OK);
+    expect_completion(submit(txn_append(10, 1, 16)), VSR_IO_OK);
+    expect_completion(submit(txn_truncate(11, 6, 0, 0)), VSR_IO_OK);
+    CHECK(h.store->versions_count == 2 && h.store->log_end == 6);
+    vsr_io_store_capture_offset(h.store, a, 100);
+    vsr_io_store_base_set(h.store, y, 11);
+    CHECK(h.store->client_base == 11);
+    expect_completion(submit_reclaim(10), VSR_IO_OK);
+    CHECK(h.store->versions_count == 2);
+    CHECK(vsr_io_store_free_floor(h.store) == 9); /* Op 6's version. */
+    expect_completion(submit_reclaim(11), VSR_IO_OK);
+    CHECK(h.store->versions_count == 0);
+    CHECK(vsr_io_store_free_floor(h.store) == 11);
+    expect_no_completion();
+    harness_close();
+}
+
+/* Freeing: a sealed slot below the floor is freed at RECLAIM, its
+ * extents die, the superblock names the new start before the slot is
+ * reused, a STORE needing the slot waits for that write, and the reuse
+ * rewrites the slot's blocks (the model forgets a freed slot). */
+static void test_free_segments(void)
+{
+    struct config c = base_config();
+    struct vsr_io_wire_superblock superblock;
+    struct vsr_id x = {0x51, 1};
+    struct vsr_io_piece piece;
+    uint64_t sequence = 1;
+    uint64_t sealed_at;
+    uint64_t held;
+    uint32_t at;
+
+    c.segments = 2;
+    c.max_segments = 2;
+    c.write_behind_bytes = c.segment_bytes;
+    c.cache_bytes += c.segment_bytes;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    while (h.store->current == 0) {
+        expect_completion(submit(txn_append(sequence, 4, 128)), VSR_IO_OK);
+        sequence++;
+    }
+    harness_run();
+    sealed_at = h.store->segments[0].last_sequence;
+    CHECK(vsr_io_store_hot(h.store, slot_offset(0) + h.header_bytes,
+                           (uint32_t)txns[1].bytes, &piece));
+    /* Nothing frees while the floors keep slot 0. */
+    vsr_io_store_free_segments(h.store);
+    CHECK(h.store->segments[0].number == 1);
+    expect_completion(submit(txn_trim(sequence, h.store->log_end)), VSR_IO_OK);
+    sequence++;
+    expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+    CHECK(h.store->segments[0].number == 1); /* Client base 0. */
+    vsr_io_store_base_set(h.store, x, sequence - 1);
+    CHECK(vsr_io_store_free_floor(h.store) == sequence);
+    CHECK(sealed_at < sequence);
+    vsr_io_store_free_segments(h.store);
+    CHECK(h.store->segments[0].number == 0 &&
+          h.store->segments[0].phase == VSR_IO_SEGMENT_FREEING);
+    CHECK(h.store->start_segment == 2 && h.store->start_slot == 1);
+    CHECK(h.store->superblock_dirty == 1);
+    CHECK(!vsr_io_store_hot(h.store, slot_offset(0) + h.header_bytes,
+                            (uint32_t)txns[1].bytes, &piece));
+    disk_forget_slot(0, c.segment_bytes);
+    /* Fill slot 1: the STORE that needs a slot waits for the superblock
+     * write, then reuses slot 0 as segment 3. */
+    held = 0;
+    while (h.store->stores_count == 0) {
+        uint64_t op = submit(txn_append(sequence, 4, 128));
+
+        if (h.store->stores_count == 0) {
+            expect_completion(op, VSR_IO_OK);
+        } else {
+            held = op;
+        }
+        sequence++;
+        CHECK(sequence < 128);
+    }
+    CHECK(h.store->state == VSR_IO_STORE_READY && held != 0);
+    at = NONE;
+    while (at == NONE) {
+        CHECK(harness_prepare() >= 1);
+        for (uint32_t i = 0; i < PENDING_MAX; ++i) {
+            if (h.pending[i].state == 1 &&
+                h.pending[i].sqe.opcode == VSR_IO_SQE_WRITE &&
+                h.pending[i].sqe.offset < 2 * BLOCK) {
+                at = i;
+            }
+        }
+        if (at == NONE) {
+            harness_complete(pending_of(VSR_IO_SQE_WRITE));
+        }
+    }
+    harness_poll();
+    expect_no_completion();
+    harness_complete(at); /* The slot frees and is reused at once. */
+    expect_completion(held, VSR_IO_OK);
+    CHECK(h.store->current == 0 && h.store->segments[0].number == 3);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_HEADER);
+    harness_run();
+    read_superblock(h.store->superblock_next == 0 ? 1 : 0, &superblock);
+    CHECK(superblock.start_segment == 2 && superblock.start_slot == 1);
+    CHECK(scan_records(slot_offset(0) + h.header_bytes, h.store->file_head,
+                       sequence - 1) == sequence - 1);
+    expect_no_completion();
+    harness_close();
+}
+
+/* A capture's snapshot and offsets, PUBLISH of the latest capture making
+ * it the base, a CLIENT load from the base file, then the held
+ * transactions: a PUBLISH of a foreign snapshot merging its file, a
+ * RESTORE replacing the table, a base load that fails. */
+static void test_capture_base(void)
+{
+    struct config c = base_config();
+    struct vsr_id ids[2] = {{0xA, 1}, {0xB, 1}};
+    struct vsr_id x = {0x51, 1};
+    struct vsr_id y = {0x52, 1};
+    struct vsr_id z = {0x53, 1};
+    struct vsr_id w = {0x54, 1};
+    struct vsr_id v = {0x55, 1};
+    struct vsr_id defaults[2] = {{0x1000, 1}, {0x1001, 1}};
+    uint64_t numbers[2] = {1, 1};
+    uint64_t ops[2] = {1, 2};
+    struct vsr_io_client_snapshot out[8];
+    struct vsr_client_record records[2];
+    struct vsr_io_wire_client_record wire;
+    uint64_t offsets[2] = {0, 0};
+    uint64_t header_bytes;
+    uint64_t max_record;
+    uint64_t sequence;
+    uint64_t op;
+    uint64_t wanted_sequence = 0;
+    const struct vsr_loaded *loaded;
+    const struct vsr_client_record *record;
+    struct vsr_id wanted;
+    struct vsr_io_piece piece;
+    uint32_t lease = NONE;
+    uint32_t at;
+
+    derive(&header_bytes, &max_record);
+    c.segment_bytes = round_up(header_bytes + 64 * max_record, BLOCK);
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_identity(1, VSR_MEMBER_FULL)), VSR_IO_OK);
+    expect_completion(submit(txn_clients(2, 2, ids, numbers, ops, 8)),
+                      VSR_IO_OK);
+    expect_completion(submit(txn_append_client(3, 1, 16, ids[0], 2)),
+                      VSR_IO_OK);
+    CHECK(vsr_io_store_snapshot_clients(h.store, out, 8) == 2);
+    CHECK(vsr_io_store_snapshot_clients(h.store, out, 1) == 2);
+    CHECK(h.store->capture_floor == 2);
+    for (uint32_t i = 0; i < 2; ++i) {
+        records[i] = txns[2].records[out[i].id.hi == 0xA ? 0 : 1];
+        CHECK(out[i].record.sequence == 2 &&
+              out[i].record.offset == client_of(out[i].id)->current.offset);
+    }
+    base_file_write(records, 2, offsets);
+    for (uint32_t i = 0; i < 2; ++i) {
+        vsr_io_store_capture_offset(h.store, out[i].id, offsets[i]);
+    }
+    vsr_io_store_capture_end(h.store, x, 3);
+    expect_completion(submit(txn_publish(4, x, 1)), VSR_IO_OK); /* No wait. */
+    CHECK(h.store->client_base == 3 && h.store->client_base_id.hi == 0x51);
+    CHECK(client_of(out[0].id)->base_offset == offsets[0]);
+    CHECK(h.store->anchor.id.hi == 0x51 && h.store->anchor.op == 1);
+    CHECK(h.store->anchor.manifest.size == 16 &&
+          memcmp(h.store->anchor.manifest.spans[0].data, txns[4].manifest_bytes,
+                 16) == 0);
+    /* The record is still hot: read from the ring. */
+    op = load_client(4, ids[0]);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1 && h.store->pins[lease].begin != UINT64_MAX);
+    release_lease(lease);
+    /* Once evicted: from the base file through its slot. */
+    sequence = 5;
+    while (vsr_io_store_hot(h.store, client_of(ids[0])->current.offset,
+                            client_of(ids[0])->current.length, &piece)) {
+        expect_completion(submit(txn_append(sequence, 4, 200)), VSR_IO_OK);
+        harness_run();
+        sequence++;
+        CHECK(sequence < 256);
+    }
+    op = load_client(sequence - 1, ids[1]);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_READ);
+    CHECK(at != NONE && h.pending[at].sqe.fd == BASE_SLOT);
+    CHECK(h.pending[at].sqe.offset <= offsets[1] &&
+          h.pending[at].sqe.offset + h.pending[at].sqe.length > offsets[1]);
+    harness_complete(at);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    record = loaded->items;
+    CHECK(record->request.client.hi == 0xB && record->request.number == 1 &&
+          record->op == 2 && record->result.data.size == 8);
+    CHECK(in_pool(record->result.data.spans[0].data, 8));
+    release_lease(lease);
+    /* A foreign PUBLISH waits for its file: b's newer record comes from
+     * it, a keeps the log's newer one and lowers the base below it. */
+    numbers[0] = 3;
+    ops[0] = 7;
+    expect_completion(submit(txn_clients(sequence, 1, ids, numbers, ops, 8)),
+                      VSR_IO_OK);
+    sequence++;
+    op = submit(txn_publish(sequence, y, 3));
+    expect_no_completion();
+    CHECK(h.store->stores_count == 1);
+    CHECK(vsr_io_store_base_wanted(h.store, &wanted, &wanted_sequence));
+    CHECK(wanted.hi == 0x52 && wanted_sequence == sequence);
+    vsr_io_store_base_begin(h.store);
+    CHECK(!vsr_io_store_base_wanted(h.store, &wanted, NULL));
+    memset(&wire, 0, sizeof(wire));
+    wire.client_hi = 0xB;
+    wire.client_lo = 1;
+    wire.number = 4;
+    wire.op = 9;
+    CHECK(vsr_io_store_base_record(h.store, &wire, 300) == VSR_OK);
+    wire.client_hi = 0xA;
+    wire.number = 1; /* Older than a's record: not covered. */
+    wire.op = 1;
+    CHECK(vsr_io_store_base_record(h.store, &wire, 400) == VSR_OK);
+    wire.number = 0;
+    CHECK(vsr_io_store_base_record(h.store, &wire, 500) == VSR_EINVAL);
+    vsr_io_store_base_end(h.store, y, sequence);
+    expect_no_completion();
+    vsr_io_store_base_resume(h.store, VSR_IO_OK);
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->client_base_id.hi == 0x52 &&
+          h.store->client_base == sequence - 2);
+    CHECK(client_of(ids[1])->current.number == 4 &&
+          client_of(ids[1])->current.sequence == 0 &&
+          client_of(ids[1])->base_offset == 300);
+    CHECK(client_of(ids[0])->current.number == 3 &&
+          client_of(ids[0])->base_offset == UINT64_MAX);
+    sequence++;
+    /* A RESTORE replaces the table with the file's and rebuilds the
+     * retained entries from the log above the checkpoint. */
+    op = submit(txn_restore(sequence, z, 2, VSR_MEMBER_FULL));
+    CHECK(vsr_io_store_base_wanted(h.store, &wanted, NULL) &&
+          wanted.hi == 0x53);
+    vsr_io_store_base_begin(h.store);
+    wire.client_hi = 0xB;
+    wire.number = 5;
+    wire.op = 11;
+    CHECK(vsr_io_store_base_record(h.store, &wire, 600) == VSR_OK);
+    vsr_io_store_base_end(h.store, z, sequence);
+    vsr_io_store_base_resume(h.store, VSR_IO_OK);
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->log_begin == 3 && h.store->restored == sequence);
+    CHECK(client_of(ids[1])->current.number == 5 &&
+          client_of(ids[1])->base_offset == 600);
+    CHECK(client_of(ids[0]) == NULL); /* Its only entry, op 1, is gone. */
+    CHECK(client_of(defaults[0])->retained != 0 &&
+          client_of(defaults[0])->current.number == 0);
+    CHECK(h.store->clients_count == 3);
+    CHECK(h.store->client_base == sequence && h.store->anchor.op == 2);
+    sequence++;
+    /* A witness needs no file: the table keeps only retained entries. */
+    op = submit(txn_restore(sequence, w, 2, VSR_MEMBER_WITNESS));
+    expect_completion(op, VSR_IO_OK);
+    CHECK(client_of(ids[1]) == NULL && h.store->clients_count == 2);
+    CHECK(client_of(defaults[1])->retained == h.store->log_end - 1);
+    sequence++;
+    expect_completion(submit(txn_hard(sequence, VSR_MEMBER_FULL)), VSR_IO_OK);
+    sequence++;
+    /* A base load that fails fails the transaction and fences. */
+    op = submit(txn_publish(sequence, v, 3));
+    CHECK(vsr_io_store_base_wanted(h.store, &wanted, NULL));
+    vsr_io_store_base_resume(h.store, VSR_IO_CORRUPT);
+    expect_completion(op, VSR_IO_CORRUPT);
+    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    harness_close();
+}
+
+/* The logical state reaches later segment headers and the superblock:
+ * identity, hard state and the anchor. */
+static void test_state_headers(void)
+{
+    struct config c = base_config();
+    struct vsr_io_wire_superblock superblock;
+    struct vsr_io_wire_segment fixed;
+    struct vsr_store_identity identity;
+    struct vsr_hard_state hard;
+    struct vsr_checkpoint *checkpoint = NULL;
+    struct vsr_io_bump region;
+    struct vsr_id x = {0x51, 1};
+    uint64_t sequence = 3;
+    uint32_t at;
+
+    c.write_behind_bytes = c.segment_bytes;
+    c.cache_bytes += c.segment_bytes;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_identity(1, VSR_MEMBER_WITNESS)), VSR_IO_OK);
+    CHECK(h.store->identity_set && h.store->hard.role == VSR_MEMBER_WITNESS);
+    CHECK(h.store->superblock_dirty == 1);
+    expect_completion(submit(txn_publish(2, x, 7)), VSR_IO_OK);
+    CHECK(harness_prepare() >= 1);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    while (h.pending[at].sqe.offset >= 2 * BLOCK) {
+        harness_complete(at);
+        harness_prepare();
+        at = pending_of(VSR_IO_SQE_WRITE);
+        CHECK(at != NONE);
+    }
+    harness_complete(at);
+    read_superblock(h.pending[at].sqe.offset == 0 ? 0 : 1, &superblock);
+    CHECK(superblock.cluster_hi == 0x77 && superblock.cluster_lo == 0x99 &&
+          superblock.replica == 3);
+    while (h.store->current == 0) {
+        expect_completion(submit(txn_append(sequence, 4, 128)), VSR_IO_OK);
+        sequence++;
+        CHECK(sequence < 64);
+    }
+    harness_run();
+    vsr_io_bump_init(&region, lease_memory, LEASE_BYTES);
+    CHECK(vsr_io_codec_get_segment(
+              disk_image + slot_offset(1), (size_t)h.header_bytes, &limits,
+              &region, &fixed, &identity, &hard, &checkpoint) == VSR_OK);
+    CHECK(identity.cluster.hi == 0x77 && identity.replica == 3);
+    CHECK(hard.role == VSR_MEMBER_WITNESS && hard.epoch != NULL &&
+          hard.epoch->current->count == 1);
+    CHECK(checkpoint != NULL && checkpoint->id.hi == 0x51 &&
+          checkpoint->op == 7 && checkpoint->manifest.size == 16);
+    harness_close();
+}
+
+/* A change descriptor reaching past its record (the codec bounds neither
+ * offset + length nor the descriptor area) is CORRUPT when the record is
+ * read back. */
+static void test_bad_descriptor(void)
+{
+    struct config c = base_config();
+    uint64_t header_bytes;
+    uint64_t max_record;
+    uint64_t data;
+    uint64_t sequence;
+    uint64_t op;
+    uint32_t lease = NONE;
+    unsigned char *record;
+    uint32_t length;
+
+    derive(&header_bytes, &max_record);
+    c.segment_bytes = round_up(header_bytes + 64 * max_record, BLOCK);
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    data = 2 * BLOCK + h.header_bytes;
+    expect_completion(submit(txn_append(1, 1, 64)), VSR_IO_OK);
+    harness_run();
+    record = disk_image + data;
+    length = vsr_io_get_u32(record + 4);
+    CHECK(length == txns[1].bytes);
+    /* Descriptor 0's length becomes the whole record: offset + length
+     * overshoots. Both CRCs are made good again. */
+    vsr_io_put_u32(record + 48 + 20, length);
+    vsr_io_put_u32(record + 40, vsr_io_crc32c(0, record + 48, length - 48));
+    vsr_io_put_u32(record + 44, vsr_io_crc32c(0, record, 44));
+    sequence = evict_first(2);
+    op = load_log(sequence - 1, 1, 2, 1, limits.message_bytes);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_READ));
+    expect_loaded(op, VSR_IO_CORRUPT, &lease);
+    CHECK(h.store->state == VSR_IO_STORE_READY);
+    expect_no_completion();
+    harness_close();
+}
+
+/* Names the test that fails. */
+#define RUN(test)                                                              \
+    do {                                                                       \
+        fprintf(stderr, "store: %s\n", #test);                                 \
+        test();                                                                \
+    } while (0)
 
 int main(void)
 {
@@ -1993,25 +3244,34 @@ int main(void)
     derive(&header_bytes, &max_record);
     printf("store: header %" PRIu64 " bytes, record limit %" PRIu64 "\n",
            header_bytes, max_record);
-    test_check();
-    test_create();
-    test_recover_missing();
-    test_open_existing();
-    test_store_packs();
-    test_write_behind();
-    test_sync_fdatasync();
-    test_sync_dsync();
-    test_sync_delay();
-    test_segments();
-    test_growth();
-    test_wrap();
-    test_pins();
-    test_idle_superblock();
-    test_replicated_flush();
-    test_write_error();
-    test_short_write();
-    test_close();
-    test_stubs();
+    RUN(test_check);
+    RUN(test_create);
+    RUN(test_recover_missing);
+    RUN(test_open_existing);
+    RUN(test_store_packs);
+    RUN(test_write_behind);
+    RUN(test_sync_fdatasync);
+    RUN(test_sync_dsync);
+    RUN(test_sync_delay);
+    RUN(test_segments);
+    RUN(test_growth);
+    RUN(test_wrap);
+    RUN(test_pins);
+    RUN(test_idle_superblock);
+    RUN(test_replicated_flush);
+    RUN(test_write_error);
+    RUN(test_short_write);
+    RUN(test_close);
+    RUN(test_empty_index);
+    RUN(test_index_ops);
+    RUN(test_index_full);
+    RUN(test_load_cold);
+    RUN(test_clients);
+    RUN(test_floor);
+    RUN(test_free_segments);
+    RUN(test_capture_base);
+    RUN(test_state_headers);
+    RUN(test_bad_descriptor);
     printf("store: ok\n");
     return 0;
 }
