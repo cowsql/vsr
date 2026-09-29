@@ -174,6 +174,10 @@ decoding is in place into a `vsr_io_bump` region.
   rejected; region sizes suffice for the largest graphs (an oracle counts
   bump allocations). `tests/fuzzy/frame` (libFuzzer): bytes -> decode must
   never crash, and a decoded graph re-encodes to bytes that decode equal.
+  `tests/fuzzy/entry` (libFuzzer): `get_entry_at` over split payloads fails
+  exactly when the skipped entries leave the payload, and an entry it
+  accepts is within the limits and its region budget, re-encodes to the
+  bytes it was read from, and agrees with `get_entries`.
 
 ### Pool (`src/io/pool.h`)
 
