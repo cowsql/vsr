@@ -92,8 +92,8 @@ commands can be overridden, e.g. `make tidy CLANG_TIDY=clang-tidy-21`.
 Older Valgrind versions may need `CFLAGS='-O1 -g -gdwarf-4'`.
 
 In a separate build configured with `--enable-fuzzing`, run `make fuzz`, which
-drives the `checked`, `validation`, and `cluster_fuzz` harnesses under
-`tests/fuzzy/`; `FUZZ_RUNS` and `FUZZ_ARGS` can be set in the environment or on
+drives the `checked`, `validation`, `cluster_fuzz`, `frame` and `entry`
+harnesses under `tests/fuzzy/`; `FUZZ_RUNS` and `FUZZ_ARGS` can be set in the environment or on
 the command line. See [test layers and replay](../tests/README.md). In a build
 configured with `--enable-coverage`, run `make coverage` for fresh profiles, a
 terminal report, `coverage/html/index.html` and `coverage/coverage.lcov`. LLVM

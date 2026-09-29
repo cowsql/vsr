@@ -43,6 +43,8 @@ static struct vsr_io_vec vectors[MAX_VECTORS];
 static struct test_random rng;
 static const char *corpus_dir;
 static unsigned corpus_index;
+static const char *entry_corpus_dir;
+static unsigned entry_corpus_index;
 
 static const struct vsr_limits limit_sets[] = {
     {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 4},
@@ -92,20 +94,20 @@ static void fill_random(unsigned char *out, size_t size)
     }
 }
 
-/* Writes a fuzz corpus seed when VSR_CODEC_CORPUS names a directory: the
- * harness's target byte, three zero cut bytes, then the encoding. */
-static void seed_corpus(unsigned target, const unsigned char *bytes,
-                        size_t size)
+/* Writes a fuzz corpus seed into dir when it is set: the harness's
+ * selector byte, three zero cut bytes, then the encoding. */
+static void write_seed(const char *dir, unsigned *index, unsigned selector,
+                       const unsigned char *bytes, size_t size)
 {
     char path[512];
     FILE *file;
-    unsigned char header[4] = {(unsigned char)target, 0, 0, 0};
+    unsigned char header[4] = {(unsigned char)selector, 0, 0, 0};
 
-    if (corpus_dir == NULL) {
+    if (dir == NULL) {
         return;
     }
-    if (snprintf(path, sizeof(path), "%s/seed-%03u", corpus_dir,
-                 corpus_index++) >= (int)sizeof(path)) {
+    if (snprintf(path, sizeof(path), "%s/seed-%03u", dir, (*index)++) >=
+        (int)sizeof(path)) {
         return;
     }
     file = fopen(path, "wb");
@@ -113,6 +115,22 @@ static void seed_corpus(unsigned target, const unsigned char *bytes,
     CHECK(fwrite(header, 1, sizeof(header), file) == sizeof(header));
     CHECK(fwrite(bytes, 1, size, file) == size);
     CHECK(fclose(file) == 0);
+}
+
+/* A tests/fuzzy/frame seed when VSR_CODEC_CORPUS names a directory; the
+ * selector is the harness's target. */
+static void seed_corpus(unsigned target, const unsigned char *bytes,
+                        size_t size)
+{
+    write_seed(corpus_dir, &corpus_index, target, bytes, size);
+}
+
+/* A tests/fuzzy/entry seed when VSR_CODEC_ENTRY_CORPUS names a directory:
+ * an APPEND payload and the index of the entry to decode. */
+static void seed_entry_corpus(uint32_t skip, const unsigned char *bytes,
+                              size_t size)
+{
+    write_seed(entry_corpus_dir, &entry_corpus_index, skip, bytes, size);
 }
 
 static size_t flatten_vectors(const struct vsr_io_vec *vecs, uint32_t count,
@@ -2822,6 +2840,58 @@ static void test_vector_origins(void)
     CHECK(referenced > 0);
 }
 
+/* APPEND payloads of batch_entries entries of each type, and of mixed
+ * types, at the minimal, maximal and random shapes under the limits of
+ * tests/fuzzy/entry: get_entry_at decodes every index to the entry it
+ * encodes, and each (payload, index) seeds the entry corpus. */
+static void test_entry_seeds(void)
+{
+    const struct vsr_limits *limits = &limit_sets[2];
+    size_t region_bytes;
+
+    CHECK(vsr_io_codec_load_region(limits, &region_bytes) == VSR_OK);
+    CHECK(region_bytes <= REGION_BYTES);
+    for (int type = -1; type <= VSR_REQUEST_NOOP; ++type) {
+        /* Mixed types come only from the random shape. */
+        for (int mode = type < 0 ? 2 : 0; mode < 3; ++mode) {
+            struct builder b;
+            struct vsr_change change;
+            struct vsr_store store = {1, &change, 1, 0};
+            struct vsr_io_cursor cursor;
+            struct vsr_io_wire_change wire;
+            struct vsr_entry *entries;
+            size_t written;
+
+            arena_reset();
+            builder_init(&b, limits, mode, type);
+            entries = build_entry_array(&b, limits->batch_entries);
+            change = (struct vsr_change){VSR_STORE_APPEND,
+                                         limits->batch_entries, 1, entries};
+            CHECK(vsr_io_codec_put_record(&store, 1, 1, 0, reference_frame,
+                                          sizeof(reference_frame),
+                                          &written) == VSR_OK);
+            vsr_io_cursor_init_one(
+                &cursor, reference_frame + sizeof(struct vsr_io_wire_record),
+                written - sizeof(struct vsr_io_wire_record));
+            CHECK(vsr_io_codec_get_change(&cursor, &wire) == VSR_OK);
+            CHECK((size_t)wire.offset + wire.length <= written);
+            for (uint32_t i = 0; i < change.count; ++i) {
+                struct vsr_io_bump region;
+                struct vsr_entry one;
+
+                vsr_io_cursor_init_one(&cursor, reference_frame + wire.offset,
+                                       wire.length);
+                vsr_io_bump_init(&region, region_memory, region_bytes);
+                CHECK(vsr_io_codec_get_entry_at(&cursor, i, limits, &region,
+                                                &one) == VSR_OK);
+                CHECK(same_entry(&entries[i], &one));
+                seed_entry_corpus(i, reference_frame + wire.offset,
+                                  wire.length);
+            }
+        }
+    }
+}
+
 static void test_bump(void)
 {
     struct vsr_io_bump bump;
@@ -2844,6 +2914,7 @@ static void test_bump(void)
 int main(void)
 {
     corpus_dir = getenv("VSR_CODEC_CORPUS");
+    entry_corpus_dir = getenv("VSR_CODEC_ENTRY_CORPUS");
     test_random_seed(&rng, 0x5eed, 7);
     test_bump();
     test_layout();
@@ -2860,6 +2931,7 @@ int main(void)
     test_region_shapes();
     test_over_limits();
     test_vector_origins();
+    test_entry_seeds();
     printf("codec: ok\n");
     return 0;
 }
