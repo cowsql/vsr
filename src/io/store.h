@@ -31,8 +31,10 @@
  *     only when its record would overwrite PINNED ring bytes (referenced by
  *     a LOAD lease, or not yet written) or when unwritten bytes exceed
  *     write_behind_bytes. The layout rule cache_bytes >= write_behind_bytes
- *     + pinned_payload_bytes + 2 * max_record_bytes, checked at attach,
- *     guarantees this wait always ends;
+ *     + pinned_payload_bytes + 2 * max_record_bytes + 2 * header_bytes +
+ *     block_bytes, checked at attach, guarantees this wait always ends (a
+ *     seal packs a segment header at the next block boundary, possibly
+ *     after a ring wrap, before the record; decision 69);
  *   - every record carries `flushed`, the durable sequence acknowledged to
  *     the core when it was packed, and every superblock its durable_floor;
  *     recovery's floor F is the maximum over all of them and a scan that
@@ -142,11 +144,16 @@ struct vsr_io_client {
 
 #define VSR_IO_CLIENT_TOMBSTONE_HI UINT64_MAX
 
-/* Ring <-> file mapping; a FIFO of extents in packing order. */
+/* Ring <-> file mapping; a FIFO of extents in packing order. An extent
+ * never crosses a segment boundary or a ring wrap, so its file and ring
+ * ranges are both contiguous. */
 struct vsr_io_extent {
     uint64_t file_offset;
-    uint64_t ring_offset; /* Unwrapped: monotonic; wrapped = mod size. */
-    uint64_t length;
+    uint64_t ring_offset;   /* Unwrapped: monotonic; wrapped = mod size. */
+    uint64_t length;        /* Bytes mirrored; grows while newest. */
+    uint64_t last_sequence; /* Last record ending inside it; 0 none. */
+    uint32_t segment;       /* Slot the range belongs to. */
+    uint32_t header;        /* 1 when it begins with the slot's header. */
 };
 
 /* One physical write of whole blocks from the ring. */
@@ -273,6 +280,7 @@ struct vsr_io_store {
     unsigned char *ring;
     uint64_t ring_size;         /* cache_bytes */
     uint64_t head;              /* Unwrapped offset of the next packed byte. */
+    uint64_t file_head;         /* File offset of the next packed byte. */
     uint64_t issued;            /* Unwrapped offset up to which writes were
                                 planned (block aligned). */
     uint64_t retained_floor;    /* Oldest unwrapped byte still mirrored. */
@@ -287,7 +295,9 @@ struct vsr_io_store {
     uint32_t writes_head;
     uint32_t writes_count;
     uint32_t flush_slot;       /* Outstanding fdatasync or NONE. */
-    uint32_t flush_pending;    /* 1 when a flush must be issued. */
+    uint32_t flush_pending;    /* 1 when a flush must be issued; 2 when a
+                                  SYNC asked for one and poll has yet to
+                                  apply sync_delay_ns to it. */
     uint64_t flush_target;     /* Sequence the pending flush must cover. */
     uint64_t flush_deadline;   /* sync_delay / flush_interval expiry. */
     uint64_t superblock_floor; /* durable_floor of the newest superblock. */
@@ -298,6 +308,9 @@ struct vsr_io_store {
                                   record was packed meanwhile. */
     uint32_t packed_since_durable;
     int32_t error;
+    uint32_t superblock_dirty; /* 1 when the superblock must be rewritten. */
+    uint32_t growth;           /* Private stage of a slot growth in flight. */
+    char *log_path;            /* "<path>/log" for OPENAT; NULL: too long. */
     /* Indexes. */
     struct vsr_io_op_ref *ops;       /* [max_entries] */
     struct vsr_io_version *versions; /* [max_entries] */
@@ -339,9 +352,12 @@ struct vsr_io_store {
  * max_record_bytes (vsr_io_codec_record_limit) <= slab_bytes - 2 *
  * block_bytes and <= segment_bytes - header_bytes; cache_bytes a multiple of
  * block_bytes and >= write_behind_bytes + limits->pinned_payload_bytes +
- * 2 * max_record_bytes; segments >= 2, max_segments >= segments;
- * inflight_writes >= 1; max_entries >= batch_entries; max_clients >= 1.
- * Returns OK, EINVAL or ELIMIT.
+ * 2 * max_record_bytes + 2 * header_bytes + block_bytes (decision 69);
+ * segments >= 2, max_segments >= segments; inflight_writes >= 1;
+ * max_entries >= batch_entries; max_clients >= 1; segment_bytes + 2 *
+ * block_bytes and write_behind_bytes + max_record_bytes + block_bytes (the
+ * largest single write) fit the executor's 32-bit lengths (decision 70).
+ * Returns OK, EINVAL (a malformed value) or ELIMIT (a capacity rule).
  */
 int vsr_io_store_check(const struct vsr_io_store_options *options,
                        const struct vsr_limits *limits, uint32_t slab_bytes);

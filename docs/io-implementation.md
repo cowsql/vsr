@@ -112,7 +112,8 @@ with `VSR_ELIMIT`:
 | Frame limit | `vsr_io_codec_frame_limit(limits)`; `slab_bytes >=` this and `>= stream_chunk_bytes + 40` | `codec.c` |
 | Record limit | `vsr_io_codec_record_limit(limits)`; `<= slab_bytes - 2 * block_bytes` and `<= segment_bytes - header_bytes` | `store.c`, decision 37 |
 | Segment header bytes | `round_up(vsr_io_codec_segment_limit(limits), block_bytes)` | `store.c` |
-| Tail region | `cache_bytes + 2 * block_bytes`; `cache_bytes >= write_behind_bytes + pinned_payload_bytes + 2 * record limit` | `store.c`, decision 36 |
+| Tail region | `cache_bytes + 2 * block_bytes`; `cache_bytes >= write_behind_bytes + pinned_payload_bytes + 2 * record limit + 2 * header bytes + block_bytes` | `store.c`, decisions 36 and 69 |
+| Single write | `write_behind_bytes + record limit + block_bytes <= 1 GiB`; `segment_bytes + 2 * block_bytes <= UINT32_MAX` | `store.c`, decision 70 |
 | Slots | `vsr_io_slots_size`: `listeners + 7 * links + streams * (stream_window + 2) + replicas * (inflight_writes + 8) + 8`; per link a receive, a shutdown, a connect and `VSR_IO_LINK_SENDS` (4) sends awaiting NOTIF | `slots.c` |
 | Deadlines | `links + nodes + 4 * replicas + streams` | `engine.c` |
 | Pool reserve | `replicas + 1` slabs never provided to the kernel | `pool.c` |
@@ -780,13 +781,17 @@ long) or a record. Before packing a record of `n` bytes:
    the current write (pad), move `head` to the next ring start (a new
    extent begins; the file offset continues at the next block boundary,
    and the skipped ring bytes are not mirrored).
-3. If `head + n` would pass `pin_floor + size`, where `pin_floor` is the
-   minimum of every active ring pin's `begin` and the `ring_begin` of the
-   oldest write not yet complete (or `head` when none): hold the STORE
-   (queue it; nothing after it is processed until it proceeds, since ops
-   are applied in order). The attach rule guarantees the hold ends:
-   pinned LOAD bytes are bounded by `pinned_payload_bytes` plus two record
-   alignments, unwritten bytes by `write_behind_bytes`.
+3. If the end of the packing (the seal's pad, the header after a possible
+   wrap, the record after a possible wrap, and its trailing pad, simulated
+   before anything is touched) would pass `pin_floor + size`, where
+   `pin_floor` is the minimum of every active ring pin's `begin` and the
+   `ring_begin` of the oldest write not yet complete (or `issued` when
+   none): hold the STORE (queue it; nothing after it is processed until it
+   proceeds, since ops are applied in order). The attach rule of decision
+   69 guarantees the hold ends: pinned LOAD bytes are bounded by
+   `pinned_payload_bytes` plus two record alignments, unwritten bytes by
+   `write_behind_bytes`, and the header and the pads by the rest of the
+   slack. The steps of 1 and 2 are taken only once 3 and 4 pass.
 4. Likewise hold while `head - issued_complete > write_behind_bytes`.
 5. Copy the record (`vsr_io_codec_put_record`), advance `head`, extend the
    current extent, index it, queue the completion.
@@ -800,20 +805,25 @@ ring when every byte is still mirrored (`>= retained_floor`).
 ### 6.2 Write pipeline
 
 `vsr_io_store_prepare` plans at most one record write per call per
-replica: the range `[issued, head)` rounded up to a block, padded with a
-PAD in the ring (the pad is mirrored, so the file and the ring agree),
-split into one record per contiguous (ring, file) range (a wrap or a
-segment boundary splits it; each part is `WRITE | FIXED_FILE |
-FIXED_BUFFER` on the tail region), provided a write entry is free
-(`inflight_writes`). `issued` advances to the padded end; the next write
-starts there, so no block is rewritten. Superblock writes use the two
-superblock blocks after the ring with their own slot kind and are never
-concurrent with each other. Completion: a write's `state` becomes complete;
-`written` advances over the contiguous prefix of complete writes in issue
-order to the `last_sequence` of the last one; a negative result sets
-`error` and applies `on_write_error` (FENCE: state FAILED, every queued op
-completes `FAILED`; CONTINUE, replicated only: the store stops writing and
-serves from memory).
+replica: the first extent with bytes in `[issued, head)`, cut at the
+extent's end (a wrap or a segment boundary starts a new extent; each
+write is `WRITE | FIXED_FILE | FIXED_BUFFER` on the tail region), the
+newest extent padded to a block with a PAD in the ring first (the pad is
+mirrored, so the file and the ring agree), provided a write entry is free
+(`inflight_writes`). A segment header is a write of its own and the
+records after it are not planned until it completed. `issued` advances to
+the write's end (and over a wrap's gap); the next write starts there, so
+no block is rewritten. A write is never longer than `write_behind_bytes +
+record limit + block_bytes`, which the check keeps at or below 1 GiB
+(decision 70). Superblock writes use the two superblock blocks after the
+ring with their own slot kind and are never concurrent with each other.
+Completion: a write's `state` becomes complete; `written` advances over
+the contiguous prefix of complete writes in issue order to the
+`last_sequence` of the last one; a negative or short result sets `error`
+and applies `on_write_error` (FENCE: state FAILED, every queued op
+completes `FAILED`; CONTINUE, replicated only: the store stops writing,
+growing and rewriting the superblock and serves from memory, taking slots
+of the table without preallocating them).
 
 Flush: `flush_pending` is set by a SYNC (after `sync_delay_ns` from the
 first SYNC of a batch), by the flush interval in replicated mode when
@@ -895,9 +905,10 @@ completion advances `recovery.stage`:
    `start_segment = 1`, `slots = segments`, then the first segment's
    header with STATE clear; the RECOVERY load completes `NOT_FOUND` once
    the header write completed, which is what the core expects for an empty
-   store); RECOVER completes `NOT_FOUND` at once. An existing file under
-   NEW/JOIN is recovered like RECOVER; the core rejects the recovered row
-   itself.
+   store); RECOVER completes `NOT_FOUND` at once and creates the empty
+   log the same way, holding the STOREs of a warm-up until the header
+   write completed (decision 71). An existing file under NEW/JOIN is
+   recovered like RECOVER; the core rejects the recovered row itself.
 2. `STATX` for the size; `READ` both superblocks; keep the valid one with
    the greater revision; none valid is `CORRUPT`. Geometry must match the
    options (`block_bytes`, `segment_bytes`, `header_blocks`) and identity
@@ -1278,6 +1289,8 @@ of `docs/io-design.md`:
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | One `libvsr.a` with liburing; three headers installed (done by the build skeleton) | 32 |
 | `vsr-io.h` | Platform note: Linux >= 6.18 through the io_uring syscalls, no liburing; `vsr_io_uring_init` probes once and fails with `-ENOSYS` on an older kernel | 52, 53 |
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | liburing dropped: no pkg-config check, no `Requires.private`; the kernel's UAPI header vendored under `src/io/uapi` | 52 |
+| `vsr-io.h` | `cache_bytes` rule: two headers and a block of slack besides the two records | 69 |
+| `store.h` | Extents carry their segment, a header flag and their last sequence; the store keeps `file_head`, `superblock_dirty`, `growth` and the log path; the check rule adds the executor-length bounds | 69, 70 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
