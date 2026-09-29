@@ -233,23 +233,50 @@ Purpose: everything between a node table entry and a decoded frame.
 Link life cycle:
 
 ```
- dial:    FREE ─SOCKET/CONNECT─▶ CONNECTING ─▶ HELLO (preamble+HELLO sent)
- accept:  FREE ◀─multishot ACCEPT CQE─ HELLO (waiting for preamble+HELLO)
+ dial:    FREE ─SOCKET, then CONNECT on the raw fd─▶ CONNECTING ─▶ HELLO
+ accept:  FREE ◀─multishot ACCEPT CQE (raw fd)─ HELLO (preamble+HELLO due)
  adopt:   FREE ─vsr_io_adopt─▶ ESTABLISHED (flags 0) | HELLO (HANDSHAKE)
- EXTERNAL mode: CONNECTING/accept ─▶ EXTERNAL (HANDSHAKE op) ─▶ ESTABLISHED
+ EXTERNAL mode: CONNECTING/accept ─preamble on the raw fd─▶ EXTERNAL
+                (HANDSHAKE op) ─caller OK, fd installed─▶ ESTABLISHED
  HELLO ─both HELLOs seen, mode and version match─▶ ESTABLISHED
  any ─error, timeout, revoke, close─▶ CLOSING ─recv terminated, NOTIFs in─▶ FREE
 ```
+
+Descriptors (decision 72): a link's socket is a raw descriptor
+(`raw_fd`) until the engine takes it over into an engine file slot (`fd`)
+through `vsr_io_engine_install`, at the CONNECT or ACCEPT completion in
+TRUSTED mode, at the caller's OK HANDSHAKE completion in EXTERNAL mode,
+and at adopt; from then on every record is FIXED_FILE on the slot. The
+listening socket is DIRECT into an explicit engine slot; the accept itself
+is a plain multishot ACCEPT delivering raw descriptors. Listener state
+(`vsr_io_listener`: SETUP, ACTIVE, REARM, CANCEL, CLOSING) lives in a
+fixed table of `VSR_IO_LISTENERS_MAX` entries; an accepted descriptor that
+finds no free link entry is parked in `orphans` and closed by the next
+prepare.
 
 Handshake (TRUSTED): the dialer sends the 8-byte preamble then a HELLO
 frame; the acceptor consumes the preamble, reads HELLO, checks `handshake`
 and the frame version, records `node` and `purpose`, sends its own HELLO,
 and is established; the dialer is established on receiving the acceptor's
-HELLO whose `node` must equal the dialed node. Sends are queued during the
-handshake and flow once established. A HELLO not received within
-`handshake_timeout_ns` closes the link. A peer link from a node that is not
-in the node table is closed (a node must be known to be authorized; an
-unknown node cannot be authorized for any envelope).
+HELLO whose `node` and `purpose` must be the dialed ones. Sends are queued
+during the handshake and flow once established. A HELLO not received
+within `handshake_timeout_ns` closes the link. A peer link from a node
+that is not in the node table is closed (a node must be known to be
+authorized; an unknown node cannot be authorized for any envelope), as is
+a second HELLO, a HELLO on an established link, or any other frame before
+the handshake is done.
+
+Handshake (EXTERNAL): the dialer sends the preamble on the raw descriptor
+and, once that send's result is in, the HANDSHAKE op names the raw
+descriptor with OUTBOUND and the expected node; the acceptor reads exactly
+the 8 preamble bytes with a plain RECV on the raw descriptor (re-issued
+for a short read), verifies them, and the op names the descriptor with
+INBOUND and no node. The engine touches the socket no further until
+`vsr_io_links_handshake_done`: status OK with the expected node (outbound)
+or a known node (inbound) installs the descriptor and establishes; any
+other outcome closes it with a plain CLOSE. A link closed while the caller
+holds its descriptor (revoke, shutdown, timeout) stays CLOSING until the
+completion returns it.
 
 Carrier election (decision 41): whenever a peer link to node N becomes
 established or leaves ESTABLISHED, `nodes[N].carrier` is recomputed as the
@@ -261,12 +288,20 @@ for `idle_timeout_ns` is closed; the carrier is never idle-closed while the
 node has queued sends, and is idle-closed otherwise like any link, since a
 node with no traffic needs no link (the next SEND redials).
 
-Dialing: a node with an address and no established or pending link is
-dialed when a SEND is queued for it or a replica authorizes it, immediately
-the first time and then at `next_dial_ns` = last attempt +
-`connect_backoff_ns << min(attempts, 4)`. A caller-dialed node (NULL
-address) gets a `LINK_WANTED` op on the same schedule. Success resets
-`attempts`.
+Dialing (decision 73): a node with an address and no established or
+pending link is dialed when a SEND is queued for it or a replica
+authorizes it (`wanted`), immediately the first time and then at
+`next_dial_ns` = failure time + `connect_backoff_ns << min(attempts - 1,
+4)`, where `attempts` counts consecutive dials that failed at any step
+before ESTABLISHED (connect refused, handshake refused, timeout, the
+caller's refusal). A caller-dialed node (NULL address) gets a
+`LINK_WANTED` op on the same schedule, carrying the attempt number. An
+established peer link resets `attempts` and clears `wanted`; an idle
+close clears `wanted` too, so the next SEND redials at once; the engine
+never dials its own node id. Due dials are found by poll through
+`dials_due`; a backoff in the future is a DIAL deadline. The node's
+`last_error` is the last failure of a link identified as its; an inbound
+link that failed before identifying itself is nobody's.
 
 Send path per link (decision 38), executed in `vsr_io_links_prepare`:
 
@@ -985,9 +1020,9 @@ completes.
 ```
  vsr_io_poll(io, now, ops, capacity, count, flags)
    io->now = now; wake_pending = 0
-   while deadlines_pop(now, kind, index): dispatch (LINK/DIAL -> links,
-       FLUSH/SYNC -> store, STREAM -> streams, CAPTURE -> snapshots,
-       CORE -> nothing: TIME below handles it)
+   while deadlines_pop(now, kind, index): dispatch (LINK/DIAL ->
+       vsr_io_links_deadline, FLUSH/SYNC -> store, STREAM -> streams,
+       CAPTURE -> snapshots, CORE -> nothing: TIME below handles it)
    links_poll(now); streams_poll(now)
    for each replica in OPENING or RUNNING:
        do {
@@ -1078,10 +1113,14 @@ returns immediately and prepares again):
 
 1. Pool provision: `provide()` executor call for the slabs
    `vsr_io_pool_provide` returns (not a record).
-2. `vsr_io_links_prepare`: listener setup on the first call (SOCKET, BIND,
-   LISTEN, then multishot ACCEPT with DIRECT, one chain per listen address,
-   LINKed), connects, HELLO sends, coalesced sends, receive re-arms,
-   shutdowns and closes.
+2. `vsr_io_links_prepare`: listener setup on the first call (SOCKET
+   DIRECT into an engine slot, BIND, LISTEN, then a plain multishot
+   ACCEPT, one chain per listen address, LINKed with SKIP_SUCCESS on all
+   but the ACCEPT; decision 72), orphan closes, then per link: the dial's
+   SOCKET or CONNECT, the EXTERNAL preamble receive, the control bytes
+   (preamble, HELLO) and coalesced sends, receive arming and re-arming,
+   the teardown (SHUTDOWN, CANCEL of the receive, CLOSE of the slot, or a
+   plain CLOSE of a raw descriptor).
 3. `vsr_io_streams_prepare`: file chunk reads.
 4. Per replica: `vsr_io_store_prepare` (open/create steps, header writes,
    one record write, superblock write, flush, one cold read), then
@@ -1096,8 +1135,12 @@ generation: dropped, `stats.frames_rejected` untouched, a counter in the
 slot table); then by `slot.kind`: LISTEN, CONNECT, RECV, SEND, SHUTDOWN ->
 `vsr_io_links_complete`; WRITE, FLUSH, SUPER, LOAD, FILE (owner replica)
 -> `vsr_io_store_complete`; CLIENTS, FILE (owner snapshot) ->
-`vsr_io_snapshots_complete`; STREAM -> `vsr_io_streams_complete`. Nothing
-steps a core here; every effect is queued for the next poll.
+`vsr_io_snapshots_complete`; STREAM -> `vsr_io_streams_complete`. The
+module consumes the slot (`vsr_io_slots_consumed` with the record's MORE,
+or `vsr_io_slots_free` for a zero-copy send refused before the kernel took
+it), since it knows what each completion means (decision 74). Nothing
+steps a core here; every effect is queued for the next poll, and a
+time-based effect uses `io->now`, the last poll time.
 
 ### 7.6 Leases
 
@@ -1291,6 +1334,7 @@ of `docs/io-design.md`:
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | liburing dropped: no pkg-config check, no `Requires.private`; the kernel's UAPI header vendored under `src/io/uapi` | 52 |
 | `vsr-io.h` | `cache_bytes` rule: two headers and a block of slack besides the two records | 69 |
 | `store.h` | Extents carry their segment, a header flag and their last sequence; the store keeps `file_head`, `superblock_dirty`, `growth` and the log path; the check rule adds the executor-length bounds | 69, 70 |
+| `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | 72, 73 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

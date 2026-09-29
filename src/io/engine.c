@@ -196,6 +196,10 @@ static int check_options(const struct vsr_io_options *options)
         limits->slab_bytes % ENGINE_PAGE_BYTES != 0) {
         return VSR_EINVAL;
     }
+    /* The link module keeps listener state in a fixed table (decision 72). */
+    if (options->listen_count > VSR_IO_LISTENERS_MAX) {
+        return VSR_ELIMIT;
+    }
     /* Minimum slabs: links + streams * (stream_window + 1) + 2 * replicas
      * + 4 + caller_slabs (decisions 42 and 54). */
     if (!vsr_size_add(limits->stream_window, 1, &term) ||
@@ -855,6 +859,11 @@ void vsr_io_engine_slot_free(struct vsr_io *io, uint32_t slot)
 void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size)
 {
     io->ex.ops->random(io->ex.ctx, bytes, size);
+}
+
+int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd)
+{
+    return io->ex.ops->update_file(io->ex.ctx, slot, fd);
 }
 
 /*
