@@ -1034,7 +1034,7 @@ int vsr_io_streams_write(struct vsr_io *io,
                     io->options.limits.file_slots)) {
         /* A caller's range reads a slot of the caller's: an engine slot
          * (a socket, the store's log) would stream the engine's own bytes
-         * to the peer (decision B5). The library reads engine slots. */
+         * to the peer (decision 103). The library reads engine slots. */
         return VSR_EINVAL;
     }
     if (stream->writes_count == window) {
@@ -1075,7 +1075,7 @@ int vsr_io_streams_close(struct vsr_io *io, uint64_t handle, int32_t status)
         /* Ended under the caller (lost, cancelled, a file read failed),
          * which it cannot know before the END op: that op is on its way
          * and carries the engine's status. A refused stream or a second
-         * close was the caller's own doing (decision B4). */
+         * close was the caller's own doing (decision 102). */
         if (!stream->accepted || stream->closed || stream->ended) {
             return VSR_EINVAL;
         }
@@ -1398,7 +1398,7 @@ void vsr_io_streams_link_lost(struct vsr_io *io, uint32_t index, int32_t error)
     stream->link_gone = 1;
     /* vsr_io_close shuts the links down before the streams (section 7.7):
      * a link closed by that shutdown ends its stream CANCELLED, as the
-     * stream shutdown would, not RETRY as for a loss (decision B3). */
+     * stream shutdown would, not RETRY as for a loss (decision 101). */
     stream_loss_effects(io, stream,
                         io->links.closing ? VSR_IO_CANCELLED : VSR_IO_RETRY);
 }

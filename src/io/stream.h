@@ -110,7 +110,7 @@ struct vsr_io_stream_unit {
     uint32_t write;  /* Source: index of its write in the stream's ring. */
     uint32_t span;   /* BUFFERS: first span of the chunk... */
     /* Requester: the chunk's number in the stream; its low 16 bits are the
-     * unit field of the DATA op id (decision B2). */
+     * unit field of the DATA op id (decision 100). */
     uint32_t sequence;
     uint64_t span_offset; /* ...and the offset within it. */
     uint64_t offset;      /* Stream offset of the chunk. */
@@ -164,7 +164,7 @@ struct vsr_io_stream {
                            then lingers on its link until the requester's
                            close or the inactivity timer. */
     uint32_t closed;     /* Source: the caller's CLOSE was taken; a second
-                            one is EINVAL (decision B4). */
+                            one is EINVAL (decision 102). */
     uint64_t end_offset; /* Link stream offset after the END frame. */
     uint64_t send_end;   /* Link stream offset after the last queued frame:
                             the kernel reads nothing of the stream's once
@@ -212,13 +212,13 @@ uint64_t vsr_io_streams_handle(const struct vsr_io_streams *streams,
  * stream, or a closing engine; *index is the stream's index (the library
  * sets streams[index].replica). write is EINVAL for a handle that is not
  * an OPEN source stream, malformed buffers, or a caller stream's FILE range
- * on one of the engine's file slots (decision B5), AGAIN while
+ * on one of the engine's file slots (decision 103), AGAIN while
  * stream_window writes are queued (resubmit after a WRITTEN). close is
  * EINVAL for a status outside enum vsr_io_status (the END frame's decoder
  * refuses it); it is OK once per accepted stream, OPEN or ended under the
  * caller (lost, timed out, cancelled, a file read failed) with its END op
  * still to come, and EINVAL after the caller's own close or refusal and
- * once the END op went out (decision B4). */
+ * once the END op went out (decision 102). */
 int vsr_io_streams_open(struct vsr_io *io, uint64_t cookie,
                         const struct vsr_io_stream_open *open, uint64_t lease,
                         uint32_t owner, uint32_t *index);
@@ -251,7 +251,7 @@ bool vsr_io_streams_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
                           const struct vsr_io_cursor *body, uint32_t slab);
 /* Link lifecycle from the link module. A late event for a stream that no
  * longer expects it is ignored. A loss ends the stream RETRY, CANCELLED
- * once the link module is shutting down (decision B3: vsr_io_close may
+ * once the link module is shutting down (decision 101: vsr_io_close may
  * shut the links down before the streams). */
 void vsr_io_streams_link_up(struct vsr_io *io, uint32_t stream);
 void vsr_io_streams_link_lost(struct vsr_io *io, uint32_t stream,
@@ -271,7 +271,7 @@ void vsr_io_streams_deadline(struct vsr_io *io, uint32_t index, uint64_t now);
  * link closes and stream release. Prepare: file chunk reads. Complete:
  * read completions (slot kind STREAM). Shutdown: every stream ends with
  * CANCELLED (one already ending keeps its status); the engine is closed
- * once `active` is zero. Either shutdown may come first (decision B3). */
+ * once `active` is zero. Either shutdown may come first (decision 101). */
 void vsr_io_streams_poll(struct vsr_io *io, uint64_t now);
 void vsr_io_streams_prepare(struct vsr_io *io, struct vsr_io_sqe *sqes,
                             uint32_t capacity, uint32_t *count);

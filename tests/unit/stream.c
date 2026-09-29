@@ -2086,7 +2086,7 @@ static void test_window(void)
     /* DATA op ids name the chunk, not its ring slot: the chunk that
      * reuses a completed op's slot gets an id of its own, so a repeated
      * completion of the old id is EINVAL and never frees the live unit
-     * (decision B2). */
+     * (decision 100). */
     open_stream(&k, &d, 3, NULL, 0, &index);
     s = stream_at(a, index);
     settle();

@@ -509,7 +509,7 @@ source's `STREAM_WRITE` events). Handles and ids (decision 93): the
 source's handle is `generation << 32 | index`, never reused; SERVE and
 DATA op ids carry their kind in the top two bits (`VSR_IO_STREAM_OP_*`),
 the generation, the stream and, for DATA, the chunk's 16-bit sequence in
-the stream (decision B2: the unit is found by the sequence's distance
+the stream (decision 100: the unit is found by the sequence's distance
 from the head unit's, never by a ring slot, which a later chunk reuses),
 so the engine routes a rail COMPLETE by id alone (HANDSHAKE ids have
 those bits clear) and a stale or repeated completion is `EINVAL` (a DATA
@@ -556,7 +556,7 @@ events queue in order (`AGAIN` when `stream_window` are queued: resubmit
 after a WRITTEN; `EINVAL` for a handle that is not an OPEN source
 stream, malformed buffers, or a caller stream's FILE range on one of the
 engine's file slots, which would stream the engine's own descriptors to
-the peer: decision B5). The queue is chunked in order into units: a
+the peer: decision 103). The queue is chunked in order into units: a
 BUFFERS write into slices of at most `stream_chunk_bytes` and
 `VSR_IO_STREAM_CHUNK_VECTORS` (64) spans, ready at once; a FILE write
 into `stream_chunk_bytes` reads (`READ | FIXED_FILE | FIXED_BUFFER` from
@@ -577,7 +577,7 @@ timeout, shutdown, a file read failure) until its END op is emitted,
 when it changes nothing; `EINVAL` after the caller's own close or
 refusal, once the END op went out, and for a status outside `enum
 vsr_io_status`, which the requester's decoder would refuse as a
-malformed END (decision B4). The source's END op (accepted streams only)
+malformed END (decision 102). The source's END op (accepted streams only)
 is emitted once the END frame is notified (or the link is gone); the
 stream then LINGERS on its link until the requester's close reaches it,
 or the inactivity timer closes it (decision 96): a source closing first
@@ -593,7 +593,7 @@ the requester, a chunk at the wrong offset, a malformed body) counts in
 `frames_rejected` and closes the link `-EPROTO`, FAILED on the refusing
 side; shutdown ends every stream `CANCELLED`, also when the link
 shutdown closed its link first (`link_lost` while `links.closing`:
-decision B3), and a stream already ending keeps its status
+decision 101), and a stream already ending keeps its status
 (`vsr_io_close` is done once `streams.active` is zero: the caller still
 completes its DATA and SERVE ops). At the source an early end stops
 chunking (`aborted`): unsent units are released (a read in flight at its
@@ -1566,7 +1566,7 @@ region for `vsr_deinit`.
 multishot accept and receive, SHUTDOWN and CLOSE of every link),
 `vsr_io_streams_shutdown` (END `CANCELLED` to every stream; a stream
 whose link the link shutdown closed first is CANCELLED already, decision
-B3, so the order is free); `closed` when every slot is free and every
+101, so the order is free); `closed` when every slot is free and every
 link FREE; `vsr_io_deinit` then unregisters the pool region and the
 buffer ring.
 
@@ -1741,9 +1741,9 @@ of `docs/io-design.md`:
 | `stream.h` (internal) | Units are chunks (`vsr_io_stream_unit` states READING, READY, SENT, DATA), the write queue (`vsr_io_stream_queued_write`, `writes` rings), handles and op ids (`VSR_IO_STREAM_OP_*`, `vsr_io_streams_op_kind`, `vsr_io_streams_handle`), `generation`, `ended`, `aborted`, `link_gone`, `end_*`, `send_end`, `closing`; `vsr_io_streams_deadline`; `vsr_io_streams_size` is ELIMIT beyond 65535 streams or window | 93, 95, 96, 97 |
 | `snapshot.h` (internal) | `vsr_io_snapshots_serve` returns OK to serve or the END status; `vsr_io_snapshots_stream_data` takes the DATA op id; `stream_end` is told for both sides of a library stream; weak stubs in stream.c until snapshot.c | 98 |
 | `link.h` (internal) | `vsr_io_link.recv_paused` and `recv_cancelled`; the shutdown slot also carries a paused receive's CANCEL (the teardown waits for it); a stream link whose frame waits is not closed for its held runs but paused, and its receive's `-ECANCELED` is not a loss | 99 |
-| `stream.h` (internal) | `vsr_io_stream_unit.sequence` (was `reserved`) and `vsr_io_stream.chunks`: a DATA op id's unit field is the chunk's sequence, not its slot | B2 |
-| `stream.h` (internal) | `vsr_io_streams_link_lost` ends a stream CANCELLED while the link module shuts down; `vsr_io_stream.closed`: `vsr_io_streams_close` is OK once per accepted stream until its END op (also after an end under the caller, a read failure included), EINVAL for a status outside enum vsr_io_status; `vsr_io_streams_write` is EINVAL for a caller stream's FILE range on an engine file slot; `vsr_io_streams_data_done` re-arms the requester's clock | B3, B4, B5, 97 |
-| `vsr-io.h` | Bulk streams: CANCELLED on the closing engine whichever shutdown runs first; STREAM_CLOSE once, OK until STREAM_END also after an end under the caller, its status an enum vsr_io_status; STREAM_WRITE EINVAL once the stream ended; a FILE range on one of the engine's slots EINVAL | B3, B4, B5 |
+| `stream.h` (internal) | `vsr_io_stream_unit.sequence` (was `reserved`) and `vsr_io_stream.chunks`: a DATA op id's unit field is the chunk's sequence, not its slot | 100 |
+| `stream.h` (internal) | `vsr_io_streams_link_lost` ends a stream CANCELLED while the link module shuts down; `vsr_io_stream.closed`: `vsr_io_streams_close` is OK once per accepted stream until its END op (also after an end under the caller, a read failure included), EINVAL for a status outside enum vsr_io_status; `vsr_io_streams_write` is EINVAL for a caller stream's FILE range on an engine file slot; `vsr_io_streams_data_done` re-arms the requester's clock | 101, 102, 103, 97 |
+| `vsr-io.h` | Bulk streams: CANCELLED on the closing engine whichever shutdown runs first; STREAM_CLOSE once, OK until STREAM_END also after an end under the caller, its status an enum vsr_io_status; STREAM_WRITE EINVAL once the stream ended; a FILE range on one of the engine's slots EINVAL | 101, 102, 103 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1780,7 +1780,7 @@ of `docs/io-design.md`:
   than `handshake_timeout_ns` per window ends RETRY at the source.
 - A STREAM_WRITE or STREAM_CLOSE racing the stream's STREAM_END still
   unread in the forwarded ring is EINVAL once the stream was freed (a
-  lost source is freed right after its END op; decision B4 makes CLOSE
+  lost source is freed right after its END op; decision 102 makes CLOSE
   OK only until then), so a caller must take EINVAL for a stream whose
   STREAM_END it has not consumed yet as benign; keeping the stream until
   its END op is dequeued would need the ring to report dequeues.

@@ -2,13 +2,13 @@
 
 Worktree build/wt/stream-review, branch `wt/stream-review`, on top of
 1ba88c1 (main merged). The review started with a paused reviewer's WIP
-(7482545: decision B2, unbuilt); this pass verified it and finished the
+(7482545: decision 100, unbuilt); this pass verified it and finished the
 review. Every fix has its breaking test first, observed failing before
 the fix (section "Review" at the end of tests/unit/stream.c). link.c and
 store.c untouched; include/vsr-io.h changed in one comment (section 10
 row).
 
-Commits: 7482545 (B2, previous reviewer), bdc3735, ea18dd2, 79fe89e,
+Commits: 7482545 (100, previous reviewer), bdc3735, ea18dd2, 79fe89e,
 977b57f, 7c62e27 (fixes, each with its test), 97921e6, eb42291, 6c7edcf
 (tests closing mutation survivors, formatting), 0e3b55e (decisions and
 docs), a clang-tidy fix to a test, then this file.
@@ -25,12 +25,12 @@ tests/unit/stream.c; shellcheck clean.
 
 ## CONFIRMED (6, all fixed)
 
-0. **B2, from the paused reviewer: a DATA op id named the chunk's ring
+0. **100, from the paused reviewer: a DATA op id named the chunk's ring
    slot**, so an id completed twice after the ring wrapped freed a later
    chunk's live unit (a second slab release under the caller). The id
    now carries the chunk's 16-bit sequence and the unit is found by its
    distance from the head's sequence (`chunks - units_used`). Verified:
-   test_window's B2 block fails at `k.held_ops[1] != first` with main's
+   test_window's 100 block fails at `k.held_ops[1] != first` with main's
    stream.c and passes with the fix; the math holds across the 32-bit
    wrap of `chunks` (2^32 is a multiple of 2^16) and for windows up to
    65535.
@@ -44,7 +44,7 @@ tests/unit/stream.c; shellcheck clean.
    engine. Fix bdc3735: `link_lost` reports CANCELLED while
    `io->links.closing`; either order now gives the same statuses, the
    peer still RETRY. Test `test_review_shutdown_order` (both engines
-   closing, and the source's alone). Decision B3.
+   closing, and the source's alone). Decision 101.
 
 2. **A DATA completion did not re-arm the requester's clock** (area:
    deadlines). Decision 97 re-arms at every completion and caller call;
@@ -68,7 +68,7 @@ tests/unit/stream.c; shellcheck clean.
    `closed` flag; close is OK once per accepted stream until its END op
    (a no-op after an engine-decided end), EINVAL after the caller's own
    close or refusal, after the END op, or for a bad status. Test
-   `test_review_close`. Decision B4 (the WIP had documented the old
+   `test_review_close`. Decision 102 (the WIP had documented the old
    behaviour in stream.h; that comment is replaced).
 
 4. **A failed read over-reported the END's byte count** (area: unit ring).
@@ -89,12 +89,12 @@ tests/unit/stream.c; shellcheck clean.
    peer. Fix 7c62e27: EINVAL for a caller stream's range on
    `[file_slot_base, file_slot_base + file_slots)`; library streams (the
    snapshot module's served file) are exempt. Test
-   `test_review_engine_slot`. Decision B5.
+   `test_review_engine_slot`. Decision 103.
 
-Docs (0e3b55e): decisions B3-B5 in docs/io-design.md section 10;
+Docs (0e3b55e): decisions 101-103 in docs/io-design.md section 10;
 docs/io-implementation.md Streams (write/close refusals, early ends,
-timeouts), 7.7, section 10 rows (the B2 row loses its close sentence,
-now B4's), two section 11 items; stream.h and vsr-io.h comments.
+timeouts), 7.7, section 10 rows (the 100 row loses its close sentence,
+now 102's), two section 11 items; stream.h and vsr-io.h comments.
 
 ## Test gaps closed (mutants that survived the suite)
 
@@ -120,7 +120,7 @@ now B4's), two section 11 items; stream.h and vsr-io.h comments.
 ## Checked and found fine
 
 - Which side reports what (97, 99): requester lost while DIALING or
-  REQUESTED RETRY (CANCELLED if its own engine closes, B3); after the END
+  REQUESTED RETRY (CANCELLED if its own engine closes, 101); after the END
   frame it keeps the END's status (a mismatched count is FAILED), also
   at a later loss, timeout or shutdown; a refusing side's protocol error
   FAILED, the other side RETRY; source lost while SERVING: END op RETRY
@@ -134,7 +134,7 @@ now B4's), two section 11 items; stream.h and vsr-io.h comments.
 - Exactly once: END op (`ended`, emission retried on a full ring); a
   WRITTEN per queued write in order before END (the `writes_count == 0`
   gate and one FIFO ring; abort marks writes chunked); DATA units live
-  until the caller completes them, repeats and stale ids EINVAL (B2 and
+  until the caller completes them, repeats and stale ids EINVAL (100 and
   the generation); slab references released once (`unit_release`
   asserts, request slab at `served`); `active` pairs take/free and every
   non-FREE state reaches `stream_finish` (DIALING/REQUESTED by loss,
@@ -154,7 +154,7 @@ now B4's), two section 11 items; stream.h and vsr-io.h comments.
   `stream_data`; `stream_end` runs before `stream_free` (a hook opening a
   new stream cannot take the slot); a library source is told only when
   accepted; the WIP snapshot module (wt/snapshot) ignores write/close
-  results and closes after a failed open, which B4 keeps OK after a loss.
+  results and closes after a failed open, which 102 keeps OK after a loss.
 - Deadlines and teardown (74, 87): streams' deadlines are dispatched
   before the polls; a stream's END op never waits for the link's
   CONNECT cancel (its request was never queued); a lost stream's clock
@@ -166,7 +166,7 @@ now B4's), two section 11 items; stream.h and vsr-io.h comments.
 | --- | --- |
 | Loss keeps no status for an END in the kernel | test_loss |
 | No linger: the source closes after its END op | test_window |
-| data_done by slot, no position bound nor sequence check | test_window (B2) |
+| data_done by slot, no position bound nor sequence check | test_window (100) |
 | data_done by `sequence % window` keeping the position bound | equivalent (the unit's slot is its sequence mod window) |
 | A late OK SERVE on a lost stream owes no END op | test_loss |
 | END op before the END frame is notified | test_review_close |
