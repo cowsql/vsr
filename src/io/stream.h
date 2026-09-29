@@ -163,6 +163,8 @@ struct vsr_io_stream {
     uint32_t ended;      /* END op emitted (or the library told); a source
                            then lingers on its link until the requester's
                            close or the inactivity timer. */
+    uint32_t closed;     /* Source: the caller's CLOSE was taken; a second
+                            one is EINVAL (decision B4). */
     uint64_t end_offset; /* Link stream offset after the END frame. */
     uint64_t send_end;   /* Link stream offset after the last queued frame:
                             the kernel reads nothing of the stream's once

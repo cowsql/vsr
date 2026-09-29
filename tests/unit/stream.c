@@ -3332,6 +3332,74 @@ static void test_review_data_done_rearms(void)
     engine_forget(b);
 }
 
+/* STREAM_CLOSE racing an end the engine decided under the caller (a file
+ * read failed after the caller's last write) is OK like after a loss: the
+ * caller cannot know until the END op, which follows with the failure's
+ * status. A second close, and a close with a status that is not an enum
+ * vsr_io_status (which the peer's decoder would refuse as a malformed END,
+ * failing the transfer as a protocol error), are EINVAL. */
+static void test_review_close(void)
+{
+    const unsigned char *bytes = pattern(24);
+    struct engine *a;
+    struct engine *b;
+    struct sink k;
+    struct feed d;
+    uint32_t index = NONE;
+    const struct vsr_io_stream *t;
+
+    world_reset(24);
+    two_engines(VSR_IO_HANDSHAKE_TRUSTED);
+    a = &world.engines[0];
+    b = &world.engines[1];
+    settle();
+    b->files[0].bytes = bytes;
+    b->files[0].size = BYTES_MAX;
+    open_stream(&k, &d, 1, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    t = stream_at(b, (uint32_t)(d.handle & 0xFFFF));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, -1) == VSR_EINVAL);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_CANCELLED + 1) ==
+          VSR_EINVAL);
+    CHECK(t->state == VSR_IO_STREAM_OPEN);
+    world.fail_read = 1;
+    CHECK(feed_write_file(&d, 1, FILE_FD_BASE, 0, CHUNK) == VSR_OK);
+    for (uint32_t i = 0; i < 8 && t->state != VSR_IO_STREAM_ENDING; ++i) {
+        engine_step(b);
+    }
+    CHECK(t->state == VSR_IO_STREAM_ENDING && t->end_due && !t->ended);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_EINVAL);
+    pump(&k, &d);
+    CHECK(d.ended && d.end.status == VSR_IO_FAILED && d.written_count == 1);
+    CHECK(k.ended && k.end.status == VSR_IO_FAILED && k.received == 0);
+    CHECK(a->io->stats.frames_rejected == 0);
+    /* A close decided by the caller stays the only one: EINVAL after it,
+     * and after a refusal. */
+    open_stream(&k, &d, 2, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_OK) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_RETRY) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_EINVAL);
+    pump(&k, &d);
+    CHECK(k.ended && k.end.status == VSR_IO_RETRY);
+    CHECK(d.ended && d.end.status == VSR_IO_RETRY);
+    open_stream(&k, &d, 3, NULL, 0, &index);
+    settle();
+    CHECK(feed_take_serve(&d));
+    CHECK(vsr_io_streams_served(b->io, d.serve_op, VSR_IO_FAILED) == VSR_OK);
+    CHECK(vsr_io_streams_close(b->io, d.handle, VSR_IO_OK) == VSR_EINVAL);
+    pump(&k, &d);
+    CHECK(k.ended && k.end.status == VSR_IO_RETRY && !d.ended);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
+    CHECK(pool_refs(a) == 0 && pool_refs(b) == 0);
+    engine_forget(a);
+    engine_forget(b);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = argc > 1 ? strtoull(argv[1], NULL, 10) : 4242;
@@ -3348,6 +3416,7 @@ int main(int argc, char **argv)
     test_shutdown();
     test_review_shutdown_order();
     test_review_data_done_rearms();
+    test_review_close();
     test_random(seed);
     test_random(seed + 1);
     printf("stream: ok\n");

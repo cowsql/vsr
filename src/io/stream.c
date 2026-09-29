@@ -1058,19 +1058,28 @@ int vsr_io_streams_close(struct vsr_io *io, uint64_t handle, int32_t status)
 {
     struct vsr_io_stream *stream = stream_resolve(io, handle);
 
-    if (stream == NULL || stream->direction != VSR_IO_INBOUND) {
+    /* The status goes out in the END frame, whose decoder refuses anything
+     * but an enum vsr_io_status (a protocol error at the requester). */
+    if (stream == NULL || stream->direction != VSR_IO_INBOUND ||
+        status < VSR_IO_OK || status > VSR_IO_CANCELLED) {
         return VSR_EINVAL;
     }
     if (stream->state == VSR_IO_STREAM_ENDING) {
-        /* Lost or cancelled under the caller; its END op is on its way. */
-        return stream->accepted && !stream->end_due && !stream->ended
-                   ? VSR_OK
-                   : VSR_EINVAL;
+        /* Ended under the caller (lost, cancelled, a file read failed),
+         * which it cannot know before the END op: that op is on its way
+         * and carries the engine's status. A refused stream or a second
+         * close was the caller's own doing (decision B4). */
+        if (!stream->accepted || stream->closed || stream->ended) {
+            return VSR_EINVAL;
+        }
+        stream->closed = 1;
+        return VSR_OK;
     }
     if (stream->state != VSR_IO_STREAM_OPEN) {
         return VSR_EINVAL;
     }
     stream->state = VSR_IO_STREAM_ENDING;
+    stream->closed = 1;
     stream->end_due = 1;
     stream->status = status;
     stream_touch(io, stream);
