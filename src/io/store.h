@@ -92,6 +92,9 @@ struct vsr_io_segment {
     uint64_t used;         /* Bytes packed, header included. */
     uint32_t phase;        /* enum vsr_io_segment_phase */
     uint32_t header_write; /* Write index while HEADER, else NONE. */
+    uint32_t run;          /* Run that wrote its header (the successor
+                              rule of recovery, decision 48). */
+    uint32_t reserved;
 };
 
 /* Op ring entry: the current version of one op. */
@@ -232,22 +235,33 @@ struct vsr_io_trim_event {
     uint64_t log_begin;
 };
 
-/* Recovery scan state: one step at a time through prepare/complete. */
+/* Recovery state (section 6.4): one step at a time through prepare and
+ * complete; the reads go into a pool slab, the superblocks into their
+ * tail blocks, and the ring is scratch until the scan is over. */
 struct vsr_io_recovery {
-    uint32_t stage;         /* Private stage enumeration. */
-    uint32_t slot;          /* Slot being read. */
-    uint32_t slab;          /* Read buffer. */
-    uint32_t region;        /* Region of the recovered graph. */
-    uint64_t offset;        /* Next file offset to read. */
-    uint64_t chunk;         /* Bytes in the slab. */
+    uint32_t stage;     /* Private stage enumeration. */
+    uint32_t slot;      /* Segment slot whose header is read, then
+                               the one being scanned. */
+    uint32_t slab;      /* Pool slab of the reads, or NONE. */
+    uint32_t io_slot;   /* Executor slot of the read in flight, NONE. */
+    uint32_t copy;      /* Superblock copy recovered from. */
+    uint32_t last_slot; /* Slot holding the last valid record, else
+                               the start slot. */
+    uint32_t mode;      /* Private: replaying the chain, or sweeping
+                               for floors only (decision 50). */
+    uint32_t reserved;
+    uint64_t offset;        /* File offset of the chunk in the slab. */
+    uint64_t position;      /* File offset of the next record to judge. */
     uint64_t sequence;      /* Last valid record replayed. */
-    uint32_t run;           /* Run of the last valid record. */
-    uint32_t retried;       /* 1 while the one re-read of a bad range is out. */
-    uint64_t retry_offset;  /* File offset of the range being re-read. */
+    uint32_t run;           /* Run of the last valid record (or header). */
+    uint32_t retried;       /* 1 once the range at retry_offset was read
+                               a second time (decision 50). */
+    uint64_t retry_offset;  /* File offset of that range. */
     uint64_t durable_floor; /* F: max of the superblock's and headers'
                                floors and every valid record's flushed. */
+    uint64_t resume;        /* File offset of the block after the last
+                               valid record: where writing resumes. */
     uint64_t load_op;       /* The RECOVERY load op to complete. */
-    struct vsr_recovered *recovered; /* Being built in `region`. */
 };
 
 struct vsr_io_store {
@@ -419,10 +433,16 @@ void vsr_io_store_init(struct vsr_io_store *store, void *metadata,
 
 /*
  * Starts the asynchronous open: RECOVER opens and recovers, NEW and JOIN
- * create (an existing log is reported to the RECOVERY load as a recovered
- * row, which makes the core fail NEW/JOIN as vsr.h requires; a missing log
- * under RECOVER is NOT_FOUND). load_op is the core's RECOVERY LOAD, whose
- * completion carries the recovered row or the status.
+ * create (an existing log is recovered under every mode: one with records
+ * is reported to the RECOVERY load as a recovered row, which makes the
+ * core fail NEW/JOIN as vsr.h requires; an empty one, like a missing log
+ * under RECOVER, is NOT_FOUND and the store is READY over it, decision
+ * 71). load_op is the core's RECOVERY LOAD, whose completion carries the
+ * recovered row in a lease region, or the status: CORRUPT for a log the
+ * scan cannot trust (section 6.4), FAILED for an I/O error. The recovery
+ * wants the anchor's clients file through base_wanted (a FULL replica
+ * with an anchor) before it completes; `read` carries nothing recovery
+ * needs and is ignored.
  */
 void vsr_io_store_open(struct vsr_io_store *store, uint32_t start_mode,
                        uint64_t load_op, const struct vsr_store_read *read);

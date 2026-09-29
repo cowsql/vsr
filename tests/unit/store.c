@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /*
  * Store unit test, phase 1: layout checks, creation of an empty store,
@@ -90,6 +91,7 @@ struct disk {
     uint32_t flushes;
     uint32_t fallocates;
     uint32_t reads;
+    uint32_t stats; /* STATX calls. */
     uint64_t base_size; /* The base file image (base_image). */
     int32_t base_slot;
     uint8_t once[DISK_BLOCKS];  /* A segment block written already. */
@@ -626,6 +628,23 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         memset(disk.dirty, 0, sizeof(disk.dirty));
         *result = 0;
         return true;
+    case VSR_IO_SQE_STATX: {
+        struct statx *out = (struct statx *)(uintptr_t)sqe->addr2;
+
+        CHECK(sqe->fd == AT_FDCWD && sqe->flags == 0);
+        CHECK(strcmp(sqe->addr, DIRECTORY "/log") == 0);
+        CHECK((sqe->length & STATX_SIZE) != 0 && out != NULL);
+        if (!disk.exists) {
+            *result = -ENOENT;
+            return true;
+        }
+        memset(out, 0, sizeof(*out));
+        out->stx_mask = STATX_SIZE;
+        out->stx_size = disk.size;
+        disk.stats++;
+        *result = 0;
+        return true;
+    }
     case VSR_IO_SQE_READ: {
         const unsigned char *image = disk_image;
         uint64_t size = disk.size;
@@ -1591,8 +1610,9 @@ static void test_recover_missing(void)
     harness_close();
 }
 
-/* An existing log routes to recovery, which phase 3 delivers; until then
- * the open fails, and NEW over stray state is refused either way. */
+/* An existing log routes to recovery under every start mode (NEW over
+ * stray state is refused through the recovered row, decision 57); a file
+ * without a valid superblock is CORRUPT, which fences. */
 static void test_open_existing(void)
 {
     struct config c = base_config();
@@ -1608,9 +1628,14 @@ static void test_open_existing(void)
     vsr_io_store_open(h.store, VSR_START_NEW, op, &read);
     CHECK(harness_prepare() == 1);
     harness_complete(pending_of(VSR_IO_SQE_OPENAT));
-    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
     CHECK(h.store->log_slot == (int32_t)FILE_SLOT_BASE);
-    expect_completion(op, VSR_IO_FAILED);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_STATX));
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_READ));
+    CHECK(h.store->state == VSR_IO_STORE_FAILED);
+    expect_completion(op, VSR_IO_CORRUPT);
     expect_no_completion();
     /* Every later op fails at once. */
     CHECK(vsr_io_store_store(h.store, 77, &txn_append(1, 1, 8)->store) ==
