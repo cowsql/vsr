@@ -378,7 +378,7 @@ struct vsr_io_options {
                                              through the executor on the first
                                              prepare, a bind or listen failure
                                              is fatal: vsr_io_stats.failure. */
-    uint32_t listen_count;               /* Zero: dial only. */
+    uint32_t listen_count;               /* Zero: dial only; at most 8. */
     uint32_t handshake;                  /* enum vsr_io_handshake_mode */
     struct vsr_io_limits limits;
     uint32_t file_slot_base;     /* First executor slot/region/group index */
@@ -427,13 +427,15 @@ int vsr_io_deinit(struct vsr_io *io); /* EBUSY until closed. */
 void vsr_io_wake(struct vsr_io *io);
 
 /*
- * Node table and authorization. Changing a node's address or revoking an
- * authorization closes affected links; a SEND queued on them completes with
- * RETRY. authorize with node = VSR_IO_NO_NODE revokes. A NULL address
- * records a CALLER-DIALED node: the engine never connects to it and instead
- * emits a LINK_WANTED op, on its redial backoff schedule, whenever it needs a
- * link and has none; the caller connects however it likes and adopts the
- * socket.
+ * Node table and authorization. A node must be set before it is authorized
+ * (EINVAL otherwise); clearing it removes its authorizations. Changing a
+ * node's address closes its links, and revoking an authorization closes
+ * the node's links once no (cluster, replica) names it any more; a SEND
+ * queued on them completes with RETRY. authorize with node = VSR_IO_NO_NODE
+ * revokes. A NULL address records a CALLER-DIALED node: the engine never
+ * connects to it and instead emits a LINK_WANTED op, on its redial backoff
+ * schedule, whenever it needs a link and has none; the caller connects
+ * however it likes and adopts the socket.
  */
 int vsr_io_node_set(struct vsr_io *io, uint64_t node,
                     const struct vsr_io_address *address);
@@ -618,10 +620,13 @@ struct vsr_io_op {
 enum vsr_io_direction { VSR_IO_INBOUND, VSR_IO_OUTBOUND };
 
 /*
- * EXTERNAL handshake. The descriptor is connected and owned by the caller
- * until completion. Complete with status OK and data = vsr_io_handshake_done
- * to install the link, or any other status to close it. The engine does not
- * read or write the socket meanwhile. OUTBOUND names the expected node.
+ * EXTERNAL handshake. The descriptor is connected, the VSR_IO_WIRE_MAGIC
+ * preamble has been sent (OUTBOUND) or consumed (INBOUND), and the
+ * descriptor is owned by the caller until completion. Complete with status
+ * OK and data = vsr_io_handshake_done to install the link, or any other
+ * status to close it. The engine does not read or write the socket
+ * meanwhile. OUTBOUND names the expected node; an INBOUND identity must be
+ * a node in the table.
  */
 struct vsr_io_handshake {
     int32_t fd;

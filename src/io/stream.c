@@ -132,3 +132,41 @@ void vsr_io_streams_init(struct vsr_io_streams *streams, void *memory,
                      streams->window);
     }
 }
+
+/*
+ * Link-facing entry points, stubs until the stream module lands: the link
+ * module tells a STREAM-purpose link's stream about its life cycle and
+ * hands it inbound stream frames. A frame reaching a stub is dropped; a
+ * link event is ignored.
+ */
+
+void vsr_io_streams_frame(struct vsr_io *io, uint32_t link, uint16_t kind,
+                          const struct vsr_io_cursor *body, uint32_t slab)
+{
+    (void)io;
+    (void)link;
+    (void)kind;
+    (void)body;
+    (void)slab;
+}
+
+void vsr_io_streams_link_up(struct vsr_io *io, uint32_t stream)
+{
+    (void)io;
+    (void)stream;
+}
+
+void vsr_io_streams_link_lost(struct vsr_io *io, uint32_t stream, int32_t error)
+{
+    (void)io;
+    (void)stream;
+    (void)error;
+}
+
+void vsr_io_streams_sent(struct vsr_io *io, uint32_t stream,
+                         uint64_t notified_offset)
+{
+    (void)io;
+    (void)stream;
+    (void)notified_offset;
+}
