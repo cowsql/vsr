@@ -5034,6 +5034,66 @@ static void test_reclaim_media(void)
     }
 }
 
+/* A client's completed record whose slot was freed under the base (the
+ * base term of the floor lets it go) and reused: the ring's extents of
+ * the new segment cover the old record's file range with other bytes, so
+ * a CLIENT load reads the base file, and a capture copies the record from
+ * it (sequence 0, the base offset). Found by a random walk: the load came
+ * back CORRUPT from the new segment's bytes. */
+static void test_client_freed(void)
+{
+    struct config c = script_config(VSR_IO_SYNC_FDATASYNC);
+    struct vsr_io_client_snapshot out[4];
+    struct vsr_id client = {0xC, 1};
+    struct vsr_id x = {0x51, 1};
+    struct vsr_id none = {0, 0};
+    struct vsr_io_piece piece;
+    const struct vsr_client_record *record;
+    const struct vsr_loaded *loaded;
+    uint32_t lease = NONE;
+    uint64_t base_offset;
+    uint64_t sequence;
+    uint64_t op;
+
+    c.max_segments = 2;
+    sequence = media_setup(&c); /* Client 0xC's record at 2, in slot 0. */
+    store_run(txn_trim(++sequence, h.store->log_end - 1));
+    harness_capture(x);
+    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+    base_offset = client_of(client)->base_offset;
+    CHECK(base_offset != UINT64_MAX && h.store->client_base == sequence - 1);
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+    harness_run();
+    CHECK(h.store->segments[0].number == 0 &&
+          h.store->segments[0].phase == VSR_IO_SEGMENT_FREE);
+    /* Slot 0 reused past the old record's bytes, still in the ring. */
+    while (h.store->current != 0 ||
+           h.store->file_head < txns[2].file_offset + txns[2].bytes) {
+        store_run(txn_append(++sequence, 1, 200));
+    }
+    CHECK(vsr_io_store_hot(h.store, txns[2].file_offset,
+                           (uint32_t)txns[2].bytes, &piece));
+    op = load_client(h.store->readable, client);
+    harness_run();
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    record = loaded->items;
+    CHECK(record->request.number == 1 && record->op == 1);
+    CHECK(record->result.data.size == 16 && record->result.data.count == 1 &&
+          memcmp(record->result.data.spans[0].data, txns[2].results[0], 16) ==
+              0);
+    release_lease(lease);
+    CHECK(vsr_io_store_snapshot_clients(h.store, out, 4) == 1);
+    CHECK(out[0].record.sequence == 0 && out[0].record.number == 1 &&
+          out[0].record.offset == base_offset);
+    CHECK(h.store->capture_floor == UINT64_MAX);
+    vsr_io_store_capture_end(h.store, none, 0);
+    harness_close();
+}
+
 /* -------------------------------------------------------------------------
  * An independent reading of the image
  *
@@ -6228,6 +6288,7 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_wrap_seal);
     RUN(test_freeing_flush);
     RUN(test_reclaim_media);
+    RUN(test_client_freed);
     RUN(test_walk);
     printf("store: ok\n");
     return 0;

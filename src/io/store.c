@@ -2624,6 +2624,21 @@ static uint32_t segment_of(const struct vsr_io_store *store, uint64_t offset)
     return (uint32_t)((offset - fixed) / store->options.segment_bytes);
 }
 
+/* True while the log holds the record of `sequence` at `offset`: its slot
+ * still holds the segment it was packed into. A freed slot may be
+ * rewritten, and a reused one holds later sequences only, whose ring
+ * extents cover the old record's file range with other bytes. Only a
+ * client's completed record outlives its segment: the base term of the
+ * floor frees it once the base file holds it (section 6.5). */
+static bool record_live(const struct vsr_io_store *store, uint64_t offset,
+                        uint64_t sequence)
+{
+    uint32_t slot = segment_of(store, offset);
+
+    return slot < store->slots && store->segments[slot].number != 0 &&
+           sequence >= store->segments[slot].first_sequence;
+}
+
 static void ref_set(struct vsr_io_load_ref *ref, uint64_t offset,
                     uint64_t sequence, uint32_t length, uint32_t change,
                     uint32_t index)
@@ -2672,7 +2687,8 @@ static int32_t resolve_log(const struct vsr_io_store *store,
 
 /* CLIENT: the entry's completed record when the read's sequence covers
  * it (decision 51); from the ring when still there, else from the base
- * file when it holds the record, else from the log. */
+ * file when it holds the record, else from the log. A record whose slot
+ * was freed is no longer in the log (record_live). */
 static int32_t resolve_client(const struct vsr_io_store *store,
                               struct vsr_io_pending_load *load,
                               struct vsr_io_load_ref *refs)
@@ -2680,6 +2696,7 @@ static int32_t resolve_client(const struct vsr_io_store *store,
     const struct vsr_io_client *entry = client_find(store, load->read.client);
     const struct vsr_io_client_version *version;
     uint64_t ring;
+    bool live;
 
     if (entry == NULL || entry->current.number == 0) {
         return VSR_IO_OK;
@@ -2689,14 +2706,15 @@ static int32_t resolve_client(const struct vsr_io_store *store,
         return VSR_IO_RETRY;
     }
     version = &entry->current;
-    if (version->sequence != 0 &&
-        extent_locate(store, version->offset, version->length, &ring)) {
+    live = version->sequence != 0 &&
+           record_live(store, version->offset, version->sequence);
+    if (live && extent_locate(store, version->offset, version->length, &ring)) {
         ref_set(&refs[0], version->offset, version->sequence, version->length,
                 version->change, version->index);
     } else if (entry->base_offset != UINT64_MAX) {
         ref_set(&refs[0], entry->base_offset, 0, 0, 0, 0);
         load->base = 1;
-    } else if (version->sequence != 0) {
+    } else if (live) {
         ref_set(&refs[0], version->offset, version->sequence, version->length,
                 version->change, version->index);
     } else {
@@ -4751,7 +4769,20 @@ uint32_t vsr_io_store_snapshot_clients(struct vsr_io_store *store,
             out[n].id = entry->id;
             out[n].record = entry->current;
         }
-        if (entry->current.sequence != 0 && entry->current.sequence < floor) {
+        if (entry->current.sequence != 0 &&
+            !record_live(store, entry->current.offset,
+                         entry->current.sequence) &&
+            entry->base_offset != UINT64_MAX) {
+            /* Its slot was freed under the base: the capture copies it
+             * from the base file, like a record only the file has. */
+            if (n < capacity) {
+                memset(&out[n].record, 0, sizeof(out[n].record));
+                out[n].record.number = entry->current.number;
+                out[n].record.op = entry->current.op;
+                out[n].record.offset = entry->base_offset;
+            }
+        } else if (entry->current.sequence != 0 &&
+                   entry->current.sequence < floor) {
             floor = entry->current.sequence;
         }
         n++;
