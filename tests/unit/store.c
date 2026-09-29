@@ -428,8 +428,8 @@ static void harness_open(const struct config *c)
     for (uint32_t i = 0; i < REGIONS; ++i) {
         leases[i].slab = NONE;
         leases[i].pin = NONE;
-        vsr_io_bump_init(&leases[i].region, lease_memory + i * LEASE_BYTES,
-                         LEASE_BYTES);
+        vsr_io_bump_init(&leases[i].region,
+                         lease_memory + (size_t)i * LEASE_BYTES, LEASE_BYTES);
     }
     h.replica->leases = leases;
     h.replica->regions_count = REGIONS;
@@ -2627,7 +2627,7 @@ static void test_load_cold(void)
     uint64_t header_bytes;
     uint64_t max_record;
     uint64_t sequence;
-    uint64_t data = 2 * BLOCK + h.header_bytes;
+    uint64_t data;
     uint64_t op;
     uint64_t op2;
     uint32_t lease = NONE;
@@ -3035,7 +3035,7 @@ static void test_capture_base(void)
     /* The record is still hot: read from the ring. */
     op = load_client(4, ids[0]);
     loaded = expect_loaded(op, VSR_IO_OK, &lease);
-    CHECK(h.store->pins[lease].begin != UINT64_MAX);
+    CHECK(loaded->count == 1 && h.store->pins[lease].begin != UINT64_MAX);
     release_lease(lease);
     /* Once evicted: from the base file through its slot. */
     sequence = 5;

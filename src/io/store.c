@@ -1922,6 +1922,7 @@ static bool store_pack(struct vsr_io_store *store,
         store->current == NONE ||
         store->segments[store->current].used + n > store->options.segment_bytes;
     uint32_t slot = NONE;
+    struct vsr_io_extent *newest;
     unsigned char *at;
     uint64_t offset;
     size_t written = 0;
@@ -1972,7 +1973,11 @@ static bool store_pack(struct vsr_io_store *store,
                                  &written);
     STORE_ASSERT(rc == VSR_OK && written == n);
     (void)rc;
-    extent_newest(store)->last_sequence = pending->sequence;
+    newest = extent_newest(store); /* ring_append needs it: never NULL. */
+    STORE_ASSERT(newest != NULL);
+    if (newest != NULL) {
+        newest->last_sequence = pending->sequence;
+    }
     store->readable = pending->sequence;
     store->packed_since_durable = 1;
     if (!index_apply(store, offset, (uint32_t)n, at, &status)) {
