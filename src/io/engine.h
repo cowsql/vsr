@@ -39,7 +39,6 @@
 #define VSR_IO_LEASE_REPLICA_SHIFT 40
 #define VSR_IO_LEASE_REGION_SHIFT 16
 #define VSR_IO_LEASE_GENERATION_MASK UINT64_C(0xFFFF)
-#define VSR_IO_PREAMBLE_BYTES 8u
 
 enum vsr_io_replica_state {
     VSR_IO_REPLICA_FREE,
@@ -194,5 +193,9 @@ uint32_t vsr_io_engine_slot_alloc(struct vsr_io *io);
 void vsr_io_engine_slot_free(struct vsr_io *io, uint32_t slot);
 /* Random bytes from the executor. */
 void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size);
+/* Installs a raw descriptor into an engine file slot (the executor's
+ * update_file, which takes the descriptor over); 0 or a negative errno. The
+ * link module calls it when it takes a socket over (decision 72). */
+int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd);
 
 #endif /* VSR_IO_ENGINE_H */

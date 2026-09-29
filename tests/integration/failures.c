@@ -578,7 +578,7 @@ static void reply_failure(int code)
     finish(&f);
 }
 
-static void read(struct mem_node *node, uint64_t cookie)
+static void submit_read(struct mem_node *node, uint64_t cookie)
 {
     const struct vsr_read_barrier barrier = {1, VSR_NO_DEADLINE,
                                              VSR_READ_CAUSAL, 0};
@@ -595,7 +595,7 @@ static void read_ready_failure(int code)
     struct mem_node *node = f.nodes[0];
     drive(&f, none);
     CHECK(status(node).applied == 1);
-    read(node, 19);
+    submit_read(node, 19);
     drive(&f, fence);
     size_t index = find(node, fence);
     CHECK(index != SIZE_MAX);
@@ -606,7 +606,7 @@ static void read_ready_failure(int code)
     submit(node, 700, 2, 2);
     drive(&f, none);
     CHECK(status(node).applied == 2);
-    read(node, 20);
+    submit_read(node, 20);
     drive(&f, fence);
     index = find(node, fence);
     CHECK(index != SIZE_MAX);

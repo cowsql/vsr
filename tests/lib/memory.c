@@ -628,15 +628,15 @@ static void store_grow(struct mem_store *store, uint64_t sequence)
     }
     if (capacity == store->capacity)
         return;
-    revisions = calloc(capacity, sizeof(*revisions));
-    projected = calloc(capacity, sizeof(*projected));
+    revisions = calloc(capacity, sizeof(struct mem_revision *));
+    projected = calloc(capacity, sizeof(struct mem_revision *));
     pending = calloc(capacity, sizeof(*pending));
     CHECK(revisions != NULL && projected != NULL && pending != NULL);
     if (store->capacity != 0) {
         memcpy(revisions, store->revisions,
-               store->capacity * sizeof(*revisions));
+               store->capacity * sizeof(struct mem_revision *));
         memcpy(projected, store->projected,
-               store->capacity * sizeof(*projected));
+               store->capacity * sizeof(struct mem_revision *));
         memcpy(pending, store->pending, store->capacity * sizeof(*pending));
     }
     free(store->revisions);

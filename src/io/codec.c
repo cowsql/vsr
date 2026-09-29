@@ -1244,7 +1244,9 @@ static bool vector_append(struct vector *vector, const unsigned char *base,
         return false;
     }
     /* vsr_io_vec is the executor's descriptor and is not const-qualified;
-     * a send never writes through it. */
+     * a send never writes through it. The uintptr_t round trip only drops
+     * the qualifier (-Wcast-qual), so there is no provenance to lose. */
+    /* NOLINTNEXTLINE(performance-no-int-to-ptr) */
     vector->vecs[vector->count].base = (void *)(uintptr_t)base;
     vector->vecs[vector->count].length = size;
     vector->count++;
@@ -1306,6 +1308,20 @@ static bool vector_put(struct sink *sink, const void *data, size_t size,
         vector->skip = vector->position;
     }
     return true;
+}
+
+static void vector_init(struct vector *vector, struct vsr_io_writer *writer,
+                        struct vsr_io_vec *vecs, uint32_t capacity,
+                        uint64_t budget, uint64_t skip)
+{
+    vector->sink.put = vector_put;
+    vector->writer = writer;
+    vector->vecs = vecs;
+    vector->capacity = capacity;
+    vector->count = 0;
+    vector->budget = budget;
+    vector->skip = skip;
+    vector->position = 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -1373,14 +1389,7 @@ int vsr_io_encoder_emit(struct vsr_io_encoder *encoder,
         (vecs == NULL && capacity != 0) || writer->used > writer->capacity) {
         return VSR_EINVAL;
     }
-    vector.sink.put = vector_put;
-    vector.writer = writer;
-    vector.vecs = vecs;
-    vector.capacity = capacity;
-    vector.count = 0;
-    vector.budget = budget;
-    vector.skip = encoder->offset;
-    vector.position = 0;
+    vector_init(&vector, writer, vecs, capacity, budget, encoder->offset);
     walker.sink = &vector.sink;
     walker.limits = NULL;
     walker.payload = 0;
@@ -2028,17 +2037,23 @@ int vsr_io_codec_put_record(const struct vsr_store *transaction,
     walker.aggregate = UINT64_MAX;
     for (uint32_t i = 0; i < transaction->count; ++i) {
         size_t before = copy.used;
+        size_t length;
         int rc = walk_change(&walker, &transaction->changes[i]);
 
         if (rc == VSR_AGAIN) {
             return VSR_ELIMIT;
         }
         TRY(rc);
-        if (fixed + before > UINT32_MAX || copy.used - before > UINT32_MAX) {
+        /* False positives: walk_change advanced copy.used through the sink
+         * (walker.sink points into copy), which cppcheck does not follow. */
+        /* cppcheck-suppress duplicateExpression */
+        length = copy.used - before;
+        /* cppcheck-suppress unsignedLessThanZero */
+        if (fixed + before > UINT32_MAX || length > UINT32_MAX) {
             return VSR_ELIMIT;
         }
         offsets[i] = (uint32_t)(fixed + before);
-        lengths[i] = (uint32_t)(copy.used - before);
+        lengths[i] = (uint32_t)length;
     }
     total = fixed + copy.used;
     padded = total + padding_of(total);
@@ -2683,7 +2698,7 @@ int vsr_io_codec_get_clients_record(struct vsr_io_cursor *cursor,
                                     struct vsr_io_bump *region,
                                     struct vsr_client_record *record)
 {
-    struct vsr_io_cursor copy = *cursor;
+    struct vsr_io_cursor copy;
     struct vsr_io_wire_client_record header;
     uint32_t crc = 0;
     uint32_t stored;
@@ -2692,6 +2707,7 @@ int vsr_io_codec_get_clients_record(struct vsr_io_cursor *cursor,
     if (cursor == NULL || limits == NULL || region == NULL || record == NULL) {
         return VSR_EINVAL;
     }
+    copy = *cursor;
     /* The CRC covers the header and the padded bytes: find their extent
      * from the header, checksum them from the start, then decode. */
     if (!vsr_io_cursor_skip(

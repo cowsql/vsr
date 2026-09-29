@@ -1131,6 +1131,7 @@ static void test_layout(void)
         switch (i) {
         case 0:
             vsr_io_put_u64(at, 3);
+            /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): raw */
             memcpy(at + 8, "abc\0\0\0\0\0", 8);
             at += 16;
             break;
@@ -1222,7 +1223,7 @@ static void test_frames(void)
         memcpy(copy, bytes, 24);
         switch (variant) {
         case 0:
-            vsr_io_put_u32(copy + 4, 1u | 0u << 16); /* kind 0 */
+            vsr_io_put_u32(copy + 4, 1u); /* version 1, kind 0 */
             break;
         case 1:
             vsr_io_put_u32(copy + 4, 1u | 6u << 16); /* kind 6 */
@@ -1234,6 +1235,7 @@ static void test_frames(void)
             vsr_io_put_u32(copy + 8, 36); /* not a multiple of 8 */
             break;
         default:
+            /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): tag */
             memcpy(copy, "FRM2", 4);
             break;
         }
@@ -1680,6 +1682,7 @@ static void test_scanning(void)
     vsr_io_cursor_init_one(&cursor, bytes, 0);
     CHECK(vsr_io_codec_get_record(&cursor, 4096, &header, &kind) == VSR_OK);
     CHECK(kind == VSR_IO_SCAN_END);
+    /* NOLINTNEXTLINE(bugprone-not-null-terminated-result): tag */
     memcpy(bytes, "SEG1", 4);
     vsr_io_cursor_init_one(&cursor, bytes, sizeof(bytes));
     CHECK(vsr_io_codec_get_record(&cursor, 4096, &header, &kind) == VSR_OK);
@@ -2074,6 +2077,9 @@ static void test_clients_file(void)
         vsr_io_bump_init(&region, region_memory, region_bytes);
         CHECK(vsr_io_codec_get_clients_record(&cursor, limits, &region,
                                               &records[0]) == VSR_EINVAL);
+        /* A missing cursor is EINVAL, not a dereference. */
+        CHECK(vsr_io_codec_get_clients_record(NULL, limits, &region,
+                                              &records[0]) == VSR_EINVAL);
     }
     /* Trailer. */
     vsr_io_cursor_init_one(&cursor, reference_frame + total - 8, 8);
@@ -2249,7 +2255,6 @@ static void test_sizing(void)
         {
             struct builder b;
             struct vsr_limits larger = *limits;
-            struct vsr_message *message;
             uint32_t length;
             uint32_t crc;
 
@@ -2261,6 +2266,7 @@ static void test_sizing(void)
             for (unsigned variant = 0; variant < 4; ++variant) {
                 struct vsr_io_bump region;
                 struct vsr_io_cursor cursor;
+                struct vsr_message *message;
                 struct vsr_message *decoded;
                 struct vsr_limits mixed = *limits;
 

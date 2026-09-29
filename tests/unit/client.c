@@ -108,14 +108,14 @@ static struct vsr_client_status client_status(struct vsr_client *client)
 static struct vsr_reply answer(const struct vsr_client_attempt *attempt,
                                uint32_t status)
 {
-    struct vsr_reply reply;
-    memset(&reply, 0, sizeof(reply));
-    reply.request = attempt->request.id;
-    reply.status = status;
+    struct vsr_reply result;
+    memset(&result, 0, sizeof(result));
+    result.request = attempt->request.id;
+    result.status = status;
     if (status == VSR_REPLY_OK) {
-        reply.flags = VSR_REPLY_EXECUTED;
+        result.flags = VSR_REPLY_EXECUTED;
     }
-    return reply;
+    return result;
 }
 
 static bool id_equal(struct vsr_id a, struct vsr_id b)

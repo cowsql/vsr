@@ -233,23 +233,50 @@ Purpose: everything between a node table entry and a decoded frame.
 Link life cycle:
 
 ```
- dial:    FREE ─SOCKET/CONNECT─▶ CONNECTING ─▶ HELLO (preamble+HELLO sent)
- accept:  FREE ◀─multishot ACCEPT CQE─ HELLO (waiting for preamble+HELLO)
+ dial:    FREE ─SOCKET, then CONNECT on the raw fd─▶ CONNECTING ─▶ HELLO
+ accept:  FREE ◀─multishot ACCEPT CQE (raw fd)─ HELLO (preamble+HELLO due)
  adopt:   FREE ─vsr_io_adopt─▶ ESTABLISHED (flags 0) | HELLO (HANDSHAKE)
- EXTERNAL mode: CONNECTING/accept ─▶ EXTERNAL (HANDSHAKE op) ─▶ ESTABLISHED
+ EXTERNAL mode: CONNECTING/accept ─preamble on the raw fd─▶ EXTERNAL
+                (HANDSHAKE op) ─caller OK, fd installed─▶ ESTABLISHED
  HELLO ─both HELLOs seen, mode and version match─▶ ESTABLISHED
  any ─error, timeout, revoke, close─▶ CLOSING ─recv terminated, NOTIFs in─▶ FREE
 ```
+
+Descriptors (decision 72): a link's socket is a raw descriptor
+(`raw_fd`) until the engine takes it over into an engine file slot (`fd`)
+through `vsr_io_engine_install`, at the CONNECT or ACCEPT completion in
+TRUSTED mode, at the caller's OK HANDSHAKE completion in EXTERNAL mode,
+and at adopt; from then on every record is FIXED_FILE on the slot. The
+listening socket is DIRECT into an explicit engine slot; the accept itself
+is a plain multishot ACCEPT delivering raw descriptors. Listener state
+(`vsr_io_listener`: SETUP, ACTIVE, REARM, CANCEL, CLOSING) lives in a
+fixed table of `VSR_IO_LISTENERS_MAX` entries; an accepted descriptor that
+finds no free link entry is parked in `orphans` and closed by the next
+prepare.
 
 Handshake (TRUSTED): the dialer sends the 8-byte preamble then a HELLO
 frame; the acceptor consumes the preamble, reads HELLO, checks `handshake`
 and the frame version, records `node` and `purpose`, sends its own HELLO,
 and is established; the dialer is established on receiving the acceptor's
-HELLO whose `node` must equal the dialed node. Sends are queued during the
-handshake and flow once established. A HELLO not received within
-`handshake_timeout_ns` closes the link. A peer link from a node that is not
-in the node table is closed (a node must be known to be authorized; an
-unknown node cannot be authorized for any envelope).
+HELLO whose `node` and `purpose` must be the dialed ones. Sends are queued
+during the handshake and flow once established. A HELLO not received
+within `handshake_timeout_ns` closes the link. A peer link from a node
+that is not in the node table is closed (a node must be known to be
+authorized; an unknown node cannot be authorized for any envelope), as is
+a second HELLO, a HELLO on an established link, or any other frame before
+the handshake is done.
+
+Handshake (EXTERNAL): the dialer sends the preamble on the raw descriptor
+and, once that send's result is in, the HANDSHAKE op names the raw
+descriptor with OUTBOUND and the expected node; the acceptor reads exactly
+the 8 preamble bytes with a plain RECV on the raw descriptor (re-issued
+for a short read), verifies them, and the op names the descriptor with
+INBOUND and no node. The engine touches the socket no further until
+`vsr_io_links_handshake_done`: status OK with the expected node (outbound)
+or a known node (inbound) installs the descriptor and establishes; any
+other outcome closes it with a plain CLOSE. A link closed while the caller
+holds its descriptor (revoke, shutdown, timeout) stays CLOSING until the
+completion returns it.
 
 Carrier election (decision 41): whenever a peer link to node N becomes
 established or leaves ESTABLISHED, `nodes[N].carrier` is recomputed as the
@@ -261,12 +288,20 @@ for `idle_timeout_ns` is closed; the carrier is never idle-closed while the
 node has queued sends, and is idle-closed otherwise like any link, since a
 node with no traffic needs no link (the next SEND redials).
 
-Dialing: a node with an address and no established or pending link is
-dialed when a SEND is queued for it or a replica authorizes it, immediately
-the first time and then at `next_dial_ns` = last attempt +
-`connect_backoff_ns << min(attempts, 4)`. A caller-dialed node (NULL
-address) gets a `LINK_WANTED` op on the same schedule. Success resets
-`attempts`.
+Dialing (decision 73): a node with an address and no established or
+pending link is dialed when a SEND is queued for it or a replica
+authorizes it (`wanted`), immediately the first time and then at
+`next_dial_ns` = failure time + `connect_backoff_ns << min(attempts - 1,
+4)`, where `attempts` counts consecutive dials that failed at any step
+before ESTABLISHED (connect refused, handshake refused, timeout, the
+caller's refusal). A caller-dialed node (NULL address) gets a
+`LINK_WANTED` op on the same schedule, carrying the attempt number. An
+established peer link resets `attempts` and clears `wanted`; an idle
+close clears `wanted` too, so the next SEND redials at once; the engine
+never dials its own node id. Due dials are found by poll through
+`dials_due`; a backoff in the future is a DIAL deadline. The node's
+`last_error` is the last failure of a link identified as its; an inbound
+link that failed before identifying itself is nobody's.
 
 Send path per link (decision 38), executed in `vsr_io_links_prepare`:
 
@@ -306,26 +341,48 @@ carves frames:
    with the frame limit); reject -> close.
 3. If the whole frame (header + length) is within the current slab's
    delivered bytes, decode it in place; else, if it continues in the same
-   slab on a later CQE, wait; else (the next CQE names another slab) copy
-   the partial bytes into a fresh reassembly slab
-   (`vsr_io_pool_acquire`, waiting if none is free) and append every later
-   CQE's bytes into it until the frame is complete, then decode from the
-   reassembly slab. Since a frame fits one slab and the reassembly slab is
-   fresh, this always fits.
+   slab on a later CQE, wait; else (the next CQE names another slab, or
+   the partial's frame is still to be delivered) the delivery joins the
+   link's HELD runs (`held[VSR_IO_LINK_HELD]`, arrival order, one pool
+   reference each, a delivery contiguous with the last run merging into
+   it). Once the partial run is consumed the first held run becomes the
+   partial; while the partial's frame is incomplete and a run is held,
+   the frame is reassembled (decision 76): the partial bytes are copied
+   into a reassembly slab acquired for the frame (`vsr_io_pool_acquire`
+   with internal priority, counted in `links.reassembled`) and the
+   frame's missing bytes, header first so that its length is known and
+   never past the frame's end, are copied behind them from the held run,
+   so the bytes that follow the frame stay in place for zero-copy
+   carving. A frame fits one slab (`frame_limit` is `slab_bytes`) and the
+   run starts at the slab's offset 0, so the copy always fits; the slab
+   is released once the frame is consumed. No free slab: the runs stay
+   held, `retry` is set and every `vsr_io_links_poll` carves again; a
+   link needing more than `VSR_IO_LINK_HELD` runs is closed with
+   `-ENOBUFS`.
 4. Decoding: check the body CRC over the cursor; HELLO goes to the
-   handshake, MESSAGE to `vsr_io_engine_deliver` (which allocates a region,
-   decodes, checks that `message.from` is authorized for `link.node` in
-   `message.cluster`, and queues the event; a rejection counts
-   `frames_rejected` and drops the frame; a missing region leaves the bytes
-   in place and retries next poll), stream frames to `vsr_io_streams_frame`.
+   handshake, stream frames to `vsr_io_streams_frame`. A MESSAGE on an
+   established peer link (decisions 67 and 75): the envelope's `cluster` and
+   `from` are read, the replica of the cluster resolved
+   (`vsr_io_engine_replica`) and `vsr_io_links_lookup(cluster, from)` must
+   equal the link's node; then `vsr_io_engine_deliver` allocates a
+   region, decodes and queues the event. A body shorter than its
+   envelope, a cluster without a replica, an unauthorized `from` or a
+   body the decoder rejects is dropped and counted in `frames_rejected`,
+   the link staying up; a MESSAGE before the handshake or on a stream
+   link closes the link with `-EPROTO`. A replica without a free region
+   leaves the bytes in place with `retry` set; the next poll delivers
+   them. Every accepted frame updates the node's `last_received_ns`.
 5. The slab reference taken at `recv_begin` is released once every byte of
-   that CQE has been decoded (each MESSAGE lease took its own reference) or
-   discarded.
+   its run has been decoded (each MESSAGE lease took its own reference)
+   or discarded; closing a link releases the partial, the held runs and
+   the reassembly slab at once.
 
 Invariants: a link never has two sends in flight; `notified_offset <=
 sent_offset <= stream_offset`; every queued message completes exactly
 once; a slab is referenced by a link only while it holds bytes not yet
-leased or discarded.
+leased or discarded, exactly once per run (the partial's reference is
+the reassembly slab's own once the run lives there); `retries_due`
+counts the links with `retry` set.
 
 Tests: `tests/unit/link`: a fake engine feeding CQEs and checking records:
 dial with backoff to 16x, accept, both handshake modes, refusal on mode and
@@ -333,7 +390,16 @@ version mismatch, simultaneous dial with carrier election on both ends and
 idle closure of the loser, send classification for the three flag cases,
 coalescing bounds, a message spanning two sends, short sends, NOTIF
 ordering and RETRY on close, receive splits at every byte boundary of a
-two-frame stream across one and two slabs, revoke and address change.
+two-frame stream across one, two and three slabs (the header's too),
+many frames in one slab, a frame ending exactly at a slab's end,
+slab-sized frames, delivery refused for want of a region and retried at
+poll, the reassembly slab unavailable then available, a bad CRC and an
+oversized length in reassembled frames, an unauthorized sender and an
+unknown cluster dropped, closing with runs held (references back to
+zero), a seeded random walk of MESSAGE sequences under random slicing,
+slab cuts, pool drought and lease holding (every authorized message
+exactly once, in order, byte-identical, references balanced), revoke and
+address change.
 
 ### Streams (`src/io/stream.h`)
 
@@ -1052,9 +1118,9 @@ no transaction waits.
 ```
  vsr_io_poll(io, now, ops, capacity, count, flags)
    io->now = now; wake_pending = 0
-   while deadlines_pop(now, kind, index): dispatch (LINK/DIAL -> links,
-       FLUSH/SYNC -> store, STREAM -> streams, CAPTURE -> snapshots,
-       CORE -> nothing: TIME below handles it)
+   while deadlines_pop(now, kind, index): dispatch (LINK/DIAL ->
+       vsr_io_links_deadline, FLUSH/SYNC -> store, STREAM -> streams,
+       CAPTURE -> snapshots, CORE -> nothing: TIME below handles it)
    links_poll(now); streams_poll(now)
    for each replica in OPENING or RUNNING:
        do {
@@ -1145,10 +1211,14 @@ returns immediately and prepares again):
 
 1. Pool provision: `provide()` executor call for the slabs
    `vsr_io_pool_provide` returns (not a record).
-2. `vsr_io_links_prepare`: listener setup on the first call (SOCKET, BIND,
-   LISTEN, then multishot ACCEPT with DIRECT, one chain per listen address,
-   LINKed), connects, HELLO sends, coalesced sends, receive re-arms,
-   shutdowns and closes.
+2. `vsr_io_links_prepare`: listener setup on the first call (SOCKET
+   DIRECT into an engine slot, BIND, LISTEN, then a plain multishot
+   ACCEPT, one chain per listen address, LINKed with SKIP_SUCCESS on all
+   but the ACCEPT; decision 72), orphan closes, then per link: the dial's
+   SOCKET or CONNECT, the EXTERNAL preamble receive, the control bytes
+   (preamble, HELLO) and coalesced sends, receive arming and re-arming,
+   the teardown (SHUTDOWN, CANCEL of the receive, CLOSE of the slot, or a
+   plain CLOSE of a raw descriptor).
 3. `vsr_io_streams_prepare`: file chunk reads.
 4. Per replica: `vsr_io_store_prepare` (open/create steps, header writes,
    one record write, superblock write, flush, one cold read), then
@@ -1163,8 +1233,12 @@ generation: dropped, `stats.frames_rejected` untouched, a counter in the
 slot table); then by `slot.kind`: LISTEN, CONNECT, RECV, SEND, SHUTDOWN ->
 `vsr_io_links_complete`; WRITE, FLUSH, SUPER, LOAD, FILE (owner replica)
 -> `vsr_io_store_complete`; CLIENTS, FILE (owner snapshot) ->
-`vsr_io_snapshots_complete`; STREAM -> `vsr_io_streams_complete`. Nothing
-steps a core here; every effect is queued for the next poll.
+`vsr_io_snapshots_complete`; STREAM -> `vsr_io_streams_complete`. The
+module consumes the slot (`vsr_io_slots_consumed` with the record's MORE,
+or `vsr_io_slots_free` for a zero-copy send refused before the kernel took
+it), since it knows what each completion means (decision 74). Nothing
+steps a core here; every effect is queued for the next poll, and a
+time-based effect uses `io->now`, the last poll time.
 
 ### 7.6 Leases
 
@@ -1293,7 +1367,7 @@ with node 0 talking to node 1.
 | --- | --- | --- | --- |
 | `cursor`, `codec`, `pool`, `slots`, `deadline`, `link`, `stream`, `store`, `snapshot`, `sim_world`, `client`, `uring_translate` | unit | `UNIT_TESTS`, each `tests_unit_NAME_SOURCES = tests/unit/NAME.c`, `_LDADD = $(LIBVSR)` | Section 3 |
 | `frame`, `recovery` | fuzzy (libFuzzer) | `if FUZZING` programs and the `fuzz` target, with corpora under `tests/fuzzy/corpus/frame` and `corpus/recovery` | Decoder and recovery never crash; recovered prefixes satisfy the invariants |
-| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise) | Section 8 |
+| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise), then over both again through the fault-injecting wrapper | Section 8 |
 | `engine` | integration | `INTEGRATION_TESTS` | Over the sim: attach NEW, RECOVER, JOIN; empty-store checks; a three-replica group commits, replies, checkpoints, fetches, restarts; STATUS emission; close and detach sequencing; max_clients admission at the primary |
 | `streams`, `snapshots` | integration | `INTEGRATION_TESTS` | Section 3 |
 | `iocluster`, `iocluster_extended` | fuzzy (seeded) | `FUZZY_TESTS`; `SEED COUNT STEPS [trace\|quiet] [PROFILE] [SEEDS]` as `tests/fuzzy/cluster`; the extended program sets a wider default profile | Below |
@@ -1327,7 +1401,14 @@ wraps any `vsr_io_executor`: it forwards records to the inner executor
 and, from a seeded generator, rewrites results (`-EIO`, short counts),
 delays completions by holding them for a number of reaps, and cancels
 receives; it never alters bytes, so it is safe over real files and
-sockets.
+sockets. It keeps every completion order a caller relies on (per
+`user_data`, per provided buffer, per LINK chain), shortens file results
+only in whole units of the request's alignment so the rest of an
+`O_DIRECT` transfer stays aligned, and with every rate zero is
+transparent but for the one `user_data` it reserves:
+`executor_conformance` runs every scenario through it at rate zero over
+both executors, and one more scenario at nonzero rates. Its header states
+what callers may assume of the faults it injects.
 
 `make check` grows by the programs above; `make check-unit`,
 `check-integration` and `check-fuzzy` select layers as before; `make fuzz`
@@ -1358,6 +1439,8 @@ of `docs/io-design.md`:
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | liburing dropped: no pkg-config check, no `Requires.private`; the kernel's UAPI header vendored under `src/io/uapi` | 52 |
 | `vsr-io.h` | `cache_bytes` rule: two headers and a block of slack besides the two records | 69 |
 | `store.h` | Extents carry their segment, a header flag and their last sequence; the store keeps `file_head`, `superblock_dirty`, `growth` and the log path; the check rule adds the executor-length bounds | 69, 70 |
+| `vsr-io.h` | At most 8 listen addresses (`vsr_io_layout` is ELIMIT beyond); `vsr_io_authorize` requires a node already set (EINVAL), revoking closes links only once nothing names the node, `vsr_io_node_clear` removes the node's authorizations; the HANDSHAKE op is emitted after the preamble was exchanged on the raw descriptor | 72, 73 |
+| `link.h` (internal) | Receive side of `vsr_io_link`: `held[VSR_IO_LINK_HELD]` runs (`vsr_io_run`) behind the partial, `retry`; `vsr_io_links.retries_due` and `reassembled`; `vsr_io_links_poll` also retries held bytes | 75, 76 |
 | `store.h` | `VSR_IO_SEGMENT_FREEING`; `vsr_io_load_ref` and `load_refs`, the pending load's resolved records and read state, `cold_slab`; `reindexed`, `restored`, the `base_*` fields and `base_slot`; the client entry's `next_offset`; a LOAD completion's lease carries every OK result; `release` only unpins | 77, 78, 79, 80 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
