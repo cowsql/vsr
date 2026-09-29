@@ -39,6 +39,57 @@ _Static_assert(offsetof(struct vsr_io_vec, length) ==
 _Static_assert(sizeof(struct io_uring_sqe) == 64, "64-byte SQEs");
 _Static_assert(sizeof(struct io_uring_cqe) == 16, "16-byte CQEs");
 _Static_assert(sizeof(struct io_uring_buf) == 16, "16-byte buffer entries");
+/* The kernel's ABI as this file uses it: a refreshed UAPI header must
+ * declare these layouts unchanged (src/io/uapi/README.md). */
+#define ABI_AT(type, field, offset)                                            \
+    _Static_assert(offsetof(struct type, field) == (offset),                   \
+                   #type "." #field " at " #offset)
+ABI_AT(io_uring_sqe, opcode, 0);
+ABI_AT(io_uring_sqe, flags, 1);
+ABI_AT(io_uring_sqe, ioprio, 2);
+ABI_AT(io_uring_sqe, fd, 4);
+ABI_AT(io_uring_sqe, off, 8);
+ABI_AT(io_uring_sqe, cmd_op, 8);
+ABI_AT(io_uring_sqe, addr, 16);
+ABI_AT(io_uring_sqe, level, 16);
+ABI_AT(io_uring_sqe, optname, 20);
+ABI_AT(io_uring_sqe, len, 24);
+ABI_AT(io_uring_sqe, rw_flags, 28);
+ABI_AT(io_uring_sqe, msg_flags, 28);
+ABI_AT(io_uring_sqe, nop_flags, 28);
+ABI_AT(io_uring_sqe, user_data, 32);
+ABI_AT(io_uring_sqe, buf_index, 40);
+ABI_AT(io_uring_sqe, buf_group, 40);
+ABI_AT(io_uring_sqe, file_index, 44);
+ABI_AT(io_uring_sqe, optlen, 44);
+ABI_AT(io_uring_sqe, optval, 48);
+ABI_AT(io_uring_params, sq_off, 40);
+ABI_AT(io_uring_params, cq_off, 80);
+ABI_AT(io_uring_getevents_arg, min_wait_usec, 12);
+ABI_AT(io_uring_getevents_arg, ts, 16);
+ABI_AT(io_uring_rsrc_register, data, 16);
+ABI_AT(io_uring_rsrc_update2, tags, 16);
+ABI_AT(io_uring_rsrc_update2, nr, 24);
+ABI_AT(io_uring_buf_reg, flags, 14);
+ABI_AT(io_uring_buf_status, head, 4);
+ABI_AT(io_uring_probe, ops, 16);
+ABI_AT(io_uring_probe_op, flags, 2);
+ABI_AT(io_uring_napi, opcode, 5);
+ABI_AT(io_uring_napi, op_param, 8);
+ABI_AT(io_uring_sync_cancel_reg, timeout, 16);
+#undef ABI_AT
+_Static_assert(sizeof(struct io_uring_params) == 120 &&
+                   sizeof(struct io_uring_getevents_arg) == 24 &&
+                   sizeof(struct io_uring_rsrc_register) == 32 &&
+                   sizeof(struct io_uring_rsrc_update) == 16 &&
+                   sizeof(struct io_uring_rsrc_update2) == 32 &&
+                   sizeof(struct io_uring_buf_reg) == 40 &&
+                   sizeof(struct io_uring_buf_status) == 40 &&
+                   sizeof(struct io_uring_probe_op) == 8 &&
+                   sizeof(struct io_uring_napi) == 16 &&
+                   sizeof(struct io_uring_sync_cancel_reg) == 64 &&
+                   sizeof(struct __kernel_timespec) == 16,
+               "register and enter arguments keep the kernel's sizes");
 _Static_assert(sizeof(_Atomic uint32_t) == sizeof(uint32_t) &&
                    sizeof(_Atomic uint16_t) == sizeof(uint16_t),
                "ring words are addressed as atomics in place");
@@ -2050,8 +2101,13 @@ int vsr_io_uring_init(void *memory, size_t size,
     if (options->napi_busy_poll_us > 0) {
         struct io_uring_napi napi;
 
+        /* Registration with dynamic tracking: the ring learns the NAPI ids
+         * of the sockets it polls (both values are 0, the layout older
+         * kernels read as padding). */
         memset(&napi, 0, sizeof(napi));
         napi.busy_poll_to = options->napi_busy_poll_us;
+        napi.opcode = IO_URING_NAPI_REGISTER_OP;
+        napi.op_param = IO_URING_NAPI_TRACKING_DYNAMIC;
         rc = ring_register(&uring->ring, IORING_REGISTER_NAPI, &napi, 1);
         if (rc < 0) {
             goto fail;

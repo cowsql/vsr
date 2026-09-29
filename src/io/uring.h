@@ -4,8 +4,21 @@
 #include "vsr-io.h"
 
 /* The kernel's io_uring UAPI, vendored under src/io/uapi (its README says
- * where it comes from). It uses two extensions -Wpedantic reports:
- * zero-length arrays and an enumerator above INT_MAX. */
+ * where it comes from). It uses two extensions -Wpedantic reports: the
+ * empty struct of __DECLARE_FLEX_ARRAY and an enumerator above INT_MAX.
+ * The system's <linux/types.h> brings <linux/stddef.h>, which defines
+ * __DECLARE_FLEX_ARRAY only from Linux 5.16's headers: an older
+ * linux-libc-dev gets the kernel's own definition from here, so the build
+ * does not depend on that package's version. */
+#include <linux/types.h>
+#ifndef __DECLARE_FLEX_ARRAY
+#define __DECLARE_FLEX_ARRAY(TYPE, NAME)                                       \
+    struct {                                                                   \
+        struct {                                                               \
+        } __empty_##NAME;                                                      \
+        TYPE NAME[];                                                           \
+    }
+#endif
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #include "io/uapi/io_uring.h"

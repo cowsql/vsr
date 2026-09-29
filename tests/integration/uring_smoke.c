@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #include "config.h"
 
+#include "io/uring.h" /* The UAPI, for the NAPI read-back alone. */
 #include "lib/check.h"
 #include "vsr-io.h"
 
@@ -28,6 +29,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1487,8 +1489,21 @@ static void test_variants(void)
     rc = open_fixture(&f, &o);
     printf("NAPI ring: %d\n", rc);
     if (rc == 0) {
+        struct io_uring_napi napi;
+
         submit1(&f, rec(VSR_IO_SQE_NOP, 402));
         CHECK(take(&f, 402).result == 0);
+        /* The kernel answers a registration with the settings it replaces:
+         * registering the same ones again reads back what init registered,
+         * a 20 us busy poll with dynamic tracking. */
+        memset(&napi, 0, sizeof(napi));
+        napi.busy_poll_to = 20;
+        napi.opcode = IO_URING_NAPI_REGISTER_OP;
+        napi.op_param = IO_URING_NAPI_TRACKING_DYNAMIC;
+        CHECK(syscall(SYS_io_uring_register, vsr_io_uring_fd(&f.ex),
+                      IORING_REGISTER_NAPI, &napi, 1) == 0);
+        CHECK(napi.busy_poll_to == 20 && napi.prefer_busy_poll == 0 &&
+              napi.op_param == IO_URING_NAPI_TRACKING_DYNAMIC);
         close_fixture(&f);
     }
 }

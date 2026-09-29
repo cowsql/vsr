@@ -30,12 +30,14 @@ src_libvsr_a_SOURCES += src/io/crc32c.c src/io/crc32c.h src/io/cursor.c \
   src/sim/exec.c
 # Private headers of the I/O layer: the interface specification every
 # module implements (docs/io-implementation.md); compiled by the header
-# check until their sources land. src/io/uapi/io_uring.h is the kernel's
-# io_uring UAPI header, vendored verbatim (src/io/uapi/README.md).
+# check until their sources land. src/io/uapi/io_uring.h and
+# src/io/uapi/io_uring/zcrx.h are Linux 7.2.6's io_uring UAPI headers,
+# vendored with one include redirected (src/io/uapi/README.md).
 src_libvsr_a_SOURCES += src/io/cursor.h src/io/wire.h src/io/codec.h \
   src/io/pool.h src/io/slots.h src/io/deadline.h src/io/link.h \
   src/io/stream.h src/io/store.h src/io/snapshot.h src/io/engine.h \
-  src/io/uring.h src/io/uapi/io_uring.h src/sim/sim.h
+  src/io/uring.h src/io/uapi/io_uring.h src/io/uapi/io_uring/zcrx.h \
+  src/sim/sim.h
 noinst_HEADERS = tests/lib/check.h
 noinst_PROGRAMS = examples/replication examples/failover examples/checkpoint \
   examples/epochs examples/reads examples/witness
@@ -337,7 +339,7 @@ CLANG_TIDY = $(shell $(CC) -print-prog-name=clang-tidy)
 SCAN_BUILD = $(shell $(CC) -print-prog-name=scan-build)
 LLVM_COV = $(shell $(CC) -print-prog-name=llvm-cov)
 LLVM_PROFDATA = $(shell $(CC) -print-prog-name=llvm-profdata)
-# The vendored kernel header under src/io/uapi keeps the kernel's style.
+# The vendored kernel headers under src/io/uapi keep the kernel's style.
 FORMAT_FILES = find $(srcdir)/include $(srcdir)/src $(srcdir)/tests $(srcdir)/examples \
   -path '*/src/io/uapi' -prune -o -type f \( -name '*.c' -o -name '*.h' \) -print0
 # Overridable from the environment as well as the command line.

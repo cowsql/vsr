@@ -40,7 +40,10 @@ simulation and `vsr_client_` in the client.
    snapshot.h        snapshot.c   clients files and the joint snapshot ops
    engine.h          engine.c     struct vsr_io, replicas, entry points
    uring.h           uring.c      vsr_io_uring_* over the io_uring syscalls
-   uapi/io_uring.h                the kernel's UAPI header, vendored
+   uapi/io_uring.h                the kernel's UAPI header, vendored: Linux
+   uapi/io_uring/zcrx.h           7.2.6's headers_install output (from
+                                  linux-libc-dev 7.2.6-1), one include
+                                  redirected; uapi/README.md
  src/sim/           the simulated world
    sim.h             world.c net.c disk.c exec.c
  src/client/        the client bookkeeping
@@ -738,9 +741,11 @@ Section 7.
 Section 8 is the contract; `uring.c` realizes it on Linux >= 6.18 (design
 section 2) through the raw `io_uring_setup`, `io_uring_enter` and
 `io_uring_register` syscalls over the vendored UAPI header
-`src/io/uapi/io_uring.h` (decision 52); there is no liburing and no other
-library. Specifics: the executor state and its tables live in the caller's
-page-aligned region; the rings and the SQE array are the kernel's pages,
+`src/io/uapi/io_uring.h`, Linux 7.2.6's (decision 52; `src/io/uapi/README.md`
+says where it comes from and how to refresh it, and `uring.c` asserts the
+layout of every structure it hands the kernel); there is no liburing and no
+other library. Specifics: the executor state and its tables live in the
+caller's page-aligned region; the rings and the SQE array are the kernel's pages,
 mapped from the ring descriptor by init (one mapping for both rings,
 `IORING_FEAT_SINGLE_MMAP`, one for the SQEs) and unmapped by deinit before
 the descriptor is closed, not caller memory through `NO_MMAP`, because the
@@ -779,7 +784,8 @@ eventfd wake is a multishot `POLL_ADD` whose completions are consumed in
 `REGISTER_BUFFERS2` sparse and `BUFFERS_UPDATE` with tags,
 `REGISTER_PBUF_RING`/`UNREGISTER_PBUF_RING` with `IOU_PBUF_RING_INC` for
 incremental rings and `PBUF_STATUS` for the kernel's head, `REGISTER_NAPI`
-when requested; `provide` writes `struct io_uring_buf` entries then
+when requested (`IO_URING_NAPI_REGISTER_OP` with dynamic tracking, the ring
+learning the NAPI ids of the sockets it polls); `provide` writes `struct io_uring_buf` entries then
 publishes the ring tail with a release store. A vectored zero-copy send
 from a registered region is `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`
 and a `struct msghdr` naming the record's vectors, kept in a per-SQE-slot
