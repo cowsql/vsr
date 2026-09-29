@@ -857,32 +857,70 @@ revision can still name its entries. Each change type:
 | RESTORE | entries `<= op` dropped from the ring as by TRIM to `op + 1`; `anchor` replaced; the table is rebuilt: the transaction waits for the base load of `id` at this sequence (WITNESS: emptied at once), then every client's `retained` is recomputed by walking `[log_begin, log_end)` |
 | TRIM | for op from `log_begin` to `first - 1`: if `clients[c].retained == op` clear it, and delete the client entry when it has no record and is not in flight; `log_begin = first`; a `trims` entry `(sequence, first)` is recorded (history full: `retained_begin` simply does not advance until it drains, which is safe) |
 | IDENTITY | `identity` set; only at sequence 1 |
-| RECLAIM(oldest) | `reclaim = oldest`; `retained_begin` = `log_begin` as of `oldest - 1` from `trims`; versions with `truncated <= oldest` deleted; then `vsr_io_store_free_segments` |
+| RECLAIM(oldest) | `reclaim = oldest`; `retained_begin` = `log_begin` as of `oldest` from `trims` (the newest event with `sequence <= oldest`; a full history merges the newest event into the new one, which reports the older begin in between and so retains more); the ring below it is cleared; versions with `truncated <= oldest` deleted; then `vsr_io_store_free_segments` |
+
+`index_apply` works from a record's bytes (the ring copy of a STORE, or
+a recovery slab): the header, then every change descriptor checked
+against the record's length (`offset >= 48 + 24 * count`, `offset +
+length <= length`), then each change from its payload cursor. An empty
+log (`log_begin == log_end == 0`, never appended) takes its bounds from
+the first APPEND, TRIM or RESTORE (the core's genesis is 1). Bytes the
+codec rejects or a change contradicting the log (an APPEND not at the log
+end, a TRUNCATE below `log_begin`, an IDENTITY after sequence 1) are
+`CORRUPT`; an index at capacity is `FAILED`; either fails the STORE and
+fences. HARD_STATE and the anchor are decoded into `state_region` (the
+hard state's epoch first, then the checkpoint with its epoch and a copy of
+the manifest bytes, which the ring would overwrite); IDENTITY sets
+`superblock_dirty` so the superblock carries the identity. The client
+table is an open-addressing table with backward-shift deletion (no
+tombstones); `reindexed` records the sequence of the latest TRUNCATE,
+TRIM or RESTORE and `restored` that of the latest RESTORE.
 
 LOAD at sequence `s` (the core always names its `stored_sequence`; the
 engine routes every LOAD of an update before its STOREs, so normally
-`readable == s`, decision 51):
+`readable == s`, decision 51). `s > readable`, `s < reclaim`, a bad type or
+count, or `first > end` are EINVAL (a caller bug). The records a load
+needs are resolved against the indexes when it is accepted and kept in
+`load_refs`; the result, an empty one included, is a `vsr_loaded` graph
+in an engine lease (`vsr_io_lease_alloc` through the replica embedding
+the store) whose pin or slab the completion's `lease` names. A load that
+finds no free lease waits in the load queue; the queue is FIFO and a cold
+load at its head waits for the single read in flight (decision 37):
 
 - RECOVERY: only from `open`; answered by recovery.
-- LOG `[first, end)`: for `op = first` while `op < end`, count and bytes
-  allow: the version is `ops[op]` when `ops[op].op == op` and `sequence <=
-  s`, else the entry of `versions` with `appended <= s < truncated`, else
-  stop. Consecutive versions in one record are read together. Hot
-  (`vsr_io_store_hot`): the region gets `vsr_entry`s with spans into the
-  ring, one pin covering the records. Cold: one `READ | FIXED_FILE |
-  FIXED_BUFFER` of the block-aligned range covering the records (bounded
-  by the slab; the batch is cut where it would exceed the slab or leave
-  the segment) into a slab; on completion the records' CRCs are checked
-  (`CORRUPT` on failure), entries decoded with spans into the slab. `next
-  = first + count`, `next = end` when the range is complete; an empty
-  result for a nonempty range is `NOT_FOUND`.
-- CLIENT: the entry's `current` when `current.sequence <= s`, else
-  `RETRY` (decision 51: the core resets the route and reloads at its newer
-  stored sequence, without fencing); no entry or `number == 0` is count 0. The record is read hot or cold
-  from the log when `sequence > client_base`, else from the base file at
-  `base_offset` (a cold read through the clients-file slot).
+- LOG `[first, end)`: for `op = first` while `op < end` and the count
+  allows: the version is `ops[op]` when `ops[op].op == op` and `sequence
+  <= s`, else the entry of `versions` with `appended <= s < truncated`,
+  else stop. The byte bound is applied when the entries are decoded (the
+  body sizes are in the records): the result stops before the entry that
+  would exceed it, never before the first. Hot (every record in the
+  ring): the region gets `vsr_entry`s with spans into the ring, one pin
+  covering the records. Cold: one `READ | FIXED_FILE | FIXED_BUFFER` of
+  the block-aligned range covering the records (bounded by the slab; the
+  batch is cut where it would exceed the slab or leave the segment) into
+  a slab; on completion (a short read that leaves a record incomplete is
+  `CORRUPT`, a negative result `FAILED`, neither fences) the records'
+  headers, sequences and CRCs are checked (`CORRUPT` on failure), entries
+  decoded with spans into the slab, and the lease takes the slab's
+  reference. `next = first + count`, which is `end` when the range is
+  complete; an empty result for a nonempty range is `NOT_FOUND`.
+- CLIENT: the entry's `current` when `current.sequence <= s` and no
+  RESTORE rebuilt the table after `s`, else `RETRY` (decision 51: the core
+  resets the route and reloads at its newer stored sequence, without
+  fencing); no entry or `number == 0` is count 0. The record is read from
+  the ring when still there, else from the base file when `base_offset`
+  is set (a cold read through `base_slot`, the registered slot of the
+  current base file the snapshot module keeps open: a slab from the
+  record's block, short at the file's end, whose record CRC the clients
+  codec checks), else cold from the log.
 - REQUEST: `retained` when the version's `sequence <= s`, else walk
-  `previous` links; the entry is decoded from its record like LOG.
+  `previous` links over the APPENDs after `s`; `RETRY` when a TRUNCATE,
+  TRIM or RESTORE was applied after `s` (`reindexed > s`); the entry is
+  decoded from its record like LOG.
+
+The store fencing completes every queued load `FAILED`; a read in flight
+keeps its slab (`cold_slab`) until its completion, and `vsr_io_store_close`
+is EBUSY until then.
 
 `vsr_io_store_admit` looks the incarnation up; unknown and `clients_count
 == max_clients` returns false; unknown otherwise inserts an entry with
@@ -969,14 +1007,43 @@ holding another segment (`CORRUPT`).
 
 ### 6.5 Freeing
 
-`vsr_io_store_free_floor` = min(`ops[retained_begin].sequence` (or
-`readable + 1` when the log is empty), `reclaim`, `client_base + 1`,
-`capture_floor`). A SEALED slot whose `last_sequence < floor` is freed;
-when the start slot is freed the new start is the live slot with the
-smallest number and a superblock write is planned; freed slots are not
-reused until that write completes (a superblock always names a present
-segment). Growth also rewrites the superblock after the `FALLOCATE`
-completes.
+`vsr_io_store_free_floor` = min(the sequence of the first live op from
+`retained_begin` (or `readable + 1` when the log is empty; sequences never
+decrease along the ring), the `appended` of every kept version,
+`reclaim`, `client_base + 1`, `capture_floor`). A SEALED slot whose
+`last_sequence < floor`, whose bytes are all written (nothing of it
+planned or in flight) and from which no queued load still reads is freed:
+its extents die (`segment = NONE`, so `vsr_io_store_hot` no longer answers
+for its file range) and the new start is the live slot with the smallest
+number, with a superblock write planned. A freed slot is `FREEING` until a
+superblock write issued after the free completed (a superblock always
+names a present segment; a slot freed after the write was issued waits for
+the next one); in memory-only mode it is free at once. A STORE that needs
+a slot frees first, then grows, then waits while a slot is `FREEING`, and
+fails with `FAILED` when nothing can free (section 6.1). RECLAIM, a
+capture's end and `base_set` retry held STOREs. Growth also rewrites the
+superblock after the `FALLOCATE` completes.
+
+Base files (decision 43): `store_pack` holds a RESTORE, or a PUBLISH of a
+snapshot that is neither the latest capture nor the current base, before
+packing it when the replica's role after the transaction is FULL:
+`base_wanted` reports the id and the transaction's sequence,
+`base_begin` clears every entry's `next_offset`, `base_record` merges a
+file record by request number (greater: `current` replaced, `sequence
+0`, the file offset; equal: the ops must agree, else EINVAL; lower: the
+log's record stays and the entry is not covered; a full table is ELIMIT),
+`base_end` marks the load done and `base_resume(OK)` packs the
+transaction, whose PUBLISH or RESTORE then applies the base: a RESTORE
+deletes the entries the file lacks (a WITNESS empties the table without a
+file) and rebuilds every `retained` from `[log_begin, log_end)`;
+`client_base` becomes the transaction's sequence lowered below the record
+of any entry the file does not cover, so that `client_base + 1` never
+frees a record only the log holds; `client_base_id` the file's. A PUBLISH
+of the latest capture applies the capture's offsets the same way without
+a load (`base_set`). `base_resume` with any other status fails the held
+STORE with it and fences. Recovery loads the anchor's file after its scan
+through the same `base_begin/record/end`, which applies it at once when
+no transaction waits.
 
 ## 7. Engine internals
 
@@ -1291,6 +1358,7 @@ of `docs/io-design.md`:
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | liburing dropped: no pkg-config check, no `Requires.private`; the kernel's UAPI header vendored under `src/io/uapi` | 52 |
 | `vsr-io.h` | `cache_bytes` rule: two headers and a block of slack besides the two records | 69 |
 | `store.h` | Extents carry their segment, a header flag and their last sequence; the store keeps `file_head`, `superblock_dirty`, `growth` and the log path; the check rule adds the executor-length bounds | 69, 70 |
+| `store.h` | `VSR_IO_SEGMENT_FREEING`; `vsr_io_load_ref` and `load_refs`, the pending load's resolved records and read state, `cold_slab`; `reindexed`, `restored`, the `base_*` fields and `base_slot`; the client entry's `next_offset`; a LOAD completion's lease carries every OK result; `release` only unpins | S4, S5, S6, S7 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

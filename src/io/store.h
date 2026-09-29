@@ -460,13 +460,19 @@ bool vsr_io_store_admit(struct vsr_io_store *store, struct vsr_id client);
 void vsr_io_store_replied(struct vsr_io_store *store, struct vsr_id client);
 
 /*
- * Capture support. snapshot copies the completed records of every entry
- * into `out` (id, number, op, record location) and sets capture_floor so
- * their segments stay; the snapshot module reads result bytes through
- * read_record and calls capture_done with each entry's file offset (into
- * capture_offset) and, at the end, capture_end. base_set makes snapshot
- * `id` the client base at `sequence` (PUBLISH of the latest capture,
- * RESTORE after its file was loaded) and re-points entries at the file.
+ * Capture support. snapshot copies the completed record of every entry
+ * into `out` (id, number, op, record location; `capacity` should hold
+ * max_clients, the count is returned regardless), resets every entry's
+ * capture_offset and sets capture_floor so their segments stay; the
+ * snapshot module reads result bytes hot or cold, calls capture_offset
+ * with each entry's offset in the file it writes and, at the end,
+ * capture_end with the snapshot id and the sequence captured (a zero id
+ * only clears the floor: an abandoned capture). base_set makes snapshot
+ * `id` the client base at `sequence`: entries point at the file through
+ * the latest capture's offsets when `id` is its id, else through the
+ * offsets of the file loaded last (base_begin to base_end), and
+ * client_base is `sequence` lowered below the record of any entry the
+ * file does not cover. A PUBLISH of the latest capture calls it itself.
  */
 struct vsr_io_client_snapshot {
     struct vsr_id id;
@@ -482,16 +488,27 @@ void vsr_io_store_capture_end(struct vsr_io_store *store, struct vsr_id id,
                               uint64_t sequence);
 void vsr_io_store_base_set(struct vsr_io_store *store, struct vsr_id id,
                            uint64_t sequence);
-/* Replaces the client table from a loaded base file: called once per
- * record by the file reader, between base_begin and base_end. */
+/* A base file load, by the snapshot module: base_begin, then base_record
+ * per file record (merged by request number: a greater one replaces the
+ * entry's record with the file's, sequence 0; an equal one must name the
+ * same op, else EINVAL; a lower one is ignored; a full table is ELIMIT),
+ * then base_end. When a held RESTORE or PUBLISH waits for it (below) the
+ * merge applies once base_resume packs the transaction; otherwise
+ * (recovery) at once, as base_set. */
 void vsr_io_store_base_begin(struct vsr_io_store *store);
 int vsr_io_store_base_record(struct vsr_io_store *store,
                              const struct vsr_io_wire_client_record *record,
                              uint64_t file_offset);
 void vsr_io_store_base_end(struct vsr_io_store *store, struct vsr_id id,
                            uint64_t sequence);
-/* The RESTORE or PUBLISH transaction waiting for a base file load; the
- * snapshot module resumes it with base_resume(status). */
+/* The RESTORE, or PUBLISH of a snapshot that is neither the latest
+ * capture nor the current base, held before packing until its clients
+ * file is read (decision 43; FULL role only): true while one waits for
+ * the snapshot module to start the load, with its id and the
+ * transaction's sequence. base_resume(OK) packs it (with the merged
+ * table; a RESTORE then drops the entries the file lacks and rebuilds the
+ * retained index); any other status fails it with that status and fences
+ * the store. */
 bool vsr_io_store_base_wanted(const struct vsr_io_store *store,
                               struct vsr_id *id, uint64_t *sequence);
 void vsr_io_store_base_resume(struct vsr_io_store *store, int32_t status);
