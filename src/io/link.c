@@ -771,6 +771,7 @@ static void link_release_partial(struct vsr_io *io, struct vsr_io_link *link)
     }
     link->held_count = 0;
     link_set_retry(io, link, false);
+    link->recv_paused = false;
 }
 
 /* A CLOSING link is FREE once its teardown records went out and every
@@ -1974,7 +1975,11 @@ static bool link_reassemble(struct vsr_io *io, struct vsr_io_link *link)
  * Carves everything the link holds: the partial run, then each held run in
  * turn once the partial is consumed, reassembling a frame that straddles
  * runs. Stops, with `retry` set for poll, when a frame cannot be delivered
- * or reassembled yet.
+ * or reassembled yet. A STREAM link whose frame the stream module cannot
+ * take is PAUSED (its receive cancelled and not re-armed, so the socket
+ * buffer, not the held runs, absorbs the source) until every byte it
+ * holds is carved: the stream module frees a window unit, the poll's
+ * retry takes the frame, and the receive is re-armed at the next prepare.
  */
 static void link_drain(struct vsr_io *io, struct vsr_io_link *link)
 {
@@ -1987,6 +1992,7 @@ static void link_drain(struct vsr_io *io, struct vsr_io_link *link)
         if (result == CARVE_EMPTY) {
             if (link->held_count == 0) {
                 link_set_retry(io, link, false);
+                link->recv_paused = false;
                 return;
             }
             link->partial_slab = link->held[0].slab;
@@ -1999,11 +2005,15 @@ static void link_drain(struct vsr_io *io, struct vsr_io_link *link)
         }
         if (result == CARVE_BLOCKED) {
             link_set_retry(io, link, true);
+            if (link->purpose == VSR_IO_PURPOSE_STREAM) {
+                link->recv_paused = true;
+            }
             return;
         }
         LINKS_ASSERT(result == CARVE_INCOMPLETE);
         if (link->held_count == 0) {
             link_set_retry(io, link, false);
+            link->recv_paused = false;
             return; /* The rest is still to arrive. */
         }
         if (!link_reassemble(io, link)) {
@@ -2800,14 +2810,45 @@ static bool link_prepare_nodelay(struct vsr_io *io, struct vsr_io_link *link,
     return true;
 }
 
+/* The link's multishot RECV; or, while the link is paused with the receive
+ * still armed, the CANCEL that stops it (on the shutdown slot, one
+ * completion, its result ignored: -ENOENT or -EALREADY mean the receive
+ * terminated on its own). A new receive waits for the pause to lift and
+ * for that CANCEL to complete, so a late cancel never hits it. */
 static bool link_prepare_recv(struct vsr_io *io, struct vsr_io_link *link,
                               struct batch *batch)
 {
     struct vsr_io_sqe *sqe;
 
-    if (link->recv_slot != LINK_NONE || link->fd < 0 || link->recv_starved ||
-        (link->state != VSR_IO_LINK_HELLO &&
-         link->state != VSR_IO_LINK_ESTABLISHED)) {
+    if (link->fd < 0 || (link->state != VSR_IO_LINK_HELLO &&
+                         link->state != VSR_IO_LINK_ESTABLISHED)) {
+        return true;
+    }
+    if (link->recv_slot != LINK_NONE) {
+        if (!link->recv_paused || link->recv_cancelled ||
+            link->shutdown_slot != LINK_NONE) {
+            return true;
+        }
+        sqe = batch_next(batch);
+        if (sqe == NULL) {
+            return false;
+        }
+        link->shutdown_slot =
+            vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_SHUTDOWN, 1,
+                               link_index(io, link), TEARDOWN_LINK, 0);
+        if (link->shutdown_slot == LINK_NONE) {
+            return false;
+        }
+        sqe->opcode = VSR_IO_SQE_CANCEL;
+        sqe->offset = vsr_io_slots_user_data(&io->slots, link->recv_slot);
+        sqe->user_data =
+            vsr_io_slots_user_data(&io->slots, link->shutdown_slot);
+        batch->count++;
+        link->recv_cancelled = true;
+        return true;
+    }
+    if (link->recv_starved || link->recv_paused ||
+        link->shutdown_slot != LINK_NONE) {
         return true;
     }
     sqe = batch_next(batch);
@@ -2843,8 +2884,9 @@ static bool link_prepare_teardown(struct vsr_io *io, struct vsr_io_link *link,
     uint64_t user_data;
     bool cancel_dial = false;
 
-    if (link->torn_down || link->handshake_op != 0) {
-        return true;
+    if (link->torn_down || link->handshake_op != 0 ||
+        link->shutdown_slot != LINK_NONE) {
+        return true; /* Or a paused receive's CANCEL still owns the slot. */
     }
     if (link->connect_slot != LINK_NONE) {
         uint32_t stage = io->slots.slots[link->connect_slot].sub;
@@ -3100,6 +3142,7 @@ static void link_recv_complete(struct vsr_io *io, struct vsr_io_link *link,
 {
     uint32_t index = link_index(io, link);
     bool more = (cqe->flags & VSR_IO_CQE_MORE) != 0;
+    bool cancelled;
 
     if (cqe->result > 0 && (cqe->flags & VSR_IO_CQE_BUFFER) != 0) {
         if (link->state == VSR_IO_LINK_CLOSING) {
@@ -3119,6 +3162,8 @@ static void link_recv_complete(struct vsr_io *io, struct vsr_io_link *link,
         return;
     }
     link->recv_slot = LINK_NONE;
+    cancelled = link->recv_cancelled;
+    link->recv_cancelled = false;
     if (link->state == VSR_IO_LINK_CLOSING) {
         return;
     }
@@ -3130,6 +3175,9 @@ static void link_recv_complete(struct vsr_io *io, struct vsr_io_link *link,
     if (cqe->result == 0) {
         link_close(io, index, -EPIPE); /* End of stream. */
         return;
+    }
+    if (cqe->result == -ECANCELED && cancelled) {
+        return; /* Paused: re-armed once the held bytes are carved. */
     }
     if (cqe->result < 0) {
         link_close(io, index, cqe->result);

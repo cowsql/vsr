@@ -667,14 +667,23 @@ struct vsr_io_link_wanted {
  * Source: receive STREAM_SERVE {stream, node, request bytes}; complete it
  * with OK to accept or any other status to refuse; then submit STREAM_WRITE
  * events, each either caller buffers under a lease or a file range on a
- * registered slot, in order; STREAM_WRITTEN reports when a write's bytes are
- * no longer read; submit STREAM_CLOSE {stream, status} last. The engine sends
- * buffers zero-copy; a file range is read into pool slabs, stream_chunk_bytes
- * at a time with fixed-buffer reads, and sent chunk by chunk exactly like
- * buffers, so no pipe or splice is involved. Connection loss ends the
- * stream on both sides with VSR_IO_RETRY. Request bytes beginning with
- * VSR_IO_LIBRARY_MAGIC are the engine's own and are never offered to the
- * caller as STREAM_SERVE.
+ * registered slot, in order (vsr_io_submit refuses one with AGAIN while
+ * stream_window writes are queued: resubmit after a STREAM_WRITTEN);
+ * STREAM_WRITTEN reports when a write's bytes are no longer read, for every
+ * queued write in order, also when the stream ends early; submit
+ * STREAM_CLOSE {stream, status} last. The engine sends buffers zero-copy;
+ * a file range is read into pool slabs, stream_chunk_bytes at a time with
+ * fixed-buffer reads, and sent chunk by chunk exactly like buffers, so no
+ * pipe or splice is involved; a read error, or a file ending inside the
+ * range, ends the stream with FAILED. Connection loss ends the stream on
+ * both sides with VSR_IO_RETRY, as does no progress for
+ * handshake_timeout_ns. Request bytes beginning with VSR_IO_LIBRARY_MAGIC
+ * are the engine's own and are never offered to the caller as
+ * STREAM_SERVE, nor accepted from a caller's STREAM_OPEN.
+ *
+ * Leases: the engine emits no RELEASE op for the lease of a STREAM_OPEN or
+ * a STREAM_WRITE. The request bytes are no longer read once the stream's
+ * STREAM_END arrived; a write's buffers once its STREAM_WRITTEN did.
  */
 struct vsr_io_stream_serve {
     uint64_t stream;
