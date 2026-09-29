@@ -4931,6 +4931,89 @@ static void test_review_failed_send_closing(void)
 }
 
 
+/* A caller-dialed node whose LINK_WANTED goes unanswered retries only the
+ * messages that never went out: those a lost link's kernel may still be
+ * reading complete at its NOTIFs, never before. */
+static void test_review_link_wanted_retiring(void)
+{
+    struct engine *a;
+    struct engine *b;
+    struct vsr_io_replica *ra;
+    const struct vsr_io_link *out;
+    uint64_t op = 0;
+    int32_t status = 0;
+    bool done[4];
+    int fd;
+
+    world_reset(44);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_TRUSTED);
+    b = engine_open(1, 2, VSR_IO_HANDSHAKE_TRUSTED);
+    CHECK(vsr_io_links_node_set(a->io, 2, NULL) == VSR_OK);
+    CHECK(vsr_io_links_node_set(a->io, 1, NULL) == VSR_OK);
+    CHECK(vsr_io_links_node_set(b->io, 1, &a->listen) == VSR_OK);
+    CHECK(vsr_io_links_node_set(b->io, 2, NULL) == VSR_OK);
+    ra = open_replica(a, 0, cluster);
+    (void)open_replica(b, 0, cluster);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
+    fd = engine_connect(a, &b->listen);
+    CHECK(vsr_io_links_adopt(a->io, fd, 2,
+                             VSR_IO_ADOPT_HANDSHAKE | VSR_IO_ADOPT_OUTBOUND) ==
+          VSR_OK);
+    world_settle();
+    /* b, linked by then, authorizes without dialing. */
+    CHECK(vsr_io_links_authorize(b->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(b->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    check_linked(a, b);
+    out = carrier_of(a, 2);
+    memset(samples_next, 0, sizeof(samples_next));
+    world.hold_notifs = true;
+    CHECK(send_fresh(a, 0, 1, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(send_fresh(a, 0, 2, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(world.held_count == 2);
+    link_reset(a, out);
+    world_settle();
+    CHECK(out->state == VSR_IO_LINK_CLOSING);
+    CHECK(ra->completions_count == 0);
+    CHECK(a->io->links.nodes[0].queue_count == 2);
+    /* A new SEND asks the caller for a link; the backoff runs out
+     * unanswered: the new message retries, the two on the old link's
+     * stream wait for its NOTIFs. */
+    CHECK(send_fresh(a, 0, 3, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
+    CHECK(ra->completions_count == 0);
+    world_advance(BACKOFF_NS);
+    world_settle();
+    expect_completion(ra, 3, VSR_IO_RETRY);
+    CHECK(ra->completions_count == 0);
+    CHECK(a->io->links.nodes[0].queue_count == 2);
+    /* The want persists: the caller is asked again on the backoff. */
+    CHECK(node_state(a, 2) == VSR_IO_NODE_PENDING);
+    CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    memset(done, 0, sizeof(done));
+    while (take_completion(ra, &op, &status)) {
+        CHECK(op >= 1 && op <= 2 && !done[op] && status == VSR_IO_RETRY);
+        done[op] = true;
+    }
+    CHECK(done[1] && done[2]);
+    CHECK(a->io->links.nodes[0].queue_count == 0);
+    CHECK(out->state == VSR_IO_LINK_FREE);
+    check_quiet(a);
+    CHECK(pool_refs(a) == 0);
+    engine_forget(a);
+    engine_forget(b);
+}
+
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 0x5EED2u;
@@ -4966,6 +5049,7 @@ int main(int argc, char **argv)
     test_send_random(seed);
     test_review_own_node();
     test_review_failed_send_closing();
+    test_review_link_wanted_retiring();
     printf("link: ok\n");
     return 0;
 }

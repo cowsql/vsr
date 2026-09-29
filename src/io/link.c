@@ -2422,7 +2422,9 @@ void vsr_io_links_deadline(struct vsr_io *io, uint16_t kind, uint32_t index,
         if (node_peer_pending(io, index) == 0) {
             node->dialing = false; /* A LINK_WANTED's wait is over. */
             if (!node->has_address && node->carrier == LINK_NONE) {
-                node_queue_drop(io, index, true); /* Unanswered. */
+                /* Unanswered: the waiting messages retry; those a lost
+                 * link's kernel may still read wait for its NOTIFs. */
+                node_queue_drop(io, index, false);
             }
         }
         node_want_dial(io, index);
