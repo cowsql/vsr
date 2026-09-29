@@ -49,8 +49,7 @@
  * end through vsr_io_snapshots_stream_data / stream_end instead of ops and
  * completes each chunk with vsr_io_streams_data_done. A source-side library
  * stream hears its end through vsr_io_snapshots_stream_end too, so the
- * file slot can be closed; it gets no WRITTEN. Until snapshot.c exists,
- * stream.c carries weak stubs of those three functions.
+ * file slot can be closed; it gets no WRITTEN.
  *
  * Timeouts: a stream that makes no progress (no frame received, no send
  * progress, no completion, no caller call) for handshake_timeout_ns ends
