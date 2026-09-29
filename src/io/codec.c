@@ -2683,7 +2683,7 @@ int vsr_io_codec_get_clients_record(struct vsr_io_cursor *cursor,
                                     struct vsr_io_bump *region,
                                     struct vsr_client_record *record)
 {
-    struct vsr_io_cursor copy = *cursor;
+    struct vsr_io_cursor copy;
     struct vsr_io_wire_client_record header;
     uint32_t crc = 0;
     uint32_t stored;
@@ -2692,6 +2692,7 @@ int vsr_io_codec_get_clients_record(struct vsr_io_cursor *cursor,
     if (cursor == NULL || limits == NULL || region == NULL || record == NULL) {
         return VSR_EINVAL;
     }
+    copy = *cursor;
     /* The CRC covers the header and the padded bytes: find their extent
      * from the header, checksum them from the start, then decode. */
     if (!vsr_io_cursor_skip(

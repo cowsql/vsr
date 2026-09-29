@@ -2074,6 +2074,9 @@ static void test_clients_file(void)
         vsr_io_bump_init(&region, region_memory, region_bytes);
         CHECK(vsr_io_codec_get_clients_record(&cursor, limits, &region,
                                               &records[0]) == VSR_EINVAL);
+        /* A missing cursor is EINVAL, not a dereference. */
+        CHECK(vsr_io_codec_get_clients_record(NULL, limits, &region,
+                                              &records[0]) == VSR_EINVAL);
     }
     /* Trailer. */
     vsr_io_cursor_init_one(&cursor, reference_frame + total - 8, 8);
