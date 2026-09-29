@@ -198,9 +198,14 @@ struct engine {
     int fail_fsync_dir;
     int fail_rename;
     int fail_unlink;
+    int fail_log_read;     /* Pool-buffer reads of the log. */
+    bool short_write;      /* The next pool-buffer write stops halfway. */
+    bool short_log_read;   /* The next pool-buffer log read returns 8. */
     bool hold_pool_writes; /* Pool-buffer writes are held. */
     bool hold_rename;
     bool hold_fsync;
+    bool hold_open;  /* Opens of clients files are held. */
+    bool hold_reads; /* Pool-buffer reads of clients files are held. */
     struct held held[HELD_MAX];
     /* The replica's regions. */
     struct vsr_io_replica *replica;
@@ -497,6 +502,9 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
             return true;
         }
         CHECK(strncmp(sqe->addr, DIRECTORY "/", sizeof(DIRECTORY)) == 0);
+        if (e->hold_open && strstr(sqe->addr, "/clients-") != NULL) {
+            return false;
+        }
         file = dfile_find(e, sqe->addr);
         if ((flags & O_CREAT) != 0) {
             CHECK(sqe->length == 0644);
@@ -565,6 +573,15 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
             e->fail_write = 0;
             return true;
         }
+        if (pool && e->short_write && sqe->length > 1) {
+            e->short_write = false;
+            memcpy(f->data + sqe->offset, sqe->addr, sqe->length / 2);
+            if (sqe->offset + sqe->length / 2 > f->size) {
+                f->size = sqe->offset + sqe->length / 2;
+            }
+            *result = (int32_t)(sqe->length / 2);
+            return true;
+        }
         memcpy(f->data + sqe->offset, sqe->addr, sqe->length);
         if (end > f->size) {
             f->size = end;
@@ -590,11 +607,27 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
         if ((s->flags & O_DIRECT) != 0) {
             CHECK(sqe->offset % BLOCK == 0 && sqe->length % BLOCK == 0);
         }
+        if (pool && strcmp(f->name, DIRECTORY "/log") != 0 && e->hold_reads) {
+            return false;
+        }
         f->reads++;
         if (pool && strcmp(f->name, DIRECTORY "/log") != 0 &&
             e->fail_read != 0) {
             *result = e->fail_read;
             e->fail_read = 0;
+            return true;
+        }
+        if (pool && strcmp(f->name, DIRECTORY "/log") == 0 &&
+            e->fail_log_read != 0) {
+            *result = e->fail_log_read;
+            e->fail_log_read = 0;
+            return true;
+        }
+        if (pool && strcmp(f->name, DIRECTORY "/log") == 0 &&
+            e->short_log_read && sqe->offset < f->size) {
+            e->short_log_read = false;
+            memcpy(mutable_of(sqe->addr), f->data + sqe->offset, 8);
+            *result = 8;
             return true;
         }
         if (sqe->offset >= f->size) {
@@ -1662,7 +1695,10 @@ static void check_snapshots(const struct engine *e)
             CHECK(s->fileops[entry->fileop].used);
         }
         if (entry->state == VSR_IO_SNAPSHOT_WRITING) {
-            CHECK(s->writer.snapshot == i && s->capture == i);
+            /* The writer holds it until the library half is over; a failed
+             * file then waits for the caller and its discard. */
+            CHECK(s->capture == i &&
+                  (s->writer.snapshot == i || entry->library_status != -1));
         }
         if (entry->state == VSR_IO_SNAPSHOT_FETCHING) {
             CHECK(s->reader.snapshot == i);
@@ -1680,6 +1716,11 @@ static void check_snapshots(const struct engine *e)
     }
     CHECK(used == fileops);
     CHECK(s->chunks_count <= s->chunks_capacity);
+    CHECK(s->chunks_count == 0 ||
+          (s->reader.snapshot != NONE &&
+           s->entries[s->reader.snapshot].job == VSR_IO_SNAPSHOT_JOB_FETCH));
+    CHECK(s->pending_base == NONE ||
+          s->entries[s->pending_base].state != VSR_IO_SNAPSHOT_FREE);
     if (s->writer.snapshot != NONE) {
         CHECK(s->writer.slab != NONE &&
               e->io->pool.entries[s->writer.slab].refs > 0);
@@ -1690,6 +1731,134 @@ static void check_snapshots(const struct engine *e)
               e->io->pool.entries[s->reader.slab].refs > 0);
         CHECK(s->reader.consumed <= s->reader.filled &&
               s->reader.filled <= PAGE);
+    }
+}
+
+/* The engine file slots the module holds (entries' kept and transient
+ * slots, serves, the directory) are distinct and allocated (not on the
+ * engine's free list, which has no duplicate), and every slot the model
+ * has open besides the log's is one of them: nothing leaks, nothing is
+ * freed twice or used after its free. */
+static void check_file_slots(const struct engine *e)
+{
+    const struct vsr_io_snapshots *s = e->snapshots;
+    const struct vsr_io *io = e->io;
+    uint32_t held[64];
+    uint32_t n = 0;
+
+    for (uint32_t i = 0; i < s->count; ++i) {
+        const struct vsr_io_snapshot *entry = &s->entries[i];
+
+        if (entry->file_slot >= 0) {
+            held[n++] = (uint32_t)entry->file_slot;
+        }
+        if (entry->tmp_slot != NONE) {
+            held[n++] = entry->tmp_slot;
+        }
+    }
+    for (uint32_t i = 0; i < s->serves_count; ++i) {
+        if (s->serves[i].slot != NONE) {
+            held[n++] = s->serves[i].slot;
+        }
+    }
+    if (s->dir_slot != NONE) {
+        held[n++] = s->dir_slot;
+    }
+    CHECK(n <= FILE_SLOTS);
+    for (uint32_t i = 0; i < io->file_slots_free_count; ++i) {
+        for (uint32_t j = i + 1; j < io->file_slots_free_count; ++j) {
+            CHECK(io->file_slots_free[i] != io->file_slots_free[j]);
+        }
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        CHECK(held[i] >= FILE_SLOT_BASE && held[i] < io->file_slot_next);
+        CHECK((int32_t)held[i] != e->store->log_slot);
+        for (uint32_t j = i + 1; j < n; ++j) {
+            CHECK(held[i] != held[j]);
+        }
+        for (uint32_t j = 0; j < io->file_slots_free_count; ++j) {
+            CHECK(io->file_slots_free[j] != held[i]);
+        }
+    }
+    for (uint32_t i = 0; i < FILE_SLOTS; ++i) {
+        uint32_t slot = FILE_SLOT_BASE + i;
+        bool found = false;
+
+        if (e->fslots[i].file == -1 || (int32_t)slot == e->store->log_slot ||
+            (e->fslots[i].file >= 0 &&
+             strcmp(e->files[e->fslots[i].file].name, DIRECTORY "/log") == 0)) {
+            continue; /* The store's. */
+        }
+        for (uint32_t j = 0; j < n; ++j) {
+            found = found || held[j] == slot;
+        }
+        if (!found) {
+            fprintf(stderr,
+                    "file slot %u (file %d %s) open in the model, not held "
+                    "(log slot %d)\n",
+                    slot, e->fslots[i].file,
+                    e->fslots[i].file >= 0 ? e->files[e->fslots[i].file].name
+                                           : "dir",
+                    e->store->log_slot);
+        }
+        CHECK(found);
+    }
+    /* The store reads the base through a slot the module holds. */
+    if (e->store->base_slot >= 0) {
+        bool found = false;
+
+        for (uint32_t j = 0; j < n; ++j) {
+            found = found || (int32_t)held[j] == e->store->base_slot;
+        }
+        CHECK(found);
+    }
+}
+
+/* Every CLIENTS record in the slot table is one of the module's file
+ * operations, and at most VSR_IO_SNAPSHOT_FILEOPS are in flight. */
+static void check_records(const struct engine *e)
+{
+    const struct vsr_io_slots *slots = &e->io->slots;
+    uint32_t records = 0;
+    uint32_t fileops = 0;
+
+    for (uint32_t i = 0; i < slots->count; ++i) {
+        if (slots->slots[i].kind == VSR_IO_SLOT_CLIENTS) {
+            CHECK(slots->slots[i].owner == REPLICA);
+            records++;
+        }
+    }
+    for (uint32_t i = 0; i < VSR_IO_SNAPSHOT_FILEOPS; ++i) {
+        if (e->snapshots->fileops[i].used) {
+            fileops++;
+            CHECK(e->snapshots->fileops[i].slot < slots->count &&
+                  slots->slots[e->snapshots->fileops[i].slot].kind ==
+                      VSR_IO_SLOT_CLIENTS);
+        }
+    }
+    CHECK(records == fileops && fileops <= VSR_IO_SNAPSHOT_FILEOPS);
+}
+
+/* Leases the module reserved are distinct and taken; a copied result
+ * lives in its lease. */
+static void check_leases(const struct engine *e)
+{
+    const struct vsr_io_snapshots *s = e->snapshots;
+
+    for (uint32_t i = 0; i < s->count; ++i) {
+        const struct vsr_io_snapshot *entry = &s->entries[i];
+
+        if (entry->lease == NONE) {
+            CHECK(entry->result == NULL);
+            continue;
+        }
+        CHECK(entry->lease < REGIONS && entry->state != VSR_IO_SNAPSHOT_FREE);
+        CHECK(e->replica->leases[entry->lease].state != 0);
+        CHECK(entry->op != 0 && (entry->op_type == VSR_OP_SNAPSHOT_CAPTURE ||
+                                 entry->op_type == VSR_OP_SNAPSHOT_FETCH));
+        for (uint32_t j = i + 1; j < s->count; ++j) {
+            CHECK(s->entries[j].lease != entry->lease);
+        }
     }
 }
 
@@ -1708,6 +1877,9 @@ static bool world_run_checked(uint32_t rounds)
             engine_step(e);
             check_streams(e);
             check_snapshots(e);
+            check_file_slots(e);
+            check_records(e);
+            check_leases(e);
             if (e->records > 0 || e->deliveries > 0 || e->cq_count > 0) {
                 moved = true;
             }
@@ -2249,7 +2421,9 @@ static bool core_take(struct engine *e, struct vsr_event *out)
     return true;
 }
 
-static const void *expect_core(struct engine *e, uint64_t op, int32_t status)
+/* The next core completion is `op` with `status`, carrying no data and
+ * no lease (every completion but an OK CAPTURE or FETCH). */
+static void expect_core(struct engine *e, uint64_t op, int32_t status)
 {
     struct vsr_event event;
 
@@ -2262,7 +2436,7 @@ static const void *expect_core(struct engine *e, uint64_t op, int32_t status)
     }
     CHECK(event.type == VSR_EVENT_COMPLETE && event.id == op &&
           event.status == status);
-    return event.data;
+    CHECK(event.data == NULL && event.lease == 0);
 }
 
 static void expect_no_core(struct engine *e)
@@ -2542,6 +2716,272 @@ static bool files_equal(const struct dfile *x, const struct dfile *y)
            memcmp(x->data, y->data, x->size) == 0;
 }
 
+/* A SYNC or DROP of `id` taken by the module (task in `h`, pinned until
+ * the completion); returns the module's answer. */
+static int joint_start(struct engine *e, uint32_t type, struct task_holder *h,
+                       struct vsr_id id, uint64_t *op)
+{
+    task_init(h, id, 5, 0, 0);
+    *op = next_op(e);
+    if (type == VSR_OP_SNAPSHOT_SYNC) {
+        return vsr_io_snapshots_sync(e->io, REPLICA, *op, &h->task);
+    }
+    return vsr_io_snapshots_drop(e->io, REPLICA, *op, &h->task);
+}
+
+/* The caller's half of a forwarded op. */
+static void caller_done(struct engine *e, uint64_t op, int32_t status,
+                        const void *data)
+{
+    CHECK(vsr_io_snapshots_forwarded_done(e->io, REPLICA, op, status, data) ==
+          VSR_OK);
+}
+
+/* A whole SYNC or DROP: forwarded, the caller completes with `caller`, the
+ * core hears `expected`. */
+static void joint_run(struct engine *e, uint32_t type, struct vsr_id id,
+                      int32_t caller, int32_t expected)
+{
+    struct task_holder h;
+    uint64_t op;
+
+    CHECK(joint_start(e, type, &h, id, &op) == VSR_OK);
+    settle();
+    CHECK(forwarded_core(e, type, op) != NULL);
+    caller_done(e, op, caller, NULL);
+    settle();
+    expect_core(e, op, expected);
+    expect_no_core(e);
+}
+
+/* Appends until no client record is hot in the ring any more. */
+static uint64_t evict_clients(struct engine *e, uint64_t sequence)
+{
+    for (;;) {
+        bool hot = false;
+
+        for (uint32_t i = 0; i < e->store->clients_capacity; ++i) {
+            const struct vsr_io_client *c = &e->store->clients[i];
+            struct vsr_io_piece piece;
+
+            if ((c->id.hi != 0 || c->id.lo != 0) && c->current.number != 0 &&
+                c->current.sequence != 0 &&
+                vsr_io_store_hot(e->store, c->current.offset, c->current.length,
+                                 &piece)) {
+                hot = true;
+            }
+        }
+        if (!hot) {
+            return sequence;
+        }
+        store_run(e, txn_append(e, sequence, 4, 200));
+        sequence++;
+        CHECK(sequence < TXN_MAX);
+    }
+}
+
+/* A clients file built by the test: header, `count` records of clients
+ * 0x60 + i (number 4, op 30 + i, `result` bytes each), trailer. */
+struct craft {
+    unsigned char bytes[4096];
+    uint64_t size;
+    uint64_t record_at[9]; /* Record offsets; [count] = the trailer's. */
+};
+
+static void craft_file(struct craft *c, struct vsr_id id, uint32_t count,
+                       size_t result)
+{
+    struct vsr_io_wire_clients_header header;
+    unsigned char data[256];
+
+    CHECK(count <= 8 && result <= sizeof(data));
+    memset(c, 0, sizeof(*c));
+    memset(&header, 0, sizeof(header));
+    header.cluster_hi = 0x77;
+    header.cluster_lo = 0x99;
+    header.snapshot_hi = id.hi;
+    header.snapshot_lo = id.lo;
+    header.op = 5;
+    header.sequence = 1;
+    header.count = count;
+    vsr_io_codec_put_clients_header(&header, c->bytes);
+    c->size = 64;
+    for (uint32_t i = 0; i < count; ++i) {
+        struct vsr_client_record record;
+        struct vsr_span span;
+
+        for (size_t b = 0; b < result; ++b) {
+            data[b] = (unsigned char)(i * 17u + b);
+        }
+        span.data = data;
+        span.size = result;
+        memset(&record, 0, sizeof(record));
+        record.request.client.hi = 0x60 + i;
+        record.request.client.lo = 1;
+        record.request.number = 4;
+        record.op = 30 + i;
+        record.result.code = (int32_t)i;
+        record.result.data.spans = result > 0 ? &span : NULL;
+        record.result.data.size = result;
+        record.result.data.count = result > 0 ? 1 : 0;
+        c->record_at[i] = c->size;
+        CHECK(c->size + vsr_io_codec_clients_record_bytes(result) + 8 <=
+              sizeof(c->bytes));
+        vsr_io_codec_put_clients_record(&record, c->bytes + c->size);
+        c->size += vsr_io_codec_clients_record_bytes(result);
+    }
+    c->record_at[count] = c->size;
+    vsr_io_codec_put_clients_trailer(count, c->bytes + c->size);
+    c->size += 8;
+}
+
+static void put_le32(unsigned char *at, uint32_t value)
+{
+    for (uint32_t i = 0; i < 4; ++i) {
+        at[i] = (unsigned char)(value >> (8 * i));
+    }
+}
+
+/* Recomputes the CRC of record `i` of a crafted file after an edit. */
+static void craft_seal(struct craft *c, uint32_t i)
+{
+    uint64_t at = c->record_at[i];
+    uint32_t length =
+        (uint32_t)c->bytes[at + 36] | (uint32_t)c->bytes[at + 37] << 8 |
+        (uint32_t)c->bytes[at + 38] << 16 | (uint32_t)c->bytes[at + 39] << 24;
+    uint64_t padded = length + (8 - length % 8) % 8;
+
+    CHECK(at + 40 + padded + 4 <= sizeof(c->bytes));
+    put_le32(c->bytes + at + 40 + padded,
+             vsr_io_crc32c(0, c->bytes + at, (size_t)(40 + padded)));
+}
+
+/* Writes `bytes` as clients-<id> (tmp: .tmp) into the engine's directory,
+ * durable (synced, its name too). */
+static struct dfile *file_install(struct engine *e, struct vsr_id id, bool tmp,
+                                  const unsigned char *bytes, uint64_t size)
+{
+    char path[128];
+    int i;
+    struct dfile *f;
+
+    clients_path(path, id, tmp);
+    i = dfile_find(e, path);
+    if (i < 0) {
+        i = dfile_create(e, path);
+    }
+    f = &e->files[i];
+    CHECK(size <= DFILE_BYTES);
+    memset(f->data, 0, DFILE_BYTES);
+    memcpy(f->data, bytes, (size_t)size);
+    f->size = size;
+    memcpy(f->flushed, f->data, DFILE_BYTES);
+    f->flushed_size = size;
+    strcpy(f->durable_name, f->name);
+    return f;
+}
+
+/* A writable view of a file of the model. */
+static struct dfile *dfile_mutable(struct engine *e, const struct dfile *f)
+{
+    CHECK(f != NULL && f >= e->files && f < e->files + DFILES);
+    return &e->files[f - e->files];
+}
+
+/* The replica's retry deadline is armed. */
+static bool capture_deadline_armed(const struct engine *e)
+{
+    return e->io->deadlines.entries[DEADLINE_CAPTURE].when != VSR_NO_DEADLINE;
+}
+
+/* A fresh engine 0 with a store holding an identity and `clients` clients
+ * with 8-byte results; returns the next sequence. */
+static uint64_t fresh_store(struct engine **out, uint64_t seed,
+                            uint32_t clients)
+{
+    struct engine *a;
+    uint64_t sequence = 2;
+
+    world_reset(seed);
+    a = engine_open(0);
+    expect_store(a, store_start(a, VSR_START_NEW), VSR_IO_NOT_FOUND);
+    store_run(a, txn_identity(a, 1, VSR_MEMBER_FULL));
+    if (clients > 0) {
+        sequence = store_clients(a, sequence, clients, 8);
+    }
+    *out = a;
+    return sequence;
+}
+
+/* The module holds nothing but kept slots: no job, writer, reader, lease,
+ * slab or file operation. */
+static void expect_idle(const struct engine *e)
+{
+    const struct vsr_io_snapshots *s = e->snapshots;
+
+    CHECK(s->writer.snapshot == NONE && s->reader.snapshot == NONE);
+    CHECK(s->writer.slab == NONE && s->writer.cold_slab == NONE &&
+          s->reader.slab == NONE);
+    CHECK(s->chunks_count == 0 && s->capture == NONE);
+    for (uint32_t i = 0; i < VSR_IO_SNAPSHOT_FILEOPS; ++i) {
+        CHECK(!s->fileops[i].used);
+    }
+    for (uint32_t i = 0; i < s->count; ++i) {
+        const struct vsr_io_snapshot *entry = &s->entries[i];
+
+        CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_NONE && entry->op == 0 &&
+              entry->lease == NONE && entry->tmp_slot == NONE &&
+              entry->readers == 0);
+    }
+    for (uint32_t i = 0; i < s->serves_count; ++i) {
+        CHECK(s->serves[i].state == 0 && s->serves[i].slot == NONE);
+    }
+    CHECK(e->replica->leases_free == REGIONS);
+}
+
+/* Client i of store_clients. */
+static struct vsr_id client_n(uint32_t i)
+{
+    struct vsr_id id = {0x40 + i, 1};
+
+    return id;
+}
+
+/* One step of one engine with the invariants checked. */
+static void step_checked(struct engine *e)
+{
+    engine_step(e);
+    check_streams(e);
+    check_snapshots(e);
+    check_file_slots(e);
+    check_records(e);
+    check_leases(e);
+}
+
+/* A CAPTURE stepped by hand until its file is complete (the writer done,
+ * nothing settled beyond); the forwarded op is taken and the id
+ * returned. */
+static struct vsr_id capture_stepped(struct engine *e, struct task_holder *h,
+                                     uint64_t *op)
+{
+    struct vsr_id zero = {0, 0};
+    const struct vsr_op *forwarded;
+    uint32_t index;
+    uint32_t steps = 0;
+
+    task_init(h, zero, 5, e->store->readable, 0);
+    *op = next_op(e);
+    CHECK(vsr_io_snapshots_capture(e->io, REPLICA, *op, &h->task) == VSR_OK);
+    index = e->snapshots->capture;
+    while (e->snapshots->entries[index].state != VSR_IO_SNAPSHOT_WRITTEN) {
+        step_checked(e);
+        CHECK(++steps < 20);
+    }
+    forwarded = forwarded_core(e, VSR_OP_SNAPSHOT_CAPTURE, *op);
+    CHECK(forwarded != NULL);
+    return ((const struct vsr_snapshot_task *)forwarded->data)->checkpoint->id;
+}
+
 /* -------------------------------------------------------------------------
  * Tests
  * ---------------------------------------------------------------------- */
@@ -2798,6 +3238,436 @@ static void test_fetch(void)
           a->replica->leases_free == REGIONS);
 }
 
+/* A CAPTURE whose caller half fails, or whose library half fails at each
+ * step: the file never outlives the op, the core hears the caller's
+ * status (else FAILED, CORRUPT for bad record bytes) once both halves are
+ * over, and the capture floor, lease, slabs and slots are all released. */
+static void test_capture_failures(void)
+{
+    struct engine *a;
+    struct task_holder h;
+    struct vsr_id id;
+    struct vsr_id before;
+    uint64_t op;
+    uint64_t sequence;
+
+    /* The caller fails while the header write is held: the writer stops,
+     * the file is closed and unlinked, then the core hears RETRY. */
+    sequence = fresh_store(&a, 3, 2);
+    (void)sequence;
+    before = a->store->last_capture;
+    a->hold_pool_writes = true;
+    id = capture_begin(a, &h, &op);
+    CHECK(held_count(a) == 1 && clients_file(a, id, false) != NULL);
+    CHECK(a->store->capture_floor != UINT64_MAX);
+    caller_done(a, op, VSR_IO_RETRY, NULL);
+    settle();
+    expect_no_core(a); /* The write is still out. */
+    a->hold_pool_writes = false;
+    world_release_held(a);
+    settle();
+    expect_core(a, op, VSR_IO_RETRY);
+    CHECK(clients_file(a, id, false) == NULL && entry_of(a, id) == NULL);
+    CHECK(a->store->capture_floor == UINT64_MAX);
+    CHECK(a->store->last_capture.hi == before.hi &&
+          a->store->last_capture.lo == before.lo);
+    expect_idle(a);
+    CHECK(pool_refs(a) == 0);
+    /* The caller fails after the file is complete: unlinked, then its
+     * status reaches the core. */
+    id = capture_begin(a, &h, &op);
+    CHECK(clients_file(a, id, false) != NULL &&
+          entry_of(a, id)->state == VSR_IO_SNAPSHOT_WRITTEN);
+    caller_done(a, op, VSR_IO_FAILED, NULL);
+    settle();
+    expect_core(a, op, VSR_IO_FAILED);
+    CHECK(clients_file(a, id, false) == NULL && entry_of(a, id) == NULL);
+    expect_idle(a);
+    /* The caller answers OK with another id, or with no checkpoint:
+     * FAILED, and the file goes. */
+    id = capture_begin(a, &h, &op);
+    {
+        struct vsr_id other = {id.hi ^ 1, id.lo};
+
+        task_result(&h, other);
+    }
+    caller_done(a, op, VSR_IO_OK, &h.checkpoint);
+    settle();
+    expect_core(a, op, VSR_IO_FAILED);
+    CHECK(clients_file(a, id, false) == NULL);
+    id = capture_begin(a, &h, &op);
+    caller_done(a, op, VSR_IO_OK, NULL);
+    settle();
+    expect_core(a, op, VSR_IO_FAILED);
+    CHECK(clients_file(a, id, false) == NULL);
+    expect_idle(a);
+    /* Library failures: the open, a write, a short write. The caller
+     * completes OK; the core hears FAILED; nothing stays on disk, and the
+     * store's latest capture is not moved (a file completed but discarded
+     * above did move it: harmless, since the core never publishes an id
+     * whose CAPTURE failed). */
+    before = a->store->last_capture;
+    for (uint32_t fault = 0; fault < 3; ++fault) {
+        if (fault == 0) {
+            a->fail_open = -EIO;
+        } else if (fault == 1) {
+            a->fail_write = -ENOSPC;
+        } else {
+            a->short_write = true;
+        }
+        id = capture_begin(a, &h, &op);
+        task_result(&h, id);
+        caller_done(a, op, VSR_IO_OK, &h.checkpoint);
+        settle();
+        expect_core(a, op, VSR_IO_FAILED);
+        CHECK(clients_file(a, id, false) == NULL && entry_of(a, id) == NULL);
+        CHECK(a->store->capture_floor == UINT64_MAX);
+        expect_idle(a);
+        CHECK(pool_refs(a) == 0);
+    }
+    CHECK(a->snapshots->error != 0);
+    CHECK(a->store->last_capture.hi == before.hi &&
+          a->store->last_capture.lo == before.lo);
+    engine_crash(a);
+
+    /* Cold records: a read error is FAILED, a short read or bytes that
+     * fail their CRC are CORRUPT. */
+    for (uint32_t fault = 0; fault < 3; ++fault) {
+        sequence = fresh_store(&a, 4 + fault, 2);
+        sequence = evict_clients(a, sequence);
+        (void)sequence;
+        if (fault == 0) {
+            a->fail_log_read = -EIO;
+        } else if (fault == 1) {
+            a->short_log_read = true;
+        } else {
+            const struct vsr_io_client *c = client_of(a, client_n(0));
+            struct dfile *log = dfile_mutable(a, log_file(a));
+
+            log->data[c->current.offset + 60] ^= 0x10;
+        }
+        id = capture_begin(a, &h, &op);
+        task_result(&h, id);
+        caller_done(a, op, VSR_IO_OK, &h.checkpoint);
+        settle();
+        expect_core(a, op, fault == 0 ? VSR_IO_FAILED : VSR_IO_CORRUPT);
+        CHECK(clients_file(a, id, false) == NULL && entry_of(a, id) == NULL);
+        CHECK(a->store->capture_floor == UINT64_MAX);
+        expect_idle(a);
+        CHECK(pool_refs(a) == 0);
+        engine_crash(a);
+    }
+
+    /* RETRY at once when a lease, a slab, a file slot or a registry entry
+     * is missing, or while another CAPTURE runs; nothing is taken. */
+    sequence = fresh_store(&a, 8, 2);
+    (void)sequence;
+    {
+        struct vsr_id zero = {0, 0};
+        uint32_t taken[SLABS];
+        uint32_t count = 0;
+        uint32_t leases[REGIONS];
+        uint32_t slots[FILE_SLOTS];
+        uint32_t lease;
+        uint32_t slot;
+
+        task_init(&h, zero, 5, a->store->readable, 0);
+        while ((lease = vsr_io_lease_alloc(a->replica, NONE, NONE)) != NONE) {
+            leases[count++] = lease;
+        }
+        CHECK(vsr_io_snapshots_capture(a->io, REPLICA, next_op(a), &h.task) ==
+              VSR_IO_RETRY);
+        while (count > 0) {
+            vsr_io_lease_release(a->replica, leases[--count]);
+        }
+        while ((slot = vsr_io_pool_acquire(&a->io->pool, false)) != NONE) {
+            taken[count++] = slot;
+        }
+        CHECK(vsr_io_snapshots_capture(a->io, REPLICA, next_op(a), &h.task) ==
+              VSR_IO_RETRY);
+        while (count > 0) {
+            vsr_io_pool_release(&a->io->pool, taken[--count]);
+        }
+        while ((slot = vsr_io_engine_slot_alloc(a->io)) != NONE) {
+            slots[count++] = slot;
+        }
+        CHECK(vsr_io_snapshots_capture(a->io, REPLICA, next_op(a), &h.task) ==
+              VSR_IO_RETRY);
+        while (count > 0) {
+            vsr_io_engine_slot_free(a->io, slots[--count]);
+        }
+        CHECK(a->replica->leases_free == REGIONS);
+        expect_idle(a);
+        /* The registry full: count entries taken by captures. */
+        for (uint32_t i = 0; i < a->snapshots->count; ++i) {
+            (void)capture(a);
+        }
+        CHECK(entries_used(a) == a->snapshots->count);
+        CHECK(vsr_io_snapshots_capture(a->io, REPLICA, next_op(a), &h.task) ==
+              VSR_IO_RETRY);
+        expect_no_core(a);
+        /* A slab missing when a cold record needs one: the step waits
+         * with the retry deadline armed, then proceeds. */
+        joint_run(a, VSR_OP_SNAPSHOT_DROP, a->store->last_capture, VSR_IO_OK,
+                  VSR_IO_OK);
+    }
+    engine_crash(a);
+    sequence = fresh_store(&a, 9, 2);
+    sequence = evict_clients(a, sequence);
+    (void)sequence;
+    {
+        struct vsr_id zero = {0, 0};
+        uint32_t taken[SLABS];
+        uint32_t count = 0;
+        uint32_t slab;
+
+        task_init(&h, zero, 5, a->store->readable, 0);
+        op = next_op(a);
+        CHECK(vsr_io_snapshots_capture(a->io, REPLICA, op, &h.task) == VSR_OK);
+        while ((slab = vsr_io_pool_acquire(&a->io->pool, false)) != NONE) {
+            taken[count++] = slab;
+        }
+        for (uint32_t steps = 0; !a->snapshots->retry; ++steps) {
+            step_checked(a); /* The open first, then the staging. */
+            CHECK(steps < 10);
+        }
+        CHECK(capture_deadline_armed(a));
+        CHECK(a->snapshots->writer.cold_slab == NONE);
+        while (count > 0) {
+            vsr_io_pool_release(&a->io->pool, taken[--count]);
+        }
+        settle_retry();
+        id = entry_of(a, a->snapshots->entries[a->snapshots->capture].id)->id;
+        CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_CAPTURE, op) != NULL);
+        task_result(&h, id);
+        caller_done(a, op, VSR_IO_OK, &h.checkpoint);
+        settle();
+        expect_checkpoint(a, op, id, &h);
+        {
+            struct parsed_record records[8];
+            const struct dfile *file = clients_file(a, id, false);
+
+            CHECK(file != NULL &&
+                  file_parse(file->data, file->size, id, records, 8) == 2);
+        }
+    }
+    expect_idle(a);
+    engine_crash(a);
+}
+
+/* SYNC: the file's fdatasync then the directory's fsync, forwarded to the
+ * caller at once; the core hears OK only when both halves are durable, and
+ * the directory model keeps the file across a crash. A file without a
+ * kept slot is opened, synced and closed. Failures of either half are
+ * reported, never retried. */
+static void test_sync(void)
+{
+    struct engine *a;
+    struct task_holder h;
+    struct vsr_id x;
+    struct vsr_id y;
+    uint64_t op;
+    const struct dfile *file;
+    uint32_t dir_fsyncs;
+    uint64_t sequence = fresh_store(&a, 10, 2);
+
+    (void)sequence;
+    x = capture(a);
+    file = clients_file(a, x, false);
+    CHECK(file != NULL && file->fsyncs == 0 && file->durable_name[0] == 0);
+    dir_fsyncs = a->dir_fsyncs;
+    /* The latest capture keeps its slot: fdatasync on it, no open. */
+    {
+        uint32_t opens_before = a->dir_opens;
+
+        joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_OK);
+        CHECK(a->dir_opens == opens_before);
+    }
+    CHECK(file->fsyncs == 1 && a->dir_fsyncs == dir_fsyncs + 1);
+    CHECK(strcmp(file->durable_name, file->name) == 0 &&
+          file->flushed_size == file->size);
+    CHECK(entry_of(a, x)->state == VSR_IO_SNAPSHOT_DURABLE);
+    CHECK(entry_of(a, x)->file_slot >= 0);
+    expect_idle(a);
+    /* A second capture: x's slot is released; its SYNC opens the file
+     * read-only, syncs it and closes it again. */
+    y = capture(a);
+    settle();
+    CHECK(entry_of(a, x)->file_slot < 0 && file->refs == 0);
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_OK);
+    CHECK(file->fsyncs == 2 && file->refs == 0 &&
+          entry_of(a, x)->file_slot < 0);
+    /* The half that fails decides: the caller's status, the fdatasync's
+     * (kept slot and transient one), the directory's. */
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, y, VSR_IO_FAILED, VSR_IO_FAILED);
+    CHECK(entry_of(a, y)->state == VSR_IO_SNAPSHOT_WRITTEN);
+    a->fail_fsync = -EIO;
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, y, VSR_IO_OK, VSR_IO_FAILED);
+    a->fail_fsync = -EIO;
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_FAILED);
+    CHECK(file->refs == 0 && entry_of(a, x)->state == VSR_IO_SNAPSHOT_WRITTEN);
+    a->fail_fsync_dir = -EIO;
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, y, VSR_IO_OK, VSR_IO_FAILED);
+    a->fail_open = -EMFILE;
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_FAILED);
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, y, VSR_IO_OK, VSR_IO_OK);
+    CHECK(entry_of(a, y)->state == VSR_IO_SNAPSHOT_DURABLE);
+    expect_idle(a);
+    /* Refusals: an unknown id is FAILED; a second op on an entry RETRY. */
+    {
+        struct vsr_id unknown = {0x1234, 5};
+        struct task_holder h2;
+        uint64_t op2;
+
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &h, unknown, &op) ==
+              VSR_IO_FAILED);
+        a->hold_fsync = true;
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &h, x, &op) == VSR_OK);
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &h2, x, &op2) ==
+              VSR_IO_RETRY);
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &h2, x, &op2) ==
+              VSR_IO_RETRY);
+        settle();
+        CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_SYNC, op) != NULL);
+        caller_done(a, op, VSR_IO_OK, NULL);
+        settle();
+        expect_no_core(a); /* The fdatasync is held. */
+        a->hold_fsync = false;
+        world_release_held(a);
+        settle();
+        expect_core(a, op, VSR_IO_OK);
+    }
+    /* A SYNC arriving while base_track releases the previous latest
+     * capture's kept slot: before the CLOSE is issued it cancels the
+     * release and syncs through the kept slot; with the CLOSE in flight it
+     * follows it (a RETRY would fence the replica). */
+    for (uint32_t variant = 0; variant < 2; ++variant) {
+        struct vsr_id prev = a->store->last_capture;
+        const struct vsr_io_snapshot *entry = entry_of(a, prev);
+        struct task_holder hc;
+        uint64_t capture_op;
+        struct vsr_id next;
+        uint32_t steps = 0;
+
+        CHECK(entry != NULL && entry->file_slot >= 0 &&
+              entry->job == VSR_IO_SNAPSHOT_JOB_NONE);
+        next = capture_stepped(a, &hc, &capture_op);
+        CHECK(a->store->last_capture.hi == next.hi &&
+              a->store->last_capture.lo == next.lo);
+        CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_NONE && entry->file_slot >= 0);
+        if (variant == 0) {
+            vsr_io_snapshots_poll(a->io, REPLICA, world.now);
+            CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE &&
+                  entry->fileop == NONE);
+            CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &h, prev, &op) ==
+                  VSR_OK);
+            CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_SYNC &&
+                  entry->file_slot >= 0);
+        } else {
+            while (entry->fileop == NONE) {
+                step_checked(a);
+                CHECK(++steps < 10);
+            }
+            CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE);
+            CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &h, prev, &op) ==
+                  VSR_OK);
+            CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE &&
+                  entry->job_next == VSR_IO_SNAPSHOT_JOB_SYNC);
+        }
+        settle();
+        CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_SYNC, op) != NULL);
+        caller_done(a, op, VSR_IO_OK, NULL);
+        settle();
+        expect_core(a, op, VSR_IO_OK);
+        CHECK(entry->state == VSR_IO_SNAPSHOT_DURABLE && entry->file_slot < 0);
+        CHECK(clients_file(a, prev, false)->refs == 0);
+        task_result(&hc, next);
+        caller_done(a, capture_op, VSR_IO_OK, &hc.checkpoint);
+        settle();
+        expect_checkpoint(a, capture_op, next, &hc);
+    }
+    expect_idle(a);
+    /* A crash keeps exactly the files whose SYNC completed. */
+    engine_crash(a);
+    CHECK(clients_file(a, x, false) != NULL &&
+          clients_file(a, y, false) != NULL);
+}
+
+/* DROP: forwarded first; on the caller's OK the kept slot is closed and
+ * the file unlinked, then the core hears the unlink's outcome. A served
+ * stream still reading the file delays the unlink, not the completion. A
+ * DROP of an id the registry lacks unlinks a stray file of that name. */
+static void test_drop(void)
+{
+    struct engine *a;
+    struct task_holder h;
+    struct vsr_id x;
+    struct vsr_id y;
+    uint64_t op;
+    uint64_t sequence = fresh_store(&a, 11, 2);
+
+    (void)sequence;
+    x = capture(a);
+    y = capture(a);
+    settle();
+    /* The caller's failure keeps the file. */
+    joint_run(a, VSR_OP_SNAPSHOT_DROP, x, VSR_IO_FAILED, VSR_IO_FAILED);
+    CHECK(clients_file(a, x, false) != NULL && entry_of(a, x) != NULL);
+    /* OK: closed (y is the latest, its slot is kept) and unlinked. */
+    CHECK(entry_of(a, y)->file_slot >= 0);
+    joint_run(a, VSR_OP_SNAPSHOT_DROP, y, VSR_IO_OK, VSR_IO_OK);
+    CHECK(clients_file(a, y, false) == NULL && entry_of(a, y) == NULL);
+    /* An unlink failure is reported; the entry is gone (the file is a
+     * stray now). */
+    a->fail_unlink = -EIO;
+    joint_run(a, VSR_OP_SNAPSHOT_DROP, x, VSR_IO_OK, VSR_IO_FAILED);
+    CHECK(entry_of(a, x) == NULL && clients_file(a, x, false) != NULL);
+    /* Unknown ids: the stray file is unlinked; no file is fine too. */
+    joint_run(a, VSR_OP_SNAPSHOT_DROP, x, VSR_IO_OK, VSR_IO_OK);
+    CHECK(clients_file(a, x, false) == NULL && entry_of(a, x) == NULL);
+    joint_run(a, VSR_OP_SNAPSHOT_DROP, x, VSR_IO_OK, VSR_IO_OK);
+    joint_run(a, VSR_OP_SNAPSHOT_DROP, x, VSR_IO_RETRY, VSR_IO_RETRY);
+    CHECK(entry_of(a, x) == NULL);
+    /* Refusals: a zero id, a file being written, a second DROP. */
+    {
+        struct vsr_id zero = {0, 0};
+        struct task_holder h2;
+        uint64_t op2;
+        uint64_t capture_op;
+        struct vsr_id w;
+
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &h, zero, &op) ==
+              VSR_IO_FAILED);
+        a->hold_pool_writes = true;
+        w = capture_begin(a, &h2, &capture_op);
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &h, w, &op) ==
+              VSR_IO_FAILED);
+        a->hold_pool_writes = false;
+        world_release_held(a);
+        settle();
+        task_result(&h2, w);
+        caller_done(a, capture_op, VSR_IO_OK, &h2.checkpoint);
+        settle();
+        expect_checkpoint(a, capture_op, w, &h2);
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &h, w, &op) == VSR_OK);
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &h2, w, &op2) ==
+              VSR_IO_RETRY);
+        settle();
+        CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_DROP, op) != NULL);
+        caller_done(a, op, VSR_IO_OK, NULL);
+        settle();
+        expect_core(a, op, VSR_IO_OK);
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &h2, w, &op2) == VSR_OK);
+        settle();
+        CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_DROP, op2) != NULL);
+        caller_done(a, op2, VSR_IO_OK, NULL);
+        settle();
+        expect_core(a, op2, VSR_IO_OK);
+    }
+    expect_idle(a);
+    engine_crash(a);
+}
+
 int main(void)
 {
     /* TEMP: helpers of the tests still to come. */
@@ -2811,8 +3681,13 @@ int main(void)
     (void)submit_sync;
     (void)store_populate;
     (void)expect_no_core;
-    (void)expect_core;
+    (void)craft_file;
+    (void)craft_seal;
+    (void)file_install;
     test_capture();
     test_fetch();
+    test_capture_failures();
+    test_sync();
+    test_drop();
     return 0;
 }
