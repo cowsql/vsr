@@ -3638,19 +3638,25 @@ static void test_review_full_ring(void)
             k.received += f->rail.data.bytes.size;
             k.data_ops++;
             CHECK(vsr_io_streams_data_done(a->io, f->op.op.id) == VSR_OK);
-        } else if ((f = forwarded_take(a, VSR_IO_OP_STREAM_END)) != NULL) {
-            CHECK(!k.ended && f->rail.end.stream == k.cookie);
-            k.ended = true;
-            k.end = f->rail.end;
+        } else {
+            f = forwarded_take(a, VSR_IO_OP_STREAM_END);
+            if (f != NULL) {
+                CHECK(!k.ended && f->rail.end.stream == k.cookie);
+                k.ended = true;
+                k.end = f->rail.end;
+            }
         }
         f = forwarded_take(b, VSR_IO_OP_STREAM_WRITTEN);
         if (f != NULL) {
             CHECK(!d.ended && f->rail.written.write == d.written_count);
             d.written[d.written_count++] = f->rail.written.write;
-        } else if ((f = forwarded_take(b, VSR_IO_OP_STREAM_END)) != NULL) {
-            CHECK(!d.ended && d.written_count == 4);
-            d.ended = true;
-            d.end = f->rail.end;
+        } else {
+            f = forwarded_take(b, VSR_IO_OP_STREAM_END);
+            if (f != NULL) {
+                CHECK(!d.ended && d.written_count == 4);
+                d.ended = true;
+                d.end = f->rail.end;
+            }
         }
         (void)world_run_checked(1);
     }
