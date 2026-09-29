@@ -836,6 +836,10 @@ static void link_close(struct vsr_io *io, uint32_t index, int32_t error)
             node->linked_since_ns = 0;
         }
     }
+    if (state == VSR_IO_LINK_EXTERNAL &&
+        link->stage == VSR_IO_STAGE_HANDSHAKE && link->handshake_op == 0) {
+        io->links.handshakes_due--; /* Its op never found ring room. */
+    }
     link->state = VSR_IO_LINK_CLOSING;
     link->error = error;
     link->stage = VSR_IO_STAGE_NONE;
@@ -1475,13 +1479,15 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
     link->inflight = 0;
     if (cqe->result < 0) {
         /* A rejected zero-copy send completes once, without MORE
-         * (decision 62); an accepted one still gets its NOTIF. */
+         * (decision 62); an accepted one still gets its NOTIF. The entry
+         * is released like at a NOTIF: the link may be closing already
+         * (a demotion, a caller's close), when nothing else would
+         * complete the retiring messages its sends covered. */
         link->vec_count = 0;
         if (send->zero_copy && (cqe->flags & VSR_IO_CQE_MORE) != 0) {
             send->state = SEND_NOTIF;
         } else {
-            send->state = SEND_FREE;
-            link_send_floor(link);
+            link_send_release(io, link, send);
         }
         link_close(io, link_index(io, link), cqe->result);
         return;
@@ -1631,8 +1637,10 @@ static void link_hello(struct vsr_io *io, struct vsr_io_link *link,
         return;
     }
     node_index = vsr_io_links_node_index(&io->links, hello->node);
-    if (node_index == LINK_NONE) {
-        /* Unknown nodes cannot be authorized for anything (decision 73). */
+    if (node_index == LINK_NONE || hello->node == io->options.node) {
+        /* Unknown nodes cannot be authorized for anything (decision 73),
+         * and nothing may claim to be this engine: it never dials itself,
+         * so such a link could only inject its own replicas' frames. */
         io->stats.frames_rejected++;
         link_close(io, index, -EPROTO);
         return;
@@ -1681,7 +1689,9 @@ int vsr_io_links_handshake_done(struct vsr_io *io, uint64_t op, int32_t status,
     } else {
         uint32_t node_index = vsr_io_links_node_index(links, done->node);
 
-        if (node_index == LINK_NONE) {
+        /* Unknown, or this engine's own identity (a reflected handshake,
+         * say): refused like the HELLO's claim. */
+        if (node_index == LINK_NONE || done->node == io->options.node) {
             link_close(io, index, -EACCES);
             return VSR_OK;
         }
@@ -2138,8 +2148,8 @@ int vsr_io_links_adopt(struct vsr_io *io, int fd, uint64_t node, uint32_t flags)
         if (node != VSR_IO_NO_NODE) {
             return VSR_EINVAL;
         }
-    } else if (node_index == LINK_NONE) {
-        return VSR_EINVAL;
+    } else if (node_index == LINK_NONE || node == io->options.node) {
+        return VSR_EINVAL; /* Unknown, or the engine itself. */
     }
     index =
         link_alloc(io, VSR_IO_PURPOSE_PEER,
@@ -2416,7 +2426,9 @@ void vsr_io_links_deadline(struct vsr_io *io, uint16_t kind, uint32_t index,
         if (node_peer_pending(io, index) == 0) {
             node->dialing = false; /* A LINK_WANTED's wait is over. */
             if (!node->has_address && node->carrier == LINK_NONE) {
-                node_queue_drop(io, index, true); /* Unanswered. */
+                /* Unanswered: the waiting messages retry; those a lost
+                 * link's kernel may still read wait for its NOTIFs. */
+                node_queue_drop(io, index, false);
             }
         }
         node_want_dial(io, index);
@@ -2817,21 +2829,34 @@ static bool link_prepare_recv(struct vsr_io *io, struct vsr_io_link *link,
     return true;
 }
 
-/* Teardown of a CLOSING link once the caller returned its descriptor and
- * no dial record is in flight: SHUTDOWN, CANCEL of the receive and CLOSE
- * of the slot, or a plain CLOSE of a raw descriptor, sharing one slot. */
+/* Teardown of a CLOSING link once the caller returned its descriptor:
+ * SHUTDOWN, CANCEL of the receive and CLOSE of the slot, or a plain CLOSE
+ * of a raw descriptor, sharing one slot. A CONNECT or the EXTERNAL
+ * preamble receive still in flight may never complete on its own (a black
+ * hole, a silent peer) and is cancelled first; a SOCKET still owes the
+ * descriptor and a SETSOCKOPT completes at once, so those are waited for. */
 static bool link_prepare_teardown(struct vsr_io *io, struct vsr_io_link *link,
                                   struct batch *batch)
 {
     struct vsr_io_sqe *sqe;
     uint8_t records = 0;
     uint64_t user_data;
+    bool cancel_dial = false;
 
-    if (link->torn_down || link->handshake_op != 0 ||
-        link->connect_slot != LINK_NONE) {
+    if (link->torn_down || link->handshake_op != 0) {
         return true;
     }
+    if (link->connect_slot != LINK_NONE) {
+        uint32_t stage = io->slots.slots[link->connect_slot].sub;
+
+        if (stage != VSR_IO_STAGE_CONNECT &&
+            stage != VSR_IO_STAGE_PREAMBLE_RECV) {
+            return true;
+        }
+        cancel_dial = true;
+    }
     if (link->fd < 0 && link->raw_fd < 0) {
+        LINKS_ASSERT(!cancel_dial);
         link->torn_down = true;
         link_try_free(io, link);
         return true;
@@ -2839,7 +2864,7 @@ static bool link_prepare_teardown(struct vsr_io *io, struct vsr_io_link *link,
     if (link->fd >= 0) {
         records = 2 + (link->recv_slot != LINK_NONE ? 1 : 0);
     } else {
-        records = 1;
+        records = 1 + (cancel_dial ? 1 : 0);
     }
     if (!batch_room(batch, records)) {
         return false;
@@ -2873,6 +2898,14 @@ static bool link_prepare_teardown(struct vsr_io *io, struct vsr_io_link *link,
         sqe->user_data = user_data;
         batch->count++;
     } else {
+        if (cancel_dial) {
+            sqe = batch_next(batch);
+            sqe->opcode = VSR_IO_SQE_CANCEL;
+            sqe->offset =
+                vsr_io_slots_user_data(&io->slots, link->connect_slot);
+            sqe->user_data = user_data;
+            batch->count++;
+        }
         sqe = batch_next(batch);
         sqe->opcode = VSR_IO_SQE_CLOSE;
         sqe->fd = link->raw_fd;

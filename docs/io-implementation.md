@@ -263,7 +263,9 @@ during the handshake and flow once established. A HELLO not received
 within `handshake_timeout_ns` closes the link. A peer link from a node
 that is not in the node table is closed (a node must be known to be
 authorized; an unknown node cannot be authorized for any envelope), as is
-a second HELLO, a HELLO on an established link, or any other frame before
+one claiming the engine's own node id (the engine never dials itself, so
+such a link could only inject its own replicas' frames; decision 86), a
+second HELLO, a HELLO on an established link, or any other frame before
 the handshake is done.
 
 Handshake (EXTERNAL): the dialer sends the preamble on the raw descriptor
@@ -273,10 +275,12 @@ the 8 preamble bytes with a plain RECV on the raw descriptor (re-issued
 for a short read), verifies them, and the op names the descriptor with
 INBOUND and no node. The engine touches the socket no further until
 `vsr_io_links_handshake_done`: status OK with the expected node (outbound)
-or a known node (inbound) installs the descriptor and establishes; any
-other outcome closes it with a plain CLOSE. A link closed while the caller
-holds its descriptor (revoke, shutdown, timeout) stays CLOSING until the
-completion returns it.
+or a known node other than the engine's own (inbound) installs the
+descriptor and establishes; any other outcome closes it with a plain
+CLOSE. A link closed while the caller holds its descriptor (revoke,
+shutdown, timeout) stays CLOSING until the completion returns it; one
+closed while its preamble RECV or its CONNECT is still in flight has that
+record cancelled by the teardown (decision 87).
 
 Carrier election (decision 41): whenever a peer link to node N becomes
 established or leaves ESTABLISHED, `nodes[N].carrier` is recomputed as the
@@ -1309,7 +1313,8 @@ returns immediately and prepares again):
    SOCKET or CONNECT, the EXTERNAL preamble receive, the control bytes
    (preamble, HELLO) and coalesced sends, receive arming and re-arming,
    the teardown (SHUTDOWN, CANCEL of the receive, CLOSE of the slot, or a
-   plain CLOSE of a raw descriptor).
+   plain CLOSE of a raw descriptor, preceded by a CANCEL of a CONNECT or
+   preamble RECV still in flight on it).
 3. `vsr_io_streams_prepare`: file chunk reads.
 4. Per replica: `vsr_io_store_prepare` (open/create steps, header writes,
    one record write, superblock write, flush, one cold read), then

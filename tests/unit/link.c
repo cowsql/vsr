@@ -4821,6 +4821,270 @@ static void test_send_random(uint64_t seed)
     engine_forget(p.b);
 }
 
+/* -------------------------------------------------------------------------
+ * Review: identity, completion and teardown corners
+ * ---------------------------------------------------------------------- */
+
+/* An inbound peer claiming the engine's own node identity is refused in
+ * both modes, and adopt refuses the own node too: a link to the own node
+ * can never be legitimate (decision 73). */
+static void test_review_own_node(void)
+{
+    struct engine *a;
+    const struct vsr_io_forwarded *op;
+    struct vsr_io_handshake_done done;
+    unsigned char bytes[128];
+    uint32_t peer;
+    uint32_t engine_side;
+    size_t n;
+
+    world_reset(41);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_TRUSTED);
+    CHECK(vsr_io_links_node_set(a->io, 1, NULL) == VSR_OK);
+    CHECK(vsr_io_links_node_set(a->io, 2, NULL) == VSR_OK);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    (void)forwarded_take(a, VSR_IO_OP_LINK_WANTED);
+    n = put_preamble(bytes);
+    n += put_hello(bytes + n, VSR_IO_HANDSHAKE_TRUSTED, VSR_IO_PURPOSE_PEER, 1,
+                   7);
+    refuse(a, bytes, n, a->io->stats.frames_rejected, -EPROTO);
+    CHECK(node_state(a, 1) == VSR_IO_NODE_UNLINKED);
+    CHECK(a->io->links.nodes[0].carrier == NONE);
+    /* Adopting a connection as the own node: EINVAL either way. */
+    peer = sock_alloc(TEST_OWNER);
+    engine_side = sock_alloc(0);
+    world.socks[peer].raw_fd = fd_alloc();
+    world.socks[engine_side].raw_fd = fd_alloc();
+    world.socks[peer].peer = engine_side;
+    world.socks[engine_side].peer = peer;
+    CHECK(vsr_io_links_adopt(a->io, world.socks[engine_side].raw_fd, 1, 0) ==
+          VSR_EINVAL);
+    CHECK(vsr_io_links_adopt(a->io, world.socks[engine_side].raw_fd, 1,
+                             VSR_IO_ADOPT_HANDSHAKE | VSR_IO_ADOPT_OUTBOUND) ==
+          VSR_EINVAL);
+    world_settle();
+    check_quiet(a);
+    CHECK(node_state(a, 1) == VSR_IO_NODE_UNLINKED);
+    sock_drop(engine_side);
+    sock_drop(peer);
+    engine_forget(a);
+    /* EXTERNAL: the caller's completion naming the own node is refused
+     * like an unknown one, without a takeover. */
+    world_reset(42);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_EXTERNAL);
+    CHECK(vsr_io_links_node_set(a->io, 1, NULL) == VSR_OK);
+    world_settle();
+    peer = peer_connect(a);
+    n = put_preamble(bytes);
+    peer_write(peer, bytes, n);
+    world_settle();
+    op = forwarded_take(a, VSR_IO_OP_HANDSHAKE);
+    CHECK(op != NULL);
+    done.node = 1;
+    CHECK(vsr_io_links_handshake_done(a->io, op->op.op.id, VSR_IO_OK, &done) ==
+          VSR_OK);
+    world_settle();
+    CHECK(peer_eof(peer));
+    CHECK(a->updates == 0);
+    check_quiet(a);
+    CHECK(node_state(a, 1) == VSR_IO_NODE_UNLINKED);
+    peer_close(peer);
+    engine_forget(a);
+}
+
+/* A send that fails without MORE on a link that is already closing (a
+ * demotion, a caller's close, a node change) still completes the messages
+ * its stream carried: nothing else releases them once the link is gone. */
+static void test_review_failed_send_closing(void)
+{
+    struct pair p;
+    const struct vsr_io_link *out;
+
+    pair_open(&p, 43, 4, PAGE);
+    out = carrier_of(p.a, 2);
+    world.reject_send = 1;
+    CHECK(send_fresh(p.a, 0, 1, 16, 2) == VSR_OK);
+    engine_step(p.a); /* The send goes out and is refused; its result
+                         is queued for the next step. */
+    CHECK(world.reject_send == 0);
+    CHECK(p.a->cq_count > 0);
+    vsr_io_links_close(p.a->io, (uint32_t)(out - p.a->io->links.links),
+                       -ECONNABORTED);
+    CHECK(out->state == VSR_IO_LINK_CLOSING);
+    CHECK(p.ra->completions_count == 0); /* Still on the wire. */
+    world_settle();
+    expect_completion(p.ra, 1, VSR_IO_RETRY);
+    CHECK(p.ra->completions_count == 0);
+    CHECK(p.a->io->links.nodes[0].queue_count == 0);
+    CHECK(p.a->io->stats.messages_retried == 1);
+    check_quiet(p.a);
+    CHECK(pool_refs(p.a) == 0);
+    world_settle();
+    check_quiet(p.b);
+    CHECK(pool_refs(p.b) == 0);
+    engine_forget(p.a);
+    engine_forget(p.b);
+}
+
+/* A caller-dialed node whose LINK_WANTED goes unanswered retries only the
+ * messages that never went out: those a lost link's kernel may still be
+ * reading complete at its NOTIFs, never before. */
+static void test_review_link_wanted_retiring(void)
+{
+    struct engine *a;
+    struct engine *b;
+    struct vsr_io_replica *ra;
+    const struct vsr_io_link *out;
+    uint64_t op = 0;
+    int32_t status = 0;
+    bool done[4];
+    int fd;
+
+    world_reset(44);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_TRUSTED);
+    b = engine_open(1, 2, VSR_IO_HANDSHAKE_TRUSTED);
+    CHECK(vsr_io_links_node_set(a->io, 2, NULL) == VSR_OK);
+    CHECK(vsr_io_links_node_set(a->io, 1, NULL) == VSR_OK);
+    CHECK(vsr_io_links_node_set(b->io, 1, &a->listen) == VSR_OK);
+    CHECK(vsr_io_links_node_set(b->io, 2, NULL) == VSR_OK);
+    ra = open_replica(a, 0, cluster);
+    (void)open_replica(b, 0, cluster);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
+    fd = engine_connect(a, &b->listen);
+    CHECK(vsr_io_links_adopt(a->io, fd, 2,
+                             VSR_IO_ADOPT_HANDSHAKE | VSR_IO_ADOPT_OUTBOUND) ==
+          VSR_OK);
+    world_settle();
+    /* b, linked by then, authorizes without dialing. */
+    CHECK(vsr_io_links_authorize(b->io, cluster, 1, 1) == VSR_OK);
+    CHECK(vsr_io_links_authorize(b->io, cluster, 2, 2) == VSR_OK);
+    world_settle();
+    check_linked(a, b);
+    out = carrier_of(a, 2);
+    memset(samples_next, 0, sizeof(samples_next));
+    world.hold_notifs = true;
+    CHECK(send_fresh(a, 0, 1, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(send_fresh(a, 0, 2, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(world.held_count == 2);
+    link_reset(a, out);
+    world_settle();
+    CHECK(out->state == VSR_IO_LINK_CLOSING);
+    CHECK(ra->completions_count == 0);
+    CHECK(a->io->links.nodes[0].queue_count == 2);
+    /* A new SEND asks the caller for a link; the backoff runs out
+     * unanswered: the new message retries, the two on the old link's
+     * stream wait for its NOTIFs. */
+    CHECK(send_fresh(a, 0, 3, 16, 2) == VSR_OK);
+    world_settle();
+    CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
+    CHECK(ra->completions_count == 0);
+    world_advance(BACKOFF_NS);
+    world_settle();
+    expect_completion(ra, 3, VSR_IO_RETRY);
+    CHECK(ra->completions_count == 0);
+    CHECK(a->io->links.nodes[0].queue_count == 2);
+    /* The want persists: the caller is asked again on the backoff. */
+    CHECK(node_state(a, 2) == VSR_IO_NODE_PENDING);
+    CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
+    world.hold_notifs = false;
+    world_release_notifs();
+    world_settle();
+    memset(done, 0, sizeof(done));
+    while (take_completion(ra, &op, &status)) {
+        CHECK(op >= 1 && op <= 2 && !done[op] && status == VSR_IO_RETRY);
+        done[op] = true;
+    }
+    CHECK(done[1] && done[2]);
+    CHECK(a->io->links.nodes[0].queue_count == 0);
+    CHECK(out->state == VSR_IO_LINK_FREE);
+    check_quiet(a);
+    CHECK(pool_refs(a) == 0);
+    engine_forget(a);
+    engine_forget(b);
+}
+
+/* The teardown of a link whose raw descriptor still has a record in
+ * flight that may never complete on its own (the EXTERNAL acceptor's
+ * preamble receive from a silent peer, a CONNECT to a black hole)
+ * cancels it: the handshake timeout frees the entry and the descriptor. */
+static void test_review_teardown_cancel(void)
+{
+    struct engine *a;
+    uint32_t peer;
+
+    world_reset(45);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_EXTERNAL);
+    world_settle();
+    log_clear(a);
+    peer = peer_connect(a);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_EXTERNAL) == 1);
+    CHECK(log_count(a, VSR_IO_SQE_RECV) == 1);
+    log_clear(a);
+    world_advance(HANDSHAKE_NS);
+    world_settle();
+    CHECK(log_count(a, VSR_IO_SQE_CANCEL) == 1);
+    CHECK(log_count(a, VSR_IO_SQE_CLOSE) == 1);
+    CHECK(peer_eof(peer));
+    check_quiet(a);
+    CHECK(a->io->links.pending == 0);
+    /* The listener still accepts. */
+    peer_close(peer);
+    peer = peer_connect(a);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_EXTERNAL) == 1);
+    peer_close(peer);
+    world_settle();
+    check_quiet(a);
+    engine_forget(a);
+}
+
+/* An EXTERNAL link that closes while its HANDSHAKE op waits for room in
+ * the forwarded ring leaves nothing due behind. */
+static void test_review_handshakes_due(void)
+{
+    struct engine *a;
+    uint32_t peer;
+    unsigned char bytes[16];
+    size_t n;
+
+    world_reset(46);
+    a = engine_open(0, 1, VSR_IO_HANDSHAKE_EXTERNAL);
+    /* Caller-dialed nodes fill the forwarded ring with LINK_WANTED ops
+     * nobody takes. */
+    for (uint64_t node = 2; node <= 5; ++node) {
+        CHECK(vsr_io_links_node_set(a->io, node, NULL) == VSR_OK);
+        CHECK(vsr_io_links_authorize(a->io, cluster, node, node) == VSR_OK);
+    }
+    for (uint32_t i = 0;
+         i < 8 && a->io->forwarded_count < a->io->options.limits.ops; ++i) {
+        world_advance(BACKOFF_NS << i);
+        world_settle();
+    }
+    CHECK(a->io->forwarded_count == a->io->options.limits.ops);
+    peer = peer_connect(a);
+    n = put_preamble(bytes);
+    peer_write(peer, bytes, n);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_EXTERNAL) == 1);
+    CHECK(a->io->links.handshakes_due == 1);
+    CHECK(forwarded_count(a, VSR_IO_OP_HANDSHAKE) == 0);
+    world_advance(HANDSHAKE_NS);
+    world_settle();
+    CHECK(links_in_state(a, VSR_IO_LINK_EXTERNAL) == 0);
+    CHECK(a->io->links.handshakes_due == 0);
+    CHECK(peer_eof(peer));
+    peer_close(peer);
+    engine_forget(a);
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 0x5EED2u;
@@ -4854,6 +5118,11 @@ int main(int argc, char **argv)
     test_send_reject();
     test_stream();
     test_send_random(seed);
+    test_review_own_node();
+    test_review_failed_send_closing();
+    test_review_link_wanted_retiring();
+    test_review_teardown_cancel();
+    test_review_handshakes_due();
     printf("link: ok\n");
     return 0;
 }
