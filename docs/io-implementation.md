@@ -112,8 +112,8 @@ with `VSR_ELIMIT`:
 | Frame limit | `vsr_io_codec_frame_limit(limits)`; `slab_bytes >=` this and `>= stream_chunk_bytes + 40` | `codec.c` |
 | Record limit | `vsr_io_codec_record_limit(limits)`; `<= slab_bytes - 2 * block_bytes` and `<= segment_bytes - header_bytes` | `store.c`, decision 37 |
 | Segment header bytes | `round_up(vsr_io_codec_segment_limit(limits), block_bytes)` | `store.c` |
-| Tail region | `cache_bytes + 2 * block_bytes`; `cache_bytes >= write_behind_bytes + pinned_payload_bytes + 2 * record limit + 2 * header bytes + block_bytes` | `store.c`, decisions 36 and S1 |
-| Single write | `write_behind_bytes + record limit + block_bytes <= 1 GiB`; `segment_bytes + 2 * block_bytes <= UINT32_MAX` | `store.c`, decision S2 |
+| Tail region | `cache_bytes + 2 * block_bytes`; `cache_bytes >= write_behind_bytes + pinned_payload_bytes + 2 * record limit + 2 * header bytes + block_bytes` | `store.c`, decisions 36 and 69 |
+| Single write | `write_behind_bytes + record limit + block_bytes <= 1 GiB`; `segment_bytes + 2 * block_bytes <= UINT32_MAX` | `store.c`, decision 70 |
 | Slots | `vsr_io_slots_size`: `listeners + 7 * links + streams * (stream_window + 2) + replicas * (inflight_writes + 8) + 8`; per link a receive, a shutdown, a connect and `VSR_IO_LINK_SENDS` (4) sends awaiting NOTIF | `slots.c` |
 | Deadlines | `links + nodes + 4 * replicas + streams` | `engine.c` |
 | Pool reserve | `replicas + 1` slabs never provided to the kernel | `pool.c` |
@@ -788,7 +788,7 @@ long) or a record. Before packing a record of `n` bytes:
    `ring_begin` of the oldest write not yet complete (or `issued` when
    none): hold the STORE (queue it; nothing after it is processed until it
    proceeds, since ops are applied in order). The attach rule of decision
-   S1 guarantees the hold ends: pinned LOAD bytes are bounded by
+   69 guarantees the hold ends: pinned LOAD bytes are bounded by
    `pinned_payload_bytes` plus two record alignments, unwritten bytes by
    `write_behind_bytes`, and the header and the pads by the rest of the
    slack. The steps of 1 and 2 are taken only once 3 and 4 pass.
@@ -815,7 +815,7 @@ records after it are not planned until it completed. `issued` advances to
 the write's end (and over a wrap's gap); the next write starts there, so
 no block is rewritten. A write is never longer than `write_behind_bytes +
 record limit + block_bytes`, which the check keeps at or below 1 GiB
-(decision S2). Superblock writes use the two superblock blocks after the
+(decision 70). Superblock writes use the two superblock blocks after the
 ring with their own slot kind and are never concurrent with each other.
 Completion: a write's `state` becomes complete; `written` advances over
 the contiguous prefix of complete writes in issue order to the
@@ -907,7 +907,7 @@ completion advances `recovery.stage`:
    the header write completed, which is what the core expects for an empty
    store); RECOVER completes `NOT_FOUND` at once and creates the empty
    log the same way, holding the STOREs of a warm-up until the header
-   write completed (decision S3). An existing file under NEW/JOIN is
+   write completed (decision 71). An existing file under NEW/JOIN is
    recovered like RECOVER; the core rejects the recovered row itself.
 2. `STATX` for the size; `READ` both superblocks; keep the valid one with
    the greater revision; none valid is `CORRUPT`. Geometry must match the
@@ -1289,8 +1289,8 @@ of `docs/io-design.md`:
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | One `libvsr.a` with liburing; three headers installed (done by the build skeleton) | 32 |
 | `vsr-io.h` | Platform note: Linux >= 6.18 through the io_uring syscalls, no liburing; `vsr_io_uring_init` probes once and fails with `-ENOSYS` on an older kernel | 52, 53 |
 | `Makefile.am`, `vsr.pc.in`, `configure.ac` | liburing dropped: no pkg-config check, no `Requires.private`; the kernel's UAPI header vendored under `src/io/uapi` | 52 |
-| `vsr-io.h` | `cache_bytes` rule: two headers and a block of slack besides the two records | S1 |
-| `store.h` | Extents carry their segment, a header flag and their last sequence; the store keeps `file_head`, `superblock_dirty`, `growth` and the log path; the check rule adds the executor-length bounds | S1, S2 |
+| `vsr-io.h` | `cache_bytes` rule: two headers and a block of slack besides the two records | 69 |
+| `store.h` | Extents carry their segment, a header flag and their last sequence; the store keeps `file_head`, `superblock_dirty`, `growth` and the log path; the check rule adds the executor-length bounds | 69, 70 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

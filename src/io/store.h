@@ -34,7 +34,7 @@
  *     + pinned_payload_bytes + 2 * max_record_bytes + 2 * header_bytes +
  *     block_bytes, checked at attach, guarantees this wait always ends (a
  *     seal packs a segment header at the next block boundary, possibly
- *     after a ring wrap, before the record; decision S1);
+ *     after a ring wrap, before the record; decision 69);
  *   - every record carries `flushed`, the durable sequence acknowledged to
  *     the core when it was packed, and every superblock its durable_floor;
  *     recovery's floor F is the maximum over all of them and a scan that
@@ -352,11 +352,11 @@ struct vsr_io_store {
  * max_record_bytes (vsr_io_codec_record_limit) <= slab_bytes - 2 *
  * block_bytes and <= segment_bytes - header_bytes; cache_bytes a multiple of
  * block_bytes and >= write_behind_bytes + limits->pinned_payload_bytes +
- * 2 * max_record_bytes + 2 * header_bytes + block_bytes (decision S1);
+ * 2 * max_record_bytes + 2 * header_bytes + block_bytes (decision 69);
  * segments >= 2, max_segments >= segments; inflight_writes >= 1;
  * max_entries >= batch_entries; max_clients >= 1; segment_bytes + 2 *
  * block_bytes and write_behind_bytes + max_record_bytes + block_bytes (the
- * largest single write) fit the executor's 32-bit lengths (decision S2).
+ * largest single write) fit the executor's 32-bit lengths (decision 70).
  * Returns OK, EINVAL (a malformed value) or ELIMIT (a capacity rule).
  */
 int vsr_io_store_check(const struct vsr_io_store_options *options,

@@ -55,7 +55,7 @@
 /* flush_interval_ns when the option is zero (decision 50). */
 #define STORE_FLUSH_INTERVAL_NS UINT64_C(100000000)
 /* The largest single write the pipeline plans: below the kernel's per-call
- * cap, so a write is never short by design (decision S2). */
+ * cap, so a write is never short by design (decision 70). */
 #define STORE_WRITE_MAX_BYTES (UINT64_C(1) << 30)
 #define STORE_BLOCK_MIN 512u
 
@@ -350,7 +350,7 @@ int vsr_io_store_check(const struct vsr_io_store_options *options,
     }
     /* Executor lengths are 32-bit: the creation FALLOCATE covers the
      * superblocks and one slot; the largest record write covers the
-     * write-behind allowance, one record and its padding (decision S2). */
+     * write-behind allowance, one record and its padding (decision 70). */
     if (!add64(options->segment_bytes, 2 * (uint64_t)options->block_bytes,
                &minimum) ||
         minimum > UINT32_MAX ||
@@ -361,7 +361,7 @@ int vsr_io_store_check(const struct vsr_io_store_options *options,
         return VSR_ELIMIT;
     }
     /* The ring holds the write-behind allowance, the pinned payload, two
-     * records and the seal's header with its alignment (decision S1). */
+     * records and the seal's header with its alignment (decision 69). */
     if (!add64(options->write_behind_bytes, limits->pinned_payload_bytes,
                &minimum) ||
         !add64(minimum, 2 * plan.max_record_bytes, &minimum) ||
@@ -1375,7 +1375,7 @@ static void file_done(struct vsr_io_store *store, uint32_t op, uint64_t cookie,
         if (store->start_mode == VSR_START_RECOVER) {
             /* Nothing survives: the core hears so at once (section 6.4)
              * and the empty log is created for the warm-up that may
-             * follow (decision S3); its STOREs are held until then. */
+             * follow (decision 71); its STOREs are held until then. */
             complete(store, store->recovery.load_op, VSR_IO_NOT_FOUND, NONE,
                      NULL);
             store->recovery.load_op = 0;

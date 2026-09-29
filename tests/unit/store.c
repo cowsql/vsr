@@ -1002,7 +1002,7 @@ static void test_check(void)
     CHECK(check_of(&o) == VSR_OK);
     o.segment_bytes = round_up(header_bytes + max_record, BLOCK) - BLOCK;
     CHECK(check_of(&o) == VSR_ELIMIT);
-    /* The ring rule of decision S1, exactly. */
+    /* The ring rule of decision 69, exactly. */
     o = base;
     o.cache_bytes =
         round_up(o.write_behind_bytes + limits.pinned_payload_bytes +
@@ -1014,7 +1014,7 @@ static void test_check(void)
     o = base;
     o.write_behind_bytes += BLOCK;
     CHECK(check_of(&o) == VSR_ELIMIT);
-    /* Executor lengths (decision S2). */
+    /* Executor lengths (decision 70). */
     o = base;
     o.segment_bytes = round_up(UINT32_MAX - 2 * BLOCK + 1, BLOCK);
     o.cache_bytes = UINT64_C(1) << 40;
