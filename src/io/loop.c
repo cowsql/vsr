@@ -692,8 +692,8 @@ static bool replica_step(struct vsr_io *io, struct vsr_io_replica *replica,
 }
 
 /* STATUS once per poll in which STATE_CHANGED was reported, and at
- * STOPPED (7.8); the status is copied into the ring entry, valid until the
- * poll after the one that returns it. */
+ * STOPPED (7.8); the status is copied into the ring entry (decision E4),
+ * valid as long as any rail descriptor (decision E6). */
 static bool emit_status(struct vsr_io *io, struct vsr_io_replica *replica)
 {
     struct vsr_io_forwarded *entry;

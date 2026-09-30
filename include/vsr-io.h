@@ -445,16 +445,18 @@ int vsr_io_layout(const struct vsr_io_options *options,
  * Copies options; registers the payload pool region at buffer_region_base
  * and the provided-buffer ring at buffer_group with the executor (the file
  * and buffer tables themselves are executor-wide and registered by whoever
- * created the executor); queues the listener setup for the first prepare. Regions must satisfy the layout and stay fixed until
- * deinit. Returns OK, EINVAL, ELIMIT, or a negative errno from the
- * executor's registrations.
+ * created the executor); seeds the engine's generator once from the
+ * executor's random; queues the listener setup for the first prepare.
+ * Regions must satisfy the layout and stay fixed until deinit. Returns OK,
+ * EINVAL, ELIMIT, or a negative errno from the executor's calls.
  */
 int vsr_io_init(const struct vsr_io_options *options,
                 const struct vsr_io_region *metadata,
                 const struct vsr_io_region *payload, struct vsr_io **out);
-/* Stops accepting, closes every link and stream after their pins end, and
- * releases executor registrations. Requires no attached replica. Asynchronous:
- * keep driving the loop until vsr_io_stats.closed, then deinit. */
+/* Stops accepting and closes every link and stream after their pins end.
+ * EBUSY while a replica is attached, else OK (also when called again).
+ * Asynchronous: keep driving the loop until vsr_io_stats.closed, then
+ * deinit, which releases the executor registrations. */
 int vsr_io_close(struct vsr_io *io);
 int vsr_io_deinit(struct vsr_io *io); /* EBUSY until closed. */
 /* Thread-safe. Wakes the owner's loop; the next poll sees nothing new. */
@@ -469,7 +471,11 @@ void vsr_io_wake(struct vsr_io *io);
  * revokes. A NULL address records a CALLER-DIALED node: the engine never
  * connects to it and instead emits a LINK_WANTED op, on its redial backoff
  * schedule, whenever it needs a link and has none; the caller connects
- * however it likes and adopts the socket.
+ * however it likes and adopts the socket. node_set is ELIMIT when the node
+ * table (limits.nodes) is full and EINVAL for VSR_IO_NO_NODE or a
+ * malformed address; authorize is ELIMIT when the authorization table is
+ * full and EINVAL for a zero cluster; node_clear is EINVAL for an unknown
+ * node.
  */
 int vsr_io_node_set(struct vsr_io *io, uint64_t node,
                     const struct vsr_io_address *address);
@@ -566,7 +572,12 @@ int vsr_io_poll(struct vsr_io *io, uint64_t now_ns, struct vsr_io_op *ops,
  * the engine's own: a REQUEST from a client incarnation the store does not
  * know, while its client table (counting incarnations in flight) is full, is
  * left unconsumed with ELIMIT, and the caller answers LIMIT itself. With the
- * same max_clients on every replica, backups therefore never exceed theirs. */
+ * same max_clients on every replica, backups therefore never exceed theirs.
+ * A full queue is AGAIN (checked before that admission). EINVAL: TIME and
+ * MESSAGE events, a replica not attached or STOPPED, a lease with
+ * VSR_IO_LEASE_ENGINE set, data without a lease or a lease without data,
+ * and after a STOP every REQUEST, CLIENT_QUERY, READ and CHECKPOINT for
+ * that replica. */
 int vsr_io_submit(struct vsr_io *io, const struct vsr_io_event *events,
                   uint32_t count, uint32_t *consumed);
 /* Fills at most capacity records (at least 5: EINVAL below); *deadline_ns
@@ -582,8 +593,11 @@ int vsr_io_prepare(struct vsr_io *io, uint64_t now_ns, struct vsr_io_sqe *sqes,
  * three hooks; these are the only callbacks in this header and are optional
  * for a caller that owns no I/O. complete receives the caller's completions;
  * step receives forwarded ops and returns events to submit; prepare appends
- * the caller's records and returns its deadline. vsr_io_run returns when
- * every replica is detached and the engine is closed, or on executor error.
+ * the caller's records and returns its deadline. Events the engine refuses
+ * with EINVAL or ELIMIT are dropped (a caller that answers LIMIT itself runs
+ * its own loop); AGAIN keeps them for the next round. vsr_io_run returns OK
+ * when every replica is detached and the engine is closed,
+ * vsr_io_stats.failure once set, or the executor's negative errno.
  */
 struct vsr_io_hooks {
     void *ctx;
@@ -607,6 +621,9 @@ int vsr_io_run(struct vsr_io *io, const struct vsr_io_hooks *hooks);
  * of caller leases. The other kinds are engine-level rails; their op.data
  * points at the kind's descriptor, op.id is nonzero when a completion is
  * required and zero for informational kinds, and op.arg is per kind.
+ * A rail descriptor lives in the engine's op ring: op.data is valid until
+ * the caller's next call into the engine other than the status accessors
+ * (vsr_io_get_stats, vsr_io_node_status, vsr_io_replica_status).
  *
  * Leases: caller lease IDs must have VSR_IO_LEASE_ENGINE clear; the engine's
  * own leases have it set and never reach the caller. Reply routes and read
@@ -638,9 +655,9 @@ enum vsr_io_op_kind {
     VSR_IO_OP_STREAM_WRITTEN, /* data: vsr_io_stream_written; informational:
                                  that write's buffers or file range are no
                                  longer read. */
-    VSR_IO_OP_STATUS,         /* data: vsr_status of replica, borrowed until
-                               the next poll; informational. Emitted when
-                               STATE_CHANGED, and once at STOPPED. */
+    VSR_IO_OP_STATUS,         /* data: vsr_status of replica, a copy per op;
+                               informational. Emitted when STATE_CHANGED,
+                               and once at STOPPED. */
     VSR_IO_OP_LINK_WANTED     /* data: vsr_io_link_wanted; informational: a
                                caller-dialed node needs a link. */
 };
@@ -928,9 +945,10 @@ struct vsr_io_store_status {
 struct vsr_io_replica_options {
     struct vsr_options core; /* Borrowed during attach; copied. */
     struct vsr_io_store_options store;
-    const char *path; /* Store directory; must exist. Opened relative
-                                to AT_FDCWD; a simulation maps that to the
-                                node's virtual root. */
+    const char *path; /* Store directory; must exist. Copied by attach
+                         (1 to 4095 bytes). Opened relative to AT_FDCWD;
+                         a simulation maps that to the node's virtual
+                         root. */
     uint32_t reserved;
 };
 
@@ -947,19 +965,24 @@ int vsr_io_replica_layout(const struct vsr_io *io,
 /*
  * Initializes the core in the metadata region, opens or creates the store
  * according to core.start_mode, and starts driving the instance on the next
- * poll. Returns OK, EINVAL, ELIMIT, EBUSY when limits.replicas is reached, or
- * a negative errno. The cluster's authorizations should be in place first;
- * peers that are not yet authorized are dialed once they are.
+ * poll. Returns OK, EINVAL (also for a cluster another attached replica
+ * runs), ELIMIT, EBUSY when limits.replicas is reached, or a negative errno
+ * from registering the tail. The cluster's authorizations should be in
+ * place first; peers that are not yet authorized are dialed once they are.
+ * After a STOP event the replica refuses REQUEST, CLIENT_QUERY, READ and
+ * CHECKPOINT with EINVAL and takes no more MESSAGEs or served files.
  */
 int vsr_io_attach(struct vsr_io *io,
                   const struct vsr_io_replica_options *options,
                   const struct vsr_io_region *metadata,
                   const struct vsr_io_region *tail,
                   struct vsr_io_replica **out);
-/* Only after the STATUS op reporting STOPPED and once the store's own
- * write-behind writes and flushes have completed: closes the store files
- * and releases the tail registration. EBUSY otherwise; keep driving the
- * loop. The regions are the caller's again. */
+/* Only after the STATUS op reporting STOPPED, once the store's own
+ * write-behind writes and flushes have completed and no op naming the
+ * replica waits to be polled: closes the store files and releases the tail
+ * registration. EBUSY otherwise; keep driving the loop. The regions are the
+ * caller's again; vsr_io_replica_core still returns the core, for
+ * vsr_deinit. */
 int vsr_io_detach(struct vsr_io_replica *replica);
 void vsr_io_replica_status(const struct vsr_io_replica *replica,
                            struct vsr_status *core,

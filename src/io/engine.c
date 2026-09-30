@@ -749,8 +749,9 @@ static uint32_t ring_slot(uint32_t head, uint32_t count, uint32_t capacity)
 }
 
 /* A rail's descriptor lives in the ring entry, so op.data of a rail op
- * points into it; the entry is reused only after the poll that dequeues
- * it, which is the lifetime vsr-io.h gives such descriptors. */
+ * points into it; the entry is reused by the first producer after the
+ * poll that dequeues it, which vsr-io.h bounds by the caller's next call
+ * into the engine (decision E6). */
 struct vsr_io_forwarded *
 vsr_io_forward(struct vsr_io *io, struct vsr_io_replica *replica, uint32_t kind)
 {
