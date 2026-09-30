@@ -68,8 +68,8 @@ no regression test fixes yet, is empty.
 | --- | --- |
 | Unit (`tests/unit`) | Ten: checked arithmetic, logical equality, PCG, the in-memory store, graph validation, runtime ownership and scheduling against a protocol double, read rounds, descriptor copies, the arena planner |
 | Integration (`tests/integration`) | Fifteen: replication, normal-path minima, reads, checkpoints, epochs, lifecycle, transitions, audit, transfer audit, failures, view change edges, offers, capture, clients, and the independent API conformance suite `api_contract`; plus the compile-only header check |
-| Regression (`tests/regression`) | Fourteen minimal reproducers of fixed bugs, each with its origin in `tests/regression/README.md` |
-| Fault simulation (`tests/fuzzy`) | `cluster` (32 seeds, profile 0) and `cluster_extended` (16 seeds, profile 93) |
+| Regression (`tests/regression`) | Nineteen minimal reproducers of fixed bugs, each with its origin in `tests/regression/README.md` |
+| Fault simulation (`tests/fuzzy`) | `cluster` (32 seeds, profile 0) and `cluster_extended` (16 seeds, profile 221) |
 | Examples (`examples`) | Six narrated key-value walkthroughs |
 
 CI adds GCC with `-fanalyzer`, the Clang integer sanitizer, lint (format,
@@ -99,12 +99,19 @@ Campaigns run on this tree, all passing:
 | `cluster 1 1 600 quiet P 32` for `P` in 2, 3, 32, 127 | 32 each |
 | `cluster 1000 1 600 quiet P 1000` for `P` in 2, 3, 6, 7 | 1000 each |
 | `cluster 1 1 2000 quiet P 150` for `P` in 6, 7 | 150 each |
+| `cluster 1 1 600 quiet P 200` for `P` in 128, 255 | 200 each |
+| `cluster 1 1 600 quiet P 100` for `P` in 129, 130, 131, 132, 136, 144, 160, 192, 221 | 100 each |
+| `cluster 1000 1 600 quiet P 300` for `P` in 134, 135, 136 | 300 each |
+| `cluster 1 1 2000 quiet P 32` for `P` in 221, 255 | 32 each |
 
 Every replay command formerly listed in `tests/fuzzy/KNOWN_FAILURES.md` also
 passes. Flags `2` and `32` are exercised by these campaigns rather than by
-`cluster_extended`, whose default union stays at `93` to bound `make check`
-time. Rerun the table after any change under `src/`; a failing seed becomes a
-regression test, not an entry that stays open.
+`cluster_extended`, whose default union stays at `221` to bound `make check`
+time. The rows with flag `128` run the link model, under which a SEND to a
+crashed or partitioned node completes `RETRY` as the I/O layer's does; on the
+tree before `regression/dead_backup_apply` was fixed nearly every seed of
+every such profile failed. Rerun the table after any change under `src/`; a
+failing seed becomes a regression test, not an entry that stays open.
 
 ### Remaining optional work
 
@@ -130,6 +137,8 @@ action of every scheduler run and integration test.
 | --- | --- | --- |
 | Message loss, duplication, reordering | Covered | Scheduler, every profile (`drop`, `duplicate`, `deliver` actions) |
 | Partitions | Covered | Scheduler flag `4` |
+| Unreachable peers: SENDs that fail instead of carrying a message | Covered | Scheduler flag `128` (the memory cluster's link model: `RETRY` held `retry_ns` for a crashed or partitioned destination); `regression/dead_backup_apply` |
+| Deadlines that time alone cannot satisfy | Covered | The memory cluster's idle-deadline oracle on every step of every scheduler run and integration test; `regression/held_store_deadline` |
 | Concurrent view changes and recovery; recovery during view change | Covered | Scheduler flag `8` (crashes in VIEW_CHANGE, RECOVERING, TRANSITIONING, up to `f` down); `view_change_edges` (`recovering_primary`, `restart_while_recovering`, `skew_and_interrupt`); `transitions`; regressions `review_epoch_recovery_vote`, `epoch_announcement_recovery` |
 | Crash injection at transaction and checkpoint boundaries | Covered | `lifecycle` `append_crashes` (crash before the STORE executes, after it is readable but unacknowledged, after it is durable but unacknowledged) and `snapshot_crashes` (four stages around CAPTURE and SNAPSHOT_SYNC); scheduler crashes at any action, with the host discarding non-durable revisions and snapshots (`mem_store_crash`) |
 | Reordered effect completions | Covered | Scheduler separates `execute` from `complete` and picks effects at random; `normal_contract` `reversed_stores` |

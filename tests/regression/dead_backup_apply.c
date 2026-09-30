@@ -8,21 +8,27 @@
 #include <stdio.h>
 
 /* Reproduction of a liveness bug found by tests/integration/engine over
- * real engines (docs/handover/engine-phase-2.md): a primary stops applying,
- * and so replying, while one backup of three is unreachable and its SENDs
- * complete RETRY, as the I/O layer's link module answers every SEND to a
- * node it has no link to (vsr.h: "SEND failures retry protocol work").
+ * real engines: a primary stopped applying, and so replying, while one
+ * backup of three was unreachable and its SENDs completed RETRY, as the I/O
+ * layer's link module answers every SEND to a node it has no link to
+ * (vsr.h: "SEND failures retry protocol work").
  *
- * The primary applies an entry only after it has issued a COMMIT at least
- * that high to every peer (the boundary rule of protocol.c's poll: "issue
- * the final old-group commit first"). A peer behind by more than one batch
- * only ever gets a PREPARE of its next batch_entries entries, whose
+ * The primary applied an entry only after it had issued a COMMIT at least
+ * that high to every peer (the old boundary rule of protocol.c's poll:
+ * "issue the final old-group commit first"). A peer behind by more than one
+ * batch only ever gets a PREPARE of its next batch_entries entries, whose
  * committed field is capped at the batch's end; a failed SEND, and every
  * retry_ns the retransmission timer, rewinds the peer's `sent` to what it
- * acknowledged, so the next PREPARE carries the same first batch again and
- * the peer's commit_sent never reaches the commitment. The memory cluster
- * completes every SEND OK at once, which hides it. Expected to fail until
- * the core is fixed (XFAIL_TESTS). */
+ * acknowledged, so the next PREPARE carried the same first batch again and
+ * the peer's commit_sent never reached the commitment. The memory cluster
+ * completed every SEND OK at once, which hid it; its link model now fails
+ * SENDs to a crashed node as the engine does, and the seeded scheduler's
+ * flag 128 runs the same model in every campaign.
+ *
+ * Fixed: only the boundary entry of an epoch waits for its COMMIT to be
+ * issued, and only to the peers up to date with it (the acknowledging
+ * quorum among them), never to one that is behind or unreachable; ordinary
+ * commitment is notified, and applied, as soon as it is known. */
 
 enum { MEMBERS = 3, DEAD = 3, CLIENT = 330 };
 
@@ -35,40 +41,10 @@ static struct vsr_status status(struct mem_node *node)
     return result;
 }
 
-/* Completes every outstanding SEND to the dead member with RETRY, as the
- * engine does retry_ns after it failed (decision 129): called when time
- * advances, never within a drive, where the core would send again at
- * once. */
-static void fail_dead_sends(struct mem_node **nodes)
-{
-    for (size_t i = 0; i < MEMBERS; i++) {
-        uint64_t ids[64];
-        size_t count = 0;
-
-        if (!mem_node_alive(nodes[i]))
-            continue;
-        /* Only those outstanding now: each RETRY makes the core send
-         * again at once, and those wait for the next time step. */
-        for (size_t j = 0; j < mem_node_effects(nodes[i]) && count < 64; j++) {
-            const struct vsr_op *op = mem_node_effect(nodes[i], j);
-
-            if (op->type == VSR_OP_SEND && op->arg == DEAD)
-                ids[count++] = op->id;
-        }
-        for (size_t k = 0; k < count; k++) {
-            for (size_t j = 0; j < mem_node_effects(nodes[i]); j++) {
-                if (mem_node_effect(nodes[i], j)->id == ids[k]) {
-                    (void)mem_node_complete(nodes[i], j, VSR_IO_RETRY);
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/* Steps every live node, completes its effects (OK, but SENDs to the dead
- * member, which wait for fail_dead_sends), delivers messages except to the
- * dead one. */
+/* Steps every live node, completes its effects (a SEND to the dead member
+ * completes RETRY once the sender's clock allows it, as the engine defers
+ * it), delivers messages except those queued for the dead member before it
+ * crashed. */
 static void drive(struct mem_cluster *cluster, struct mem_node **nodes)
 {
     for (size_t turn = 0; turn < 100000; turn++) {
@@ -82,10 +58,6 @@ static void drive(struct mem_cluster *cluster, struct mem_node **nodes)
             if (step.emitted != 0 || (step.flags & VSR_UPDATE_MORE) != 0)
                 progress = true;
             for (size_t j = 0; j < mem_node_effects(nodes[i]); j++) {
-                const struct vsr_op *op = mem_node_effect(nodes[i], j);
-
-                if (op->type == VSR_OP_SEND && op->arg == DEAD)
-                    continue;
                 if (mem_node_complete(nodes[i], j, VSR_IO_OK)) {
                     progress = true;
                     break;
@@ -164,6 +136,7 @@ int main(int argc, char **argv)
 
     (void)argv;
     CHECK(argc == 1);
+    mem_cluster_model_links(cluster, true);
     for (uint32_t i = 0; i < MEMBERS; i++) {
         struct vsr_options options = mem_options((uint64_t)i + 1, &membership);
         nodes[i] = mem_cluster_add(cluster, &options);
@@ -194,7 +167,6 @@ int main(int argc, char **argv)
             }
             now += 1;
             tick(nodes, now);
-            fail_dead_sends(nodes);
             drive(cluster, nodes);
         }
         if (!done) {
@@ -204,6 +176,30 @@ int main(int argc, char **argv)
                     "request %" PRIu64 " not replied: committed %" PRIu64
                     " applied %" PRIu64 "\n",
                     number, st.committed, st.applied);
+        }
+        CHECK(done);
+    }
+    /* The boundary of a reconfiguration is the one entry whose commitment
+     * waits for its COMMIT to be issued to the old group: to the peers up
+     * to date with it, which the dead one is not. The handoff must complete
+     * with the live backup's promise alone. */
+    {
+        const struct vsr_membership next = {1, members, MEMBERS, 1};
+        const struct vsr_request request = {
+            {{CLIENT + 1, 1}, 1}, 0, VSR_REQUEST_RECONFIGURE, 0, &next};
+        const struct vsr_event event = {VSR_EVENT_REQUEST, 0, 100, &request, 1};
+        struct mem_node *primary = leader(nodes);
+        bool done = false;
+
+        CHECK(primary != NULL);
+        CHECK(mem_node_event(primary, &event).consumed == 1);
+        for (unsigned round = 0; round < 64 && !done; round++) {
+            drive(cluster, nodes);
+            if (replied(primary, 100) && status(primary).epoch == 1 &&
+                status(primary).configuration->phase == VSR_EPOCH_STEADY)
+                done = true;
+            now += 1;
+            tick(nodes, now);
         }
         CHECK(done);
     }
