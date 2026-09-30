@@ -671,15 +671,20 @@ struct vsr_io_link_wanted {
  * stream_window writes are queued: resubmit after a STREAM_WRITTEN);
  * STREAM_WRITTEN reports when a write's bytes are no longer read, for every
  * queued write in order, also when the stream ends early; submit
- * STREAM_CLOSE {stream, status} last. The engine sends buffers zero-copy;
- * a file range is read into pool slabs, stream_chunk_bytes at a time with
- * fixed-buffer reads, and sent chunk by chunk exactly like buffers, so no
- * pipe or splice is involved; a read error, or a file ending inside the
- * range, ends the stream with FAILED. Connection loss ends the stream on
- * both sides with VSR_IO_RETRY, as does no progress for
- * handshake_timeout_ns. Request bytes beginning with VSR_IO_LIBRARY_MAGIC
- * are the engine's own and are never offered to the caller as
- * STREAM_SERVE, nor accepted from a caller's STREAM_OPEN.
+ * STREAM_CLOSE {stream, status} last, status an enum vsr_io_status (else
+ * EINVAL). CLOSE is taken once, also after the stream ended under the caller
+ * (connection loss, a read failure, the engine closing) until its STREAM_END
+ * is emitted, while WRITE is EINVAL once the stream ended; a CLOSE or WRITE
+ * racing a STREAM_END not yet polled may be EINVAL. A file range is on a
+ * slot the caller owns: one of the engine's file_slots is EINVAL. The engine
+ * sends buffers zero-copy; a file range is read into pool slabs,
+ * stream_chunk_bytes at a time with fixed-buffer reads, and sent chunk by
+ * chunk exactly like buffers, so no pipe or splice is involved; a read
+ * error, or a file ending inside the range, ends the stream with FAILED.
+ * Connection loss ends the stream on both sides with VSR_IO_RETRY, as does
+ * no progress for handshake_timeout_ns. Request bytes beginning with
+ * VSR_IO_LIBRARY_MAGIC are the engine's own and are never offered to the
+ * caller as STREAM_SERVE, nor accepted from a caller's STREAM_OPEN.
  *
  * Leases: the engine emits no RELEASE op for the lease of a STREAM_OPEN or
  * a STREAM_WRITE. The request bytes are no longer read once the stream's
