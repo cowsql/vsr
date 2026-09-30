@@ -103,6 +103,8 @@ Campaigns run on this tree, all passing:
 | `cluster 1 1 600 quiet P 100` for `P` in 129, 130, 131, 132, 136, 144, 160, 192, 221 | 100 each |
 | `cluster 1000 1 600 quiet P 300` for `P` in 134, 135, 136 | 300 each |
 | `cluster 1 1 2000 quiet P 32` for `P` in 221, 255 | 32 each |
+| `cluster 1 1 600 quiet P 300` for `P` in 44, 172 | 300 each |
+| `cluster 1 1 600 quiet P 200` for `P` in 36, 164 | 200 each |
 
 Every replay command formerly listed in `tests/fuzzy/KNOWN_FAILURES.md` also
 passes. Flags `2` and `32` are exercised by these campaigns rather than by
@@ -110,8 +112,11 @@ passes. Flags `2` and `32` are exercised by these campaigns rather than by
 time. The rows with flag `128` run the link model, under which a SEND to a
 crashed or partitioned node completes `RETRY` as the I/O layer's does; on the
 tree before `regression/dead_backup_apply` was fixed nearly every seed of
-every such profile failed. Rerun the table after any change under `src/`; a
-failing seed becomes a regression test, not an entry that stays open.
+every such profile failed. The rows with flags `4 + 32` combine partitions
+with membership changes, which found the cache placement conflict at a
+boundary that `src/protocol.c`'s `boundary_commit_pending` describes. Rerun
+the table after any change under `src/`; a failing seed becomes a regression
+test, not an entry that stays open.
 
 ### Remaining optional work
 
