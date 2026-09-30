@@ -2374,6 +2374,7 @@ static void forward_due(struct vsr_io *io, uint32_t replica)
 
 void vsr_io_snapshots_poll(struct vsr_io *io, uint32_t replica, uint64_t now)
 {
+    (void)now; /* Waits arm the deadline from io->now (retry_later). */
     struct vsr_io_replica *rep;
     struct vsr_io_snapshots *s;
     struct vsr_id wanted;
@@ -2410,10 +2411,6 @@ void vsr_io_snapshots_poll(struct vsr_io *io, uint32_t replica, uint64_t now)
         }
     }
     forward_due(io, replica);
-    if (s->retry) {
-        vsr_io_deadlines_arm(&io->deadlines, rep->deadline_capture,
-                             now + SNAPSHOT_RETRY_NS);
-    }
 }
 
 /* -------------------------------------------------------------------------

@@ -207,6 +207,7 @@ struct engine {
     bool hold_open;       /* Opens of clients files are held. */
     bool hold_log_writes; /* The store's writes (from the tail) are held. */
     bool hold_reads;      /* Pool-buffer reads of clients files are held. */
+    bool hold_eof_reads;  /* Those starting at or past the file's end. */
     struct held held[HELD_MAX];
     /* The replica's regions. */
     struct vsr_io_replica *replica;
@@ -611,7 +612,8 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
         if ((s->flags & O_DIRECT) != 0) {
             CHECK(sqe->offset % BLOCK == 0 && sqe->length % BLOCK == 0);
         }
-        if (pool && strcmp(f->name, DIRECTORY "/log") != 0 && e->hold_reads) {
+        if (pool && strcmp(f->name, DIRECTORY "/log") != 0 &&
+            (e->hold_reads || (e->hold_eof_reads && sqe->offset >= f->size))) {
             return false;
         }
         f->reads++;
@@ -3814,6 +3816,37 @@ static void test_fetch_failures(void)
         }
         fetch_fails(b, x, VSR_IO_FAILED);
     }
+    /* The whole valid file arrives, the END does not yet (the source's
+     * read past the file's end is held; the file is exactly one chunk, so
+     * no chunk waits on that read): nothing is closed or renamed, the
+     * FETCH not forwarded; then END FAILED, and the file never appears. */
+    x = fetch_setup(34, 8);
+    {
+        struct task_holder h;
+        uint64_t op;
+
+        craft_file(&craft, x, 3, 32);
+        CHECK(craft.size == CHUNK);
+        (void)file_install(a, x, false, craft.bytes, craft.size);
+        entry_mutable(a, x)->bytes = craft.size + 100;
+        a->hold_eof_reads = true;
+        CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+        settle();
+        CHECK(held_count(a) == 1 && b->io->streams.active == 1);
+        CHECK(b->snapshots->reader.stage == 3 /* DONE */ &&
+              b->snapshots->chunks_count == 0);
+        CHECK(entry_of(b, x)->step == 0 && entry_of(b, x)->fileop == NONE);
+        CHECK(clients_file(b, x, true) != NULL &&
+              clients_file(b, x, false) == NULL);
+        CHECK(forwarded_count(b, VSR_IO_OP_CORE) == 0);
+        a->hold_eof_reads = false;
+        world_release_held(a);
+        settle();
+        expect_core(b, op, VSR_IO_FAILED);
+        CHECK(clients_file(b, x, true) == NULL &&
+              clients_file(b, x, false) == NULL);
+        expect_idle(b);
+    }
     /* The requester's own errors. */
     for (uint32_t fault = 0; fault < 4; ++fault) {
         x = fetch_setup(40 + fault, 8);
@@ -4339,6 +4372,16 @@ static uint64_t restore_fetched(struct engine *b, struct vsr_id x,
     return sequence;
 }
 
+/* Packed log bytes not yet written (the store's write-behind measure). */
+static uint64_t unwritten(const struct engine *e)
+{
+    const struct vsr_io_store *s = e->store;
+    uint64_t floor =
+        s->writes_count > 0 ? s->writes[s->writes_head].ring_begin : s->issued;
+
+    return s->head - floor;
+}
+
 /* Base loads: a RESTORE of a fetched file and a PUBLISH of a capture that
  * is no longer the latest hold their transaction until the module loaded
  * the file record by record; the module then keeps the file open as the
@@ -4419,6 +4462,56 @@ static void test_base_loads(void)
         CHECK(a->store->base_slot == entry_of(a, latest)->file_slot);
         CHECK(entry_of(a, older)->file_slot < 0);
         expect_idle(a);
+        /* DROP of the base: its slot closes, base_slot is cleared. */
+        joint_run(a, VSR_OP_SNAPSHOT_DROP, latest, VSR_IO_OK, VSR_IO_OK);
+        CHECK(a->store->base_slot == -1 && entry_of(a, latest) == NULL &&
+              clients_file(a, latest, false) == NULL);
+        expect_idle(a);
+    }
+
+    /* A RESTORE the store cannot pack right after its load (the write
+     * behind is full): the loaded file stays open as the pending base, not
+     * released as neither base nor latest capture, and is the base slot
+     * once the RESTORE packs. */
+    x = fetch_setup(71, 8);
+    {
+        uint64_t op;
+        const struct vsr_io_snapshot *loaded;
+
+        fetch(b, x, 1);
+        joint_run(b, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_OK);
+        b->hold_log_writes = true;
+        sequence = 2;
+        /* HARD_STATE records: no client entry, so the file's eight
+         * clients still fit the table. */
+        while (unwritten(b) <= b->options.write_behind_bytes) {
+            struct txn *t = txn_begin(b, sequence);
+
+            txn_hard_state(t, VSR_MEMBER_FULL);
+            store_run(b, txn_finish(t));
+            sequence++;
+            CHECK(sequence < TXN_MAX);
+        }
+        op = submit(b, txn_restore(b, sequence, x, 5, VSR_MEMBER_FULL));
+        settle_retry();
+        expect_no_store(b);
+        loaded = entry_of(b, x);
+        CHECK(b->snapshots->reader.snapshot == NONE);
+        CHECK(loaded->file_slot >= 0 &&
+              b->snapshots->pending_base ==
+                  (uint32_t)(loaded - b->snapshots->entries));
+        CHECK(b->store->client_base_id.hi != x.hi ||
+              b->store->client_base_id.lo != x.lo);
+        b->hold_log_writes = false;
+        world_release_held(b);
+        settle();
+        expect_store(b, op, VSR_IO_OK);
+        settle();
+        CHECK(loaded->file_slot >= 0 &&
+              b->store->base_slot == loaded->file_slot &&
+              b->snapshots->pending_base == NONE);
+        expect_client_record(b, 3);
+        expect_idle(b);
     }
 }
 
