@@ -504,6 +504,8 @@ void iow_rule(struct iow_node *n, iow_match match, void *ctx, uint32_t action,
               int32_t result, uint32_t count);
 void iow_rules_clear(struct iow_node *n);
 void iow_release_held(struct iow_node *n);
+/* Holds matching completions again once a release has been reaped. */
+void iow_hold(struct iow_node *n);
 /* Releases what is held newest first and keeps holding new matches: a
  * completion order the executor contract allows for independent
  * records. */

@@ -457,6 +457,11 @@ void iow_release_held_reversed(struct iow_node *n)
     n->hook.reverse = true;
 }
 
+void iow_hold(struct iow_node *n)
+{
+    n->hook.holding = true;
+}
+
 /* -------------------------------------------------------------------------
  * Executors
  * ---------------------------------------------------------------------- */
