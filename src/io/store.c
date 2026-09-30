@@ -2035,7 +2035,7 @@ static bool store_pack(struct vsr_io_store *store,
             } else if (store->growth == GROWTH_NONE &&
                        !segment_freeing(store)) {
                 if (reclaim_pending(store)) {
-                    /* A floor term waits for the media (decision S16):
+                    /* A floor term waits for the media (decision 112):
                      * the flush that advances it may free a slot (the
                      * writes' completions come back here otherwise). */
                     if (store->written > store->flushed) {
@@ -2153,7 +2153,7 @@ static uint64_t media_sequence(const struct vsr_io_store *store)
 
 /* The RECLAIM revision applies as far as the sequence on media and the
  * rest as it advances; the floor's client base term is the base as of
- * that sequence (decision S16). Then whatever the floor allows frees. */
+ * that sequence (decision 112). Then whatever the floor allows frees. */
 static void reclaim_apply(struct vsr_io_store *store)
 {
     uint64_t media = media_sequence(store);
@@ -2437,8 +2437,8 @@ static void write_done(struct vsr_io_store *store, uint32_t index,
 }
 
 /* A flush the store wants for itself (FLUSHING slots wait for one issued
- * after their superblock write completed, decision S15; a floor term
- * waits for the media, decision S16): issued as soon as none is out,
+ * after their superblock write completed, decision 111; a floor term
+ * waits for the media, decision 112): issued as soon as none is out,
  * without waiting for flush_target, which a SYNC of a STORE held for a
  * slot would never let the written sequence reach. */
 static void flush_request(struct vsr_io_store *store)
@@ -2465,7 +2465,7 @@ static void flush_done(struct vsr_io_store *store, uint64_t covered,
     }
     if (store->freeing_flush == FREEING_FLUSH_INFLIGHT) {
         /* The superblock naming the new start segment is on media: the
-         * slots it no longer names may be reused (decision S15). */
+         * slots it no longer names may be reused (decision 111). */
         for (uint32_t i = 0; i < store->slots; ++i) {
             if (store->segments[i].phase == VSR_IO_SEGMENT_FLUSHING) {
                 store->segments[i].phase = VSR_IO_SEGMENT_FREE;
@@ -2497,7 +2497,7 @@ static void superblock_done(struct vsr_io_store *store, uint64_t floor,
     /* The superblock naming a present start segment is written: the
      * slots freed before this write may be reused once it is on media,
      * which O_DSYNC made it, and which in FDATASYNC mode a flush issued
-     * from now on makes it (section 6.5, decision S15). A slot freed
+     * from now on makes it (section 6.5, decision 111). A slot freed
      * after it was issued set superblock_dirty again and waits for the
      * next write. */
     if (store->superblock_dirty != 0) {
@@ -3606,9 +3606,9 @@ static void recovery_scan_end(struct vsr_io_store *store)
     /* Every op of the recovered log was replayed: the start segment's
      * header names the log as of its first record, whose earlier ops the
      * freed segments held, and freeing kept every revision from the
-     * sequence on media on (decision S16). A row older than that (media
+     * sequence on media on (decision 112). A row older than that (media
      * corruption of flushed records the floor does not cover) lacks ops
-     * and is CORRUPT rather than served with holes (decision S18). */
+     * and is CORRUPT rather than served with holes (decision 114). */
     for (uint64_t op = store->log_begin; op < store->log_end; ++op) {
         if (op_current(store, op) == NULL) {
             recovery_fail(store, VSR_IO_CORRUPT);
@@ -3726,7 +3726,7 @@ static void recovery_successor(struct vsr_io_store *store)
  * verdict inside a block ends only that block: the bytes after the last
  * valid record of a block are dead once writing resumed at the block
  * after it (decision 89), so the chain resumes there once the dead tail
- * is swept (decision S14). */
+ * is swept (decision 110). */
 static bool recovery_judge(struct vsr_io_store *store, uint64_t at)
 {
     struct vsr_io_recovery *r = &store->recovery;
@@ -3797,7 +3797,7 @@ static void recovery_chunk(struct vsr_io_store *store, int32_t result)
             r->position >= r->chain_resume) {
             /* The dead tail is swept (a stale record straddling its end
              * counted; its remainder is no header): the chain resumes
-             * at the block after it (decision S14). */
+             * at the block after it (decision 110). */
             r->position = r->chain_resume;
             r->chain_resume = 0;
             r->mode = SCAN_CHAIN;
@@ -3858,7 +3858,7 @@ static void recovery_chunk(struct vsr_io_store *store, int32_t result)
          * a run begins at a recovery, which made what it recovered
          * durable, so its records carry flushed >= that sequence; an
          * older run's record the torn rewrite of a block left before it
-         * is not its predecessor (decision S20). */
+         * is not its predecessor (decision 116). */
         if (valid && kind == VSR_IO_SCAN_RECORD && r->mode == SCAN_CHAIN &&
             (header.sequence != r->sequence + 1 || header.run < r->run ||
              (header.run > r->record_run && header.flushed < r->sequence))) {

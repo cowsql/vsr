@@ -953,7 +953,7 @@ static void feeds_reset(void);
  * random walk sets one value per run, so that a run's transaction at a
  * sequence differs from the one an older run packed there and no torn
  * rewrite splices the two into one CRC-valid record the model cannot
- * know (a splice with the next record is decision S20's). 0 otherwise. */
+ * know (a splice with the next record is decision 116's). 0 otherwise. */
 static uint32_t txn_salt;
 
 static void txns_reset(void)
@@ -3265,7 +3265,7 @@ static void test_index_ops(void)
     release_lease(lease);
     /* RECLAIM past the truncation: revision 3 can no longer be named;
      * the versions go once the media reaches the reclaimed revision
-     * (decision S16), here with the SYNC of 4. */
+     * (decision 112), here with the SYNC of 4. */
     expect_completion(submit_reclaim(4), VSR_IO_OK);
     CHECK(h.store->versions_count == 2 && h.store->reclaim == 4);
     CHECK(h.store->reclaimed == h.store->flushed);
@@ -3518,7 +3518,7 @@ static void test_floor(void)
 
     c.sync_mode = VSR_IO_SYNC_DSYNC; /* Every record on media once written:
                                          the terms apply as they are set
-                                         (decision S16). */
+                                         (decision 112). */
     harness_open(&c);
     harness_start(VSR_START_NEW);
     CHECK(vsr_io_store_free_floor(h.store) == 0); /* No RECLAIM yet. */
@@ -3548,7 +3548,7 @@ static void test_floor(void)
     CHECK(vsr_io_store_free_floor(h.store) == 4); /* Client base 3. */
     vsr_io_store_base_set(h.store, x, 5);
     CHECK(vsr_io_store_free_floor(h.store) == 5); /* RECLAIM 6 as far as
-                                                     the media, 5 (S16). */
+                                                     the media, 5 (112). */
     expect_completion(submit(txn_append_client(6, 1, 16, a, 9)), VSR_IO_OK);
     expect_completion(submit(txn_trim(7, 6)), VSR_IO_OK);
     harness_run();
@@ -3617,7 +3617,7 @@ static void test_free_segments(void)
     c.max_segments = 2;
     c.write_behind_bytes = c.segment_bytes;
     c.cache_bytes += c.segment_bytes;
-    c.sync_mode = VSR_IO_SYNC_DSYNC; /* Written is on media (S16). */
+    c.sync_mode = VSR_IO_SYNC_DSYNC; /* Written is on media (112). */
     harness_open(&c);
     harness_start(VSR_START_NEW);
     while (h.store->current == 0) {
@@ -4180,7 +4180,7 @@ static void test_recover_torn(void)
          * rewrite below it. The bytes after the last valid record in its
          * block (a torn record's head, when one straddles the tear) are
          * dead: the next recovery skips them to find that record
-         * (decision S14). */
+         * (decision 110). */
         expect_completion(submit(txn_append(expected + 1, 1, 8)), VSR_IO_OK);
         harness_run();
         CHECK(txns[expected + 1].file_offset == resume);
@@ -4294,7 +4294,7 @@ static void test_recover_floor(void)
     harness_close();
     /* A bad PAD (its length is not CRC-covered) after record 8, or after
      * record 4 below F, is the dead tail of its block: the chain resumes
-     * with record 9, or 5, at the next block (decision S14); the
+     * with record 9, or 5, at the next block (decision 110); the
      * recovered log is whole. */
     harness_open(&c);
     harness_start(VSR_START_NEW);
@@ -4816,7 +4816,7 @@ static void test_wrap_exact(void)
 }
 
 /* A record of a later run behind an older run's record it does not
- * follow (decision S20). Run 1 packs A at k + 1, two blocks from a block
+ * follow (decision 116). Run 1 packs A at k + 1, two blocks from a block
  * boundary, and a crash tears its write after the first block, which
  * recovery's flush persists; run 2 packs A' at k + 1, of A's length and
  * bytes past the first block (only its entries' clients differ), then B'
@@ -4944,7 +4944,7 @@ static void complete_writes(void)
 }
 
 /* A freed slot is reused only once the superblock naming the new start
- * segment is on media (decision S15): in FDATASYNC mode the write's
+ * segment is on media (decision 111): in FDATASYNC mode the write's
  * completion makes the slot FLUSHING, the store asks for a flush of its
  * own, and the completion of a flush issued after that makes it FREE; a
  * STORE needing the slot waits meanwhile. Variants: a crash that loses
@@ -5088,7 +5088,7 @@ static void crash_recover(const struct config *c, uint64_t sequence)
 }
 
 /* The freeing floor counts the RECLAIM revision and the client base as
- * of the sequence on media (decision S16): a crash can bring back any
+ * of the sequence on media (decision 112): a crash can bring back any
  * revision from there on, whose row must be served whole. Each part
  * puts a change above the media with its record's write still out, lets
  * everything else complete (the superblock naming a new start segment
@@ -5589,7 +5589,7 @@ static void checked_change(struct checked *c, uint32_t type, uint32_t count,
  * block's end skips, a valid record continues when it is the next
  * sequence with a run not below the last one; anything else inside a
  * block is the dead tail of the last valid record's block, swept for
- * floors and skipped (decision S14), at a block boundary it ends the
+ * floors and skipped (decision 110), at a block boundary it ends the
  * chain; the rest of the slot is swept for floors. */
 static void checked_scan(struct checked *c, uint32_t slot, uint64_t generation)
 {
@@ -5616,7 +5616,7 @@ static void checked_scan(struct checked *c, uint32_t slot, uint64_t generation)
         run = length != 0 ? vsr_io_get_u32(data + at + 36) : 0;
         flushed = length != 0 ? vsr_io_get_u64(data + at + 24) : 0;
         /* The next sequence, a run not below the chain's, and a later
-         * run's record carrying its predecessor as flushed (S20). */
+         * run's record carrying its predecessor as flushed (116). */
         next = length != 0 && sequence == c->sequence + 1 && run >= c->run &&
                (run <= c->record_run || flushed >= c->sequence);
         if (!next) {
@@ -5787,7 +5787,7 @@ static void checked_image(struct checked *c)
     if (c->sequence > 0 && !(c->identity && c->hard)) {
         return;
     }
-    /* Every op of the recovered log was replayed (decision S18). */
+    /* Every op of the recovered log was replayed (decision 114). */
     for (uint64_t op = c->log_begin; op < c->log_end; ++op) {
         if (op >= CHECKED_OPS || c->appended[op] == 0) {
             return;
@@ -6422,7 +6422,7 @@ static void walk_crash(uint8_t arg)
     disk.tear_armed = 0;
     packed = h.store->readable;
     /* The sequence on media, which no crash loses: freeing counted on
-     * every revision from it on (decision S16). */
+     * every revision from it on (decision 112). */
     media = walk.c.sync_mode == VSR_IO_SYNC_DSYNC ? h.store->written
                                                   : h.store->flushed;
     if (packed > 0) {

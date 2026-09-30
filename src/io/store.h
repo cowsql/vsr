@@ -86,7 +86,7 @@ enum vsr_io_segment_phase {
     VSR_IO_SEGMENT_FLUSHING /* That superblock write completed; in
                                FDATASYNC mode a flush issued since must
                                complete before the slot is reused
-                               (decision S15). */
+                               (decision 111). */
 };
 
 struct vsr_io_segment {
@@ -256,7 +256,7 @@ struct vsr_io_recovery {
     uint32_t record_run;    /* Run of the last valid record (the start
                             header's before one): a record of a later run
                             carries flushed >= its predecessor's sequence
-                            (decision S20). */
+                            (decision 116). */
     uint64_t offset;        /* File offset of the chunk in the slab. */
     uint64_t position;      /* File offset of the next record to judge. */
     uint64_t sequence;      /* Last valid record replayed. */
@@ -269,7 +269,7 @@ struct vsr_io_recovery {
     uint64_t resume;        /* File offset of the block after the last
                                valid record: where writing resumes. */
     uint64_t chain_resume;  /* While sweeping the dead tail of a block
-                               (decision S14): the block boundary at which
+                               (decision 110): the block boundary at which
                                the chain resumes; 0 when not. */
     uint64_t load_op;       /* The RECOVERY load op to complete. */
 };
@@ -311,7 +311,7 @@ struct vsr_io_store {
     uint64_t reclaimed;   /* The part of it applied: a crash brings back
                              any revision from the sequence on media on,
                              so RECLAIM applies as far as that sequence
-                             (decision S16). */
+                             (decision 112). */
     uint64_t client_base; /* Sequence of the current base file. */
     uint64_t client_base_floor;   /* The client base as of the sequence
                                      on media: the floor's base term. */
@@ -377,7 +377,7 @@ struct vsr_io_store {
     uint32_t freeing_flush;    /* FLUSHING slots wait for a flush: 1 one
                                   is wanted, 2 one issued since is out. */
     uint32_t flush_own;        /* 1 when the store wants a flush of its own
-                                  (decisions S15, S16), issued without
+                                  (decisions 111, 112), issued without
                                   waiting for flush_target. */
     uint64_t flush_target;     /* Sequence the pending flush must cover. */
     uint64_t flush_deadline;   /* sync_delay / flush_interval expiry. */
