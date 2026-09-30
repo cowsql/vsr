@@ -3096,6 +3096,17 @@ static void test_capture(void)
     CHECK(vsr_io_snapshots_size(&limits, &io_limits, 8, &bytes, &alignment) ==
           VSR_EINVAL);
     CHECK(a->snapshots->count == limits.transfers + VSR_IO_SNAPSHOT_EXTRA);
+    /* A checkpoint copy fits an engine lease region (P1). */
+    {
+        size_t copy = 0;
+        size_t region = 0;
+
+        CHECK(vsr_io_snapshots_region_bytes(&limits, &copy) == VSR_OK);
+        CHECK(vsr_io_codec_load_region(&limits, &region) == VSR_OK);
+        CHECK(copy > sizeof(struct vsr_checkpoint) + limits.manifest_bytes &&
+              copy <= region);
+        CHECK(vsr_io_snapshots_region_bytes(&big, &copy) == VSR_ELIMIT);
+    }
     /* An empty table: header and trailer only. */
     expect_store(a, store_start(a, VSR_START_NEW), VSR_IO_NOT_FOUND);
     store_run(a, txn_identity(a, 1, VSR_MEMBER_FULL));

@@ -163,8 +163,9 @@ static bool place(size_t *offset, size_t bytes, size_t alignment, size_t *at)
     return vsr_size_add(aligned, bytes, offset);
 }
 
-/* Bytes of one checkpoint copy: the epoch with two memberships, the
- * manifest bytes and their span, plus alignment slack. */
+/* Bytes of one checkpoint copy: the checkpoint itself (a lease region
+ * holds it with its graph), the epoch with two memberships, the manifest
+ * bytes and their span, plus alignment slack. */
 static bool region_bytes(const struct vsr_limits *limits, size_t *bytes)
 {
     size_t members;
@@ -173,6 +174,7 @@ static bool region_bytes(const struct vsr_limits *limits, size_t *bytes)
     if (!vsr_size_mul(limits->members, sizeof(struct vsr_member), &members) ||
         !vsr_size_mul(members, 2, &members) ||
         !vsr_size_add(members, sizeof(struct vsr_epoch), &total) ||
+        !vsr_size_add(total, sizeof(struct vsr_checkpoint), &total) ||
         !vsr_size_add(total, 2 * sizeof(struct vsr_membership), &total) ||
         !vsr_size_add(total, sizeof(struct vsr_span), &total) ||
         limits->manifest_bytes > SIZE_MAX / 2 ||
