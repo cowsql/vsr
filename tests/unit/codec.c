@@ -2026,6 +2026,7 @@ static void test_clients_file(void)
     size_t region_bytes;
     size_t total;
     uint32_t count;
+    uint32_t digest;
 
     vsr_io_codec_clients_name((struct vsr_id){0x0123456789abcdefu, 0xfedcba98u},
                               name);
@@ -2047,15 +2048,28 @@ static void test_clients_file(void)
         vsr_io_codec_put_clients_record(&records[i], at);
         at += bytes;
     }
-    vsr_io_codec_put_clients_trailer(8, at);
-    at += 8;
+    {
+        /* The trailer's crc: the header, every record without its CRC. */
+        const unsigned char *r = reference_frame + 64;
+
+        digest = vsr_io_crc32c(0, reference_frame, 64);
+        for (uint32_t i = 0; i < 8; ++i) {
+            size_t bytes =
+                vsr_io_codec_clients_record_bytes(records[i].result.data.size);
+
+            digest = vsr_io_crc32c(digest, r, bytes - 4);
+            r += bytes;
+        }
+    }
+    vsr_io_codec_put_clients_trailer(8, digest, at);
+    at += 16;
     total = (size_t)(at - reference_frame);
     seed_corpus(4, reference_frame, total);
 
     CHECK(vsr_io_codec_load_region(limits, &region_bytes) == VSR_OK);
     vsr_io_cursor_init_one(&cursor, reference_frame, total);
     CHECK(vsr_io_codec_get_clients_header(&cursor, &decoded) == VSR_OK);
-    CHECK(decoded.magic == VSR_IO_CLIENTS_MAGIC && decoded.format == 1 &&
+    CHECK(decoded.magic == VSR_IO_CLIENTS_MAGIC && decoded.format == 2 &&
           decoded.cluster_hi == 1 && decoded.cluster_lo == 2 &&
           decoded.snapshot_hi == 3 && decoded.snapshot_lo == 4 &&
           decoded.op == 5 && decoded.sequence == 6 && decoded.count == 8);
@@ -2067,7 +2081,7 @@ static void test_clients_file(void)
                                               &record) == VSR_OK);
         CHECK(same_client_record(&records[i], &record));
     }
-    CHECK(vsr_io_codec_get_clients_trailer(&cursor, &count) == VSR_OK);
+    CHECK(vsr_io_codec_get_clients_trailer(&cursor, digest, &count) == VSR_OK);
     CHECK(count == 8 && vsr_io_cursor_remaining(&cursor) == 0);
 
     /* Every flipped bit of the header and of the first record. */
@@ -2101,15 +2115,31 @@ static void test_clients_file(void)
         CHECK(vsr_io_codec_get_clients_record(NULL, limits, &region,
                                               &records[0]) == VSR_EINVAL);
     }
-    /* Trailer. */
-    vsr_io_cursor_init_one(&cursor, reference_frame + total - 8, 8);
-    CHECK(vsr_io_codec_get_clients_trailer(&cursor, &count) == VSR_OK);
-    vsr_io_cursor_init_one(&cursor, reference_frame + total - 8, 7);
-    CHECK(vsr_io_codec_get_clients_trailer(&cursor, &count) == VSR_EINVAL);
-    memcpy(random_frame, reference_frame + total - 8, 8);
-    random_frame[1] ^= 1;
-    vsr_io_cursor_init_one(&cursor, random_frame, 8);
-    CHECK(vsr_io_codec_get_clients_trailer(&cursor, &count) == VSR_EINVAL);
+    /* Trailer: its crc extends the file's before it; every flipped bit,
+     * a short cursor, or another file's prefix is EINVAL, and the cursor
+     * does not move. */
+    {
+        uint32_t before = digest;
+
+        vsr_io_cursor_init_one(&cursor, reference_frame + total - 16, 16);
+        CHECK(vsr_io_codec_get_clients_trailer(&cursor, before, &count) ==
+              VSR_OK);
+        CHECK(count == 8 && cursor.position == 16);
+        vsr_io_cursor_init_one(&cursor, reference_frame + total - 16, 15);
+        CHECK(vsr_io_codec_get_clients_trailer(&cursor, before, &count) ==
+              VSR_EINVAL);
+        vsr_io_cursor_init_one(&cursor, reference_frame + total - 16, 16);
+        CHECK(vsr_io_codec_get_clients_trailer(&cursor, before ^ 1, &count) ==
+              VSR_EINVAL);
+        for (unsigned bit = 0; bit < 16 * 8; ++bit) {
+            memcpy(random_frame, reference_frame + total - 16, 16);
+            random_frame[bit / 8] ^= (unsigned char)(1u << (bit % 8));
+            vsr_io_cursor_init_one(&cursor, random_frame, 16);
+            CHECK(vsr_io_codec_get_clients_trailer(&cursor, before, &count) ==
+                  VSR_EINVAL);
+            CHECK(cursor.position == 0);
+        }
+    }
     /* A result above the limit is ELIMIT even with a valid CRC. */
     {
         struct vsr_client_record big = records[0];

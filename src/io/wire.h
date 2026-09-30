@@ -430,15 +430,23 @@ struct vsr_io_wire_client_record {
  *
  * Header, then count records, each a vsr_io_wire_client_record with its
  * result bytes and a trailing uint32_t CRC32C over the record and its bytes
- * (padding included), then a vsr_io_wire_clients_trailer. The file is read
+ * (padding included), then a vsr_io_wire_clients_trailer whose crc is the
+ * CRC32C of the header, of every record without its own CRC, in file
+ * order, and of the trailer's magic and count. The file is read
  * sequentially; a reader verifies the header CRC, every record CRC, the
- * count and the trailer, and reports CORRUPT otherwise. The header's
- * sequence is the writer's store sequence at capture and is informational
- * once the file is fetched by another replica.
+ * count and the trailer's crc, and reports CORRUPT otherwise. A record's
+ * own CRC lets the store read one record by its offset; the trailer's
+ * binds every record to the file and to its place in it (a record written
+ * over another, swapped, or taken from another file keeps a valid CRC of
+ * its own). The record CRCs stay out of the trailer's: a CRC run over
+ * bytes followed by their own CRC ends in a constant, the CRC's residue,
+ * whatever the bytes. The header's sequence is the writer's store
+ * sequence at capture and is informational once the file is fetched by
+ * another replica.
  * ---------------------------------------------------------------------- */
 
 #define VSR_IO_CLIENTS_MAGIC UINT32_C(0x31544C43) /* "CLT1" */
-#define VSR_IO_CLIENTS_FORMAT 1u
+#define VSR_IO_CLIENTS_FORMAT 2u
 #define VSR_IO_CLIENTS_NAME_BYTES 41u /* "clients-" + 32 hex + NUL */
 
 struct vsr_io_wire_clients_header {
@@ -455,8 +463,10 @@ struct vsr_io_wire_clients_header {
 };
 
 struct vsr_io_wire_clients_trailer {
-    uint32_t magic; /* VSR_IO_CLIENTS_MAGIC */
-    uint32_t count; /* Records written; equals the header's. */
+    uint32_t magic;    /* VSR_IO_CLIENTS_MAGIC */
+    uint32_t count;    /* Records written; equals the header's. */
+    uint32_t crc;      /* Header, records without their CRCs, magic, count. */
+    uint32_t reserved; /* Zero. */
 };
 
 /* The layouts above are the contract; these checks pin them on every ABI
@@ -504,7 +514,7 @@ _Static_assert(sizeof(struct vsr_io_wire_client_record) == 40,
                "client record is 40");
 _Static_assert(sizeof(struct vsr_io_wire_clients_header) == 64,
                "clients header is 64");
-_Static_assert(sizeof(struct vsr_io_wire_clients_trailer) == 8,
-               "clients trailer is 8");
+_Static_assert(sizeof(struct vsr_io_wire_clients_trailer) == 16,
+               "clients trailer is 16");
 
 #endif /* VSR_IO_WIRE_H */
