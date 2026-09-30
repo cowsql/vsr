@@ -3878,8 +3878,10 @@ static void test_drop(void)
 
 /* The requester side's failures. A file the source serves wrongly (a bad
  * record CRC, a record longer than result_bytes, a header naming another
- * snapshot, a file cut before its trailer) is CORRUPT; a source that ends
- * short or fails to read is FAILED; a lost link RETRY; the requester's own
+ * snapshot, a file cut before its trailer) is FAILED, like a source that
+ * ends short or fails to read (W7: the damage is not the fetching
+ * replica's, and CORRUPT would latch its snapshot failure); a lost link
+ * RETRY; the requester's own
  * open, write, short write and rename errors FAILED. In every case the
  * temporary file is unlinked and never renamed, and the core hears the
  * status without the caller. */
@@ -3932,7 +3934,7 @@ static void test_fetch_failures(void)
             entry_mutable(a, x)->bytes = craft.size;
             break;
         }
-        fetch_fails(b, x, VSR_IO_CORRUPT);
+        fetch_fails(b, x, VSR_IO_FAILED);
     }
     /* The source ends short (its file is smaller than the bytes it
      * serves), or its read fails: END FAILED. The first case delivers a
@@ -5199,8 +5201,8 @@ static void craft_tampered(struct craft *c, struct vsr_id id, uint32_t variant)
  * and every CRC right. A RESTORE then dropped the client whose record was
  * replaced (its last reply forgotten: a retried request would run again),
  * and a fetch accepted and renamed the file. The trailer's crc over the
- * whole file catches each variant of craft_tampered: loads and fetches
- * answer CORRUPT. */
+ * whole file catches each variant of craft_tampered: a load answers
+ * CORRUPT, a fetch FAILED (W7). */
 static void test_review_record_integrity(void)
 {
     for (uint32_t variant = 0; variant < 3; ++variant) {
@@ -5230,7 +5232,7 @@ static void test_review_record_integrity(void)
             craft_tampered(&craft, x, variant);
             (void)file_install(a, x, false, craft.bytes, craft.size);
             entry_mutable(a, x)->bytes = craft.size;
-            fetch_fails(b, x, VSR_IO_CORRUPT);
+            fetch_fails(b, x, VSR_IO_FAILED);
         }
     }
     /* The untampered file restores its three clients, and fetches. */
@@ -5705,6 +5707,41 @@ static void test_review_fetch_open_waits(void)
     expect_idle(b);
 }
 
+/* Received bytes that fail verification are the source's damage (or the
+ * transfer's), not the fetching replica's: the FETCH completes FAILED, so
+ * the core restarts discovery and may pick another source, where CORRUPT
+ * would latch VSR_FAILURE_SNAPSHOT on the fetching replica (core.c). A
+ * corrupt chunk (a result byte), a bad trailer (its count, resealed), and
+ * records that pass their own CRCs but not the file's (a swap). The
+ * temporary file is unlinked in each case (fetch_fails). The replica's own
+ * files stay CORRUPT: a load of the same bytes still is. */
+static void test_review_fetch_corrupt_failed(void)
+{
+    struct engine *a = &world.engines[0];
+    struct craft craft;
+
+    for (uint32_t fault = 0; fault < 3; ++fault) {
+        struct vsr_id x = fetch_setup(143 + fault, 8);
+
+        if (fault == 0) {
+            struct dfile *source = dfile_mutable(a, clients_file(a, x, false));
+
+            source->data[64 + 108 + 50] ^= 0x01;
+        } else {
+            if (fault == 1) {
+                craft_file(&craft, x, 3, 8);
+                put_le32(craft.bytes + craft.record_at[3] + 4, 2);
+                craft_digest(&craft, 3);
+            } else {
+                craft_tampered(&craft, x, 2);
+            }
+            (void)file_install(a, x, false, craft.bytes, craft.size);
+            entry_mutable(a, x)->bytes = craft.size;
+        }
+        fetch_fails(&world.engines[1], x, VSR_IO_FAILED);
+    }
+}
+
 int main(void)
 {
     test_capture();
@@ -5735,5 +5772,6 @@ int main(void)
     test_review_open_held_chunks();
     test_review_stale_tmp();
     test_review_fetch_open_waits();
+    test_review_fetch_corrupt_failed();
     return 0;
 }
