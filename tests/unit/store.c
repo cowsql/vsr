@@ -2912,6 +2912,9 @@ static void test_idle_superblock(void)
     CHECK(superblock.durable_floor == 3 && superblock.revision == 2);
     harness_poll();
     CHECK(h.store->idle_deadline == VSR_NO_DEADLINE);
+    CHECK(harness_prepare() == 1); /* The flush that puts it on media. */
+    harness_complete(pending_of(VSR_IO_SQE_FSYNC));
+    harness_poll();
     CHECK(harness_prepare() == 0);
     /* Alternating copies: the next rewrite goes to copy B. */
     sync_op = submit_sync(3);
@@ -6890,7 +6893,7 @@ static void test_review_idle_flush(void)
     c.flush_interval_ns = 0; /* 100 ms. */
     harness_open(&c);
     harness_start(VSR_START_NEW);
-    expect_completion(submit(txn_append(1, 1, 50)), VSR_IO_OK);
+    expect_completion(submit(txn_identity(1, VSR_MEMBER_FULL)), VSR_IO_OK);
     sync_op = submit_sync(1);
     harness_run();
     expect_completion(sync_op, VSR_IO_OK);
@@ -6900,7 +6903,8 @@ static void test_review_idle_flush(void)
     CHECK(h.store->superblock_dirty == 1);
     CHECK(harness_prepare() == 1);
     at = pending_of(VSR_IO_SQE_WRITE);
-    CHECK(at != NONE && h.pending[at].sqe.offset == 0);
+    /* Copy B: the identity's rewrite took copy A. */
+    CHECK(at != NONE && h.pending[at].sqe.offset == BLOCK);
     harness_complete(at);
     CHECK(h.store->superblock_floor == 1);
     harness_poll();
@@ -6912,8 +6916,8 @@ static void test_review_idle_flush(void)
     CHECK(harness_prepare() == 0);
     expect_no_completion();
     disk_crash(true);
-    read_superblock(0, &superblock);
-    CHECK(superblock.durable_floor == 1 && superblock.revision == 2);
+    read_superblock(1, &superblock);
+    CHECK(superblock.durable_floor == 1 && superblock.revision == 3);
     harness_open_keep(&c, true);
     CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
     CHECK(loaded->sequence == 1 && h.store->superblock_floor == 1);

@@ -1059,10 +1059,13 @@ creation), revision (write counter; the valid copy with the greater one
 wins), cluster hi/lo, replica, durability, block_bytes, segment_bytes,
 header_blocks, slots (allocated), start_segment and start_slot (oldest
 live segment), run (opens of the store), durable_floor (acknowledged
-durable sequence when written), crc (over everything before it). Written:
-at creation (revision 1, both copies), at every open (run + 1, before the
-first record write), when the start segment changes, when slots grow. A
-copy is written to the block the previous write did not use.
+durable sequence when written), crc (over everything before it); the
+reserved field after the crc and the rest of the block are zero, and a
+copy whose tail is not is not valid. Written: at creation (revision 1,
+both copies), at every open (run + 1, before the first record write), when
+the start segment changes, when slots grow, and for the idle floor of
+decision 50. A copy is written to the block the previous write did not
+use.
 
 ### 5.2 Segment header (`vsr_io_wire_segment`, 80 bytes fixed part)
 
@@ -1194,7 +1197,12 @@ the contiguous prefix of complete writes in issue order to the
 and applies `on_write_error` (FENCE: state FAILED, every queued op
 completes `FAILED`; CONTINUE, replicated only: the store stops writing,
 growing and rewriting the superblock and serves from memory, taking slots
-of the table without preallocating them).
+of the table without preallocating them; every SYNC still queued, and
+every later one a completed flush does not already satisfy, completes
+`FAILED`, since nothing reaches the disk any more). A write, flush or
+superblock error while the log is being created fences under CONTINUE
+too: there is no log to serve from memory, and the RECOVERY load, or the
+STOREs a RECOVER warm-up held, must complete (decision V2).
 
 Flush: `flush_pending` is set by a SYNC (after `sync_delay_ns` from the
 first SYNC of a batch), by the flush interval in replicated mode when
@@ -1212,7 +1220,11 @@ Idle floor (decision 50): when `durable` passes `superblock_floor` and no
 record is packed within `flush_interval_ns` (100 ms when zero), a
 superblock write carrying `durable_floor = durable` is planned; a record
 packed meanwhile carries the floor in its `flushed` field instead and the
-write is skipped.
+write is skipped. In FDATASYNC mode the completed write is in the page
+cache, so the store asks for a flush of its own (`freeing_flush`, as for
+a freed slot's superblock, section 6.5) whenever a completed superblock
+write raised `superblock_floor`; an O_DSYNC write is on media at its
+completion (decision V1).
 
 ### 6.3 Indexes
 
@@ -1889,6 +1901,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | `vsr_io_uring_init` names its refusals: `-ENOSYS` (no io_uring, or a kernel older than the baseline, including one whose setup refuses a flag with `EINVAL`), `-EPERM`, `-EINVAL` | 104 |
 | `snapshot.h` (internal) | The module's structures as implemented: `vsr_io_snapshots_size`/`init` take the engine limits (`stream_window`, `streams`) and `max_clients`; `vsr_io_snapshots_region_bytes`; a registry entry carries the file size, the job and its step, the record in flight, the kept and transient slots, `on_disk`, `sync_failed`, `job_next`, the reserved `lease` and the copied `result`; the writer, the reader, the chunk ring, the serves, the file-operation table, the directory slot and `pending_base`; the ops are `RETRY` without an engine lease; an OK CAPTURE or FETCH completion carries the lease; a DROP of an id the registry lacks is taken; a file with a CAPTURE outstanding is not served; the weak hook stubs left stream.c | 105, 106, 107, 108, 109 |
 | `store.h` | `vsr_io_recovery.chain_resume` (the boundary at which the chain resumes past a block's dead tail); `VSR_IO_SEGMENT_FLUSHING`, `freeing_flush` and `flush_own` (a freed slot waits for the flush after its superblock write, which the store issues without waiting for a SYNC's target); `reclaimed`, `client_base_floor` and `client_base_pending` (the floor terms bounded by the sequence on media); `snapshot_clients` reports a record freed under the base as the base file's (sequence 0, the base offset); `vsr_io_store.replica`, the embedding replica, set by init; `vsr_io_recovery.record_run` (was `reserved`), the run of the last replayed record | 110, 111, 112, 113, 116 |
+| `store.h` | `freeing_flush` (comment only) also covers the floor a completed superblock write carries: the store flushes after the idle floor write in FDATASYNC mode | V1 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1909,12 +1922,31 @@ of `docs/io-design.md`:
 - Decision 50's residual reaches freed slots: media corruption of
   records on media that no durable floor covers makes recovery return an
   older row than the one freeing relied on (112). Missing ops make it
-  `CORRUPT` (114), but a CLIENTS record lost that way leaves the client's
-  older record (from the base file) in the table unnoticed, so a request
-  it completed could run again. Bounding freeing by the durable floor on
-  media would close it in DURABLE mode (not in REPLICATED mode, which
-  acknowledges nothing durable); a cheap recovery check of the client
-  base against the start segment is another candidate.
+  `CORRUPT` (114); a CLIENTS record lost that way leaves the client's
+  older record in the table, which is consistent with the row (decision
+  V3): the core's validation of the row fences a log that does not reach
+  its anchor's op, so a completed request whose record is missing lies
+  above the anchor, in the log the row still holds, and the core's replay
+  of that suffix executes it again and stores its result again before the
+  replica serves clients. What the row lost is acknowledged transactions
+  above the floor on media, which is decision 50's residual itself, and
+  which the idle floor flush of V1 narrows in FDATASYNC mode.
+- The store applies a PUBLISH of the latest capture with the offsets the
+  capture recorded (`base_set`): a capture started meanwhile resets them
+  (`snapshot_clients`) and fills them with the new file's, which a
+  PUBLISH of the previous capture packed in between would take for the
+  base file's. The core captures one checkpoint at a time and publishes
+  it before starting the next (`checkpoint->stage`), so the overlap does
+  not arise; a wrong offset would fail the CLIENT load `CORRUPT` (the
+  record's client is checked), not serve another client's record.
+- In REPLICATED mode the core moves its published anchor, and so lets
+  the previous anchor's clients file be dropped, once the PUBLISH is
+  stored (`safe_sequence` is the stored sequence there); a power loss
+  before that record is on media recovers the previous anchor, whose
+  file is gone: `CORRUPT` at the RECOVERY load rather than an older row.
+  A process crash keeps the page cache, so only a machine crash within
+  the flush interval reaches it; a core-side hold of the previous file
+  until the PUBLISH is on media would close it.
 - A crash during the creation itself (before the RECOVERY load's
   `NOT_FOUND`) can leave a log without a valid superblock, which the next
   open reports `CORRUPT`; the directory is not fsynced after the create

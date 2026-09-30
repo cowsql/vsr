@@ -374,8 +374,10 @@ struct vsr_io_store {
     uint32_t flush_pending;    /* 1 when a flush must be issued; 2 when a
                                   SYNC asked for one and poll has yet to
                                   apply sync_delay_ns to it. */
-    uint32_t freeing_flush;    /* FLUSHING slots wait for a flush: 1 one
-                                  is wanted, 2 one issued since is out. */
+    uint32_t freeing_flush;    /* FLUSHING slots, or the floor a completed
+                                  superblock write carries, wait for a
+                                  flush issued since: 1 one is wanted, 2
+                                  one is out. */
     uint32_t flush_own;        /* 1 when the store wants a flush of its own
                                   (decisions 111, 112), issued without
                                   waiting for flush_target. */
