@@ -273,13 +273,21 @@ static uint32_t hook_reap(void *ctx, struct vsr_io_cqe *cqes, uint32_t capacity)
     uint32_t got;
     uint32_t kept = 0;
 
-    if (!h->holding && h->held_count > 0) {
+    if ((!h->holding || h->reverse) && h->held_count > 0) {
         uint32_t take = h->held_count < capacity ? h->held_count : capacity;
 
-        memcpy(cqes, h->held, (size_t)take * sizeof(*cqes));
-        memmove(h->held, h->held + take,
-                (size_t)(h->held_count - take) * sizeof(h->held[0]));
+        if (h->reverse) {
+            /* Newest first. */
+            for (uint32_t i = 0; i < take; ++i) {
+                cqes[i] = h->held[h->held_count - 1 - i];
+            }
+        } else {
+            memcpy(cqes, h->held, (size_t)take * sizeof(*cqes));
+            memmove(h->held, h->held + take,
+                    (size_t)(h->held_count - take) * sizeof(h->held[0]));
+        }
         h->held_count -= take;
+        h->reverse = false;
         n = take;
     }
     got = h->inner.ops->reap(h->inner.ctx, cqes + n, capacity - n);
@@ -442,6 +450,11 @@ uint32_t iow_rule_hits(const struct iow_node *n)
 void iow_release_held(struct iow_node *n)
 {
     n->hook.holding = false;
+}
+
+void iow_release_held_reversed(struct iow_node *n)
+{
+    n->hook.reverse = true;
 }
 
 /* -------------------------------------------------------------------------
@@ -2160,7 +2173,7 @@ static bool node_ready(const struct iow_node *n)
     if (!n->open) {
         return false;
     }
-    if (!n->hook.holding && n->hook.held_count > 0) {
+    if ((!n->hook.holding || n->hook.reverse) && n->hook.held_count > 0) {
         return true;
     }
     if (n->faulty != NULL && n->faulty->held_count > 0) {
@@ -2185,7 +2198,7 @@ static void uring_idle(void)
             continue;
         }
         if (n->busy || (n->faulty != NULL && n->faulty->held_count > 0) ||
-            (!n->hook.holding && n->hook.held_count > 0)) {
+            ((!n->hook.holding || n->hook.reverse) && n->hook.held_count > 0)) {
             return;
         }
         if (n->deadline <= now) {
@@ -2719,20 +2732,6 @@ void iow_group_commit(struct iow_group *g, uint32_t count)
             }
             want.app = primary;
             want.replies = primary->replies + 1;
-            if (getenv("COMMITDBG")) {
-                struct vsr_status core;
-                struct vsr_io_stats stats;
-
-                vsr_io_replica_status(primary->replica, &core, NULL);
-                vsr_io_get_stats(primary->node->io, &stats);
-                fprintf(stderr,
-                        "commit t=%" PRIu64 " attempt %u client %" PRIu64
-                        " number %" PRIu64 " committed %" PRIu64
-                        " applied %" PRIu64 " ops %u retried %" PRIu64 "\n",
-                        iow_now(), attempt, client, number, core.committed,
-                        core.applied, core.outstanding_ops,
-                        stats.messages_retried);
-            }
             (void)iow_request(primary, client, number);
             if (!iow_run_until(replies_reached, &want, 5000 * IOW_MS)) {
                 continue;
@@ -2800,6 +2799,8 @@ void iow_dump_node(const struct iow_node *n)
             n->index, n->open, stats.replicas, stats.links, stats.links_pending,
             stats.streams, stats.slabs_free, stats.closed, stats.failure,
             n->pending_count);
+    fprintf(stderr, "  hook: rule hits %u held %u marks %u\n", iow_rule_hits(n),
+            n->hook.held_count, n->hook.marks_count);
     for (uint32_t j = 0; j < iow.nodes; ++j) {
         struct vsr_io_node_status st;
 
@@ -2911,12 +2912,14 @@ void iow_dump_node(const struct iow_node *n)
                 "  replica %" PRIu64 ": state %u view %" PRIu64
                 " primary %" PRIu64 " committed %" PRIu64 " applied %" PRIu64
                 " checkpoint %" PRIu64
-                " ops %u leases %u failure %u/%d store readable %" PRIu64
-                " written %" PRIu64 " durable %" PRIu64 " error %d\n",
+                " ops %u leases %u failure %u/%d op %" PRIu64
+                " type %u store readable %" PRIu64 " written %" PRIu64
+                " durable %" PRIu64 " error %d\n",
                 app->options.core.replica, core.state, core.view, core.primary,
                 core.committed, core.applied, core.checkpoint_op,
                 core.outstanding_ops, core.outstanding_leases,
-                core.failure.code, core.failure.status, store.readable,
-                store.written, store.durable, store.error);
+                core.failure.code, core.failure.status, core.failure.operation,
+                core.failure.operation_type, store.readable, store.written,
+                store.durable, store.error);
     }
 }

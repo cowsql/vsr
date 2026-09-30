@@ -6,6 +6,7 @@
 #include "vsr-io.h"
 #include "vsr-sim.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -795,6 +796,46 @@ static void test_learner_down(void)
     iow_close();
 }
 
+static bool write_record(void *ctx, const struct vsr_io_sqe *sqe)
+{
+    (void)ctx;
+    return VSR_IO_OWNER(sqe->user_data) == IOW_OWNER &&
+           iow_slot_kind(sqe->user_data) == VSR_IO_SLOT_WRITE;
+}
+
+/* A replicated group whose members keep serving from memory after a failed
+ * write (VSR_IO_WRITE_ERROR_CONTINUE): a backup's record writes fail; it
+ * reports the error, applies everything the group commits, and the group
+ * closes. */
+static void test_write_errors(void)
+{
+    struct iow_group g;
+    struct iow_app *primary;
+    struct iow_node *n;
+    struct vsr_io_store_status store;
+    uint64_t committed;
+    uint32_t index;
+
+    iow_open_sim(3, seed(9), NULL);
+    iow.durability = VSR_REPLICATED;
+    iow.store.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
+    g = iow_group_open(3, iow_cluster(12));
+    iow_group_commit(&g, 4);
+    primary = iow_group_primary(&g);
+    CHECK(primary != NULL);
+    index = (index_of(&g, primary) + 1) % 3;
+    n = g.apps[index]->node;
+    iow_rule(n, write_record, NULL, IOW_FAIL, -EIO, 3);
+    iow_group_commit(&g, 6);
+    CHECK(iow_rule_hits(n) >= 1);
+    vsr_io_replica_status(g.apps[index]->replica, NULL, &store);
+    CHECK(store.error == -EIO);
+    committed = committed_of(iow_group_primary(&g));
+    wait_caught_up(g.apps[index], committed);
+    iow_group_close(&g);
+    iow_close();
+}
+
 /* -------------------------------------------------------------------------
  * Two groups on the same engines
  * ---------------------------------------------------------------------- */
@@ -880,6 +921,7 @@ int main(int argc, char **argv)
     RUN(test_two_groups);
     RUN(test_learner_down);
     RUN(test_queue_full);
+    RUN(test_write_errors);
 #undef RUN
     return 0;
 }

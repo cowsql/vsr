@@ -268,6 +268,7 @@ struct iow_hook {
     struct vsr_io_cqe held[IOW_HELD];
     uint32_t held_count;
     bool holding; /* Keep matching completions back. */
+    bool reverse; /* Release the held completions newest first. */
     int fail_submit;
     uint32_t submits;
     uint32_t provides; /* PROVIDE records submitted. */
@@ -503,6 +504,10 @@ void iow_rule(struct iow_node *n, iow_match match, void *ctx, uint32_t action,
               int32_t result, uint32_t count);
 void iow_rules_clear(struct iow_node *n);
 void iow_release_held(struct iow_node *n);
+/* Releases what is held newest first and keeps holding new matches: a
+ * completion order the executor contract allows for independent
+ * records. */
+void iow_release_held_reversed(struct iow_node *n);
 uint32_t iow_rule_hits(const struct iow_node *n);
 /* Matchers over the engine's user_data (slot kind in bits 48..55). */
 uint8_t iow_slot_kind(uint64_t user_data);

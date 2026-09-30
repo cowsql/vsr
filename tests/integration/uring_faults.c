@@ -126,18 +126,14 @@ static void test_group_faults(void)
         exit(77);
     }
     memset(&faults, 0, sizeof(faults));
-    faults.seed = seed_base;
-    for (uint32_t i = 0; i < 3; ++i) {
-        faults.seed = seed_base * 10u + i;
-        iow_node_faulty(i, &faults); /* Rates zero until the group runs. */
-    }
-    g = iow_group_open(3, iow_cluster(1));
     faults.delay_ppm = 100000;
     faults.delay_reaps_max = 4;
-    faults.cancel_recv_ppm = 20000;
+    faults.cancel_recv_ppm = 100000;
     for (uint32_t i = 0; i < 3; ++i) {
-        faulty_executor_set_options(iow.node[i].faulty, &faults);
+        faults.seed = seed_base * 10u + i;
+        iow_node_faulty(i, &faults);
     }
+    g = iow_group_open(3, iow_cluster(1));
     iow_group_commit(&g, 12);
     primary = iow_group_primary(&g);
     CHECK(primary != NULL);
@@ -170,6 +166,63 @@ static void test_group_faults(void)
         printf("  node %u: delayed %" PRIu64 ", cancelled %" PRIu64 "\n", i,
                stats.delayed, stats.cancelled);
     }
+    iow_group_close(&g);
+    iow_close();
+}
+
+struct store_match {
+    uint8_t kind;
+};
+
+/* A store record of one slot kind (WRITE, SUPER, FLUSH, ...). */
+static bool store_record(void *ctx, const struct vsr_io_sqe *sqe)
+{
+    const struct store_match *m = ctx;
+
+    return VSR_IO_OWNER(sqe->user_data) == IOW_OWNER &&
+           iow_slot_kind(sqe->user_data) == m->kind;
+}
+
+/* A replicated group whose members keep serving from memory when a write
+ * fails (VSR_IO_WRITE_ERROR_CONTINUE): a backup's record writes fail for a
+ * while; it goes on applying and the group commits, and after a crash it
+ * recovers what reached its disk and catches up through the group. */
+static void test_write_errors(void)
+{
+    struct iow_group g;
+    struct iow_app *primary;
+    struct iow_node *n;
+    struct store_match write = {VSR_IO_SLOT_WRITE};
+    struct vsr_io_store_status store;
+    uint64_t committed;
+    uint32_t index;
+
+    if (!world(3)) {
+        exit(77);
+    }
+    iow.durability = VSR_REPLICATED;
+    iow.store.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
+    g = iow_group_open(3, iow_cluster(5));
+    iow_group_commit(&g, 4);
+    primary = iow_group_primary(&g);
+    CHECK(primary != NULL);
+    index = (primary->node->index + 1) % 3;
+    n = &iow.node[index];
+    iow_rule(n, store_record, &write, IOW_FAIL, -EIO, 3);
+    iow_group_commit(&g, 6);
+    CHECK(iow_rule_hits(n) >= 1);
+    vsr_io_replica_status(g.apps[index]->replica, NULL, &store);
+    CHECK(store.error == -EIO);
+    committed = committed_of(iow_group_primary(&g));
+    wait_caught_up(g.apps[index], committed);
+    iow_crash(n);
+    iow_restart(n);
+    iow_replica_options(&n->apps[0], iow_cluster(5), index + 1, 3,
+                        VSR_START_RECOVER, 0);
+    g.apps[index] = iow_attach_with(n, 0);
+    iow_group_commit(&g, 2);
+    committed = committed_of(iow_group_primary(&g));
+    wait_caught_up(g.apps[index], committed);
     iow_group_close(&g);
     iow_close();
 }
@@ -264,19 +317,6 @@ static void test_registrations(void)
 /* -------------------------------------------------------------------------
  * Store faults
  * ---------------------------------------------------------------------- */
-
-struct store_match {
-    uint8_t kind;
-};
-
-/* A store record of one slot kind (WRITE, SUPER, FLUSH, ...). */
-static bool store_record(void *ctx, const struct vsr_io_sqe *sqe)
-{
-    const struct store_match *m = ctx;
-
-    return VSR_IO_OWNER(sqe->user_data) == IOW_OWNER &&
-           iow_slot_kind(sqe->user_data) == m->kind;
-}
 
 static bool app_failed(void *ctx)
 {
@@ -389,6 +429,7 @@ int main(int argc, char **argv)
     } while (0)
     setvbuf(stdout, NULL, _IONBF, 0);
     RUN(test_group_faults);
+    RUN(test_write_errors);
     RUN(test_registrations);
     RUN(test_creation_error);
     RUN(test_stop_held);
