@@ -36,6 +36,8 @@ void vsr_io_deadlines_init(struct vsr_io_deadlines *set, void *memory,
 {
     set->capacity = capacity;
     set->count = 0;
+    set->rebasing = 0;
+    set->marked = 0;
     if (capacity == 0) {
         set->entries = NULL;
         set->heap = NULL;
@@ -49,7 +51,7 @@ void vsr_io_deadlines_init(struct vsr_io_deadlines *set, void *memory,
         entry->when = VSR_NO_DEADLINE;
         entry->position = DEADLINE_NONE;
         entry->kind = VSR_IO_DEADLINE_KINDS;
-        entry->reserved = 0;
+        entry->rebase = 0;
         entry->index = DEADLINE_NONE;
         entry->reserved2 = 0;
         set->heap[i] = DEADLINE_NONE;
@@ -140,11 +142,25 @@ static void deadline_remove(struct vsr_io_deadlines *set, uint32_t handle)
     deadline_down(set, set->entries[last].position);
 }
 
+/* Marks or unmarks an entry for the next rebase. */
+static void deadline_mark(struct vsr_io_deadlines *set,
+                          struct vsr_io_deadline_entry *entry, bool mark)
+{
+    if (entry->rebase != 0 && !mark) {
+        entry->rebase = 0;
+        set->marked--;
+    } else if (entry->rebase == 0 && mark) {
+        entry->rebase = 1;
+        set->marked++;
+    }
+}
+
 void vsr_io_deadlines_arm(struct vsr_io_deadlines *set, uint32_t handle,
                           uint64_t when)
 {
     struct vsr_io_deadline_entry *entry = &set->entries[handle];
 
+    deadline_mark(set, entry, set->rebasing != 0 && when != VSR_NO_DEADLINE);
     if (when == VSR_NO_DEADLINE) {
         if (entry->position != DEADLINE_NONE) {
             deadline_remove(set, handle);
@@ -161,6 +177,29 @@ void vsr_io_deadlines_arm(struct vsr_io_deadlines *set, uint32_t handle,
     entry->when = when;
     deadline_up(set, entry->position);
     deadline_down(set, entry->position);
+}
+
+void vsr_io_deadlines_rebase(struct vsr_io_deadlines *set, uint64_t delta)
+{
+    for (uint32_t handle = 0; set->marked > 0 && handle < set->capacity;
+         ++handle) {
+        struct vsr_io_deadline_entry *entry = &set->entries[handle];
+        uint64_t when;
+
+        if (entry->rebase == 0) {
+            continue;
+        }
+        deadline_mark(set, entry, false);
+        if (entry->position == DEADLINE_NONE || delta == 0) {
+            continue;
+        }
+        /* Saturating below NO_DEADLINE, which means disarmed. */
+        when = entry->when < VSR_NO_DEADLINE - 1 - delta ? entry->when + delta
+                                                         : VSR_NO_DEADLINE - 1;
+        entry->when = when;
+        deadline_up(set, entry->position);
+        deadline_down(set, entry->position);
+    }
 }
 
 uint64_t vsr_io_deadlines_earliest(const struct vsr_io_deadlines *set)

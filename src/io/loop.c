@@ -148,9 +148,14 @@ int vsr_io_complete(struct vsr_io *io, const struct vsr_io_cqe *cqes,
     if (io == NULL || (cqes == NULL && count > 0)) {
         return VSR_EINVAL;
     }
+    /* A completion carries no clock: what the modules arm now counts from
+     * io->now, the last poll's time, and moves with the next poll's
+     * (decision 137). */
+    io->deadlines.rebasing = 1;
     for (uint32_t i = 0; i < count; ++i) {
         complete_one(io, &cqes[i]);
     }
+    io->deadlines.rebasing = 0;
     vsr_io_engine_check_closed(io);
     return VSR_OK;
 }
@@ -168,17 +173,7 @@ int vsr_io_complete(struct vsr_io *io, const struct vsr_io_cqe *cqes,
 static void complete_now(struct vsr_io_replica *replica, uint64_t op,
                          int32_t status)
 {
-    uint32_t capacity = replica->options.limits.operations;
-    struct vsr_io_deferred *deferred;
-
-    LOOP_ASSERT(replica->deferred_count < capacity);
-    deferred = &replica->deferred[ring_at(replica->deferred_head,
-                                          replica->deferred_count, capacity)];
-    deferred->due = replica->io->now + replica->options.retry_ns;
-    deferred->op = op;
-    deferred->status = status;
-    deferred->reserved = 0;
-    replica->deferred_count++;
+    vsr_io_engine_complete_later(replica, op, status);
 }
 
 /* Moves the deferred completions that are due into the internal ring. */
@@ -793,9 +788,7 @@ int vsr_io_poll(struct vsr_io *io, uint64_t now_ns, struct vsr_io_op *ops,
         return VSR_EINVAL;
     }
     /* TIME ids never decrease (vsr.h), whatever the caller's clock does. */
-    if (now_ns > io->now) {
-        io->now = now_ns;
-    }
+    vsr_io_engine_advance(io, now_ns);
     now = io->now;
     (void)__atomic_exchange_n(&io->wake_pending, 0, __ATOMIC_ACQUIRE);
     io->forwarded_overflow = 0;
@@ -1053,9 +1046,7 @@ int vsr_io_prepare(struct vsr_io *io, uint64_t now_ns, struct vsr_io_sqe *sqes,
         capacity < VSR_IO_ENGINE_BATCH_MIN || now_ns >= VSR_NO_DEADLINE) {
         return VSR_EINVAL;
     }
-    if (now_ns > io->now) {
-        io->now = now_ns;
-    }
+    vsr_io_engine_advance(io, now_ns);
     provided = vsr_io_pool_provide(&io->pool, io->provide_buffers,
                                    io->options.limits.slabs);
     room = provided > 0 ? capacity - 1 : capacity;

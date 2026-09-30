@@ -828,8 +828,11 @@ struct vsr_io_stream_write {
  * single registered region; a send with any vector outside the pool (tail
  * buffers, the core arena, caller memory) goes SEND_ZERO_COPY | VECTORED
  * without FIXED_BUFFER, which pins the pages per send, when its bytes reach
- * zero_copy_bytes, and plain VECTORED SEND (kernel copy) below. Release a
- * slab only when no lease, op, or record of the caller still covers it.
+ * zero_copy_bytes, and plain VECTORED SEND (kernel copy) below. A link
+ * whose socket refuses a zero-copy send (-EOPNOTSUPP: Linux has none on
+ * AF_UNIX) sends those bytes again, and everything after, as plain
+ * VECTORED SENDs. Release a slab only when no lease, op, or record of the
+ * caller still covers it.
  * The caller holds at most limits.caller_slabs slabs at once, and the
  * engine never hands the part of that share the caller does not hold to
  * the kernel, which returns a provided slab only once it has filled it.

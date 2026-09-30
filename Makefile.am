@@ -75,6 +75,8 @@ INTEGRATION_TESTS += tests/integration/failures tests/integration/view_change_ed
   tests/integration/offers tests/integration/capture tests/integration/clients
 INTEGRATION_TESTS += tests/integration/uring_smoke \
   tests/integration/uring_refusals tests/integration/executor_conformance
+INTEGRATION_TESTS += tests/integration/engine tests/integration/streams \
+  tests/integration/snapshots tests/integration/uring_faults
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
   tests/regression/witness_prefix tests/regression/boundary_from_view_change \
@@ -84,11 +86,13 @@ REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/anchor_behind_applied tests/regression/reply_restore \
   tests/regression/next_epoch_before_steady \
   tests/regression/recovery_into_handoff tests/regression/view_change_minimum \
-  tests/regression/lagging_reload
+  tests/regression/lagging_reload tests/regression/dead_backup_apply \
+  tests/regression/held_store_deadline tests/regression/compare_load_order
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 # Reproductions of open safety bugs found in review go here; they turn into
 # XPASS once the core is fixed and then move to the ordinary regressions.
-XFAIL_TESTS =
+XFAIL_TESTS = tests/regression/dead_backup_apply \
+  tests/regression/held_store_deadline
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
 tests_unit_checked_LDADD = $(LIBVSR)
@@ -158,6 +162,20 @@ tests_integration_executor_conformance_SOURCES = \
 tests_integration_executor_conformance_LDADD = $(LIBVSR)
 tests_integration_executor_conformance_CFLAGS = $(AM_CFLAGS) -pthread
 tests_integration_executor_conformance_LDFLAGS = $(AM_LDFLAGS) -pthread
+# Engines over the simulation or real rings (tests/lib/io_world.h).
+IO_WORLD = tests/lib/io_world.c tests/lib/io_world.h \
+  tests/lib/pure_executor.c tests/lib/pure_executor.h \
+  tests/lib/faulty_executor.c tests/lib/faulty_executor.h \
+  tests/lib/random.c tests/lib/random.h
+tests_integration_engine_SOURCES = tests/integration/engine.c $(IO_WORLD)
+tests_integration_engine_LDADD = $(LIBVSR)
+tests_integration_streams_SOURCES = tests/integration/streams.c $(IO_WORLD)
+tests_integration_streams_LDADD = $(LIBVSR)
+tests_integration_snapshots_SOURCES = tests/integration/snapshots.c $(IO_WORLD)
+tests_integration_snapshots_LDADD = $(LIBVSR)
+tests_integration_uring_faults_SOURCES = tests/integration/uring_faults.c \
+  $(IO_WORLD)
+tests_integration_uring_faults_LDADD = $(LIBVSR)
 tests_integration_replication_SOURCES = tests/integration/replication.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
@@ -287,6 +305,19 @@ tests_regression_recovery_into_handoff_SOURCES = \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_recovery_into_handoff_LDADD = $(LIBVSR)
+tests_regression_dead_backup_apply_SOURCES = \
+  tests/regression/dead_backup_apply.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_dead_backup_apply_LDADD = $(LIBVSR)
+tests_regression_held_store_deadline_SOURCES = \
+  tests/regression/held_store_deadline.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_held_store_deadline_LDADD = $(LIBVSR)
+tests_regression_compare_load_order_SOURCES = \
+  tests/regression/compare_load_order.c $(IO_WORLD)
+tests_regression_compare_load_order_LDADD = $(LIBVSR)
 tests_regression_api_init_out_SOURCES = tests/regression/api_init_out.c
 tests_regression_api_init_out_LDADD = $(LIBVSR)
 CLUSTER_SCENARIO = tests/fuzzy/scenario.c tests/fuzzy/scenario.h \

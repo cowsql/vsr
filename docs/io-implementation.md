@@ -239,9 +239,14 @@ dropped and counted.
 
 Purpose: the one timer mechanism of the engine (decision 40). Handles are
 dense per kind and bound once at init; arm and pop are heap operations.
+While `rebasing` is set (the engine sets it for the length of
+`vsr_io_complete`), an armed entry is marked; `vsr_io_deadlines_rebase`
+moves every marked entry by the time that passed and clears the marks, and
+a later arm or disarm outside `rebasing` unmarks it (137).
 
 - Tests: `tests/unit/deadline`: earliest after random arms and disarms
-  equals a linear scan; pop order; re-arming a popped periodic entry.
+  equals a linear scan; pop order; re-arming a popped periodic entry;
+  rebase of marked entries only, once, saturating (`test_rebase`).
 
 ### Links (`src/io/link.h`)
 
@@ -354,10 +359,13 @@ is below a frame header plus one inline copy and the front holds more.
    frame's header) merges with it.
 2. Emit the build if it is not empty: classify (`fixed` when every vector
    lies in the pool, `vsr_io_pool_contains`; else `zero_copy` when bytes
-   `>= zero_copy_bytes`), allocate a SEND slot expecting two completions
-   for a zero-copy send and one otherwise, fill the entry (`begin`, `end`,
-   `header_begin`, `header_end`) and mark the link in flight.
-3. On the result CQE: a negative result closes the link (the queued
+   `>= zero_copy_bytes`; neither once the link has `plain_sends`),
+   allocate a SEND slot expecting two completions for a zero-copy send
+   and one otherwise, fill the entry (`begin`, `end`, `header_begin`,
+   `header_end`) and mark the link in flight.
+3. On the result CQE: a zero-copy send refused with `-EOPNOTSUPP` and
+   `MORE` (AF_UNIX) sets `plain_sends` and counts as a short send of
+   nothing (138); any other negative result closes the link (the queued
    messages complete `RETRY` through the node's review, below); a short
    result trims the entry to the bytes sent and leaves the unsent tail of
    the vectors in place as the next build, its header bytes reserved from
@@ -422,9 +430,10 @@ carves frames:
    delivered bytes, decode it in place; else, if it continues in the same
    slab on a later CQE, wait; else (the next CQE names another slab, or
    the partial's frame is still to be delivered) the delivery joins the
-   link's HELD runs (`held[VSR_IO_LINK_HELD]`, arrival order, one pool
-   reference each, a delivery contiguous with the last run merging into
-   it). Once the partial run is consumed the first held run becomes the
+   link's HELD runs (`held`, arrival order, one pool reference each, a
+   delivery contiguous with the last run merging into it; a peer link
+   holds `VSR_IO_LINK_HELD`, a stream link `held_per_link`, the pool's
+   slab count, 139). Once the partial run is consumed the first held run becomes the
    partial; while the partial's frame is incomplete and a run is held,
    the frame is reassembled (decision 76): the partial bytes are copied
    into a reassembly slab acquired for the frame (`vsr_io_pool_acquire`
@@ -436,8 +445,7 @@ carves frames:
    run starts at the slab's offset 0, so the copy always fits; the slab
    is released once the frame is consumed. No free slab: the runs stay
    held, `retry` is set and every `vsr_io_links_poll` carves again; a
-   link needing more than `VSR_IO_LINK_HELD` runs is closed with
-   `-ENOBUFS`.
+   link needing more runs than it may hold is closed with `-ENOBUFS`.
 4. Decoding: check the body CRC over the cursor; HELLO goes to the
    handshake, stream frames to `vsr_io_streams_frame`. A MESSAGE on an
    established peer link (decisions 67 and 75): the envelope's `cluster` and
@@ -464,8 +472,10 @@ carves frames:
    `vsr_io_streams_data_done`, or the ring drained), at which point the
    next prepare re-arms the receive. The socket buffer then fills and the
    TCP window throttles the source; what the kernel delivered before the
-   cancel took effect joins the held runs, whose bound (step 3) must
-   absorb that burst (section 11). A paused link learns of a reset or an
+   cancel took effect joins the held runs, a run per slab it filled,
+   which the stream link's bound of the pool's slab count absorbs (139;
+   the whole reap batch is carved in `vsr_io_complete`, before the caller
+   can complete a DATA op, so the burst is that batch). A paused link learns of a reset or an
    EOF only when it receives again; peer links never pause.
 5. The slab reference taken at `recv_begin` is released once every byte of
    its run has been decoded (each MESSAGE lease took its own reference)
@@ -1589,7 +1599,9 @@ no transaction waits.
 
 ```
  vsr_io_poll(io, now, ops, capacity, count, flags)      (src/io/loop.c)
-   io->now = max(io->now, now); wake_pending = 0; forwarded_overflow = 0
+   vsr_io_engine_advance(now): the timers armed while completions were
+       processed move by now - io->now (137); io->now = max(io->now, now)
+   wake_pending = 0; forwarded_overflow = 0
    while deadlines_pop(now, kind, index): dispatch (LINK/DIAL ->
        vsr_io_links_deadline, STREAM -> vsr_io_streams_deadline,
        FLUSH/SYNC -> nothing: store_poll below checks its own,
@@ -1658,11 +1670,12 @@ emits can be routed at once; a step cap of 256 per replica and poll is a
 backstop (MORE).
 
 A completion the routing decides at once (a SEND the link module refuses,
-a snapshot op's status, a malformed op's FAILED) waits in the replica's
-deferred ring for `retry_ns` before it is fed (decision 129): the core
-re-sends at once on a failed SEND, so a same-poll RETRY turned an
-unauthorized destination into a hot loop. Prepare's deadline covers the
-earliest one.
+or one it evicts from a full node queue for a newer SEND, a snapshot op's
+status, a malformed op's FAILED) waits in the replica's deferred ring for
+`retry_ns` before it is fed (decisions 129 and 136): the core re-sends at
+once on a failed SEND, so a same-poll RETRY turned an unauthorized
+destination, or a full queue, into a hot loop. Prepare's deadline covers
+the earliest one.
 
 ### 7.2 vsr_io_submit
 
@@ -1693,7 +1706,7 @@ in emission order (decision 51):
 
 | Op | Route |
 | --- | --- |
-| SEND | `vsr_io_links_send(replica, id, message, arg)`; `RETRY` returned -> COMPLETE(RETRY) deferred `retry_ns` (decision 129); OK -> queued, completed later through the replica's completion ring (decision 83) |
+| SEND | `vsr_io_links_send(replica, id, message, arg)`; `RETRY` returned -> COMPLETE(RETRY) deferred `retry_ns` (decision 129); OK -> queued, completed later through the replica's completion ring (decision 83); an older SEND the full node queue evicts for it completes RETRY deferred `retry_ns` as well (`vsr_io_engine_complete_later`, 136) |
 | LOAD RECOVERY | `vsr_io_store_open(start_mode, id, read)`; FAILED (deferred) when the store is already open |
 | LOAD, STORE, SYNC, RECLAIM | `vsr_io_store_*`; completions arrive through `next_completion`; `EINVAL` (a malformed op) -> FAILED (deferred) |
 | SNAPSHOT_CAPTURE, FETCH, SYNC, DROP | `vsr_io_snapshots_*`; a status returned -> that COMPLETE (deferred), `EINVAL` -> FAILED |
@@ -1710,6 +1723,7 @@ In order, each stopping when `capacity` or a table is exhausted (leftovers
 stay queued and the engine sets `*deadline_ns = now_ns` so the loop
 returns immediately and prepares again):
 
+0. `vsr_io_engine_advance(now_ns)`, as the poll does (137).
 1. Pool provision (decision 133): the slabs `vsr_io_pool_provide` returns
    go into `provide_buffers`, and one place is set aside for their
    `PROVIDE` record, which ends the batch (the executor runs it before the
@@ -1761,7 +1775,11 @@ module consumes the slot (`vsr_io_slots_consumed` with the record's MORE,
 or `vsr_io_slots_free` for a zero-copy send refused before the kernel took
 it), since it knows what each completion means (decision 74). Nothing
 steps a core here; every effect is queued for the next poll, and a
-time-based effect uses `io->now`, the last poll time.
+time-based effect uses `io->now`, the last poll time: the deadlines armed
+during the call are marked (`deadlines.rebasing`) and the next poll or
+prepare moves them by the time that passed since (`vsr_io_engine_advance`,
+137), so an engine that slept without a deadline does not arm a timer
+already past.
 
 ### 7.6 Leases
 
@@ -1882,7 +1900,7 @@ Opcodes:
 | LISTEN | `length` backlog; result 0 |
 | ACCEPT | with `MULTISHOT`: a completion per accepted connection with `MORE` set, result the descriptor or slot (with `DIRECT`); terminates with `MORE` clear on a negative result: `-ECANCELED` (cancelled), `-ENFILE` (no free slot with `DIRECT`: that connection was accepted and is closed again, so its peer sees a reset; later connections stay queued, decision 65). Closing the listener's descriptor does not terminate it: the listener lives on until the record is cancelled (decision 58). A full completion queue at a delivery also ends it, with that connection's result and `MORE` clear (ring only, decision 68). Without `MULTISHOT`: one accept |
 | RECV | Without `BUFFER_SELECT`: into `addr`/`length`; result bytes, 0 at end of stream, `-ECONNRESET` on reset; `PEEK` returns bytes without consuming them. With `BUFFER_SELECT`: buffers are taken from ring `buffer_group` in the order they were provided; `BUFFER` set and `buffer_id` names the buffer; bytes land at the buffer's base plus the bytes previously delivered from it (INCREMENTAL rings) or at its base (others, which consume the whole buffer per completion); `BUFFER_MORE` set means the buffer remains at the head of the ring with its remaining space and the next receive continues in it; clear means the buffer left the ring. With `MULTISHOT`: a completion per delivery with `MORE` set; terminates (`MORE` clear) with `-ENOBUFS` when the ring is empty or has been unregistered at a delivery (never at arming: the ring issues these receives poll-first and the sim parks the record until bytes arrive, decisions 58 and 65), with 0 at end of stream, with a negative result on error or cancel, or (ring only) with that delivery's positive result when the completion queue is full at a delivery (decision 68); after termination the record must be resubmitted. A buffer never appears in two receives at once |
-| SEND | `addr`/`length`, or with `VECTORED` `addr` is `vsr_io_vec[length]`; result bytes sent, possibly short (the caller resubmits the rest); `-EPIPE`/`-ECONNRESET` on a closed peer. With `ZERO_COPY`: two completions with the same `user_data`: first the result with `MORE` set, then a completion with `NOTIF` set and result 0 once the kernel no longer reads the buffers; both always arrive, even after a failed send. The bytes must stay unchanged until the NOTIF. Two sends on one socket may complete in either order; ordering requires waiting for the first result. A zero-copy record the executor rejects at translation (`SKIP_SUCCESS` set, an out-of-region `FIXED_BUFFER`, an unsupported opcode) completes exactly once with the error and `MORE` clear, so a first completion without `MORE` means no `NOTIF` follows; the result completion always precedes the `NOTIF` (decision 62) |
+| SEND | `addr`/`length`, or with `VECTORED` `addr` is `vsr_io_vec[length]`; result bytes sent, possibly short (the caller resubmits the rest); `-EPIPE`/`-ECONNRESET` on a closed peer. With `ZERO_COPY`: two completions with the same `user_data`: first the result with `MORE` set, then a completion with `NOTIF` set and result 0 once the kernel no longer reads the buffers; both always arrive, even after a failed send. The bytes must stay unchanged until the NOTIF. Two sends on one socket may complete in either order; ordering requires waiting for the first result. A zero-copy record the executor rejects at translation (`SKIP_SUCCESS` set, an out-of-region `FIXED_BUFFER`, an unsupported opcode) completes exactly once with the error and `MORE` clear, so a first completion without `MORE` means no `NOTIF` follows; the result completion always precedes the `NOTIF` (decision 62). A zero-copy send on an `AF_UNIX` socket completes `-EOPNOTSUPP` with `MORE`, then its `NOTIF`, and sends nothing (Linux has no zero-copy send there; 138) |
 | SHUTDOWN | `length` `SHUT_*`; result 0; the peer's receive returns 0 after the queued bytes |
 | SETSOCKOPT, GETSOCKOPT | `op_flags = level << 16 \| name`; result 0 (get: the value length); GETSOCKOPT serves level `SOL_SOCKET` only and any other level completes `-EOPNOTSUPP` on both executors, since the kernel's socket command serves no other level; the sim accepts `TCP_NODELAY` and `SO_KEEPALIVE` only (decision 65) |
 | TIMEOUT | fires at `offset` ns (absolute in the executor clock with `ABSOLUTE`, else relative to submission) with `-ETIME`; `-ECANCELED` when cancelled; the sim adds the clock jitter fault |
@@ -1930,10 +1948,11 @@ with node 0 talking to node 1.
 | `uring_refusals` | integration | `INTEGRATION_TESTS` (skips without a ring or seccomp) | `vsr_io_uring_init` on emulated kernels, each in a forked child under a seccomp filter: no io_uring (`ENOSYS`) and io_uring disabled (`EPERM`) pass through; Linux 6.1 (setup refuses `NO_SQARRAY`, old features), 6.11 (no `MIN_TIMEOUT`), 6.14 (no `READV_FIXED`) and a kernel without networking are `-ENOSYS`, answered by a supervisor thread through `SECCOMP_RET_USER_NOTIF`; no descriptor stays open; a nonexistent SQPOLL CPU stays `-EINVAL` (decision 104) |
 | `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise) as the default, SQPOLL and NAPI rings, then over the sim and the default ring again through the fault-injecting wrapper | Section 8 |
 | `engine` (unit) | unit | `UNIT_TESTS`, with `tests/lib/pure_executor.c` | Over one simulated world and the sim executor, with `tests/lib/pure_executor` armed around every primitive, module poll and node call (decision 133): routing of every core op kind, LOADs before STOREs in one update, lease life cycle and stale RELEASEs, attach and detach errors and while busy, every public function's refusals, submit statuses and queue order, STATUS emission and poll flags, a three-replica group committing, capture and fetch, streams and their timers, prepare's order, capacity and deadline, stale and duplicate completions, EXTERNAL handshakes, `vsr_io_run`, redials, a view change and a replicated replica's interval flush; `tests/unit/engine_tables` covers layout, reserve and minimum-slab boundaries |
-| `engine` | integration | `INTEGRATION_TESTS` | Over the sim: attach NEW, RECOVER, JOIN; empty-store checks; a three-replica group commits, replies, checkpoints, fetches, restarts; STATUS emission; close and detach sequencing; max_clients admission at the primary |
-| `streams`, `snapshots` | integration | `INTEGRATION_TESTS` | Section 3 |
+| `engine` | integration | `INTEGRATION_TESTS`, over `tests/lib/io_world` | Over the sim, the purity guard armed around every primitive, every APPLY, INSTALL and reply checked against one history per cluster (exactly once): attach NEW, RECOVER (a retry answered from the recovered table), NEW over a used log (IDENTITY), RECOVER over an empty directory; a three-replica group's life (crash and RECOVER of a backup and of the primary, a lost disk recovered through the group with a snapshot fetch, a JOIN learner warmed and admitted by RECONFIGURE); max_clients admission at the primary and at a backup; STOP, detach and close with work in flight; the minimum slab and file-slot counts with `caller_slabs = 0`; two groups on three engines through a crash; a learner's node crashing; a full node send queue during an epoch transition (136); a replicated backup's write errors under CONTINUE. `IOW_TEST`, `IOW_SEED`, `IOW_TRACE` |
+| `streams` | integration | same | Caller streams both ways filling the stream tables (BUFFERS pieces around the chunk size, FILE writes, empty, one-byte and one-chunk streams), every byte checked; backpressure (a dripping requester, the window on both sides); early ends (refused SERVE, CLOSE FAILED halfway, a FILE range past the end, an unanswered SERVE, CLOSE NOT_FOUND); an idle source's accept (137); engines closing, resets and crashes; split and corrupt segments; streams beside a group that never changes view |
+| `snapshots` | integration | same | A JOIN learner fetching a member's clients file (byte for byte) and the application's image over a caller stream beside it, RESTORE and INSTALL, recovery of the anchor's file after a crash (90); durable files and drops over repeated checkpoints; a corrupt source's FETCH completing FAILED, never fencing (123); a SYNC failed in the module's prepare waking the loop at once (122) |
 | `iocluster`, `iocluster_extended` | fuzzy (seeded) | `FUZZY_TESTS`; `SEED COUNT STEPS [trace\|quiet] [PROFILE] [SEEDS]` as `tests/fuzzy/cluster`; the extended program sets a wider default profile | Below |
-| `uring_faults` | integration | `INTEGRATION_TESTS` (skips without a ring) | A three-replica group over real rings under the fault-injecting wrapper executor: transient `-EIO` on writes, short sends, delayed NOTIFs, cancelled receives; recovery after a crash simulated by `vsr_io_deinit` without flush |
+| `uring_faults` | integration | `INTEGRATION_TESTS` (skips without a ring), over `tests/lib/io_world` | A three-replica group over real rings on abstract AF_UNIX sockets (138): delayed completions and cancelled receives from the fault wrapper, a backup's crash (its ring closed and its engine abandoned, never deinit, which is EBUSY until closed) and RECOVER; failed takeovers (a chained FILES_UPDATE failing in the kernel) and failed slot clears with no descriptor leaked; a creation write error under CONTINUE (125) with STOP and detach finishing; a STOP with record writes held and the write-behind full; a replicated backup's write errors under CONTINUE, then its crash and RECOVER, catching up through the group (where a transition's comparison LOAD completing after an apply LOAD of the same entries fenced it before the core's fix) |
 
 `tests/fuzzy/iocluster` composes real engines over one simulated world:
 N nodes (3 to 5 replicas, plus 0 to 2 learners with flag 32), each an
@@ -2026,6 +2045,10 @@ of `docs/io-design.md`:
 | `vsr-io.h` | `vsr_io_submit`'s refusals (AGAIN before admission, EINVAL after a STOP); a snapshot COMPLETE's lease returned by a RELEASE op at once; STATUS data a copy per op; rail descriptors valid until the caller's next engine call; `vsr_io_close` EBUSY with a replica attached; `vsr_io_attach` EINVAL for a cluster already attached, the path copied; `vsr_io_detach` EBUSY while an op naming the replica waits, the core still returned after; node table ELIMIT/EINVAL rules; `vsr_io_run`'s drops and return values | 128, 130, 132 |
 | `engine.h` (internal) | The replica's priority ring, deferred ring (`vsr_io_deferred`), copies of path and members, `stopping`, `step_events_capacity`, `tail_region`; the engine's `releases_rejected`, `events_rejected` and `vsr_io_run` scratch arrays (in the layout); lease states FREE, QUEUED, LEASED; `vsr_io_engine_route`, `vsr_io_engine_check_closed`, `vsr_io_engine_reserve`; the engine split into `engine.c` (kernel), `replica.c` and `loop.c` | 128, 129, 130, 131 |
 | `vsr-io.h`, `pool.h` (internal) | Sizing rule: minimum slabs `2 * links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs`, and the pool's three shares; `vsr_io_slab_acquire` is ELIMIT at the caller's share, or while the engine's users hold more than the reserve and use the untaken share; the pool's `internal_taken`, the slab's `internal` flag (with `state` now 8 bits), `vsr_io_pool_handoff`, `vsr_io_pool_floor` | 127 |
+| `engine.h`, `link.c` (internal) | `vsr_io_engine_complete_later` (the deferred ring's producer, moved from loop.c's `complete_now` into the kernel); a SEND evicted from a full node queue completes through it | 136 |
+| `deadline.h`, `engine.h` (internal) | `vsr_io_deadline_entry.rebase` (was `reserved`), `vsr_io_deadlines.rebasing` and `marked`, `vsr_io_deadlines_rebase`; `vsr_io_engine_advance`, which `vsr_io_poll` and `vsr_io_prepare` call instead of setting `io->now` | 137 |
+| `vsr-io.h`, `link.h` (internal), the simulation | Payload pool send rule: a link whose socket refuses a zero-copy send (`-EOPNOTSUPP`, AF_UNIX) sends those bytes again and everything after as plain `VECTORED` sends (`vsr_io_link.plain_sends`); executor contract, SEND: `-EOPNOTSUPP` with `MORE`, then the `NOTIF`, for a zero-copy send on `AF_UNIX`, in the simulation as in Linux | 138 |
+| `link.h` (internal) | `vsr_io_link.held` is a pointer into the links region (`vsr_io_links.held`, `held_per_link` = max(`VSR_IO_LINK_HELD`, `slabs`) runs per link); a stream link holds up to `held_per_link` runs, a peer link `VSR_IO_LINK_HELD`; the engine metadata region grows by `links * held_per_link` runs | 139 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -2075,17 +2098,15 @@ of `docs/io-design.md`:
   `NOT_FOUND`) can leave a log without a valid superblock, which the next
   open reports `CORRUPT`; the directory is not fsynced after the create
   either (the engine or the snapshot module should).
-- A paused stream link (decision 99) still holds what the kernel
-  delivered between the frame that blocked and the CANCEL taking effect,
-  within the `VSR_IO_LINK_HELD` (8) runs of decision 76: with page slabs a
-  burst above about 32 KiB reaped at once (a socket buffer holding more,
-  a multishot receive delivering up to its per-wake limit) closes the
-  link `-ENOBUFS` as before, and the transfer ends RETRY. Larger slabs
-  raise the bound in bytes; giving stream links a held capacity of the
-  pool's worth of runs (memory per link) would make the pool the only
-  bound. The unit harness bounds the burst with its socket buffer
-  (`world.inbox_limit`); a burst past the bound is not modelled as a
-  passing test.
+- A paused stream link (decision 99) holds what the kernel delivered
+  between the frame that blocked and the CANCEL taking effect, a run per
+  slab (139: up to the pool's slab count per stream link, a
+  `slabs`-sized run array per link in the links region); only deliveries
+  of several links interleaved inside the same incremental slab can
+  still split a slab into more runs than that, and would close the link
+  `-ENOBUFS`. Meanwhile the paused link keeps the slabs it holds, which
+  the ring then lacks for the other links' receives until the caller
+  completes its DATA ops.
 - A source throttled by a paused requester makes no send progress and is
   bounded by the inactivity timer like a dead one; a requester slower
   than `handshake_timeout_ns` per window ends RETRY at the source.
@@ -2100,8 +2121,14 @@ of `docs/io-design.md`:
   EOF when it receives again, and a multishot receive that posts data
   and the EOF in one completion batch while a frame waits for a window
   unit closes the link `-EPIPE` with the END frame still held, ending
-  the transfer RETRY at the requester while the source reported OK. Only
-  a requester slower than `handshake_timeout_ns` per window gets there.
+  the transfer RETRY at the requester while the source reported OK. The
+  linger is not re-armed while the requester reads (the source cannot
+  see it), so what matters is not the pace per window but whether the
+  requester consumes what the socket buffer held when the source ended
+  within `handshake_timeout_ns`: a transfer that fits the buffer ends the
+  source at once, and a caller dripping its DATA completions for longer
+  gets RETRY (tests/integration/streams `test_beside_group` raises the
+  timeout for its drip).
 - Where Linux 7.2.6 and the simulation answer differently within the
   contract (the conformance and smoke logs print these, recorded and not
   checked), the engine depends on neither answer today, so the
@@ -2197,3 +2224,26 @@ of `docs/io-design.md`:
   `RETRY` would say what it is. A read reporting more bytes than asked but
   within the slab's room is parsed as data (bytes after the trailer:
   `CORRUPT`), not reported as the I/O error it is.
+- Two core defects found by tests/integration/engine over real engines are
+  open, reproduced with the memory cluster and listed in `XFAIL_TESTS`:
+  `tests/regression/dead_backup_apply` (a primary stops applying, and
+  replying, once an unreachable backup is more than `batch_entries`
+  behind, since the engine completes SENDs to a node without a link
+  RETRY and the core rewinds that peer's `sent` at every failure and
+  retry timer) and `tests/regression/held_store_deadline` (a RECOVERING
+  replica whose hard-state STORE is held, during a lost store's log
+  creation, reports a deadline already past after every TIME, which
+  spins the loop). The integration tests keep a member away for fewer
+  commits than a batch, and their harness counts spins without failing
+  on the short ones.
+- A REQUEST the core refuses when it is stepped (`EINVAL` or `ELIMIT`
+  from its validation: a RECONFIGURE naming more members than
+  `limits.members`, say) is dropped with its lease returned by a RELEASE
+  op and no REPLY (decision 129): the caller cannot tell it from a request
+  still in flight but by that RELEASE.
+- Decision 137 moves the timers armed during `vsr_io_complete`, not the
+  times a completion records (`link->last_active_ns`, a node's
+  `next_dial_ns`, a stream's last touch): they stay at the previous
+  poll's time, which only makes a lazily checked timer (the idle timeout)
+  count from a little earlier than the completion. Recording the poll's
+  time instead needs the same rebase for those fields.

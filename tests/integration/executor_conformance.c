@@ -3143,7 +3143,8 @@ static void scenario_close_pending(struct fixture *f)
     CHECK(f->factory->peer_close(f, peer, false) == 0);
 }
 
-/* AF_UNIX: a listener and a client of the executor in one namespace. */
+/* AF_UNIX: a listener and a client of the executor in one namespace; a
+ * zero-copy send there is refused (decision 138). */
 static void scenario_unix_socket(struct fixture *f)
 {
     struct sockaddr_un un;
@@ -3182,6 +3183,16 @@ static void scenario_unix_socket(struct fixture *f)
     cqe = take(f, UD(3));
     CHECK(cqe.result >= 0 && cqe.flags == 0);
     server = cqe.result;
+    /* No zero-copy send on AF_UNIX: the kernel refuses it at issue with
+     * -EOPNOTSUPP, the result with MORE and then the NOTIF, and sends
+     * nothing. */
+    r = send_record(client, false, "zcpy", 4, UD(7));
+    r.op_flags = VSR_IO_SEND_ZERO_COPY;
+    submit1(f, r);
+    cqe = take(f, UD(7));
+    CHECK(cqe.result == -EOPNOTSUPP && cqe.flags == VSR_IO_CQE_MORE);
+    cqe = take(f, UD(7));
+    CHECK(cqe.result == 0 && cqe.flags == VSR_IO_CQE_NOTIF);
     CHECK(run(f, send_record(client, false, "unix", 4, UD(5))) == 4);
     receive_exact(f, server, buffer, 4);
     CHECK(memcmp(buffer, "unix", 4) == 0);

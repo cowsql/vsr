@@ -67,9 +67,19 @@ struct links_plan {
     size_t links;
     size_t queue;
     size_t vecs;
+    size_t held;
     size_t total;
     size_t alignment;
 };
+
+/* Held runs per link: a paused stream link keeps what the kernel delivered
+ * before its receive's CANCEL took effect, a run per slab it filled, so
+ * the pool's slab count bounds it (decision 139); a peer link uses
+ * VSR_IO_LINK_HELD of them (decision 76). */
+static uint32_t held_per_link(const struct vsr_io_limits *limits)
+{
+    return limits->slabs > VSR_IO_LINK_HELD ? limits->slabs : VSR_IO_LINK_HELD;
+}
 
 static size_t align_max(size_t a, size_t b)
 {
@@ -103,6 +113,7 @@ static bool links_plan(const struct vsr_io_limits *limits,
     plan->alignment =
         align_max(plan->alignment, alignof(struct vsr_io_queued_send));
     plan->alignment = align_max(plan->alignment, alignof(struct vsr_io_vec));
+    plan->alignment = align_max(plan->alignment, alignof(struct vsr_io_run));
     if (!vsr_size_mul(limits->nodes, sizeof(struct vsr_io_node), &bytes) ||
         !place(&offset, bytes, alignof(struct vsr_io_node), &plan->nodes) ||
         !vsr_size_mul(limits->authorizations,
@@ -117,7 +128,10 @@ static bool links_plan(const struct vsr_io_limits *limits,
                &plan->queue) ||
         !vsr_size_mul(limits->links, VSR_IO_SEND_VECTORS, &count) ||
         !vsr_size_mul(count, sizeof(struct vsr_io_vec), &bytes) ||
-        !place(&offset, bytes, alignof(struct vsr_io_vec), &plan->vecs)) {
+        !place(&offset, bytes, alignof(struct vsr_io_vec), &plan->vecs) ||
+        !vsr_size_mul(limits->links, held_per_link(limits), &count) ||
+        !vsr_size_mul(count, sizeof(struct vsr_io_run), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_run), &plan->held)) {
         return false;
     }
     plan->total = offset;
@@ -148,7 +162,7 @@ static void node_reset(struct vsr_io_node *node)
 }
 
 static void link_reset(struct vsr_io_link *link, struct vsr_io_vec *vecs,
-                       uint32_t deadline)
+                       struct vsr_io_run *held, uint32_t deadline)
 {
     memset(link, 0, sizeof(*link));
     link->state = VSR_IO_LINK_FREE;
@@ -170,6 +184,7 @@ static void link_reset(struct vsr_io_link *link, struct vsr_io_vec *vecs,
     link->deadline = deadline; /* Bound by the engine after init. */
     link->shutdown_slot = LINK_NONE;
     link->vecs = vecs;
+    link->held = held;
 }
 
 void vsr_io_links_init(struct vsr_io_links *links, void *memory, size_t size,
@@ -190,6 +205,8 @@ void vsr_io_links_init(struct vsr_io_links *links, void *memory, size_t size,
     links->links = (struct vsr_io_link *)(void *)(base + plan.links);
     links->queue = (struct vsr_io_queued_send *)(void *)(base + plan.queue);
     links->vecs = (struct vsr_io_vec *)(void *)(base + plan.vecs);
+    links->held = (struct vsr_io_run *)(void *)(base + plan.held);
+    links->held_per_link = held_per_link(limits);
     links->nodes_count = limits->nodes;
     links->authorizations_count = limits->authorizations;
     links->links_count = limits->links;
@@ -203,7 +220,8 @@ void vsr_io_links_init(struct vsr_io_links *links, void *memory, size_t size,
     }
     for (uint32_t i = 0; i < links->links_count; ++i) {
         link_reset(&links->links[i],
-                   links->vecs + (size_t)i * VSR_IO_SEND_VECTORS, LINK_NONE);
+                   links->vecs + (size_t)i * VSR_IO_SEND_VECTORS,
+                   links->held + (size_t)i * links->held_per_link, LINK_NONE);
     }
     for (uint32_t i = 0; i < VSR_IO_LISTENERS_MAX; ++i) {
         links->listener_table[i].state = VSR_IO_LISTENER_FREE;
@@ -610,7 +628,7 @@ static uint32_t link_alloc(struct vsr_io *io, uint32_t purpose,
         if (link->state != VSR_IO_LINK_FREE) {
             continue;
         }
-        link_reset(link, link->vecs, link->deadline);
+        link_reset(link, link->vecs, link->held, link->deadline);
         link->purpose = purpose;
         link->direction = direction;
         link->node_index = node_index;
@@ -795,7 +813,7 @@ static void link_try_free(struct vsr_io *io, struct vsr_io_link *link)
     if (link->fd >= 0) {
         vsr_io_engine_slot_free(io, (uint32_t)link->fd);
     }
-    link_reset(link, link->vecs, link->deadline);
+    link_reset(link, link->vecs, link->held, link->deadline);
 }
 
 /* Leaves the current state for CLOSING: counts, election and the node's
@@ -1054,21 +1072,25 @@ static void link_sqe_fd(const struct vsr_io_link *link, struct vsr_io_sqe *sqe)
     }
 }
 
-/* Classifies a send by the flag rule (decision 38) and fills the record. */
-static void link_send_flags(const struct vsr_io *io, struct vsr_io_send *send,
+/* Classifies a send by the flag rule (decision 38) and fills the record; a
+ * link whose socket has no zero-copy send sends plain (decision 138). */
+static void link_send_flags(const struct vsr_io *io,
+                            const struct vsr_io_link *link,
+                            struct vsr_io_send *send,
                             const struct vsr_io_vec *vecs, uint32_t count,
                             struct vsr_io_sqe *sqe)
 {
     uint64_t bytes = 0;
 
-    send->fixed = true;
+    send->fixed = !link->plain_sends;
     for (uint32_t i = 0; i < count; ++i) {
         bytes += vecs[i].length;
         if (!vsr_io_pool_contains(&io->pool, vecs[i].base, vecs[i].length)) {
             send->fixed = false;
         }
     }
-    send->zero_copy = send->fixed || bytes >= io->options.zero_copy_bytes;
+    send->zero_copy = !link->plain_sends &&
+                      (send->fixed || bytes >= io->options.zero_copy_bytes);
     sqe->op_flags = VSR_IO_SEND_VECTORED;
     if (send->zero_copy) {
         sqe->op_flags |= VSR_IO_SEND_ZERO_COPY;
@@ -1105,14 +1127,23 @@ static uint32_t node_queue_unstarted(struct vsr_io_links *links,
     return position;
 }
 
-/* Completes a queued SEND op to its replica. */
+/* Completes a queued SEND op to its replica: at once, or `later` through
+ * the replica's deferred ring (an eviction decided while a SEND is routed:
+ * the core sends again on the RETRY, so feeding it within the same poll
+ * would evict again, decision 136). */
 static void queued_complete(struct vsr_io *io,
                             const struct vsr_io_queued_send *queued,
-                            int32_t status)
+                            int32_t status, bool later)
 {
     struct vsr_io_completion completion = {queued->op, status, LINK_NONE, NULL};
 
-    vsr_io_engine_complete_core(&io->replicas[queued->replica], &completion);
+    if (later) {
+        vsr_io_engine_complete_later(&io->replicas[queued->replica], queued->op,
+                                     status);
+    } else {
+        vsr_io_engine_complete_core(&io->replicas[queued->replica],
+                                    &completion);
+    }
     if (status == VSR_IO_OK) {
         io->stats.messages_sent++;
     } else if (status == VSR_IO_RETRY) {
@@ -1124,14 +1155,15 @@ static void queued_complete(struct vsr_io *io,
  * later ones move up, and the carrier's encoder follows the message it is
  * on (never the removed one). */
 static void node_queue_remove(struct vsr_io *io, uint32_t node_index,
-                              uint32_t position, int32_t status)
+                              uint32_t position, int32_t status, bool later)
 {
     struct vsr_io_links *links = &io->links;
     struct vsr_io_node *node = &links->nodes[node_index];
     uint32_t base = node_index * links->link_queue;
 
     LINKS_ASSERT(position < node->queue_count);
-    queued_complete(io, node_queue_at(links, node_index, position), status);
+    queued_complete(io, node_queue_at(links, node_index, position), status,
+                    later);
     if (node->carrier != LINK_NONE &&
         links->links[node->carrier].encoding != LINK_NONE) {
         struct vsr_io_link *carrier = &links->links[node->carrier];
@@ -1194,13 +1226,13 @@ static void node_queue_ready(struct vsr_io *io, uint32_t node_index)
             if (queued->end <= link->notified_offset ||
                 link_live_sends(link) == 0) {
                 node_queue_remove(io, node_index, position,
-                                  links_fail_status(links));
+                                  links_fail_status(links), false);
                 continue;
             }
         } else if (node->carrier != LINK_NONE) {
             link = &links->links[node->carrier];
             if (queued->end <= link->notified_offset) {
-                node_queue_remove(io, node_index, position, VSR_IO_OK);
+                node_queue_remove(io, node_index, position, VSR_IO_OK, false);
                 continue;
             }
         }
@@ -1223,7 +1255,7 @@ static void node_queue_drop(struct vsr_io *io, uint32_t node_index, bool all)
         node->queue_count > 0 &&
         (all ||
          node_queue_at(links, node_index, node->queue_count - 1)->end == 0)) {
-        node_queue_remove(io, node_index, node->queue_count - 1, status);
+        node_queue_remove(io, node_index, node->queue_count - 1, status, false);
     }
 }
 
@@ -1364,7 +1396,7 @@ static bool link_prepare_send(struct vsr_io *io, struct vsr_io_link *link,
     LINKS_ASSERT(link->build_bytes > 0 && link->send_slab != LINK_NONE);
     sqe->opcode = VSR_IO_SQE_SEND;
     link_sqe_fd(link, sqe);
-    link_send_flags(io, send, link->vecs, link->vec_count, sqe);
+    link_send_flags(io, link, send, link->vecs, link->vec_count, sqe);
     slot = vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_SEND,
                               send->zero_copy ? 2 : 1, link_index(io, link),
                               entry, 0);
@@ -1470,6 +1502,7 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
 {
     struct vsr_io_send *send = &link->sends[entry];
     uint64_t total = send->end - send->begin;
+    int32_t result = cqe->result;
     uint64_t sent;
 
     if ((cqe->flags & VSR_IO_CQE_NOTIF) != 0) {
@@ -1479,7 +1512,15 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
     }
     LINKS_ASSERT(send->state == SEND_INFLIGHT && link->inflight != 0);
     link->inflight = 0;
-    if (cqe->result < 0) {
+    if (result == -EOPNOTSUPP && send->zero_copy &&
+        (cqe->flags & VSR_IO_CQE_MORE) != 0) {
+        /* The socket has no zero-copy send (AF_UNIX; decision 138): nothing
+         * went out and the NOTIF follows. As a short send of nothing, the
+         * same bytes go again, plain, as every later send of the link. */
+        link->plain_sends = true;
+        result = 0;
+    }
+    if (result < 0) {
         /* A rejected zero-copy send completes once, without MORE
          * (decision 62); an accepted one still gets its NOTIF. The entry
          * is released like at a NOTIF: the link may be closing already
@@ -1491,10 +1532,10 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
         } else {
             link_send_release(io, link, send);
         }
-        link_close(io, link_index(io, link), cqe->result);
+        link_close(io, link_index(io, link), result);
         return;
     }
-    sent = (uint64_t)cqe->result < total ? (uint64_t)cqe->result : total;
+    sent = (uint64_t)result < total ? (uint64_t)result : total;
     if (sent < total) {
         /* Short: the unsent tail of the vectors is the next build, its
          * header bytes reserved from the send's own until it goes out. */
@@ -2061,14 +2102,18 @@ static void link_received(struct vsr_io *io, struct vsr_io_link *link,
                last->offset + last->length == offset) {
         last->length += bytes;
         vsr_io_pool_release(&io->pool, slab);
-    } else if (link->held_count < VSR_IO_LINK_HELD) {
+    } else if (link->held_count < (link->purpose == VSR_IO_PURPOSE_STREAM
+                                       ? io->links.held_per_link
+                                       : VSR_IO_LINK_HELD)) {
         last = &link->held[link->held_count++];
         last->slab = slab;
         last->offset = offset;
         last->length = bytes;
     } else {
-        /* Every held run is a slab the pool could not replace: the stream
-         * cannot be kept intact without unbounded memory. */
+        /* Every held run is a slab the pool could not replace: a peer
+         * link whose MESSAGE waits holds VSR_IO_LINK_HELD at most
+         * (decision 76); a stream link, a run per slab of the pool (139),
+         * which only interleaved deliveries sharing slabs can exceed. */
         vsr_io_pool_release(&io->pool, slab);
         link_close(io, link_index(io, link), -ENOBUFS);
         return;
@@ -2244,7 +2289,9 @@ int vsr_io_links_send(struct vsr_io *io, uint32_t replica, uint64_t op,
             io->stats.messages_retried++;
             return VSR_IO_RETRY;
         }
-        node_queue_remove(io, node_index, position, VSR_IO_RETRY);
+        /* Decided while the newer SEND is routed: through the deferred
+         * ring, as a refused one (decision 136). */
+        node_queue_remove(io, node_index, position, VSR_IO_RETRY, true);
     }
     queued = node_queue_at(links, node_index, node->queue_count);
     queued->op = op;

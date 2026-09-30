@@ -1154,6 +1154,11 @@ static void start_send(struct vsr_sim_node *node, uint32_t op, uint32_t index)
          * every later failure of a zero-copy send still posts both. */
         vsr_sim_op(node, op)->zero_copy = 0;
         error = -EINVAL;
+    } else if ((record->sqe.op_flags & VSR_IO_SEND_ZERO_COPY) != 0 &&
+               object->domain == AF_UNIX) {
+        /* As Linux: no zero-copy send on AF_UNIX; the result, then the
+         * NOTIF, nothing sent (decision 138). */
+        error = -EOPNOTSUPP;
     } else if (object->state != VSR_SIM_SOCKET_CONNECTED) {
         error = -ENOTCONN;
     } else {

@@ -247,6 +247,14 @@ struct vsr_io_forwarded *vsr_io_forward(struct vsr_io *io,
  * completion; the event is fed on the next poll. */
 void vsr_io_engine_complete_core(struct vsr_io_replica *replica,
                                  const struct vsr_io_completion *completion);
+/* A completion decided at once while an op is routed (a SEND the link
+ * module refuses, or one it evicts from a full node queue for a newer
+ * SEND, a snapshot op's status, a malformed op's FAILED), with no data and
+ * no lease: queued in the replica's deferred ring and fed retry_ns later
+ * (decisions 129 and 136), since the core answers a failed SEND by sending
+ * again and a completion fed within the same poll loops. */
+void vsr_io_engine_complete_later(struct vsr_io_replica *replica, uint64_t op,
+                                  int32_t status);
 /* Engine leases. */
 uint32_t vsr_io_lease_alloc(struct vsr_io_replica *replica, uint32_t slab,
                             uint32_t pin);
@@ -288,6 +296,11 @@ uint64_t vsr_io_engine_provide_user_data(const struct vsr_io *io);
  * at vsr_io_init and never calling the executor after (decision 134):
  * unique, not secret. */
 void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size);
+
+/* Brings the engine's clock to now_ns (never back) at a poll or prepare,
+ * first moving the timers armed while completions were processed by the
+ * time that passed since the last poll (decision 137). */
+void vsr_io_engine_advance(struct vsr_io *io, uint64_t now_ns);
 
 /* The pool's reserve for the limits (decision 127): one send slab per
  * link, the chunk reads of every stream window, per replica a cold-load

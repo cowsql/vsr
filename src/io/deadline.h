@@ -36,8 +36,8 @@ struct vsr_io_deadline_entry {
     uint64_t when;     /* VSR_NO_DEADLINE when disarmed. */
     uint32_t position; /* Heap index or INDEX_NONE. */
     uint16_t kind;     /* enum vsr_io_deadline_kind */
-    uint16_t reserved;
-    uint32_t index; /* Owner index within its kind. */
+    uint16_t rebase;   /* Armed while `rebasing`: moved by the next rebase. */
+    uint32_t index;    /* Owner index within its kind. */
     uint32_t reserved2;
 };
 
@@ -46,6 +46,9 @@ struct vsr_io_deadlines {
     uint32_t *heap;                        /* [capacity] handles. */
     uint32_t capacity;
     uint32_t count;
+    uint32_t rebasing; /* 1 while the engine processes completions: arms
+                          are marked for the next rebase (decision 137). */
+    uint32_t marked;   /* Entries marked. */
 };
 
 /* Bytes for capacity handles (entries, then heap), in memory aligned for
@@ -63,6 +66,13 @@ void vsr_io_deadlines_bind(struct vsr_io_deadlines *set, uint32_t handle,
 void vsr_io_deadlines_arm(struct vsr_io_deadlines *set, uint32_t handle,
                           uint64_t when);
 uint64_t vsr_io_deadlines_earliest(const struct vsr_io_deadlines *set);
+/* Moves every entry armed while `rebasing` was set (and not re-armed or
+ * disarmed since) `delta` later, and clears the marks. Completions carry
+ * no clock: a timer armed while one is processed counts from the engine's
+ * time of the previous poll, which an idle engine left behind by as long
+ * as it slept, so the next poll (the first to bring the clock) moves such
+ * timers by the time that passed (decision 137). */
+void vsr_io_deadlines_rebase(struct vsr_io_deadlines *set, uint64_t delta);
 /* Pops the earliest entry due at or before now; false when none. Equal
  * deadlines pop in handle order. The entry is disarmed; a periodic owner
  * re-arms it after now, since an entry armed at or before now is due at
