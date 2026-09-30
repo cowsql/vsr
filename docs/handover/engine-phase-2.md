@@ -5,7 +5,7 @@ phase 1 merged). Not pushed. This phase proves the engine with the
 integration tests of the testing plan (docs/io-implementation.md section
 9: `engine`, `streams`, `snapshots`, `uring_faults`) over one shared
 harness, `tests/lib/io_world`, and fixes what they found: four I/O-layer
-bugs (placeholder decisions G1 to G4 in docs/io-design.md section 10;
+bugs (placeholder decisions 136 to 139 in docs/io-design.md section 10;
 the coordinator renumbers them), one core bug fixed in a separately
 labelled commit, and two core bugs left open as XFAIL reproductions.
 
@@ -15,19 +15,19 @@ Commits (first parent):
 | --- | --- |
 | 1bd1c69 | `tests/lib/io_world` and `tests/integration/engine` |
 | 74956cb | Failing test: a full node send queue loops within one poll (`test_queue_full`) |
-| 5c256d7 | G1: an evicted SEND's RETRY goes through the deferred ring |
+| 5c256d7 | 136: an evicted SEND's RETRY goes through the deferred ring |
 | a325323 | `tests/integration/streams`; two cases fail on an idle source |
-| 7c10b7a | G2: timers armed at completion time count from the next poll |
+| 7c10b7a | 137: timers armed at completion time count from the next poll |
 | e7aa0c5 | `tests/integration/snapshots` (and a harness overrun fixed) |
 | e6a8b74 | XFAIL `tests/regression/dead_backup_apply` (core) |
 | 3933bb1 | XFAIL `tests/regression/held_store_deadline` (core) |
 | 9846556 | `tests/integration/uring_faults`; its groups fail on AF_UNIX links |
 | 2110e52 | Failing conformance check: no zero-copy send on AF_UNIX |
-| 7c964c2 | G3: a link sends plain once its socket refuses zero-copy |
+| 7c964c2 | 138: a link sends plain once its socket refuses zero-copy |
 | fb875dd | Write-error cases; the ring's replicated group fails in the core |
 | 62a2ece | Core: `compare_chunk` waits for its comparison load |
 | be0d654 | Failing test: a burst overflows a paused stream link (`test_burst`) |
-| 6e6a636 | G4: a stream link holds a run per pool slab |
+| 6e6a636 | 139: a stream link holds a run per pool slab |
 | cc35a0a | The harness checks its snprintf results (gcc 16's format-truncation) |
 | 5fe0787 | `tests/regression/compare_load_order`: the core fix above over the simulation |
 | 98db249 | Docs: section 9 rows, section 11, tests/README.md |
@@ -142,10 +142,10 @@ tests/integration/engine (over the simulation; `IOW_TEST`, `IOW_SEED`):
   with `caller_slabs` 0, file slots at the documented minimum; commits,
   two checkpoints, a JOIN learner's fetch.
 - `test_two_groups`: two groups on the same three engines through a crash.
-- `test_learner_down`, `test_queue_full` (G1), `test_write_errors`.
+- `test_learner_down`, `test_queue_full` (136), `test_write_errors`.
 
 tests/integration/streams: `test_transfers`, `test_backpressure`,
-`test_burst` (G4), `test_early_ends`, `test_idle_source` (G2),
+`test_burst` (139), `test_early_ends`, `test_idle_source` (137),
 `test_loss`, `test_faults`, `test_beside_group` (each described in its
 comment and in section 9).
 
@@ -164,25 +164,25 @@ simulation.
 
 ## Bugs found and fixed
 
-1. G1, a hot loop (`test_queue_full`; first seen as a seeded run of
+1. 136, a hot loop (`test_queue_full`; first seen as a seeded run of
    `test_group_lifecycle` never finishing one poll). A full node queue
    evicted its oldest unstarted SEND with RETRY at once, inside the
    routing of the newer SEND; the core re-sends on a failed SEND (the
    epochs extension restarts its whole START_EPOCH broadcast), which
    evicted again. Evictions now complete through the deferred ring,
    `retry_ns` later, like refused SENDs.
-2. G2, idle engines killed new links (`test_idle_source`, and the last
+2. 137, idle engines killed new links (`test_idle_source`, and the last
    case of `test_early_ends`). Timers armed while completions are
    processed counted from the previous poll's time; an engine asleep
    without a deadline armed an accepted link's handshake timer already
    past, and the next poll closed the link ETIMEDOUT. Deadlines armed in
    `vsr_io_complete` are marked and moved by the next poll or prepare.
-3. G3, AF_UNIX links never worked on a ring (`uring_faults`' groups, the
+3. 138, AF_UNIX links never worked on a ring (`uring_faults`' groups, the
    `unix_socket` conformance scenario). Linux has no zero-copy send on
    AF_UNIX and the engine's pool sends are zero-copy; the simulation
    accepted them. The link falls back to plain sends at the first
    `-EOPNOTSUPP`; the simulation now refuses like the kernel.
-4. G4, bulk streams ended RETRY (`test_burst`; 24 of 40 seeds of the
+4. 139, bulk streams ended RETRY (`test_burst`; 24 of 40 seeds of the
    streams suite). The whole reap batch is carved in `vsr_io_complete`
    before the caller can complete a DATA op, so a window of two blocked
    the third chunk and the rest of the batch overflowed the paused
@@ -293,7 +293,7 @@ On the final tree (Linux 7.2.6, 8 cores, RLIMIT_MEMLOCK 8 MiB):
 
 ## What the networked examples need
 
-- AF_UNIX works on rings since G3; TCP loopback needs no change.
+- AF_UNIX works on rings since 138; TCP loopback needs no change.
 - A ring caller registers the executor's file and buffer tables itself
   (`register_files`, `register_buffers`) before `vsr_io_init`, maps its
   regions anonymously (the payload pool and tails are registered), and
@@ -306,13 +306,13 @@ On the final tree (Linux 7.2.6, 8 cores, RLIMIT_MEMLOCK 8 MiB):
 ## Open items
 
 In docs/io-implementation.md section 11: the two core XFAILs; a REQUEST
-the core refuses at the step gets no REPLY; G2 moves armed timers, not
+the core refuses at the step gets no REPLY; 137 moves armed timers, not
 the times completions record; the decision-96 linger residual, now
 described by what the tests hit (the linger ends while a requester still
 drains the socket buffer: the source cannot see the requester read, so a
 slow consumer of the socket buffer's worth gets RETRY; a progress frame
 from the requester would fix it and is a wire change), and what is left
-of decision 99's after G4 (interleaved deliveries splitting a slab; a
+of decision 99's after 139 (interleaved deliveries splitting a slab; a
 paused link keeping the slabs it holds from the other links). Also: the
 simulation takes up to 256 KiB per send, so a source's END reaches the
 kernel before an early loss and keeps its status (decision 97): tests of

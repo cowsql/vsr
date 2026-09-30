@@ -150,7 +150,7 @@ int vsr_io_complete(struct vsr_io *io, const struct vsr_io_cqe *cqes,
     }
     /* A completion carries no clock: what the modules arm now counts from
      * io->now, the last poll's time, and moves with the next poll's
-     * (decision G2). */
+     * (decision 137). */
     io->deadlines.rebasing = 1;
     for (uint32_t i = 0; i < count; ++i) {
         complete_one(io, &cqes[i]);

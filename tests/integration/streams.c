@@ -285,7 +285,7 @@ static void test_backpressure(void)
  * burst before the pause's CANCEL takes effect, one run per slab. With
  * eight held runs a stream link closed -ENOBUFS and the transfer ended
  * RETRY (the residual of decision 99); a stream link holds up to the
- * pool's worth of runs (decision G4), so the caller releases its DATA ops
+ * pool's worth of runs (decision 139), so the caller releases its DATA ops
  * and every byte arrives. The linger is long here: this is about the
  * requester's link, not the source's timer. */
 static void test_burst(void)
@@ -434,7 +434,7 @@ static void test_early_ends(void)
  * read: every stream to an engine idle longer than handshake_timeout_ns
  * failed (RETRY at the requester, no SERVE at the source). Timers armed
  * while completions are processed now count from the poll that follows
- * (decision G2). */
+ * (decision 137). */
 static void test_idle_source(void)
 {
     struct iow_node *a;

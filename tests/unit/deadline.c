@@ -656,7 +656,7 @@ static void test_edges(void)
     check_model(&set);
 }
 
-/* Decision G2: entries armed while `rebasing` is set move by the delta of
+/* Decision 137: entries armed while `rebasing` is set move by the delta of
  * the next rebase, once; entries armed outside it, re-armed outside it
  * since, or disarmed, do not; a delta of zero only clears the marks; the
  * move saturates below VSR_NO_DEADLINE; the heap order holds after. */

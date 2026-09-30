@@ -74,7 +74,7 @@ struct links_plan {
 
 /* Held runs per link: a paused stream link keeps what the kernel delivered
  * before its receive's CANCEL took effect, a run per slab it filled, so
- * the pool's slab count bounds it (decision G4); a peer link uses
+ * the pool's slab count bounds it (decision 139); a peer link uses
  * VSR_IO_LINK_HELD of them (decision 76). */
 static uint32_t held_per_link(const struct vsr_io_limits *limits)
 {
@@ -1073,7 +1073,7 @@ static void link_sqe_fd(const struct vsr_io_link *link, struct vsr_io_sqe *sqe)
 }
 
 /* Classifies a send by the flag rule (decision 38) and fills the record; a
- * link whose socket has no zero-copy send sends plain (decision G3). */
+ * link whose socket has no zero-copy send sends plain (decision 138). */
 static void link_send_flags(const struct vsr_io *io,
                             const struct vsr_io_link *link,
                             struct vsr_io_send *send,
@@ -1130,7 +1130,7 @@ static uint32_t node_queue_unstarted(struct vsr_io_links *links,
 /* Completes a queued SEND op to its replica: at once, or `later` through
  * the replica's deferred ring (an eviction decided while a SEND is routed:
  * the core sends again on the RETRY, so feeding it within the same poll
- * would evict again, decision G1). */
+ * would evict again, decision 136). */
 static void queued_complete(struct vsr_io *io,
                             const struct vsr_io_queued_send *queued,
                             int32_t status, bool later)
@@ -1514,7 +1514,7 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
     link->inflight = 0;
     if (result == -EOPNOTSUPP && send->zero_copy &&
         (cqe->flags & VSR_IO_CQE_MORE) != 0) {
-        /* The socket has no zero-copy send (AF_UNIX; decision G3): nothing
+        /* The socket has no zero-copy send (AF_UNIX; decision 138): nothing
          * went out and the NOTIF follows. As a short send of nothing, the
          * same bytes go again, plain, as every later send of the link. */
         link->plain_sends = true;
@@ -2112,7 +2112,7 @@ static void link_received(struct vsr_io *io, struct vsr_io_link *link,
     } else {
         /* Every held run is a slab the pool could not replace: a peer
          * link whose MESSAGE waits holds VSR_IO_LINK_HELD at most
-         * (decision 76); a stream link, a run per slab of the pool (G4),
+         * (decision 76); a stream link, a run per slab of the pool (139),
          * which only interleaved deliveries sharing slabs can exceed. */
         vsr_io_pool_release(&io->pool, slab);
         link_close(io, link_index(io, link), -ENOBUFS);
@@ -2290,7 +2290,7 @@ int vsr_io_links_send(struct vsr_io *io, uint32_t replica, uint64_t op,
             return VSR_IO_RETRY;
         }
         /* Decided while the newer SEND is routed: through the deferred
-         * ring, as a refused one (decision G1). */
+         * ring, as a refused one (decision 136). */
         node_queue_remove(io, node_index, position, VSR_IO_RETRY, true);
     }
     queued = node_queue_at(links, node_index, node->queue_count);

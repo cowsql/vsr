@@ -251,7 +251,7 @@ void vsr_io_engine_complete_core(struct vsr_io_replica *replica,
  * module refuses, or one it evicts from a full node queue for a newer
  * SEND, a snapshot op's status, a malformed op's FAILED), with no data and
  * no lease: queued in the replica's deferred ring and fed retry_ns later
- * (decisions 129 and G1), since the core answers a failed SEND by sending
+ * (decisions 129 and 136), since the core answers a failed SEND by sending
  * again and a completion fed within the same poll loops. */
 void vsr_io_engine_complete_later(struct vsr_io_replica *replica, uint64_t op,
                                   int32_t status);
@@ -299,7 +299,7 @@ void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size);
 
 /* Brings the engine's clock to now_ns (never back) at a poll or prepare,
  * first moving the timers armed while completions were processed by the
- * time that passed since the last poll (decision G2). */
+ * time that passed since the last poll (decision 137). */
 void vsr_io_engine_advance(struct vsr_io *io, uint64_t now_ns);
 
 /* The pool's reserve for the limits (decision 127): one send slab per
