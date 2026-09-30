@@ -160,6 +160,9 @@ static void disk_crash(bool lose_dirty)
 /* One block written since the last flush did not persist. */
 static void disk_lose_block(uint64_t at)
 {
+    if (disk_trace) {
+        fprintf(stderr, "disk: lose block %" PRIu64 "\n", at);
+    }
     CHECK(disk.dirty[at] != 0);
     memcpy(disk_image + at * BLOCK, disk_flushed + at * BLOCK, BLOCK);
     disk.dirty[at] = 0;
@@ -1780,6 +1783,13 @@ static void snapshot_check(uint64_t sequence)
             CHECK(ref->op != s->log_begin + i);
             continue;
         }
+        if (ref->op != expected->op || ref->sequence != expected->sequence) {
+            fprintf(stderr,
+                    "snapshot %" PRIu64 ": op %" PRIu64 " sequence %" PRIu64
+                    " recovered as op %" PRIu64 " sequence %" PRIu64 "\n",
+                    sequence, expected->op, expected->sequence, ref->op,
+                    ref->sequence);
+        }
         CHECK(ref->op == expected->op && ref->sequence == expected->sequence);
         CHECK(ref->offset == expected->offset &&
               ref->length == expected->length);
@@ -1795,6 +1805,17 @@ static void snapshot_check(uint64_t sequence)
             continue; /* An in-flight entry: the crash forgot it. */
         }
         CHECK(entry != NULL);
+        if (entry->current.number != expected->number ||
+            entry->current.op != expected->op) {
+            fprintf(stderr,
+                    "snapshot %" PRIu64 ": client %" PRIx64 " number %" PRIu64
+                    " op %" PRIu64 " recovered as number %" PRIu64
+                    " op %" PRIu64 " (sequence %" PRIu64
+                    ", base offset %" PRIu64 ")\n",
+                    sequence, expected->id.hi, expected->number, expected->op,
+                    entry->current.number, entry->current.op,
+                    entry->current.sequence, entry->base_offset);
+        }
         CHECK(entry->current.number == expected->number &&
               entry->current.op == expected->op);
         CHECK(entry->retained == expected->retained);
@@ -5689,7 +5710,8 @@ struct walk {
     uint32_t captures;
     bool trace;      /* VSR_WALK_TRACE set: every step on stderr. */
     bool corrupting; /* Bytes flipped at the last crash. */
-    bool failed;     /* The store is fenced: the walk is over. */
+    bool failed;     /* The store is fenced, or bytes were flipped: the
+                        walk is over. */
     bool exhausted;  /* Out of snapshot ids: the walk is over. */
     uint64_t log_begin;
     uint64_t log_end;
@@ -6187,6 +6209,7 @@ static void walk_crash(uint8_t arg)
     struct checked checked;
     uint32_t lease = NONE;
     uint64_t packed;
+    uint64_t media;
     int32_t status;
 
     walk.corrupting = false;
@@ -6216,6 +6239,10 @@ static void walk_crash(uint8_t arg)
     harness_run(); /* Until the lost completion stalls it. */
     disk.tear_armed = 0;
     packed = h.store->readable;
+    /* The sequence on media, which no crash loses: freeing counted on
+     * every revision from it on (decision S16). */
+    media = walk.c.sync_mode == VSR_IO_SYNC_DSYNC ? h.store->written
+                                                  : h.store->flushed;
     if (packed > 0) {
         snapshot_take();
     }
@@ -6232,10 +6259,15 @@ static void walk_crash(uint8_t arg)
 
         for (uint32_t i = 0; i < flips; ++i) {
             uint64_t offset = walk_byte();
+            unsigned char bit;
 
             offset = offset << 8 | walk_byte();
             offset = (offset << 8 | walk_byte()) % disk.size;
-            disk_image[offset] ^= (unsigned char)(1u << (walk_byte() & 7));
+            bit = (unsigned char)(1u << (walk_byte() & 7));
+            /* On media: a later crash reverting the block to its flushed
+             * content keeps the flip. */
+            disk_image[offset] ^= bit;
+            disk_flushed[offset] ^= bit;
             walk.stats.flips++;
         }
         walk.corrupting = true;
@@ -6264,6 +6296,17 @@ static void walk_crash(uint8_t arg)
         CHECK(((const struct vsr_recovered *)loaded->items)->sequence ==
               loaded->sequence);
         CHECK(walk.corrupting || loaded->sequence >= walk.durable_ack);
+        CHECK(walk.corrupting || loaded->sequence >= media);
+        if (loaded->sequence < media) {
+            /* Flipped bytes cut records on media no floor covers, which
+             * recovery takes for a torn tail (decision 50's residual):
+             * slots freed for the revisions from `media` on may hold what
+             * this older row needs, so it is not checked against the
+             * model. The walk ends below. */
+            release_lease(lease);
+            walk.stats.recovered++;
+            break;
+        }
         walk_replay(loaded->sequence);
         walk.durable_ack = loaded->sequence;
         release_lease(lease);
@@ -6291,6 +6334,14 @@ static void walk_crash(uint8_t arg)
         walk.stats.corrupt++;
         break;
     }
+    /* After flipped bytes the walk ends once their recovery is checked:
+     * the records a flip cut off stay on media, CRC-valid behind the
+     * damage, and a later crash that loses the block a new run rewrote
+     * over the damage can bring them back (an unacknowledged suffix of an
+     * older run), which the model of the log cannot follow. */
+    if (walk.corrupting) {
+        walk.failed = true;
+    }
 }
 
 static void walk_step(uint8_t action, uint8_t arg)
@@ -6301,10 +6352,12 @@ static void walk_step(uint8_t action, uint8_t arg)
         fprintf(stderr,
                 "walk: step %" PRIu64 " action %u arg %u: readable %" PRIu64
                 " written %" PRIu64 " flushed %" PRIu64 " durable ack %" PRIu64
-                " reclaim %" PRIu64 "\n",
+                " reclaim %" PRIu64 "/%" PRIu64 " base %" PRIu64 "/%" PRIu64
+                " pending %" PRIu64 "\n",
                 walk.stats.steps, action, arg, h.store->readable,
                 h.store->written, h.store->flushed, walk.durable_ack,
-                h.store->reclaim);
+                h.store->reclaim, h.store->reclaimed, h.store->client_base,
+                h.store->client_base_floor, h.store->client_base_pending);
     }
     h.now += (uint64_t)(action >> 4) * 10000000; /* Idle writes fire. */
     switch (action & 15) {
