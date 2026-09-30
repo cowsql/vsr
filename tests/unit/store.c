@@ -6737,6 +6737,206 @@ static void test_walk_bounds(void)
     CHECK(!walk.failed && walk.stats.captures >= 60);
 }
 
+/* -------------------------------------------------------------------------
+ * Review: errors during creation and after a CONTINUE error, the idle
+ * floor on media
+ * ---------------------------------------------------------------------- */
+
+/* Starts an open without driving it: the RECOVERY load's op. */
+static uint64_t open_load(uint32_t mode)
+{
+    struct vsr_store_read read;
+    uint64_t op = next_op();
+
+    memset(&read, 0, sizeof(read));
+    read.type = VSR_LOAD_RECOVERY;
+    vsr_io_store_open(h.store, mode, op, &read);
+    CHECK(h.store->state == VSR_IO_STORE_OPENING);
+    return op;
+}
+
+/* Completes pending SQEs, preparing more, until one of `opcode` is
+ * pending, whose index is returned. */
+static uint32_t run_until(uint8_t opcode)
+{
+    for (unsigned rounds = 0; rounds < 1000; ++rounds) {
+        uint32_t at;
+
+        harness_poll();
+        harness_prepare();
+        at = pending_of(opcode);
+        if (at != NONE) {
+            return at;
+        }
+        at = pending_first();
+        CHECK(at != NONE);
+        harness_complete(at);
+    }
+    CHECK(false);
+    return NONE;
+}
+
+/* A write or flush error while the log is created fences the store
+ * under CONTINUE too: there is no log to serve from memory, and the
+ * RECOVERY load (or the STOREs RECOVER's warm-up held) must complete;
+ * the store stayed CREATING forever instead. */
+static void test_review_create_continue(void)
+{
+    struct config c = base_config();
+    uint64_t op;
+    uint64_t store_op;
+    uint32_t at;
+
+    c.durability = VSR_REPLICATED;
+    c.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
+    /* The first segment's header write fails. */
+    harness_open(&c);
+    op = open_load(VSR_START_NEW);
+    run_except(2 * BLOCK);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    CHECK(at != NONE && h.pending[at].sqe.offset == 2 * BLOCK);
+    CHECK(h.store->state == VSR_IO_STORE_CREATING);
+    disk.fail_write = -EIO;
+    harness_complete(at);
+    harness_run();
+    CHECK(h.store->state == VSR_IO_STORE_FAILED && h.store->error == -EIO);
+    expect_completion(op, VSR_IO_FAILED);
+    expect_no_completion();
+    harness_close();
+    /* The flush after it (FDATASYNC) fails, with a STORE held by RECOVER's
+     * warm-up. */
+    harness_open(&c);
+    op = open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_FSYNC);
+    expect_completion(op, VSR_IO_NOT_FOUND);
+    CHECK(h.store->state == VSR_IO_STORE_CREATING);
+    store_op = submit(txn_append(1, 1, 50));
+    CHECK(h.store->stores_count == 1);
+    disk.fail_flush = -EIO;
+    harness_complete(at);
+    harness_run();
+    CHECK(h.store->state == VSR_IO_STORE_FAILED && h.store->error == -EIO);
+    expect_completion(store_op, VSR_IO_FAILED);
+    expect_no_completion();
+    harness_close();
+    /* The superblock write fails (DSYNC). */
+    c.sync_mode = VSR_IO_SYNC_DSYNC;
+    harness_open(&c);
+    op = open_load(VSR_START_NEW);
+    at = run_until(VSR_IO_SQE_WRITE);
+    CHECK(h.pending[at].sqe.offset == 0);
+    disk.fail_write = -EIO;
+    harness_complete(at);
+    harness_run();
+    CHECK(h.store->state == VSR_IO_STORE_FAILED && h.store->error == -EIO);
+    expect_completion(op, VSR_IO_FAILED);
+    expect_no_completion();
+    harness_close();
+}
+
+/* After a write error under CONTINUE nothing reaches the disk, so no
+ * SYNC can ever complete OK: a SYNC queued before the error, and one
+ * submitted after it, complete FAILED rather than never (every op gets
+ * exactly one completion). One already satisfied completes OK. */
+static void test_review_sync_continue(void)
+{
+    static const uint8_t modes[2] = {VSR_IO_SYNC_FDATASYNC,
+                                     VSR_IO_SYNC_DSYNC};
+    struct config c = base_config();
+    uint64_t sync_op;
+
+    c.durability = VSR_REPLICATED;
+    c.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
+    for (uint32_t m = 0; m < 2; ++m) {
+        c.sync_mode = modes[m];
+        harness_open(&c);
+        harness_start(VSR_START_NEW);
+        expect_completion(submit(txn_append(1, 1, 50)), VSR_IO_OK);
+        sync_op = submit_sync(1);
+        harness_run();
+        expect_completion(sync_op, VSR_IO_OK);
+        expect_completion(submit(txn_append(2, 1, 50)), VSR_IO_OK);
+        sync_op = submit_sync(2); /* Queued before the error. */
+        CHECK(harness_prepare() >= 1);
+        disk.fail_write = -EIO;
+        harness_complete(pending_of(VSR_IO_SQE_WRITE));
+        CHECK(h.store->state == VSR_IO_STORE_READY && h.store->error == -EIO);
+        expect_completion(sync_op, VSR_IO_FAILED);
+        expect_completion(submit(txn_append(3, 1, 50)), VSR_IO_OK);
+        sync_op = submit_sync(3); /* After it. */
+        expect_completion(sync_op, VSR_IO_FAILED);
+        sync_op = submit_sync(1); /* Satisfied before it. */
+        expect_completion(sync_op, VSR_IO_OK);
+        harness_run();
+        expect_no_completion();
+        CHECK(harness_prepare() == 0);
+        harness_close();
+    }
+}
+
+/* The idle superblock write persists the durable floor (decision 50): in
+ * FDATASYNC mode the write alone leaves it in the page cache, so a flush
+ * follows it, and a crash losing every unflushed block keeps the floor.
+ * An O_DSYNC write needs none. */
+static void test_review_idle_flush(void)
+{
+    struct config c = base_config();
+    struct vsr_io_wire_superblock superblock;
+    const struct vsr_loaded *loaded = NULL;
+    uint32_t lease = NONE;
+    uint64_t sync_op;
+    uint32_t at;
+
+    c.flush_interval_ns = 0; /* 100 ms. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_append(1, 1, 50)), VSR_IO_OK);
+    sync_op = submit_sync(1);
+    harness_run();
+    expect_completion(sync_op, VSR_IO_OK);
+    CHECK(h.store->durable == 1 && h.store->superblock_floor == 0);
+    h.now += UINT64_C(100000000);
+    harness_poll();
+    CHECK(h.store->superblock_dirty == 1);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    CHECK(at != NONE && h.pending[at].sqe.offset == 0);
+    harness_complete(at);
+    CHECK(h.store->superblock_floor == 1);
+    harness_poll();
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_FSYNC);
+    CHECK(at != NONE);
+    harness_complete(at);
+    harness_poll();
+    CHECK(harness_prepare() == 0);
+    expect_no_completion();
+    disk_crash(true);
+    read_superblock(0, &superblock);
+    CHECK(superblock.durable_floor == 1 && superblock.revision == 2);
+    harness_open_keep(&c, true);
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == 1 && h.store->superblock_floor == 1);
+    release_lease(lease);
+    harness_close();
+    /* DSYNC: on media at the write's completion. */
+    c.sync_mode = VSR_IO_SYNC_DSYNC;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_append(1, 1, 50)), VSR_IO_OK);
+    sync_op = submit_sync(1);
+    harness_run();
+    expect_completion(sync_op, VSR_IO_OK);
+    h.now += UINT64_C(100000000);
+    harness_poll();
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->superblock_floor == 1);
+    harness_poll();
+    CHECK(harness_prepare() == 0);
+    harness_close();
+}
+
 /* Names the test that fails; VSR_STORE_TEST in the environment runs
  * only the test of that name. */
 #define RUN(test)                                                              \
@@ -6818,6 +7018,9 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_client_base_moved);
     RUN(test_walk);
     RUN(test_walk_bounds);
+    RUN(test_review_create_continue);
+    RUN(test_review_sync_continue);
+    RUN(test_review_idle_flush);
     printf("store: ok\n");
     return 0;
 }
