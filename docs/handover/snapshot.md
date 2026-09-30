@@ -7,7 +7,19 @@ engines with real stores, links and streams) and ran two mutation
 campaigns. Decisions P1..P5 in docs/io-design.md section 10 are
 placeholders (the coordinator renumbers); docs/io-implementation.md
 "Snapshots", 5.4, 7.1, 7.4, 7.5, section 10 and section 11 are updated.
-`store.c`/`store.h` are untouched.
+`store.c`/`store.h` are untouched. `main` (e3385c0, the stream review,
+decisions 100-103) is merged in; the module's library-stream paths agree
+with them (it completes DATA ops by the id given, closes each accepted
+served stream once with a valid status, and its served FILE write names
+an engine slot, which 103 allows for library streams).
+
+Verification (Debian, kernel 7.2, clang 21, gcc 16): `make check` 67/67
+under clang ASan+UBSan (`--enable-werror`) and gcc (`--enable-werror
+--disable-sanitize`); `make format-check` clean; clang-tidy 21 and cppcheck
+clean on src/io/snapshot.c and tests/unit/snapshot.c. `make lint` still
+fails on files outside this work: clang-tidy 21's new
+`clang-analyzer-security.ArrayBound` on store.c's container_of, cppcheck
+on uring.c (style), tests/unit/stream.c and executor_conformance.c.
 
 ## Data structures (src/io/snapshot.h)
 
