@@ -460,6 +460,24 @@ static void submit(struct simulation *s, uint32_t index, uint32_t client)
     CHECK(result.result == VSR_OK || result.result == VSR_AGAIN);
 }
 
+/* With links modelled, a partition cuts the links across it: a SEND to the
+ * other side fails as one to a crashed node does, instead of carrying a
+ * message the delivery action then drops. Links to crashed nodes need no
+ * bookkeeping: the cluster fails those SENDs itself. */
+static void apply_links(struct simulation *s)
+{
+    if (!flag(s, SCENARIO_LINKS))
+        return;
+    for (uint32_t i = 0; i < s->count; ++i) {
+        bool side = (s->partition & (UINT32_C(1) << i)) != 0;
+        for (uint32_t j = 0; j < s->count; ++j) {
+            bool other = (s->partition & (UINT32_C(1) << j)) != 0;
+            if (i != j)
+                mem_cluster_set_link(s->cluster, i + 1, j + 1, side == other);
+        }
+    }
+}
+
 static void restart(struct simulation *s, uint32_t index)
 {
     ++s->incarnation[index];
@@ -652,6 +670,7 @@ static void spawn_learner(struct simulation *s)
     s->count = index + 1;
     mem_node_output_capacity(s->nodes[index], 1 + choose(s, 4));
     time_event(s->nodes[index], s->now);
+    apply_links(s);
     record(s, "learner", index, role);
 }
 
@@ -959,6 +978,7 @@ static void random_event(struct simulation *s)
             s->partition = s->partition == 0
                                ? 1 + choose(s, (UINT32_C(1) << s->count) - 2)
                                : 0;
+            apply_links(s);
             record(s, "partition", s->partition, 0);
         }
         record(s, "drain", index, 0);
@@ -1031,6 +1051,7 @@ static void heal(struct simulation *s)
     uint64_t committed = 0;
     s->healing = true;
     s->partition = 0;
+    apply_links(s);
     for (uint32_t i = 0; i < s->count; ++i)
         if (!alive(s, i) && restartable(s, i))
             restart(s, i);
@@ -1167,6 +1188,8 @@ void scenario_run(const struct scenario_options *options,
              s.durability, operations, cache, options->profile);
     if (!options->quiet)
         fprintf(stderr, "%s\n", header);
+    if (flag(&s, SCENARIO_LINKS))
+        mem_cluster_model_links(s.cluster, true);
     s.base = mem_options(1, NULL);
     s.base.durability = s.durability;
     s.base.limits.operations = operations;

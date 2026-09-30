@@ -63,6 +63,19 @@ const struct vsr_op *mem_node_effect(const struct mem_node *node, size_t index);
  * pending (e.g. a preceding STORE or a future snapshot revision). */
 bool mem_node_execute(struct mem_node *node, size_t index, int status);
 bool mem_node_complete(struct mem_node *node, size_t index, int status);
+/* Link model. By default every SEND completes OK and its message waits in the
+ * cluster queue whether or not the destination is alive; the driver delivers,
+ * drops, or duplicates it. With links modelled, a SEND to a node that is
+ * crashed, unknown, or whose link the driver cut completes RETRY and carries
+ * nothing, as the I/O layer's link module answers a SEND to a node it has no
+ * link to. The core sends again at once on RETRY, so, as that engine defers
+ * such completions (decision 129), the completion becomes available only once
+ * the sender's clock has advanced retry_ns past the failure: mem_node_complete
+ * returns false for it until then. Every link is up initially; a restart
+ * restores the links to the node. */
+void mem_cluster_model_links(struct mem_cluster *cluster, bool links);
+void mem_cluster_set_link(struct mem_cluster *cluster, uint64_t from,
+                          uint64_t to, bool up);
 /* Explicit completion injection for contract tests. Does not execute the
  * effect. A rejected event leaves the effect active; consumed completion ends
  * its graph lifetime. Data is cloned using the pending operation's schema. */

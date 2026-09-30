@@ -91,8 +91,7 @@ REGRESSION_TESTS = tests/regression/trim_resend \
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 # Reproductions of open safety bugs found in review go here; they turn into
 # XPASS once the core is fixed and then move to the ordinary regressions.
-XFAIL_TESTS = tests/regression/dead_backup_apply \
-  tests/regression/held_store_deadline
+XFAIL_TESTS =
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
 tests_unit_checked_LDADD = $(LIBVSR)
@@ -324,11 +323,11 @@ tests_fuzzy_cluster_SOURCES = tests/fuzzy/cluster.c $(CLUSTER_SCENARIO) \
   tests/lib/random.c tests/lib/random.h
 tests_fuzzy_cluster_LDADD = $(LIBVSR)
 # The same scheduler with a wider default flag union: 16 seeds of
-# 1+4+8+16+64. Flags 2 and 32 run in the campaigns listed in
+# 1+4+8+16+64+128. Flags 2 and 32 run in the campaigns listed in
 # docs/implementation.md rather than on every check, to bound its time.
 tests_fuzzy_cluster_extended_SOURCES = $(tests_fuzzy_cluster_SOURCES)
 tests_fuzzy_cluster_extended_CPPFLAGS = $(AM_CPPFLAGS) \
-  -DCLUSTER_DEFAULT_COUNT=16 -DCLUSTER_DEFAULT_PROFILE=93
+  -DCLUSTER_DEFAULT_COUNT=16 -DCLUSTER_DEFAULT_PROFILE=221
 tests_fuzzy_cluster_extended_LDADD = $(LIBVSR)
 EXTRA_PROGRAMS = tests/benchmark/core
 tests_benchmark_core_SOURCES = tests/benchmark/core.c \

@@ -19,7 +19,8 @@ enum scenario_flags {
     SCENARIO_IO_FAULTS = 16,  /* Transient RETRY/NOT_FOUND on retryable I/O. */
     SCENARIO_MEMBERSHIP = 32, /* Learners, RECONFIGURE, CHECK_EPOCH. */
     SCENARIO_READS = 64,      /* Read barriers issued right before faults. */
-    SCENARIO_PROFILE_MAX = 127
+    SCENARIO_LINKS = 128,     /* SENDs to unreachable nodes complete RETRY. */
+    SCENARIO_PROFILE_MAX = 255
 };
 
 struct scenario_source {

@@ -21,8 +21,16 @@ struct mem_effect {
     struct mem_graph *result_graph;
     const void *result;
     int status;
+    uint64_t due; /* Held completion: available once the clock reaches it. */
     bool started;
     bool executed;
+    bool held;
+};
+
+/* A link the driver cut, observed with links modelled. */
+struct mem_link {
+    uint64_t from;
+    uint64_t to;
 };
 
 struct mem_delivery {
@@ -110,6 +118,8 @@ struct mem_node {
     uint64_t completing; /* Operation whose completion this step consumed. */
     uint64_t issued;     /* Operations emitted by this incarnation. */
     uint64_t completed;  /* Completions it accepted. */
+    uint64_t now;        /* The last TIME this incarnation consumed. */
+    bool time_set;
 };
 
 struct mem_cluster {
@@ -127,6 +137,9 @@ struct mem_cluster {
     size_t execution_count;
     struct mem_client_latest *clients;
     size_t client_count;
+    struct mem_link *cuts;
+    size_t cut_count;
+    bool links;
 };
 
 static void action_prerequisites(struct mem_node *node,
@@ -434,6 +447,25 @@ static struct mem_step submit_graph(struct mem_node *node,
     result.flags = update.flags;
     result.deadline = update.deadline_ns;
     CHECK(update.consumed <= (input == NULL ? 0u : 1u));
+    if (input != NULL && event.type == VSR_EVENT_TIME && update.consumed == 1) {
+        node->now = event.id;
+        node->time_set = true;
+    }
+    /* A deadline promises that time alone will wake the core into work. At
+     * an idle return nothing runnable remains, so a deadline at or before
+     * the clock the core has seen would be reported again at every TIME
+     * event, and a host that wakes at deadlines would spin: every timer the
+     * core reports must lie in its future, or be withheld while what it
+     * waits for is a completion rather than time (regression
+     * held_store_deadline). */
+    if ((result.result == VSR_OK || result.result == VSR_AGAIN) &&
+        (update.flags & VSR_UPDATE_MORE) == 0 && node->time_set)
+        ORACLE(node, NULL,
+               update.deadline_ns == VSR_NO_DEADLINE ||
+                   update.deadline_ns > node->now,
+               "idle with deadline %" PRIu64 " at time %" PRIu64
+               " (flags %" PRIu32 ", %zu effects)",
+               update.deadline_ns, node->now, update.flags, node->effect_count);
     if (graph != NULL &&
         (input == NULL || event.data == NULL || update.consumed == 0)) {
         if (event.lease != 0)
@@ -568,6 +600,51 @@ const struct vsr_op *mem_node_effect(const struct mem_node *node, size_t index)
 {
     CHECK(index < node->effect_count);
     return &node->effects[index]->op;
+}
+
+void mem_cluster_model_links(struct mem_cluster *cluster, bool links)
+{
+    cluster->links = links;
+}
+
+static size_t cut_find(const struct mem_cluster *cluster, uint64_t from,
+                       uint64_t to)
+{
+    for (size_t i = 0; i < cluster->cut_count; i++)
+        if (cluster->cuts[i].from == from && cluster->cuts[i].to == to)
+            return i;
+    return cluster->cut_count;
+}
+
+void mem_cluster_set_link(struct mem_cluster *cluster, uint64_t from,
+                          uint64_t to, bool up)
+{
+    size_t index = cut_find(cluster, from, to);
+    if (up) {
+        if (index == cluster->cut_count)
+            return;
+        cluster->cuts[index] = cluster->cuts[cluster->cut_count - 1];
+        cluster->cut_count--;
+        return;
+    }
+    if (index != cluster->cut_count)
+        return;
+    cluster->cuts =
+        resize(cluster->cuts, cluster->cut_count + 1, sizeof(*cluster->cuts));
+    cluster->cuts[cluster->cut_count++] = (struct mem_link){from, to};
+}
+
+/* Whether a SEND from this node to a destination finds a link. */
+static bool linked(const struct mem_cluster *cluster,
+                   const struct mem_node *from, uint64_t to)
+{
+    const struct mem_node *node;
+    if (!cluster->links)
+        return true;
+    node = mem_cluster_find(cluster, to);
+    if (node == NULL || !mem_node_alive(node))
+        return false;
+    return cut_find(cluster, from->options.replica, to) == cluster->cut_count;
 }
 
 static struct mem_delivery *message_append(struct mem_cluster *cluster,
@@ -1352,6 +1429,14 @@ bool mem_node_execute(struct mem_node *node, size_t index, int status)
     switch (effect->op.type) {
     case VSR_OP_SEND: {
         struct mem_cluster *cluster = node->cluster;
+        if (!linked(cluster, node, effect->op.arg)) {
+            /* No link: the message is not carried, and the failure is
+             * reported retry_ns later on the sender's clock. */
+            effect->status = VSR_IO_RETRY;
+            effect->held = true;
+            effect->due = node->now + node->options.retry_ns;
+            break;
+        }
         cluster->messages =
             message_append(cluster, effect->op.data, effect->op.arg);
         break;
@@ -1507,6 +1592,8 @@ bool mem_node_complete(struct mem_node *node, size_t index, int status)
     if (!mem_node_execute(node, index, status))
         return false;
     const struct mem_effect *effect = node->effects[index];
+    if (effect->held && (!node->time_set || node->now < effect->due))
+        return false;
     step = mem_node_notify(node, index, effect->status, effect->result);
     CHECK(step.result == VSR_OK || step.result == VSR_AGAIN);
     return step.consumed != 0;
@@ -1632,6 +1719,8 @@ void mem_node_crash(struct mem_node *node)
     node->admission_count = 0;
     node->issued = 0;
     node->completed = 0;
+    node->now = 0;
+    node->time_set = false;
     application_reset(node);
     mem_store_crash(node->store);
     for (size_t i = node->snapshot_count; i > 0; i--) {
@@ -1772,6 +1861,7 @@ void mem_cluster_destroy(struct mem_cluster *cluster)
     free(cluster->snapshots);
     free(cluster->executions);
     free(cluster->clients);
+    free(cluster->cuts);
     mem_graph_destroy(cluster->oracle);
     free(cluster->nodes);
     free(cluster);
