@@ -2961,6 +2961,13 @@ static bool capture_deadline_armed(const struct engine *e)
     return e->io->deadlines.entries[DEADLINE_CAPTURE].when != VSR_NO_DEADLINE;
 }
 
+/* The replica's CAPTURE deadline is due now: the loop polls and prepares
+ * again at once instead of sleeping. */
+static bool capture_deadline_now(const struct engine *e)
+{
+    return e->io->deadlines.entries[DEADLINE_CAPTURE].when <= world.now;
+}
+
 /* A fresh engine 0 with a store holding an identity and `clients` clients
  * with 8-byte results; returns the next sequence. */
 static uint64_t fresh_store(struct engine **out, uint64_t seed,
@@ -5064,8 +5071,28 @@ static void test_review_dir_retry(void)
     CHECK(a->dir_opens == 1 && a->fail_dir_opens == 1);
     CHECK(a->snapshots->dir_slot == NONE);
     x = capture(a);
-    /* The SYNC's own open fails too: FAILED once, bounded. */
-    joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_FAILED);
+    /* The SYNC's own open fails too: FAILED once, bounded. The caller
+     * answered first, so the failure found in the module's prepare
+     * completes the op there, and wakes the loop to deliver it. */
+    {
+        struct task_holder h;
+        uint64_t op;
+        uint32_t steps = 0;
+
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &h, x, &op) == VSR_OK);
+        step_checked(a);
+        CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_SYNC, op) != NULL);
+        caller_done(a, op, VSR_IO_OK, NULL);
+        vsr_io_deadlines_arm(&a->io->deadlines, DEADLINE_CAPTURE,
+                             VSR_NO_DEADLINE);
+        while (entry_of(a, x)->op != 0) {
+            step_checked(a);
+            CHECK(++steps < 20);
+        }
+        CHECK(capture_deadline_now(a));
+        expect_core(a, op, VSR_IO_FAILED);
+        settle();
+    }
     CHECK(a->dir_opens == 2 && a->fail_dir_opens == 0);
     CHECK(entry_of(a, x)->state == VSR_IO_SNAPSHOT_WRITTEN);
     expect_idle(a);
@@ -5202,6 +5229,51 @@ static void test_review_witness_promotion(void)
     engine_crash(e);
 }
 
+/* A serve that finds no engine file slot for its open ends the stream
+ * RETRY: an OK close with nothing written would be a truncated file at the
+ * requester, CORRUPT there. The refusal is decided in the module's prepare,
+ * after the links' prepare ran, so the loop is woken at once to send the
+ * END; without that it waited for an unrelated event (at worst the
+ * requester's inactivity timer). */
+static void test_review_serve_no_slot(void)
+{
+    struct engine *a = &world.engines[0];
+    struct engine *b = &world.engines[1];
+    struct vsr_id x = fetch_setup(135, 8);
+    uint32_t slots[FILE_SLOTS];
+    uint32_t count = 0;
+    uint32_t rounds = 0;
+    uint32_t slot;
+    struct task_holder h;
+    uint64_t op;
+
+    while ((slot = vsr_io_engine_slot_alloc(a->io)) != NONE) {
+        slots[count++] = slot;
+    }
+    CHECK(count > 0);
+    vsr_io_engine_slot_free(a->io, slots[--count]); /* The link's. */
+    vsr_io_deadlines_arm(&a->io->deadlines, DEADLINE_CAPTURE, VSR_NO_DEADLINE);
+    CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+    while (a->snapshots->serves[0].state != 2 /* OPEN */) {
+        step_checked(b);
+        step_checked(a);
+        CHECK(++rounds < 200);
+    }
+    CHECK(a->snapshots->serves[0].slot == NONE && capture_deadline_now(a));
+    settle();
+    CHECK(forwarded_count(b, VSR_IO_OP_CORE) == 0);
+    expect_core(b, op, VSR_IO_RETRY);
+    CHECK(clients_file(b, x, false) == NULL &&
+          clients_file(b, x, true) == NULL && entry_of(b, x) == NULL);
+    CHECK(entry_of(a, x)->readers == 0 && a->snapshots->serves[0].state == 0);
+    while (count > 0) {
+        vsr_io_engine_slot_free(a->io, slots[--count]);
+    }
+    fetch(b, x, 1);
+    expect_idle(a);
+    expect_idle(b);
+}
+
 int main(void)
 {
     test_capture();
@@ -5221,5 +5293,6 @@ int main(void)
     test_review_dir_retry();
     test_review_record_integrity();
     test_review_witness_promotion();
+    test_review_serve_no_slot();
     return 0;
 }

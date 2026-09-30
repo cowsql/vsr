@@ -453,12 +453,22 @@ static void op_complete(struct vsr_io_replica *rep,
 }
 
 /* A step waits for a resource (a slab, a slot, a file operation): the
- * replica's CAPTURE deadline makes the loop poll and prepare again. */
+ * replica's CAPTURE deadline makes the loop poll and prepare again in a
+ * millisecond (its pop needs no dispatch). */
 static void retry_later(struct vsr_io *io, struct vsr_io_replica *rep)
 {
     rep->snapshots.retry = 1;
     vsr_io_deadlines_arm(&io->deadlines, rep->deadline_capture,
                          io->now + SNAPSHOT_RETRY_NS);
+}
+
+/* The module's prepare decided an outcome (a completion to the core, a
+ * stream's close, a failed directory) after the core's poll and the links'
+ * prepare ran: the loop must poll and prepare again at once, or the
+ * outcome waits for an unrelated event to wake it. */
+static void wake_now(struct vsr_io *io, struct vsr_io_replica *rep)
+{
+    vsr_io_deadlines_arm(&io->deadlines, rep->deadline_capture, io->now);
 }
 
 /* Frees an engine file slot the module holds, clearing its descriptor. */
@@ -2555,6 +2565,7 @@ static bool prepare_entry(struct vsr_io *io, uint32_t replica, uint32_t index,
         }
         if (s->dir_state != DIR_OPEN) {
             sync_done(io, replica, entry, STEP_FSYNC_DIR, -EIO);
+            wake_now(io, rep);
             return false;
         }
     }
@@ -2588,6 +2599,7 @@ static bool prepare_entry(struct vsr_io *io, uint32_t replica, uint32_t index,
         fileop_free(s, op);
         entry->step = STEP_IDLE;
         entry_done(io, replica, entry, step, -ENAMETOOLONG);
+        wake_now(io, rep);
         return false;
     }
     switch (step) {
@@ -2645,6 +2657,7 @@ static bool prepare_entry(struct vsr_io *io, uint32_t replica, uint32_t index,
                 fileop_free(s, op);
                 entry->step = STEP_IDLE;
                 writer_finish(io, replica, VSR_IO_FAILED);
+                wake_now(io, rep);
                 return false;
             }
             sqe_transfer(io, sqe, VSR_IO_SQE_READ, (uint32_t)fd,
@@ -2736,6 +2749,7 @@ static bool prepare_serve(struct vsr_io *io, uint32_t replica, uint32_t stream,
             serve->state = SERVE_OPEN;
             (void)vsr_io_streams_close(
                 io, vsr_io_streams_handle(&io->streams, stream), VSR_IO_RETRY);
+            wake_now(io, rep);
             return false;
         }
     }
@@ -2759,6 +2773,7 @@ static bool prepare_serve(struct vsr_io *io, uint32_t replica, uint32_t stream,
             vsr_io_slots_free(&io->slots, slot);
             fileop_free(s, op);
             serve_done(io, replica, stream, STEP_OPEN, -ENAMETOOLONG);
+            wake_now(io, rep);
             return false;
         }
         sqe_path(sqe, VSR_IO_SQE_OPENAT, rep->store.dir_fd, fileop->path,
@@ -2814,6 +2829,7 @@ static bool prepare_dir(struct vsr_io *io, uint32_t replica,
         s->dir_slot = NONE;
         s->dir_state = DIR_FAILED;
         s->error = -ENAMETOOLONG;
+        wake_now(io, rep);
         return false;
     }
     sqe_path(sqe, VSR_IO_SQE_OPENAT, rep->store.dir_fd, fileop->path,
