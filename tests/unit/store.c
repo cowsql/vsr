@@ -1033,7 +1033,7 @@ static void txn_entries(struct txn *t, uint64_t first, uint32_t count,
         for (size_t b = 0; b < body; ++b) {
             t->bodies[i][b] =
                 (unsigned char)(sequence * 31u + (uint64_t)i * 7u + b +
-                                txn_salt * 101u);
+                                (uint64_t)txn_salt * 101u);
         }
         t->spans[i].data = t->bodies[i];
         t->spans[i].size = body;
@@ -1117,8 +1117,8 @@ static const struct txn *txn_clients(uint64_t sequence, uint32_t count,
         struct vsr_client_record *record = &t->records[i];
 
         for (size_t b = 0; b < result; ++b) {
-            t->results[i][b] =
-                (unsigned char)(numbers[i] * 13u + b + txn_salt * 101u);
+            t->results[i][b] = (unsigned char)(numbers[i] * 13u + b +
+                                               (uint64_t)txn_salt * 101u);
         }
         t->result_spans[i].data = t->results[i];
         t->result_spans[i].size = result;
@@ -6468,7 +6468,10 @@ static void walk_step(uint8_t action, uint8_t arg)
     h.now += (uint64_t)(action >> 4) * 10000000; /* Idle writes fire. */
     switch (action & 15) {
     case 9:
-        walk_publish();
+        walk_housekeep(); /* A PUBLISH is a record too. */
+        if (!walk.exhausted) {
+            walk_publish();
+        }
         break;
     case 10:
         if (h.store->readable > 0) {
@@ -6620,10 +6623,10 @@ static void test_walk(void)
     CHECK(total.torn > 0 && total.lost > 0 && total.captures > 0);
 }
 
-/* A walk that submits more SYNCs than the core's `operations` bound
- * before it lets them complete, and more RECLAIMs than the walk expects
- * at once: it waits as the core would (the recovery fuzzer's first
- * crash was the store refusing the seventeenth SYNC). */
+/* Walks the recovery fuzzer broke: more SYNCs than the core's
+ * `operations` bound before they complete, and more RECLAIMs than the
+ * store's completion ring holds (the walk waits as the core would: the
+ * fuzzer's first crash was the store refusing the seventeenth SYNC). */
 static void test_walk_bounds(void)
 {
     uint8_t bytes[1 + 2 * (3 + 40 + 70)];
@@ -6645,6 +6648,16 @@ static void test_walk_bounds(void)
     CHECK(n == sizeof(bytes));
     walk_run(bytes, n);
     CHECK(!walk.failed && walk.stats.syncs == 40 && walk.stats.reclaims >= 70);
+    /* PUBLISH steps alone: each is a record, so the walk reclaims before
+     * them as before any STORE (the fuzzer's second crash: the slots
+     * filled under a RECLAIM that never moved and a STORE failed). */
+    n = 1;
+    for (uint32_t i = 0; i < 60; ++i) {
+        bytes[n++] = 9;
+        bytes[n++] = 0;
+    }
+    walk_run(bytes, n);
+    CHECK(!walk.failed && walk.stats.captures >= 60);
 }
 
 /* Names the test that fails; VSR_STORE_TEST in the environment runs
