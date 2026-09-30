@@ -246,6 +246,36 @@ a group; the LIMIT answer path through `vsr_io_run`; `wait_min_*`.
    `tests/lib/pure_executor` (arm around the four primitives) in the new
    tests too; it can wrap a ring.
 
+## The store review's items for the engine
+
+- `vsr_io_store_close` drops queued STOREs, SYNCs and LOADs without a
+  completion. Detach runs only at STOPPED, which core.c's `maybe_stopped`
+  grants only with every operation slot free and no lease: every store op
+  was completed and fed before the STATUS that reported STOPPED. Detach
+  asserts the store's queues are empty (replica.c). No cancel path is
+  needed for exactly-once; what phase 2 should test is that a STOP never
+  waits for ever on a held STORE (the holds vsr-io.h lists all end
+  without the core: writes complete, leases are released by the stopping
+  core, a clients file is read), e.g. STOP with write-behind full and a
+  LOAD lease pinning the ring.
+- Replicated mode: the core issues no SYNC; `vsr_io_store_poll` arms the
+  replica's FLUSH deadline at `flush_interval_ns`, prepare's deadline
+  covers it (`vsr_io_deadlines_earliest`), and the next poll's store poll
+  issues the flush. `test_replicated_flush` pins it (the store's
+  `flushed` reaches what it packed with no further event). The status's
+  `durable` stays 0 there (it counts SYNCs; section 11).
+- Decision 125 (on main with the store review): a creation write error
+  fences under CONTINUE, a SYNC in memory-only mode completes FAILED. The
+  engine routes both like any completion; detach does not wait for
+  unwritten bytes of a fenced store (`store_unwritten`). Untested at the
+  engine level: phase 2's fault-wrapper tests should fail a creation
+  write and check STOP and detach still finish.
+- The core serializes CAPTURE and PUBLISH and the replicated-mode DROP of
+  the previous anchor; the engine keeps emission order across updates and
+  within an update routes LOADs, then STOREs, then SYNC and RECLAIM, then
+  the rest (decision 51), so a CAPTURE is routed after its update's
+  STOREs and never ahead of an earlier update's op.
+
 ## Open items
 
 In docs/io-implementation.md section 11: EXTERNAL inbound links cannot

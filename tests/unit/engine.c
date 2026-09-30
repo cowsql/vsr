@@ -189,6 +189,7 @@ struct world {
     uint32_t nodes;
     struct node node[NODES];
     uint64_t incarnation;
+    uint32_t durability; /* Of the replicas attached next. */
 };
 
 static struct world world;
@@ -355,6 +356,7 @@ static void world_open(uint32_t nodes, uint64_t seed)
 
     CHECK(nodes <= NODES);
     memset(&world, 0, sizeof(world));
+    world.durability = VSR_DURABLE;
     memset(&options, 0, sizeof(options));
     options.seed = seed;
     options.nodes = nodes;
@@ -1031,7 +1033,7 @@ static void app_options(struct app *app, struct vsr_id cluster,
     core->retry_ns = 5 * MS;
     core->transfer_timeout_ns = 100 * MS;
     core->start_mode = mode;
-    core->durability = VSR_DURABLE;
+    core->durability = world.durability;
     app->options.store = store_options();
     snprintf(app->path, sizeof(app->path), "c%" PRIu64 "-r%" PRIu64, cluster.lo,
              replica_id);
@@ -1125,6 +1127,17 @@ static bool replies_reached(void *ctx)
     const struct replies_at_least *want = ctx;
 
     return want->app->replies >= want->replies;
+}
+
+/* Everything the store packed has been written (not necessarily
+ * flushed). */
+static bool store_written(void *ctx)
+{
+    const struct app *app = ctx;
+    struct vsr_io_store_status store;
+
+    vsr_io_replica_status(app->replica, NULL, &store);
+    return store.written >= store.readable && store.unwritten_bytes == 0;
 }
 
 static void stop_app(struct app *app)
@@ -3411,6 +3424,62 @@ static void test_view_change(void)
  * Test: the primitives never call the executor (decision E7)
  * ---------------------------------------------------------------------- */
 
+/* In replicated mode the core never SYNCs: the store flushes its writes
+ * every flush_interval_ns (100 ms at zero) on the replica's FLUSH
+ * deadline. Nothing else asks for that flush, so prepare's deadline must
+ * cover it and the next poll must let the store issue it; the log then
+ * becomes durable with no further event. A STOP and detach end it, the
+ * store closing with nothing of the core's queued (STOPPED means every op
+ * completed). */
+static void test_replicated_flush(void)
+{
+    struct node *n;
+    struct app *app;
+    struct replies_at_least want;
+    struct vsr_io_store_status store;
+    struct vsr_io_sqe sqes[BATCH];
+    uint64_t deadline = 0;
+    uint64_t flush_at;
+    uint32_t count = 0;
+
+    world_open(1, 23);
+    world.durability = VSR_REPLICATED;
+    n = node_open(0);
+    app = app_attach(n, 0, cluster_of(1), 1, 1, VSR_START_NEW);
+    CHECK(run_until(app_normal, app, 20000));
+    for (uint64_t i = 1; i <= 3; ++i) {
+        (void)submit_request(app, i, 1);
+    }
+    want.app = app;
+    want.replies = 3;
+    CHECK(run_until(replies_reached, &want, 20000));
+    vsr_io_replica_status(app->replica, NULL, &store);
+    CHECK(store.durable == 0);
+    /* Written but not flushed: the FLUSH deadline is armed within the
+     * interval and prepare reports it (or something earlier). */
+    CHECK(run_until(store_written, app, 20000));
+    vsr_io_replica_status(app->replica, NULL, &store);
+    CHECK(app->replica->store.flushed < store.readable);
+    flush_at = n->io->deadlines.entries[app->replica->deadline_flush].when;
+    CHECK(flush_at != VSR_NO_DEADLINE);
+    CHECK(flush_at <= n->io->now + 100 * MS);
+    CHECK(PURE(n, vsr_io_prepare(n->io, n->io->now, sqes, BATCH, &count,
+                                 &deadline)) == VSR_OK);
+    CHECK(deadline <= flush_at);
+    CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) == 0);
+    run_for(150 * MS);
+    /* vsr_io_store_status's durable counts SYNCs, which replicated mode
+     * never issues; the flush shows in the store's own flushed. */
+    vsr_io_replica_status(app->replica, NULL, &store);
+    CHECK(app->replica->store.flushed >= store.readable);
+    CHECK(store.durable == 0);
+    CHECK(store.error == 0);
+    stop_app(app);
+    detach_app(app);
+    close_node(n);
+    world_close();
+}
+
 /* Every test runs with the purity guard armed around the primitives (and
  * the routing seam, the modules' polls, close and the node calls); this one
  * checks the guard itself, then runs a scenario across links, TRUSTED
@@ -3520,6 +3589,7 @@ int main(int argc, char **argv)
     RUN(test_stream_timers);
     RUN(test_redial);
     RUN(test_view_change);
+    RUN(test_replicated_flush);
     RUN(test_purity);
 #undef RUN
     return 0;

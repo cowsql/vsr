@@ -1793,8 +1793,12 @@ drains; `STATUS` with STOPPED marks the replica STOPPED. `vsr_io_detach`:
 `EBUSY` unless STOPPED, no forwarded op in the ring names the replica, the
 store has no packed bytes left to write, no deferred completion waits, and
 `vsr_io_snapshots_close` and `vsr_io_store_close` both return OK (no
-write, flush or file operation in flight); then the log's, the
-directory's and any clients file's slots are given back
+write, flush or file operation in flight). `vsr_io_store_close` drops
+the store's queued core ops without completing them, which is safe only
+because none is left: the core reaches STOPPED with every op completed,
+and the engine fed every completion queued before that STATUS (asserted
+at detach). Then the log's, the directory's and any clients file's slots
+are given back
 (`vsr_io_engine_slot_clear`, a `FILES_UPDATE` of -1 each from the next
 prepare, decision E9), queued events drop their engine leases,
 `update_buffer(index, NULL)` unregisters the tail (teardown may call the
@@ -2117,6 +2121,11 @@ of `docs/io-design.md`:
   (decision E3), adding that latency to an unauthorized or queue-full
   destination; the core's own backoff would be the better pacing if it
   had one for SEND.
+- `vsr_io_store_status.durable` counts SYNCs, so it stays 0 in
+  replicated mode although the store flushes every `flush_interval_ns`
+  (vsr-io.h calls it the last flushed transaction); the unit test reads
+  the store's own `flushed` instead. A status field for the flushed
+  sequence would let a caller see replicated-mode durability.
 - `vsr_io_run` drops events refused with `ELIMIT`, so its callers cannot
   answer LIMIT to a client the store does not admit (decision E6).
 - When the executor fails a submission (`submit_and_wait` below zero),

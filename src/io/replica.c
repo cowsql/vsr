@@ -533,6 +533,15 @@ int vsr_io_detach(struct vsr_io_replica *replica)
         replica->deferred_count > 0) {
         return VSR_EBUSY;
     }
+    /* vsr_io_store_close drops the store's queued core ops without a
+     * completion (store review). None is left: the core is STOPPED only
+     * with every op completed (core.c maybe_stopped), and the engine fed
+     * every completion the store queued before the STATUS that reported
+     * it. */
+    REPLICA_ASSERT(replica->store.stores_count == 0 &&
+                   replica->store.syncs_count == 0 &&
+                   replica->store.loads_count == 0 &&
+                   replica->store.completions_count == 0);
     rc = vsr_io_snapshots_close(io, replica->index);
     if (rc != VSR_OK) {
         return rc;
