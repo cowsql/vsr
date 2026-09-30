@@ -4760,7 +4760,7 @@ static void test_wrap_seal(void)
     target = ring - 200;
     while (h.store->head < target) {
         uint64_t left = target - h.store->head;
-        uint64_t bytes = left > 3 * 128 ? 272 : left;
+        uint64_t bytes = left > UINT64_C(384) ? 272 : left;
 
         expect_completion(submit(append_of(sequence++, bytes)), VSR_IO_OK);
     }
@@ -5562,7 +5562,7 @@ static void checked_scan(struct checked *c, uint32_t slot, uint64_t generation)
         c->last_slot = slot;
         c->resume = slot_offset(slot) + round_up(at + length, BLOCK);
         for (uint32_t i = 0; i < count; ++i) {
-            const unsigned char *change = data + at + 48 + 24 * i;
+            const unsigned char *change = data + at + 48 + 24 * (uint64_t)i;
 
             checked_change(c, vsr_io_get_u32(change),
                            vsr_io_get_u32(change + 4),
@@ -6466,7 +6466,7 @@ static void walk_step(uint8_t action, uint8_t arg)
         walk_settle();
         if (walk.log_end > walk.log_begin) {
             uint64_t span = walk.log_end - walk.log_begin;
-            uint64_t first = walk.log_begin + (arg * 7u) % span;
+            uint64_t first = walk.log_begin + (uint64_t)arg * 7u % span;
             uint64_t end = first + 1 + ((arg >> 3) & 3);
 
             walk_check_log(first, end < walk.log_end ? end : walk.log_end);
