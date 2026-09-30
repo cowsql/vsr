@@ -3001,6 +3001,43 @@ static uint64_t fresh_store(struct engine **out, uint64_t seed,
     return sequence;
 }
 
+/* Engine file slots allocated (taken and not on the free list). */
+static uint32_t engine_slots_in_use(const struct engine *e)
+{
+    return e->io->file_slot_next - FILE_SLOT_BASE -
+           e->io->file_slots_free_count;
+}
+
+/* At rest, every engine file slot allocated is accounted for: the
+ * module's (kept, transient, serves, directory), the store's log, or a
+ * socket's; a slot taken and never installed would be none of them. */
+static void expect_slots_accounted(const struct engine *e)
+{
+    const struct vsr_io_snapshots *s = e->snapshots;
+    uint32_t known = 0;
+
+    for (uint32_t i = 0; i < s->count; ++i) {
+        known += s->entries[i].file_slot >= 0 ? 1 : 0;
+        known += s->entries[i].tmp_slot != NONE ? 1 : 0;
+    }
+    for (uint32_t i = 0; i < s->serves_count; ++i) {
+        known += s->serves[i].slot != NONE ? 1 : 0;
+    }
+    known += s->dir_slot != NONE ? 1 : 0;
+    known += e->store->log_slot >= 0 ? 1 : 0;
+    for (uint32_t i = 0; i < SOCKETS; ++i) {
+        known += world.socks[i].used && world.socks[i].owner == e->index &&
+                         world.socks[i].slot >= 0
+                     ? 1
+                     : 0;
+    }
+    if (known != engine_slots_in_use(e)) {
+        fprintf(stderr, "engine %u: %u file slots in use, %u accounted for\n",
+                e->index, engine_slots_in_use(e), known);
+    }
+    CHECK(known == engine_slots_in_use(e));
+}
+
 /* The module holds nothing but kept slots: no job, writer, reader, lease,
  * slab or file operation. */
 static void expect_idle(const struct engine *e)
@@ -3025,6 +3062,7 @@ static void expect_idle(const struct engine *e)
         CHECK(s->serves[i].state == 0 && s->serves[i].slot == NONE);
     }
     CHECK(e->replica->leases_free == REGIONS);
+    expect_slots_accounted(e);
 }
 
 /* Client i of store_clients. */
@@ -5593,6 +5631,77 @@ static void test_review_open_held_chunks(void)
     expect_idle(b);
 }
 
+/* A temporary file left by an earlier fetch (a crash mid-transfer) is
+ * truncated by the next one: the renamed file holds the source's bytes and
+ * nothing after them. */
+static void test_review_stale_tmp(void)
+{
+    struct engine *a = &world.engines[0];
+    struct engine *b = &world.engines[1];
+    struct vsr_id x = fetch_setup(141, 8);
+    unsigned char junk[2048];
+
+    memset(junk, 0x5A, sizeof(junk));
+    (void)file_install(b, x, true, junk, sizeof(junk));
+    CHECK(clients_file(b, x, true)->size > clients_file(a, x, false)->size);
+    fetch(b, x, 1);
+    CHECK(files_equal(clients_file(a, x, false), clients_file(b, x, false)));
+    expect_idle(b);
+}
+
+/* A fetch whose stream ends before its temporary file's open was issued
+ * (every file operation busy; the source refuses the id) completes with
+ * the stream's status and never closes the slot it never opened. */
+static void test_review_fetch_open_waits(void)
+{
+    struct engine *b = &world.engines[1];
+    struct vsr_id x = fetch_setup(142, 8);
+    struct vsr_id unknown = {x.hi ^ 0xFF, x.lo};
+    struct task_holder hs[3];
+    uint64_t ops[3];
+    struct vsr_id ids[3];
+    struct task_holder hc;
+    uint64_t capture_op;
+    struct vsr_id w;
+    struct task_holder hf;
+    uint64_t fetch_op;
+
+    for (uint32_t i = 0; i < 3; ++i) {
+        ids[i] = capture(b);
+    }
+    b->hold_fsync = true;
+    for (uint32_t i = 0; i < 3; ++i) {
+        CHECK(joint_start(b, VSR_OP_SNAPSHOT_SYNC, &hs[i], ids[i], &ops[i]) ==
+              VSR_OK);
+    }
+    settle();
+    for (uint32_t i = 0; i < 3; ++i) {
+        CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_SYNC, ops[i]) != NULL);
+    }
+    b->hold_pool_writes = true;
+    w = capture_begin(b, &hc, &capture_op);
+    CHECK(held_count(b) == 4);
+    CHECK(fetch_start(b, &hf, unknown, 1, &fetch_op) == VSR_OK);
+    settle();
+    CHECK(entry_of(b, unknown) == NULL || entry_of(b, unknown)->fileop == NONE);
+    expect_core(b, fetch_op, VSR_IO_NOT_FOUND);
+    CHECK(entry_of(b, unknown) == NULL &&
+          clients_file(b, unknown, true) == NULL);
+    b->hold_fsync = false;
+    b->hold_pool_writes = false;
+    world_release_held(b);
+    settle_retry();
+    for (uint32_t i = 0; i < 3; ++i) {
+        caller_done(b, ops[i], VSR_IO_OK, NULL);
+    }
+    task_result(&hc, w);
+    caller_done(b, capture_op, VSR_IO_OK, &hc.checkpoint);
+    settle();
+    expect_cores(b, ops, 3, VSR_IO_OK);
+    expect_checkpoint(b, capture_op, w, &hc);
+    expect_idle(b);
+}
+
 int main(void)
 {
     test_capture();
@@ -5621,5 +5730,7 @@ int main(void)
     test_review_long_read();
     test_review_short_cold_read();
     test_review_open_held_chunks();
+    test_review_stale_tmp();
+    test_review_fetch_open_waits();
     return 0;
 }
