@@ -1222,7 +1222,6 @@ static bool source_request(struct vsr_io *io, uint32_t link_index,
     if (is_library) {
         int r = vsr_io_snapshots_serve(io, at, &library);
 
-        /* cppcheck-suppress knownConditionTrueFalse ; the weak stub */
         if (r == VSR_OK) {
             stream->state = VSR_IO_STREAM_OPEN;
             stream->accepted = 1;
@@ -1548,47 +1547,4 @@ void vsr_io_streams_shutdown(struct vsr_io *io)
         }
         stream_lose(io, stream, -ECANCELED, VSR_IO_CANCELLED);
     }
-}
-
-/* -------------------------------------------------------------------------
- * Weak stubs of the snapshot module's hooks
- *
- * STUB: snapshot.c is a later module. These weak definitions let the tree
- * link and stand in for it: a library request is refused with RETRY, a
- * library chunk is completed at once, an end is ignored. The snapshot
- * module's strong definitions replace them; delete these then.
- * ---------------------------------------------------------------------- */
-
-__attribute__((weak)) int
-vsr_io_snapshots_serve(struct vsr_io *io, uint32_t stream,
-                       const struct vsr_io_wire_library_request *request)
-{
-    (void)io;
-    (void)stream;
-    (void)request;
-    return VSR_IO_RETRY;
-}
-
-__attribute__((weak)) void
-vsr_io_snapshots_stream_data(struct vsr_io *io, uint32_t replica,
-                             uint32_t stream, uint64_t op, uint64_t offset,
-                             const struct vsr_span *bytes, uint32_t slab)
-{
-    (void)replica;
-    (void)stream;
-    (void)offset;
-    (void)bytes;
-    (void)slab;
-    (void)vsr_io_streams_data_done(io, op);
-}
-
-__attribute__((weak)) void vsr_io_snapshots_stream_end(struct vsr_io *io,
-                                                       uint32_t replica,
-                                                       uint32_t stream,
-                                                       int32_t status)
-{
-    (void)io;
-    (void)replica;
-    (void)stream;
-    (void)status;
 }

@@ -1388,7 +1388,11 @@ int vsr_io_snapshots_serve(struct vsr_io *io, uint32_t stream,
 {
     snap.serves++;
     snap.served_stream = stream;
-    snap.request = *request;
+    /* cppcheck's whole-program pass pairs this double with the snapshot
+     * test's NULL call into the real module. */
+    if (request != NULL) {
+        snap.request = *request;
+    }
     if (snap.serve_result == VSR_OK) {
         io->streams.streams[stream].replica = 7;
     }
