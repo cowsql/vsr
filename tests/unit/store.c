@@ -5366,7 +5366,7 @@ static void test_client_base_moved(void)
     CHECK(file->count == 3 && file->offsets[2] != old_offset);
     expect_completion(submit(txn_publish(++sequence, x2, 1)), VSR_IO_OK);
     harness_run();
-    loaded = expect_loaded(log_op, VSR_IO_OK, &lease);
+    (void)expect_loaded(log_op, VSR_IO_OK, &lease);
     release_lease(lease);
     loaded = expect_loaded(op, VSR_IO_OK, &lease);
     CHECK(loaded->count == 1);
@@ -5710,6 +5710,7 @@ static void checked_image(struct checked *c)
     uint32_t slot;
 
     memset(c, 0, sizeof(*c));
+    memset(headers, 0, sizeof(headers));
     c->status = VSR_IO_CORRUPT;
     if (sb == NULL) {
         return;
@@ -6238,10 +6239,11 @@ static void walk_check_log(uint64_t first, uint64_t end)
     const struct vsr_entry *entries;
     uint32_t reads = disk.reads;
     uint32_t lease = NONE;
-    uint64_t op;
 
     while (first < end) {
-        op = load_log(h.store->readable, first, end, 4, limits.message_bytes);
+        uint64_t op =
+            load_log(h.store->readable, first, end, 4, limits.message_bytes);
+
         harness_run();
         loaded = expect_loaded(op, VSR_IO_OK, &lease);
         /* A cold batch is cut to a slab: at least one entry comes. */
@@ -6269,7 +6271,6 @@ static void walk_check_client(uint32_t ci)
 {
     const struct walk_client *m = &walk.clients[ci];
     const struct vsr_loaded *loaded;
-    const struct vsr_client_record *record;
     uint32_t reads = disk.reads;
     uint32_t lease = NONE;
     uint64_t op = load_client(h.store->readable, walk_ids[ci]);
@@ -6280,10 +6281,10 @@ static void walk_check_client(uint32_t ci)
         CHECK(loaded->count == 0);
     } else {
         const struct txn *t = &txns[m->sequence];
+        const struct vsr_client_record *record = loaded->items;
         uint64_t size = t->records[m->index].result.data.size;
 
         CHECK(loaded->count == 1);
-        record = loaded->items;
         if (record->request.number != m->number || record->op != m->op) {
             fprintf(stderr,
                     "walk: client %u loaded number %" PRIu64 " op %" PRIu64
