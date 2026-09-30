@@ -65,11 +65,11 @@
 #define IOW_LEASES 192u  /* Caller leases per replica. */
 #define IOW_PENDING 256u /* Events waiting for a submit, per node. */
 #define IOW_SNAPSHOTS 16u
-#define IOW_STREAMS 8u /* Harness streams per node, each role. */
-#define IOW_STREAM_BYTES (256u * 1024u)
+#define IOW_STREAMS 8u           /* Harness streams per node, each role. */
+#define IOW_STREAM_BYTES 262144u /* 256 KiB */
 #define IOW_STREAM_WRITES 64u
-#define IOW_FILE_BYTES (64u * 1024u)
-#define IOW_HISTORY 8192u /* Ops tracked per cluster. */
+#define IOW_FILE_BYTES 65536u /* 64 KiB */
+#define IOW_HISTORY 8192u     /* Ops tracked per cluster. */
 #define IOW_CLUSTERS 8u
 #define IOW_RULES 8u
 #define IOW_MARKS 64u
@@ -276,16 +276,17 @@ struct iow_hook {
 };
 
 struct iow_node {
-    uint32_t index; /* Node id index + 1. */
-    bool open;      /* The loop runs it. */
-    bool crashed;
+    uint32_t index;       /* Node id index + 1. */
     uint32_t bank;        /* Memory bank of the current engine. */
     uint32_t incarnation; /* Engines this node has had. */
+    bool open;            /* The loop runs it. */
+    bool crashed;
+    bool use_faulty;
+    bool busy; /* The last iteration did something. */
     struct vsr_io *io;
     struct vsr_io_executor base;
     struct faulty_executor *faulty; /* NULL: none. */
     struct faulty_executor_options faulty_options;
-    bool use_faulty;
     struct iow_hook hook;
     struct pure_executor pure;
     struct vsr_io_executor ex; /* The engine's. */
@@ -297,9 +298,9 @@ struct iow_node {
     uint32_t pending_count;
     uint32_t hold_ops; /* Poll with capacity 0 while set. */
     uint64_t deadline; /* The last prepare's, for the ring's idle wait. */
-    bool busy;         /* The last iteration did something. */
     uint32_t spins;    /* Idle iterations in a row with a past deadline. */
     /* Rails. */
+    uint32_t held_data_count;
     struct iow_rstream rstreams[IOW_STREAMS];
     struct iow_sstream sstreams[IOW_STREAMS];
     uint64_t stream_serves;
@@ -308,14 +309,13 @@ struct iow_node {
     uint64_t stream_written;
     uint64_t handshakes;
     uint64_t links_wanted;
+    uint64_t held_data[IOW_PENDING];
+    uint64_t foreign; /* Completions of the caller's own records. */
+    uint64_t foreign_user_data;
+    int32_t foreign_result;
+    bool foreign_seen;
     bool hold_serve; /* Leave STREAM_SERVE unanswered. */
     bool hold_data;  /* Keep STREAM_DATA completions back. */
-    uint64_t held_data[IOW_PENDING];
-    uint32_t held_data_count;
-    uint64_t foreign; /* Completions of the caller's own records. */
-    int32_t foreign_result;
-    uint64_t foreign_user_data;
-    bool foreign_seen;
     bool file_ready; /* The caller's pattern file exists at its slot. */
 };
 
@@ -346,7 +346,7 @@ struct iow_world {
     uint32_t nodes;
     struct vsr_sim *sim;
     struct vsr_sim_options sim_options;
-    char directory[256]; /* IOW_URING: the stores' root. */
+    char directory[64]; /* IOW_URING: the stores' root, iow.<pid>.XXXXXX. */
     struct iow_node node[IOW_NODES];
     uint64_t incarnation;
     /* Defaults for the replicas attached next. */
@@ -504,6 +504,8 @@ void iow_rule(struct iow_node *n, iow_match match, void *ctx, uint32_t action,
               int32_t result, uint32_t count);
 void iow_rules_clear(struct iow_node *n);
 void iow_release_held(struct iow_node *n);
+/* Holds matching completions again once a release has been reaped. */
+void iow_hold(struct iow_node *n);
 /* Releases what is held newest first and keeps holding new matches: a
  * completion order the executor contract allows for independent
  * records. */

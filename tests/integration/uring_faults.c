@@ -381,7 +381,7 @@ static void test_stop_held(void)
         exit(77);
     }
     iow.durability = VSR_REPLICATED;
-    iow.store.write_behind_bytes = 2u * iow.block_bytes;
+    iow.store.write_behind_bytes = 2 * (uint64_t)iow.block_bytes;
     n = iow_node_open(0);
     app = iow_attach(n, 0, iow_cluster(4), 1, 1, VSR_START_NEW);
     CHECK(iow_run_until(iow_app_normal, app, 10000 * IOW_MS));

@@ -69,7 +69,7 @@
  * REASSEMBLY slab acquired for it, and a frame is decoded only when
  * complete. The unconsumed bytes form the PARTIAL run (one slab,
  * contiguous) that carving works on, plus up to VSR_IO_LINK_HELD later
- * runs (a STREAM link: up to the pool's slab count, decision G4) in
+ * runs (a STREAM link: up to the pool's slab count, decision 139) in
  * arrival order, each holding exactly one pool reference, that
  * wait for the reassembly copy or for the partial's frame to be delivered
  * (a MESSAGE whose replica has no free region stays in place and is
@@ -235,7 +235,7 @@ struct vsr_io_link {
     bool nodelay_set;       /* TCP_NODELAY record issued (or not wanted). */
     bool plain_sends;       /* The socket refused a zero-copy send
                                (-EOPNOTSUPP: AF_UNIX): plain sends only
-                               (decision G3). */
+                               (decision 138). */
     bool install_establish; /* Established once the takeover completes. */
     uint32_t installing;    /* The takeover (decision 135): 0 none, 1 its
                               record to issue, 2 in flight. */
@@ -258,7 +258,7 @@ struct vsr_io_link {
                                  poll retries. */
     struct vsr_io_run *held;  /* [links.held_per_link], in the links
                                  region: a peer link uses VSR_IO_LINK_HELD
-                                 of them, a stream link all (G4). */
+                                 of them, a stream link all (139). */
     /* Send side. The send slab is a ring addressed by unwrapped 64-bit
      * counters (offset = counter % slab_bytes). */
     uint32_t send_slab;   /* Pool slab holding header bytes; INDEX_NONE. */

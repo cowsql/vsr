@@ -3567,7 +3567,7 @@ static bool take_completion(struct vsr_io_replica *replica, uint64_t *op,
 }
 
 /* The completion of op waits in the replica's deferred ring, due retry_ns
- * after the engine's time (decision G1). */
+ * after the engine's time (decision 136). */
 static void expect_deferred(struct vsr_io_replica *replica, uint64_t op,
                             int32_t status)
 {
@@ -3985,7 +3985,7 @@ static void test_send_pressure(void)
     /* A queue of eight: four on the wire, four waiting for an entry; the
      * ninth makes the oldest waiting one yield, its RETRY deferred like a
      * refused SEND's (the core sends again at once on a failed SEND: fed
-     * in the same poll, an eviction evicted again, decision G1). */
+     * in the same poll, an eviction evicted again, decision 136). */
     pair_open(&p, 34, 8, PAGE);
     world.hold_notifs = true;
     for (uint64_t i = 1; i <= 8; ++i) {
@@ -4686,7 +4686,7 @@ static void walker_send(struct walker *w, uint32_t size)
 
 /* Every completion of the sender's replica: once per op, OK or RETRY. */
 /* A completion taken off the replica's deferred ring, as the engine's poll
- * feeds it once due (a SEND evicted from a full queue, decision G1). */
+ * feeds it once due (a SEND evicted from a full queue, decision 136). */
 static bool take_deferred(struct vsr_io_replica *replica, uint64_t *op,
                           int32_t *status)
 {

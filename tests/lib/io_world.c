@@ -457,6 +457,11 @@ void iow_release_held_reversed(struct iow_node *n)
     n->hook.reverse = true;
 }
 
+void iow_hold(struct iow_node *n)
+{
+    n->hook.holding = true;
+}
+
 /* -------------------------------------------------------------------------
  * Executors
  * ---------------------------------------------------------------------- */
@@ -740,8 +745,8 @@ bool iow_open_uring(uint32_t nodes, uint64_t seed)
         return false;
     }
     ring_close(&probe);
-    snprintf(iow.directory, sizeof(iow.directory), "iow.%ld.XXXXXX",
-             (long)getpid());
+    (void)snprintf(iow.directory, sizeof(iow.directory), "iow.%ld.XXXXXX",
+                   (long)getpid());
     CHECK(mkdtemp(iow.directory) != NULL);
     for (uint32_t i = 0; i < nodes; ++i) {
         iow.node[i].address = unix_address(i);
@@ -991,15 +996,17 @@ static void wait_address(const struct iow_node *n)
     for (uint32_t i = 0; i < 5000; ++i) {
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         int rc;
+        int error;
 
         CHECK(fd >= 0);
         rc = bind(fd, (const struct sockaddr *)&n->address.sockaddr,
                   (socklen_t)n->address.length);
+        error = rc == 0 ? 0 : errno;
         CHECK(close(fd) == 0);
         if (rc == 0) {
             return;
         }
-        CHECK(errno == EADDRINUSE);
+        CHECK(error == EADDRINUSE);
         CHECK(usleep(1000) == 0);
     }
     CHECK(false);
@@ -1538,11 +1545,11 @@ static void app_install(struct iow_app *app, const struct vsr_op *op)
 static void app_drop(struct iow_app *app, const struct vsr_op *op)
 {
     const struct vsr_snapshot_task *task = op->data;
-    struct iow_snapshot *s;
 
     app->drops++;
     if (task != NULL && task->checkpoint != NULL) {
-        s = snapshot_find(app, task->checkpoint->id);
+        struct iow_snapshot *s = snapshot_find(app, task->checkpoint->id);
+
         if (s != NULL) {
             s->used = false;
         }
@@ -2382,19 +2389,22 @@ void iow_caller_file(struct iow_node *n)
 {
     struct vsr_io_sqe sqe;
     char path[300];
+    int written;
 
     if (n->file_ready) {
         return;
     }
     if (iow.backend == IOW_URING) {
-        snprintf(path, sizeof(path), "%s/n%u-file", iow.directory, n->index);
+        written = snprintf(path, sizeof(path), "%s/n%u-file", iow.directory,
+                           n->index);
     } else {
-        snprintf(path, sizeof(path), "caller-file");
+        written = snprintf(path, sizeof(path), "caller-file");
     }
+    CHECK(written > 0 && (size_t)written < sizeof(path));
     memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = VSR_IO_SQE_OPENAT;
     sqe.flags = VSR_IO_SQE_DIRECT;
-    sqe.fd = iow.backend == IOW_SIM ? VSR_SIM_ROOT : AT_FDCWD;
+    sqe.fd = AT_FDCWD; /* VSR_SIM_ROOT in a simulation: the same value. */
     sqe.fd2 = (int32_t)IOW_CALLER_SLOT;
     sqe.addr = path;
     sqe.op_flags = O_RDWR | O_CREAT;
@@ -2420,6 +2430,7 @@ void iow_replica_options(struct iow_app *app, struct vsr_id cluster,
 {
     struct vsr_options *core = &app->options.core;
     char suffix[16] = "";
+    int written;
 
     CHECK(members <= IOW_MEMBERS);
     memset(&app->options, 0, sizeof(app->options));
@@ -2449,16 +2460,19 @@ void iow_replica_options(struct iow_app *app, struct vsr_id cluster,
     store_resize();
     app->options.store = iow.store;
     if (generation > 0) {
-        snprintf(suffix, sizeof(suffix), "-%u", generation);
+        written = snprintf(suffix, sizeof(suffix), "-%u", generation);
+        CHECK(written > 0 && (size_t)written < sizeof(suffix));
     }
     if (iow.backend == IOW_URING) {
-        snprintf(app->path, sizeof(app->path),
-                 "%s/n%u-c%" PRIu64 "-r%" PRIu64 "%s", iow.directory,
-                 app->node->index, cluster.lo, replica, suffix);
+        written = snprintf(app->path, sizeof(app->path),
+                           "%s/n%u-c%" PRIu64 "-r%" PRIu64 "%s", iow.directory,
+                           app->node->index, cluster.lo, replica, suffix);
     } else {
-        snprintf(app->path, sizeof(app->path), "c%" PRIu64 "-r%" PRIu64 "%s",
-                 cluster.lo, replica, suffix);
+        written = snprintf(app->path, sizeof(app->path),
+                           "c%" PRIu64 "-r%" PRIu64 "%s", cluster.lo, replica,
+                           suffix);
     }
+    CHECK(written > 0 && (size_t)written < sizeof(app->path));
     app->options.path = app->path;
 }
 

@@ -3144,7 +3144,7 @@ static void scenario_close_pending(struct fixture *f)
 }
 
 /* AF_UNIX: a listener and a client of the executor in one namespace; a
- * zero-copy send there is refused (decision G3). */
+ * zero-copy send there is refused (decision 138). */
 static void scenario_unix_socket(struct fixture *f)
 {
     struct sockaddr_un un;

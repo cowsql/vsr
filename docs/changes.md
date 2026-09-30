@@ -279,11 +279,12 @@ Defects whose fix needed no new contract text, listed for completeness:
 `regression/pressure_reload` (input-pressure relief waits for an idle protocol
 poll so a pin the next poll consumes is not evicted and reloaded),
 `regression/anchor_behind_applied` (a selected offer's checkpoint below the
-applied position is not installed behind applied entries), and
+applied position is not installed behind applied entries),
 `regression/reply_restore` (a reply decided before a `RESTORE` replaced the
 client base is decided again from the restored revision), and
-`integration/uring_faults` (`test_write_errors`: a transition's comparison
-waits for its own comparison LOAD instead of advancing through entries a
-concurrent apply LOAD cached, which let the chunk be replaced and the stale
-load be compared at the new chunk's offset, fencing a healthy replica with
-`VSR_FAILURE_INVARIANT` when LOADs completed out of order).
+`regression/compare_load_order`, found by `integration/uring_faults`
+(`test_write_errors`: a transition's comparison waits for its own comparison
+LOAD instead of advancing through entries a concurrent replay LOAD cached,
+which let the chunk be replaced and the stale load be compared at the new
+chunk's offset, fencing a healthy replica with `VSR_FAILURE_INVARIANT` when
+LOADs completed out of order).

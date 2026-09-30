@@ -47,7 +47,7 @@ struct vsr_io_deadlines {
     uint32_t capacity;
     uint32_t count;
     uint32_t rebasing; /* 1 while the engine processes completions: arms
-                          are marked for the next rebase (decision G2). */
+                          are marked for the next rebase (decision 137). */
     uint32_t marked;   /* Entries marked. */
 };
 
@@ -71,7 +71,7 @@ uint64_t vsr_io_deadlines_earliest(const struct vsr_io_deadlines *set);
  * no clock: a timer armed while one is processed counts from the engine's
  * time of the previous poll, which an idle engine left behind by as long
  * as it slept, so the next poll (the first to bring the clock) moves such
- * timers by the time that passed (decision G2). */
+ * timers by the time that passed (decision 137). */
 void vsr_io_deadlines_rebase(struct vsr_io_deadlines *set, uint64_t delta);
 /* Pops the earliest entry due at or before now; false when none. Equal
  * deadlines pop in handle order. The entry is disarmed; a periodic owner
