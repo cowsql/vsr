@@ -1275,10 +1275,10 @@ static void load_done(struct vsr_io *io, uint32_t replica, uint32_t step,
             int32_t status = VSR_IO_FAILED;
 
             if (result == -ENOENT) {
-                /* A witness keeps no table: an empty base. */
-                status = rep->store.hard.role == VSR_MEMBER_WITNESS
-                             ? VSR_IO_OK
-                             : VSR_IO_CORRUPT;
+                /* The store wants a file only for a FULL role (the held
+                 * transaction's, or a FULL replica's recovery): a missing
+                 * one is corruption, also on a witness being promoted. */
+                status = VSR_IO_CORRUPT;
             } else {
                 s->error = result;
             }

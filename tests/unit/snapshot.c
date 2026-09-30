@@ -5170,6 +5170,38 @@ static void test_review_record_integrity(void)
     }
 }
 
+/* The store wants a base file only for a transaction whose role is FULL
+ * (a RESTORE, or a PUBLISH of a file that is neither the latest capture nor
+ * the base) and for a FULL replica's recovery, so a missing file is always
+ * CORRUPT. The module took ENOENT for an empty base whenever the store's
+ * current hard state was WITNESS: a witness promoted to FULL by a RESTORE
+ * whose file had gone would come up FULL with an empty client table, its
+ * completed requests forgotten. A witness's own RESTORE loads nothing. */
+static void test_review_witness_promotion(void)
+{
+    struct engine *e;
+    struct vsr_id id = {0xFEED, 1};
+    uint64_t op;
+
+    world_reset(131);
+    e = engine_open(0);
+    expect_store(e, store_start(e, VSR_START_NEW), VSR_IO_NOT_FOUND);
+    store_run(e, txn_identity(e, 1, VSR_MEMBER_WITNESS));
+    CHECK(e->store->hard.role == VSR_MEMBER_WITNESS);
+    /* A witness's RESTORE: no load, an empty table. */
+    op = submit(e, txn_restore(e, 2, id, 5, VSR_MEMBER_WITNESS));
+    settle();
+    expect_store(e, op, VSR_IO_OK);
+    CHECK(entry_of(e, id) == NULL && e->store->base_slot == -1);
+    /* Promoted to FULL: the file must be there. */
+    op = submit(e, txn_restore(e, 3, id, 6, VSR_MEMBER_FULL));
+    settle();
+    expect_store(e, op, VSR_IO_CORRUPT);
+    CHECK(e->store->state != VSR_IO_STORE_READY);
+    expect_idle(e);
+    engine_crash(e);
+}
+
 int main(void)
 {
     test_capture();
@@ -5188,5 +5220,6 @@ int main(void)
     test_review_refetch_kept();
     test_review_dir_retry();
     test_review_record_integrity();
+    test_review_witness_promotion();
     return 0;
 }
