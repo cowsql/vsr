@@ -6,7 +6,7 @@ test first, observed failing before the fix (section "Review" at the end
 of tests/unit/snapshot.c, `test_review_*`). store.c, stream.c, link.c,
 engine.c and pool.c untouched; the clients-file format change touches
 wire.h, codec.c/.h, tests/unit/codec.c and tests/fuzzy/frame.c.
-Placeholder decisions W1..W6 in docs/io-design.md section 10 (the
+Placeholder decisions W1..W7 in docs/io-design.md section 10 (the
 coordinator renumbers); docs/io-implementation.md "Snapshots", 5.4, 7.4,
 section 10 (two rows) and section 11 updated.
 
@@ -14,7 +14,8 @@ Commits: 1166607 (W1), 9cf3e6a (W2), e23f2e3 (W3), 72abe58 (W4),
 0f14160 (W5), 090da53 (W6), dbc726c and ec6bd46 (tests closing mutation
 survivors, slot accounting), 2d4710f and 46f77b6 (lint in the new tests),
 f23abc0 (decisions and docs), cad7411 (wake_now moved away from
-`slot_drop`), then this file. No `vsr_io_engine_install` or other executor
+`slot_drop`), this file, then 766053d (W7, the coordinator's decision on
+the first open item) and its docs. No `vsr_io_engine_install` or other executor
 call was added or moved: `slot_drop` and its surroundings are as on main
 (the engine agent converts that call into a submission record); the fixes
 issue only records (the directory's OPENAT for W3) and arm deadlines.
@@ -30,8 +31,10 @@ tests/fuzzy/frame.c is not built outside `--enable-fuzzing`: built by hand
 against the ASan library and run 30 s on the corpus tests/unit/codec seeds
 (5.2M runs, no failure), clang-tidy clean. The experiment behind the
 pool-reserve item below was a scratch change to the harness, not committed.
+After W7: tests/unit/snapshot passes under both compilers; format-check,
+clang-tidy and cppcheck are clean on snapshot.c and its test.
 
-## CONFIRMED (6, all fixed)
+## CONFIRMED (7, all fixed)
 
 1. **A CAPTURE or SYNC answered while base_track released its file's slot
    never completed** (exactly-once). `base_track` marked a RELEASE (CLOSE
@@ -111,25 +114,36 @@ pool-reserve item below was a scratch change to the harness, not committed.
    `test_review_serve_no_slot`, the prepare-time failure in
    `test_review_dir_retry`. W6.
 
+7. **A remote file's corruption latched the fetching replica** (status;
+   reported open, decided by the coordinator). A FETCH whose received
+   bytes failed verification completed CORRUPT, and core.c's
+   `completion_failure` latches `VSR_FAILURE_SNAPSHOT` for CORRUPT from any
+   snapshot op: one damaged clients file at a source failed every replica
+   that fetched it, though their state was intact. FAILED goes through
+   checkpoint.c's `finish()` and transition.c's `restart_selection()`:
+   discovery restarts and may pick another source. Fix 766053d:
+   `fetch_finish` completes such a fetch (and a source's CORRUPT END)
+   FAILED; CORRUPT stays for the replica's own files. Test
+   `test_review_fetch_corrupt_failed` (corrupt chunk, bad trailer, a swap
+   only the file's crc catches; the .tmp unlinked each time);
+   test_fetch_failures and the fetches of test_review_record_integrity now
+   expect FAILED. W7.
+
 ## OPEN, not fixed
 
-7. **The pool reserve** (docs section 11, recommendation below).
-8. **A remote file's corruption latches the local replica.** A FETCH
-   whose bytes fail verification completes CORRUPT, and core.c's
-   `completion_failure` latches `VSR_FAILURE_SNAPSHOT` for any CORRUPT
-   snapshot completion: one corrupted clients file at a source fails every
-   replica that fetches it, though their state is intact. The author
-   documents CORRUPT; docs/vsr-api.md's FETCH row ("discover another valid
-   offer; corruption fences snapshot state") reads either way. Reporting
-   remote corruption as FAILED would confine it to the source, which finds
-   it at its own next load. A design call for the coordinator.
-9. **A base change during a capture** would point the writer's cold read
+8. **The pool reserve** (docs section 11, recommendation below).
+9. **A damaged source keeps failing its fetchers.** A source serves its
+   own file raw (the FILE write is not read through the reader), so every
+   fetch from a source whose file is damaged ends FAILED (W7) until
+   discovery picks another source; the source learns of it only at its own
+   next load. Verifying on serve is left open (section 11).
+10. **A base change during a capture** would point the writer's cold read
    of a file-only record at the new base file (`store.base_slot` as of the
    read, offsets of the old base): CORRUPT, latched. The core's checkpoint
    stages never overlap a capture with a PUBLISH or RESTORE; keeping the
    capture's base entry open and reading through its own slot removes the
    dependency.
-10. Minor: a serve refused because the index's previous serve is still
+11. Minor: a serve refused because the index's previous serve is still
    closing answers FAILED (RETRY would be accurate; the requester
    rediscovers either way); a read reporting more bytes than asked but
    within the slab's room is parsed (CORRUPT at the trailer) rather than
@@ -264,11 +278,12 @@ The runner applies each mutant to the file, rebuilds tests/unit/snapshot
 | R76 | RENAMEAT to the .tmp name | test_fetch |
 | R78 | fetch_settle does not wait for a DISCARD | equivalent: a DISCARD starts only once the caller answered, and no settle runs again before it ends |
 | T1 | codec: the trailer's crc not compared (codec.c) | test_load_failures, test_review_record_integrity |
+| R79 | a failed fetch completes CORRUPT again (W7 reverted) | test_review_fetch_corrupt_failed (observed failing before the fix) |
 | A4 | record CRC not verified (the author's M4, rechecked under W4) | test_fetch_failures (the CRC byte flipped: the file digest leaves record CRCs out) |
 | A16 | bytes after the trailer accepted (M16 rechecked) | test_load_failures |
 | A20 | header count not bounded (M20 rechecked) | test_fetch_failures |
 
-52 new mutants (R*, T1): 47 killed, 5 equivalent (R6, R11, R21, R38, R78);
+53 new mutants (R*, T1): 48 killed, 5 equivalent (R6, R11, R21, R38, R78);
 the author's M4, M16 and M20 rechecked under the new trailer, killed. The
 runner and the lists are in the session scratchpad, not the tree; each
 entry is (file, exact snippet, replacement).

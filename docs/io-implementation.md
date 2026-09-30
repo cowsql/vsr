@@ -743,8 +743,10 @@ states the four op sequences; the details:
   `sequence = 0` (set by the RESTORE's load) and forwards FETCH; any other
   outcome closes and unlinks the temporary file and completes the core op
   with the stream's status (`RETRY` on loss, `FAILED` for a source read
-  error or a local I/O error, `CORRUPT` for bytes that fail verification,
-  `NOT_FOUND` from the source) without involving the caller. A caller
+  error, a local I/O error or bytes that fail verification, `NOT_FOUND`
+  from the source; a fetch never reports `CORRUPT`, which would latch the
+  fetching replica's snapshot failure for the source's damage, W7) without
+  involving the caller. A caller
   failure on a file this FETCH's stream wrote, not yet adopted by a
   RESTORE, unlinks it (vsr.h's private partial object); a FETCH of an id
   already held transferred nothing and keeps the file whatever its caller
@@ -1139,7 +1141,8 @@ record is bound to its file and its place (a record CRC alone accepts a
 record written over another of the same length, or two swapped). The
 record CRCs are left out because a CRC run over bytes followed by their
 own CRC ends in a constant, whatever the bytes. A reader verifies every
-CRC and both counts; anything else is `CORRUPT`. The snapshot
+CRC and both counts; anything else is `CORRUPT` (a fetch reports it
+`FAILED`, W7: the damage is the source's). The snapshot
 module's reader bounds a record's `length` by `result_bytes` and, when the
 file's size is known (loads, not fetches), the record's whole extent by the
 bytes left before the trailer; it waits for the record's bytes, checks the
@@ -1915,6 +1918,7 @@ of `docs/io-design.md`:
 | `store.h` | `vsr_io_recovery.chain_resume` (the boundary at which the chain resumes past a block's dead tail); `VSR_IO_SEGMENT_FLUSHING`, `freeing_flush` and `flush_own` (a freed slot waits for the flush after its superblock write, which the store issues without waiting for a SYNC's target); `reclaimed`, `client_base_floor` and `client_base_pending` (the floor terms bounded by the sequence on media); `snapshot_clients` reports a record freed under the base as the base file's (sequence 0, the base offset); `vsr_io_store.replica`, the embedding replica, set by init; `vsr_io_recovery.record_run` (was `reserved`), the run of the last replayed record | 110, 111, 112, 113, 116 |
 | `wire.h`, `codec.h` (internal) | Clients file format 2: `vsr_io_wire_clients_trailer` is 16 bytes (`crc`, `reserved`); `vsr_io_codec_put_clients_trailer` and `get_clients_trailer` take the running CRC32C of the header and the records (each without its CRC), which the trailer's crc extends over its magic and count | W4 |
 | `snapshot.h` (internal) | `vsr_io_snapshot.transferred` (was `reserved`: a FETCH's own stream wrote the file) and `dir_retried` (a SYNC retried the directory's open); the writer's and reader's `digest`; `base_track` releases no slot of an entry with an op in progress; a missing base file is `CORRUPT` on any role; outcomes decided in `vsr_io_snapshots_prepare` wake the loop at once | W1, W2, W3, W4, W5, W6 |
+| `snapshot.h` (internal) | A FETCH whose received bytes fail verification, or whose source ends it `CORRUPT`, completes `FAILED` (restarting discovery); `CORRUPT` stays for the replica's own files (base loads, captures, recovery) | W7 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -2030,15 +2034,12 @@ of `docs/io-design.md`:
 - The capture writer reads one cold record at a time (one READ per record
   not in the ring); batching adjacent records of one segment would save
   reads for large tables.
-- A FETCH whose bytes fail verification completes `CORRUPT`, and the core
-  latches `VSR_FAILURE_SNAPSHOT` on any `CORRUPT` snapshot completion
-  (core.c `completion_failure`), so a clients file corrupted at one source
-  fails every replica that fetches it, though their own state is intact;
-  docs/vsr-api.md's FETCH row ("discover another valid offer; corruption
-  fences snapshot state") reads either way. Reporting a remote file's
-  corruption as `FAILED` (a new discovery) would confine it to the source,
-  which finds it at its own next load. The source serves its file without
-  reading it through the reader.
+- A source whose own clients file is damaged serves it raw (the served
+  FILE write is not read through the reader), so every fetch from it ends
+  `FAILED` (W7) until discovery picks another source; the source learns of
+  the damage only at its own next load of the file. Verifying on serve
+  (the reader over the served bytes, `NOT_FOUND` or a local `CORRUPT` on
+  failure) is left open.
 - The capture writer reads a file-only record through `store.base_slot`
   as it is when the read is issued, at the offset the table snapshot
   took from the base of that moment; a PUBLISH or RESTORE packed during a
