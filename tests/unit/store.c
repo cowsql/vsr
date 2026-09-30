@@ -112,6 +112,7 @@ struct disk {
 };
 
 static struct disk disk;
+static bool disk_trace; /* The walk's trace: every WRITE and FSYNC. */
 static unsigned char base_image[65536];
 /* The image as of the last flush: what a crash is sure to keep. */
 static unsigned char disk_flushed[DISK_BYTES];
@@ -665,6 +666,10 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         first = sqe->offset / BLOCK;
         blocks = (sqe->length + BLOCK - 1) / BLOCK;
         keep = disk.tear_armed != 0 ? disk.tear_blocks : blocks;
+        if (disk_trace) {
+            fprintf(stderr, "disk: write %" PRIu64 "+%u%s\n", sqe->offset,
+                    sqe->length, disk.tear_armed != 0 ? " (torn)" : "");
+        }
         for (uint64_t b = 0; b < blocks && b < keep; ++b) {
             uint64_t at = first + b;
             uint64_t from = at * BLOCK;
@@ -694,6 +699,9 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         CHECK(sqe->flags == VSR_IO_SQE_FIXED_FILE && sqe->fd == disk.slot);
         CHECK(sqe->op_flags == VSR_IO_FSYNC_DATASYNC);
         disk.flushes++;
+        if (disk_trace) {
+            fprintf(stderr, "disk: flush\n");
+        }
         if (disk.fail_flush != 0) {
             *result = disk.fail_flush;
             disk.fail_flush = 0;
@@ -5309,6 +5317,57 @@ static void checked_scan(struct checked *c, uint32_t slot, uint64_t generation)
     checked_sweep(data, at, end, end, generation, &c->floor);
 }
 
+/* The image as the checker reads it, on stderr (the walk's trace): the
+ * superblocks, each slot's header and every CRC-valid record or PAD at an
+ * aligned position of its data. */
+static void checked_dump(void)
+{
+    const unsigned char *sb = checked_superblock();
+    uint64_t generation = sb != NULL ? vsr_io_get_u64(sb + 8) : 0;
+    uint64_t slots = disk.size > 2 * BLOCK
+                         ? (disk.size - 2 * BLOCK) / h.options.segment_bytes
+                         : 0;
+
+    for (uint32_t copy = 0; copy < 2; ++copy) {
+        const unsigned char *b = disk_image + copy * BLOCK;
+
+        fprintf(stderr,
+                "image: superblock %u: revision %" PRIu64 " start %" PRIu64
+                "/%u run %u floor %" PRIu64 "%s\n",
+                copy, vsr_io_get_u64(b + 16), vsr_io_get_u64(b + 72),
+                vsr_io_get_u32(b + 80), vsr_io_get_u32(b + 84),
+                vsr_io_get_u64(b + 88), b == sb ? " (chosen)" : "");
+    }
+    for (uint32_t slot = 0; slot < slots && slot < CHECKED_SLOTS; ++slot) {
+        const unsigned char *data = disk_image + slot_offset(slot);
+        struct checked_header header;
+
+        checked_header(slot, generation, &header);
+        fprintf(stderr,
+                "image: slot %u: header %s segment %" PRIu64 " last %" PRIu64
+                " run %u floor %" PRIu64 "\n",
+                slot, header.valid ? "valid" : "invalid", header.number,
+                header.last_sequence, header.run, header.floor);
+        for (uint64_t at = h.header_bytes; at + 8 <= h.options.segment_bytes;
+             at += 8) {
+            uint32_t length = checked_record(
+                data + at, h.options.segment_bytes - at, generation);
+
+            if (length != 0) {
+                fprintf(stderr,
+                        "image:   %" PRIu64 ": record %" PRIu64 " run %u "
+                        "flushed %" PRIu64 " length %u\n",
+                        at, vsr_io_get_u64(data + at + 8),
+                        vsr_io_get_u32(data + at + 36),
+                        vsr_io_get_u64(data + at + 24), length);
+            } else if (vsr_io_get_u32(data + at) == VSR_IO_PAD_MAGIC) {
+                fprintf(stderr, "image:   %" PRIu64 ": pad %u\n", at,
+                        vsr_io_get_u32(data + at + 4));
+            }
+        }
+    }
+}
+
 /* The verdict on the image as it is now, under the harness
  * configuration. */
 static void checked_image(struct checked *c)
@@ -5464,6 +5523,7 @@ struct walk {
     uint64_t sequence;    /* Last submitted (or recovered) transaction. */
     uint64_t durable_ack; /* Greatest sequence acknowledged durable. */
     uint32_t captures;
+    bool trace;      /* VSR_WALK_TRACE set: every step on stderr. */
     bool corrupting; /* Bytes flipped at the last crash. */
     bool failed;     /* The store is fenced: the walk is over. */
     bool exhausted;  /* Out of snapshot ids: the walk is over. */
@@ -6013,6 +6073,9 @@ static void walk_crash(uint8_t arg)
     walk.expected_count = 0;
     harness_open_keep(&walk.c, true);
     checked_image(&checked); /* Before the recovery's superblock write. */
+    if (walk.trace) {
+        checked_dump();
+    }
     status = harness_recover(VSR_START_RECOVER, &loaded, &lease);
     if (status != checked.status ||
         (status == VSR_IO_OK && loaded->sequence != checked.sequence)) {
@@ -6062,6 +6125,15 @@ static void walk_step(uint8_t action, uint8_t arg)
 {
     uint32_t ci = arg % WALK_CLIENTS;
 
+    if (walk.trace) {
+        fprintf(stderr,
+                "walk: step %" PRIu64 " action %u arg %u: readable %" PRIu64
+                " written %" PRIu64 " flushed %" PRIu64 " durable ack %" PRIu64
+                " reclaim %" PRIu64 "\n",
+                walk.stats.steps, action, arg, h.store->readable,
+                h.store->written, h.store->flushed, walk.durable_ack,
+                h.store->reclaim);
+    }
     h.now += (uint64_t)(action >> 4) * 10000000; /* Idle writes fire. */
     switch (action & 15) {
     case 9:
@@ -6069,9 +6141,10 @@ static void walk_step(uint8_t action, uint8_t arg)
         break;
     case 10:
         if (h.store->readable > 0) {
-            uint64_t sequence = h.store->readable - (arg % 3);
+            /* A little behind the packed sequence, never below 1. */
+            uint64_t sequence =
+                h.store->readable > arg % 3 ? h.store->readable - arg % 3 : 1;
 
-            sequence = sequence > 0 ? sequence : 1;
             walk_expect(submit_sync(sequence), WALK_SYNC, sequence);
             walk.stats.syncs++;
             if ((arg & 4) != 0) {
@@ -6120,6 +6193,8 @@ static void walk_step(uint8_t action, uint8_t arg)
 static void walk_run(const uint8_t *bytes, size_t size)
 {
     memset(&walk, 0, sizeof(walk));
+    walk.trace = getenv("VSR_WALK_TRACE") != NULL;
+    disk_trace = walk.trace;
     walk.bytes = bytes;
     walk.size = size;
     walk.c = walk_config(walk_byte());
@@ -6181,7 +6256,8 @@ static void walk_seeded(uint64_t seed, size_t size)
         CHECK(fclose(file) == 0);
     }
     /* On stderr, unbuffered: a failing walk names its seed. */
-    fprintf(stderr, "store: walk seed %" PRIu64 "\n", seed);
+    fprintf(stderr, "store: walk seed %" PRIu64 " (%s)\n", seed,
+            size > 0 && (bytes[0] & 1) != 0 ? "dsync" : "fdatasync");
     walk_run(bytes, size);
     fprintf(stderr,
             "store: walk seed %" PRIu64 ": %" PRIu64 " steps, %" PRIu64

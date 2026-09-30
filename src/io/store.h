@@ -509,8 +509,10 @@ void vsr_io_store_replied(struct vsr_io_store *store, struct vsr_id client);
 /*
  * Capture support. snapshot copies the completed record of every entry
  * into `out` (id, number, op, record location; `capacity` should hold
- * max_clients, the count is returned regardless), resets every entry's
- * capture_offset and sets capture_floor so their segments stay; the
+ * max_clients, the count is returned regardless; a record only the base
+ * file holds, because it never was in this log or because its slot was
+ * freed under the base, has sequence 0 and the file offset), resets every
+ * entry's capture_offset and sets capture_floor so their segments stay; the
  * snapshot module reads result bytes hot or cold, calls capture_offset
  * with each entry's offset in the file it writes and, at the end,
  * capture_end with the snapshot id and the sequence captured (a zero id
