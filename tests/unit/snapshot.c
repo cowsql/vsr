@@ -5032,7 +5032,6 @@ static void test_review_capture_release(void)
 static void test_review_sync_release(void)
 {
     struct engine *a;
-    const struct vsr_io_snapshot *entry;
     uint64_t sequence = fresh_store(&a, 121, 2);
 
     (void)sequence;
@@ -5043,6 +5042,7 @@ static void test_review_sync_release(void)
         uint64_t capture_op;
         struct vsr_id prev = capture(a);
         struct vsr_id next;
+        const struct vsr_io_snapshot *entry;
 
         entry = entry_of(a, prev);
         CHECK(entry->file_slot >= 0);
