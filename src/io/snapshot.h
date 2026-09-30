@@ -43,16 +43,19 @@
  *
  * Registry: one entry per snapshot id the replica holds locally, mirroring
  * the core's local holds (core.limits.transfers + 4 entries); an entry is
- * created by CAPTURE, by FETCH, or by the base load of a recovered anchor
- * (the core holds it after RECOVERY), and freed by DROP.
+ * created by CAPTURE, by FETCH, by a base load (a recovered anchor, which
+ * the core holds after RECOVERY, or a RESTORE's file) or for the duration
+ * of a DROP of an id it did not hold, and freed by DROP.
  *
  * File slots (vsr_io_limits.file_slots): per replica the module keeps open
- * the directory (fsync at SYNC), the current base file (store.base_slot:
- * cold CLIENT loads at or below the client base read it) and the latest
- * capture's file (a PUBLISH of it makes it the base at once, with no open
- * in between), plus one transient file: a capture or fetch being written,
- * or a base file being loaded. A served stream opens the file once more
- * into the slot budgeted per stream.
+ * the directory (fsync at SYNC), the current base file (store.base_slot,
+ * which this module alone sets: cold CLIENT loads at or below the client
+ * base and a capture's file-only records read it), the latest capture's
+ * file (a PUBLISH of it makes it the base at once, with no open in
+ * between) and a file loaded for a held RESTORE or PUBLISH until the
+ * store packs it, plus transient files: a capture or fetch being written,
+ * a base file being loaded, a file opened for its SYNC. A served stream
+ * opens the file once more into the slot budgeted per stream.
  *
  * Executor records: every record the module submits uses slot kind
  * VSR_IO_SLOT_CLIENTS with owner = replica index, so the engine routes

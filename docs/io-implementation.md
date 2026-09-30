@@ -688,61 +688,114 @@ states the four op sequences; the details:
 
 - CAPTURE: `vsr_io_snapshots_capture` requires
   `store.clients_sequence <= task->sequence` (else `FAILED`, an invariant
-  since ops are processed in emission order), takes a registry entry and a
-  staging slab (`RETRY` when none), draws 16 random bytes for the id
-  (redrawn while zero), copies the task and its checkpoint into the
-  template with the id, snapshots the table (`vsr_io_store_snapshot_clients`,
-  which also sets the capture floor), and forwards the op with
-  `data = &template task`. The writer then produces the file: header; for
-  each snapshot entry, the record bytes come from the ring (hot: cursor
-  over the pinned range) or from a cold read of the record into
-  `cold_slab`; each record is encoded into the staging slab and the slab is
-  written when full or at the end with `WRITE | FIXED_FILE | FIXED_BUFFER`
-  (the clients file is opened without O_DIRECT, so chunks need no
-  alignment); trailer; close. `vsr_io_store_capture_offset` records each
-  entry's offset; `capture_end` sets `last_capture`. Completion to the
-  core: `OK` with the caller's checkpoint (copied into `result_region`)
-  when both halves are OK; otherwise the file is unlinked and the caller's
-  status, or the library's failure, is reported. Any I/O error of the
-  writer fails the capture with `FAILED`; the core schedules captures on
-  its own, so the engine does not retry.
-- SNAPSHOT_SYNC: `FSYNC | DATASYNC` of the file, then `FSYNC` of the
-  directory (opened once per replica into a slot at attach), then forward;
-  completion when both halves succeed; any failure is reported as-is (the
-  core fences on it).
-- FETCH: `task->peer` is resolved to a node through the authorization
-  table (no node: `RETRY`); a library stream is opened with a
-  `vsr_io_wire_library_request` for `(cluster, task->peer, task->checkpoint->id)`;
-  chunks are written to `clients-<id>.tmp` at their offsets and parsed by
-  the reader as they arrive (header, records, trailer); END with OK and a
-  complete, verified file renames it to `clients-<id>` (RENAMEAT), creates
-  the registry entry with `sequence = 0` (set at RESTORE), and forwards
-  FETCH; any other outcome unlinks the temporary file and completes the
-  core op with the stream's status (`RETRY` on loss). `basis` is passed
-  through; the library half does not use it.
-- DROP: forwards; on the caller's completion, unlinks the file once
-  `readers == 0` (a served library stream still reading it delays the
-  unlink, not the completion) and frees the registry entry.
-- Base loads: `vsr_io_snapshots_load_base(id, sequence)` opens
-  `clients-<id>`, reads it through the reader in slab-sized chunks, calls
-  `vsr_io_store_base_begin`, `base_record` per record and `base_end`, then
+  since ops are processed in emission order), takes an engine lease (for
+  the completion, P1), a staging slab, an engine file slot and a registry
+  entry (`RETRY` when any is missing, or while another CAPTURE runs), draws
+  16 random bytes for the id (redrawn while zero or held), copies the task
+  and its checkpoint into the template with the id, snapshots the table
+  (`vsr_io_store_snapshot_clients`, which also sets the capture floor),
+  and forwards the op with `data = &template task` at its next poll. The
+  writer then produces the file (`O_RDWR | O_CREAT | O_EXCL`, no
+  O_DIRECT, so chunks need no alignment): header; for each snapshot entry
+  the record bytes come from the ring when hot (`vsr_io_store_hot`), else
+  from a cold read into `cold_slab`, block-aligned from the log for a log
+  record (the CLIENTS record's CRCs checked, the client record located
+  through its change descriptor) or `slab_bytes` from the base file
+  through `store.base_slot` for a file-only record (bounded and CRC-checked
+  like any file record); each record plus its CRC is staged in the slab,
+  written (`WRITE | FIXED_FILE | FIXED_BUFFER`) when full and at the end;
+  trailer. `vsr_io_store_capture_offset` records each entry's offset;
+  `capture_end` sets `last_capture` (a zero id when the library half
+  fails: the floor only). The file stays open (the latest capture's kept
+  slot, P2). Completion to the core: `OK` with the caller's checkpoint
+  under the lease when both halves are OK; otherwise the file is closed and
+  unlinked first, then the caller's status (or the library's: `FAILED`
+  for I/O errors, `CORRUPT` for record bytes that fail their checks) is
+  reported. The core schedules captures on its own; the engine does not
+  retry.
+- SNAPSHOT_SYNC: forwarded at once; `FSYNC | DATASYNC` of the file
+  through its kept slot or a transient read-only open (closed again),
+  then `FSYNC` of the directory (opened into a slot at the module's first
+  poll); completion when both halves are over, with the caller's status
+  or `FAILED`; any failure is reported as-is (the core fences on it). A
+  SYNC of an entry whose kept slot is being released cancels or follows
+  that RELEASE (P3).
+- FETCH: an id already held is forwarded at once. Otherwise `task->peer`
+  is resolved to a node through the authorization table (no node:
+  `RETRY`), an engine lease, the reader's slab, a file slot and an entry
+  are taken (`RETRY` when missing, or while the reader serves another
+  fetch or a base load), and a library stream is opened with a
+  `vsr_io_wire_library_request` for
+  `(cluster, task->peer, task->checkpoint->id)`. `clients-<id>.tmp` is
+  opened (`O_WRONLY | O_CREAT | O_TRUNC`); chunks arrive through
+  `vsr_io_snapshots_stream_data` in order, are copied into the reader and
+  verified as they arrive, and are written at their offsets one write at a
+  time, each DATA op completed when its write completes (P5). At
+  `stream_end`: an OK END with the reader past a matching trailer closes
+  the file, renames it to `clients-<id>` (RENAMEAT), keeps the entry with
+  `sequence = 0` (set by the RESTORE's load) and forwards FETCH; any other
+  outcome closes and unlinks the temporary file and completes the core op
+  with the stream's status (`RETRY` on loss, `FAILED` for a source read
+  error or a local I/O error, `CORRUPT` for bytes that fail verification,
+  `NOT_FOUND` from the source) without involving the caller. A caller
+  failure on a fetched file not yet adopted by a RESTORE unlinks it
+  (vsr.h's private partial object). `basis` is passed through; the library
+  half does not use it.
+- DROP: forwards; on the caller's OK, the kept slot is closed and the
+  file unlinked once `readers == 0`, then the entry freed; a served library
+  stream still reading it delays the unlink, not the completion. An id the
+  registry does not hold is forwarded all the same and its file unlinked
+  if present (P3). The caller's failure keeps the file.
+- Base loads: the module's poll starts one whenever
+  `vsr_io_store_base_wanted` reports a file (a held RESTORE, a PUBLISH of
+  a file that is neither the latest capture nor the base, or recovery's
+  anchor, decision 90); `vsr_io_snapshots_load_base(id, sequence)` opens
+  `clients-<id>`, STATXes its size, reads it in slab-sized reads through
+  the reader, calls `vsr_io_store_base_begin`, `base_record` per record
+  (ELIMIT: `FAILED`, EINVAL: `CORRUPT`) and `base_end`, then
   `vsr_io_store_base_resume(status)`. A missing file on a replica whose
   hard-state role is `FULL` is `CORRUPT`; on a `WITNESS` it is expected and
-  yields an empty table.
+  yields an empty table. The file stays open; `store.base_slot` follows the
+  store's client base (P2).
 - Serving: `vsr_io_snapshots_serve` finds the replica by cluster and
-  replica id, requires the registry entry in WRITTEN or later state (else
-  END `NOT_FOUND`), opens the file into a slot, increments `readers`, and
+  replica id, requires the registry entry complete, not discarded or
+  dropped and with no CAPTURE outstanding (else END `NOT_FOUND`),
+  increments `readers`, then opens the file into a slot from prepare and
   feeds one FILE write of the whole file to the stream module followed by
-  CLOSE OK; the slot is closed and `readers` decremented at END.
+  CLOSE OK (FAILED when the write is refused; the open's failure ends the
+  stream `NOT_FOUND` for `ENOENT`, else `FAILED`); the slot is closed and
+  `readers` decremented at `stream_end` (P4).
 
-Tests: `tests/unit/snapshot` (fake engine and a fake store: file bytes
-produced for a table of 0, 1 and `max_clients` entries with hot and cold
-records, chunk boundaries at every record boundary, header/record/trailer
-verification, each joint op's completion ordering with the caller half
-completing first and last, failure on each half, DROP with a reader);
+At most `VSR_IO_SNAPSHOT_FILEOPS` (4) records of a replica's module are in
+flight (slot kind CLIENTS, owner the replica, `sub` naming the entry, the
+serve or the directory, the cookie the step). A wait for a slab, a slot, a
+lease or a file operation arms the replica's CAPTURE deadline at
+`io->now + 1 ms`; its pop needs no dispatch, the poll that follows retries.
+`vsr_io_snapshots_close` (detach) is EBUSY while a record is in flight,
+the writer or reader is busy or a served stream is open; otherwise it
+drops every kept slot, clears `store.base_slot` and releases the leases of
+ops the stopped core abandoned.
+
+Tests: `tests/unit/snapshot` (two engines over fake executors with a
+modelled network and a directory model per engine: named files behind
+registered slots with a flushed shadow and durable names, faults and holds
+per record kind; each engine has a real store, real links and streams,
+and the test plays engine part 2): capture from the ring, cold log reads
+and the base file, files of 0, 2 and `max_clients` records, every
+library-half and caller-half failure of a capture, SYNC with and without a
+kept slot and racing a RELEASE, DROP (unknown ids, under a reader, of the
+base), fetches of several chunks, every CORRUPT/FAILED/NOT_FOUND/RETRY
+cause on both sides of a library stream, the rename only after a verified
+END, the serve's file-operation wait and its end in every state, base
+loads for a RESTORE and a PUBLISH (also one that cannot pack at once), 14
+load failures, recovery of the anchor (decision 90) including a missing,
+corrupt or unreadable file, close and engine shutdown with work in flight.
+After every step the harness checks the module's invariants: engine file
+slots held exactly once and covering every open handle, CLIENTS records
+equal to the file operations and at most four, reserved leases distinct.
 `tests/integration/snapshots` over the simulation (capture on one engine,
 fetch by another, restore, recovery from the file after a crash, a corrupt
-file detected).
+file detected) is still to be written.
 
 ### Engine (`src/io/engine.h`)
 
@@ -1046,11 +1099,17 @@ Header (64 bytes): magic "CLT1", format, cluster hi/lo, snapshot hi/lo, op,
 sequence (the writer's), count, crc (over the preceding bytes). Records:
 `vsr_io_wire_client_record`, result bytes padded to 8, then `u32 crc` of
 the record and bytes. Trailer (8 bytes): magic, count. A reader verifies
-every CRC and both counts; anything else is `CORRUPT`. A reader bounds a
-record's `length` by the bytes left before the trailer before it calls
-`vsr_io_codec_get_clients_record`, which checksums the padded bytes before
-it checks the limit. Files are written once, sequentially, and never
-modified; the fetch path writes `clients-<id>.tmp` and renames.
+every CRC and both counts; anything else is `CORRUPT`. The snapshot
+module's reader bounds a record's `length` by `result_bytes` and, when the
+file's size is known (loads, not fetches), the record's whole extent by the
+bytes left before the trailer; it waits for the record's bytes, checks the
+CRC over them and only then decodes the fixed part
+(`vsr_io_codec_skip_client_record` over exactly those bytes), so no length
+reads past what it holds. A header naming another snapshot or cluster or
+more than `max_clients` records, a record longer than a slab, a trailer
+count that disagrees, or any byte after the trailer is `CORRUPT`. Files are
+written once, sequentially, and never modified; the fetch path writes
+`clients-<id>.tmp` and renames.
 
 ## 6. Store internals
 
@@ -1401,7 +1460,8 @@ no transaction waits.
    while deadlines_pop(now, kind, index): dispatch (LINK/DIAL ->
        vsr_io_links_deadline, FLUSH/SYNC -> store, STREAM ->
        vsr_io_streams_deadline,
-       CAPTURE -> snapshots, CORE -> nothing: TIME below handles it)
+       CAPTURE -> nothing: the module's poll below retries its waits,
+       CORE -> nothing: TIME below handles it)
    links_poll(now); streams_poll(now)
    for each replica in OPENING or RUNNING:
        do {
@@ -1507,8 +1567,9 @@ returns immediately and prepares again):
    completion each; the same `count` continues the array).
 4. Per replica: `vsr_io_store_prepare` (open/create steps, header writes,
    one record write, superblock write, flush, one cold read), then
-   `vsr_io_snapshots_prepare` (clients file reads and writes, fsyncs,
-   renames, unlinks).
+   `vsr_io_snapshots_prepare` (the directory open, clients file opens,
+   reads, writes, STATX, fsyncs, closes, renames, unlinks, at most
+   `VSR_IO_SNAPSHOT_FILEOPS` in flight; the same `count` continues).
 5. `*deadline_ns = vsr_io_deadlines_earliest()`.
 
 ### 7.5 vsr_io_complete
@@ -1517,8 +1578,9 @@ For each record: `vsr_io_slots_resolve` (foreign owner tag or stale
 generation: dropped, `stats.frames_rejected` untouched, a counter in the
 slot table); then by `slot.kind`: LISTEN, CONNECT, RECV, SEND, SHUTDOWN ->
 `vsr_io_links_complete`; WRITE, FLUSH, SUPER, LOAD, FILE (owner replica)
--> `vsr_io_store_complete`; CLIENTS, FILE (owner snapshot) ->
-`vsr_io_snapshots_complete`; STREAM -> `vsr_io_streams_complete`. The
+-> `vsr_io_store_complete`; CLIENTS -> `vsr_io_snapshots_complete(io,
+slot.owner, slot, cqe)` (every record of the snapshot module has that
+kind, owner = replica index); STREAM -> `vsr_io_streams_complete`. The
 module consumes the slot (`vsr_io_slots_consumed` with the record's MORE,
 or `vsr_io_slots_free` for a zero-copy send refused before the kernel took
 it), since it knows what each completion means (decision 74). Nothing
@@ -1744,6 +1806,7 @@ of `docs/io-design.md`:
 | `stream.h` (internal) | `vsr_io_stream_unit.sequence` (was `reserved`) and `vsr_io_stream.chunks`: a DATA op id's unit field is the chunk's sequence, not its slot | 100 |
 | `stream.h` (internal) | `vsr_io_streams_link_lost` ends a stream CANCELLED while the link module shuts down; `vsr_io_stream.closed`: `vsr_io_streams_close` is OK once per accepted stream until its END op (also after an end under the caller, a read failure included), EINVAL for a status outside enum vsr_io_status; `vsr_io_streams_write` is EINVAL for a caller stream's FILE range on an engine file slot; `vsr_io_streams_data_done` re-arms the requester's clock | 101, 102, 103, 97 |
 | `vsr-io.h` | Bulk streams: CANCELLED on the closing engine whichever shutdown runs first; STREAM_CLOSE once, OK until STREAM_END also after an end under the caller, its status an enum vsr_io_status; STREAM_WRITE EINVAL once the stream ended; a FILE range on one of the engine's slots EINVAL | 101, 102, 103 |
+| `snapshot.h` (internal) | The module's structures as implemented: `vsr_io_snapshots_size`/`init` take the engine limits (`stream_window`, `streams`) and `max_clients`; `vsr_io_snapshots_region_bytes`; a registry entry carries the file size, the job and its step, the record in flight, the kept and transient slots, `on_disk`, `sync_failed`, `job_next`, the reserved `lease` and the copied `result`; the writer, the reader, the chunk ring, the serves, the file-operation table, the directory slot and `pending_base`; the ops are `RETRY` without an engine lease; an OK CAPTURE or FETCH completion carries the lease; a DROP of an id the registry lacks is taken; a file with a CAPTURE outstanding is not served; the weak hook stubs left stream.c | P1, P2, P3, P4, P5 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1791,3 +1854,32 @@ of `docs/io-design.md`:
   unit closes the link `-EPIPE` with the END frame still held, ending
   the transfer RETRY at the requester while the source reported OK. Only
   a requester slower than `handshake_timeout_ns` per window gets there.
+- The pool's reserve (`replicas + 1` free slabs, decision 54's floor) does
+  not count the snapshot module's staging slabs (the writer's and its cold
+  slab, the reader's: up to three per replica) nor the link send slab a new
+  stream link takes. With every other slab provided to the ring and idle
+  links returning none, a fetch's reader slab can take the last free slab
+  before its stream link's send slab: the handshake stalls and the fetch
+  ends RETRY at the inactivity timer, and the same can happen again. The
+  unit harness gives each engine a caller share (`caller_slabs = 8`) to
+  model a pool with slack. Counting three slabs per replica and one per
+  stream in the reserve (and the minimum-slabs rule) would close it; the
+  module already answers RETRY at once when a slab is missing.
+- A CLIENT load of a file-only record is resolved against the base file
+  when it is accepted but reads through `store.base_slot` when issued; a
+  base change in between (a PUBLISH or RESTORE packed while the load
+  queued) makes it read the new file at the old offset. The store's floor
+  covers queued cold loads of the log only.
+- A fetch whose verification or local write failed keeps receiving the
+  stream until its END (the chunks are completed and dropped at once); the
+  requester has no early abort of a library stream. The files are small.
+- A failed open of the directory is final for the replica's module: every
+  later SYNC completes `FAILED` (the core fences). The open is issued once,
+  at the module's first poll.
+- A capture whose caller half fails after the file was complete has
+  already moved the store's `last_capture` to its id, whose file is then
+  unlinked; harmless, since the core never publishes an id whose CAPTURE
+  failed, and the next capture moves it again.
+- The capture writer reads one cold record at a time (one READ per record
+  not in the ring); batching adjacent records of one segment would save
+  reads for large tables.
