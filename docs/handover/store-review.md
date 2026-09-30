@@ -5,7 +5,7 @@ of main fb747c3 (not merged, not pushed). Every fix has its breaking test
 first (section "Review: ..." at the end of tests/unit/store.c), each
 observed failing before its fix; the other review tests pin down corners
 found sound. snapshot.c, engine.c and link.c untouched; store.h changed
-only in one comment (`freeing_flush`). Placeholder decisions V1, V2, V3
+only in one comment (`freeing_flush`). Placeholder decisions 124, 125, 126
 in docs/io-design.md section 10 (the coordinator renumbers).
 
 Checks on the final tree: clang 21 (ASan+UBSan, `--enable-werror`)
@@ -26,7 +26,7 @@ below cheap.
    reported) the STOREs held for the header hung. Fix 30b2e26: a
    creation error fences under every `on_write_error` (there is no log
    to serve from memory); the load or the held STOREs complete FAILED.
-   Decision V2. Test `test_review_create_continue` (a failed header
+   Decision 125. Test `test_review_create_continue` (a failed header
    write under NEW, a failed creation flush under RECOVER with a held
    STORE, a failed superblock write in DSYNC mode).
 
@@ -37,7 +37,7 @@ below cheap.
    completion per op. Fix 30b2e26: `syncs_fail` completes the queued
    SYNCs FAILED at the error and `vsr_io_store_sync` fails a later one a
    completed flush does not already satisfy (a satisfied one still
-   completes OK). Decision V2. Test `test_review_sync_continue` (both
+   completes OK). Decision 125. Test `test_review_sync_continue` (both
    sync modes). Replicated replicas never SYNC, so this reaches only a
    misconfigured durable one, which then fences instead of hanging.
 
@@ -50,7 +50,7 @@ below cheap.
    30b2e26: `superblock_done` asks for the store's own flush (the
    `freeing_flush` request of decision 111) whenever a completed
    superblock write raised `superblock_floor` in FDATASYNC mode; an
-   O_DSYNC write needs none. Decision V1. Test `test_review_idle_flush`
+   O_DSYNC write needs none. Decision 124. Test `test_review_idle_flush`
    (the flush follows, a crash losing unflushed blocks keeps the floor,
    the recovery reads it; no flush in DSYNC mode); `test_idle_superblock`
    now completes that flush.
@@ -87,7 +87,7 @@ freed slots held nothing a consistent older row needs). Bounding freeing
 by the durable floor on media would free nothing in replicated mode, and
 the header's client base predates its segment's records, so a check of
 the client base against the start segment cannot see records freed under
-a later base. Recorded as decision V3; the idle floor flush of V1 narrows
+a later base. Recorded as decision 126; the idle floor flush of 124 narrows
 50's window in FDATASYNC mode. The section-11 item is rewritten.
 
 ## The independent checker (tests/unit/store.c, `checked_*`)
@@ -203,7 +203,7 @@ resume offset. Findings:
   client id, the byte bound never cuts the first entry.
 - Exactly-once: STORE (packed, aborted with its status, failed at a
   fence, or failed by `base_resume`), SYNC (settled, failed at a fence,
-  V2), LOAD (a resolve failure, `load_finish`, a read error, a fence, no
+  125), LOAD (a resolve failure, `load_finish`, a read error, a fence, no
   base slot), RECLAIM (at once), the RECOVERY load (NOT_FOUND at the
   probe under RECOVER or at creation's end, OK, CORRUPT/FAILED through
   `recovery_fail`/`store_fail`, once because `load_op` is zeroed).
@@ -301,9 +301,9 @@ existed, e.g. the lost `chain_resume`).
 | M42 trims_reclaim: the ring below retained_begin not cleared | test_floor |
 | M43 pack_end: the seal header ignores the wrap (69) | test_review_seal_wrap_pin |
 | M44 pin_floor: pins ignored | test_pins |
-| M45 superblock_done: no flush after a raised floor (V1) | test_idle_superblock, test_review_idle_flush |
-| M46 write_error: creation errors follow CONTINUE (V2) | test_review_create_continue |
-| M47 sync: SYNCs in memory-only mode wait forever (V2) | test_review_sync_continue |
+| M45 superblock_done: no flush after a raised floor (124) | test_idle_superblock, test_review_idle_flush |
+| M46 write_error: creation errors follow CONTINUE (125) | test_review_create_continue |
+| M47 sync: SYNCs in memory-only mode wait forever (125) | test_review_sync_continue |
 | M48 chunk: the chain resumes one position past the boundary | survived: equivalent (below) |
 | M49 judge: a bad range is never judged (re-read forever) | test_recover_torn |
 | M50 record_changes: a descriptor may overlap the last one (77) | test_review_descriptor_overlap |

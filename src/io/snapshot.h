@@ -119,13 +119,17 @@ struct vsr_io_snapshot {
                                found by a load); 0 once unlinked. */
     uint32_t sync_failed;   /* SYNC: the fdatasync failed; reported once
                                the transient slot is closed. */
+    uint32_t dir_retried;   /* SYNC: the directory's open was retried for
+                               it; a second failure fails the SYNC. */
     uint32_t job_next;      /* JOB_SYNC to start once the RELEASE whose
                                CLOSE is in flight completes, or NONE. */
     uint32_t lease;         /* CAPTURE, FETCH: the engine lease reserved
                                when the op was taken; the caller's
                                checkpoint is copied into its region and the
                                OK completion carries it. NONE otherwise. */
-    uint32_t reserved;
+    uint32_t transferred;   /* FETCH: this op's stream wrote the file, a
+                               private object until the op completes OK (a
+                               held file a FETCH found is the core's). */
     const struct vsr_snapshot_task *task; /* The core op's task, pinned
                                              until the op completes. */
     const struct vsr_checkpoint *result;  /* The caller's checkpoint copied
@@ -153,6 +157,10 @@ struct vsr_io_clients_writer {
     uint32_t cold_bytes;  /* Bytes the cold read returned. */
     uint64_t cold_offset; /* File offset the cold read started at. */
     uint64_t file_offset; /* Bytes written to the file so far. */
+    uint32_t digest;      /* The trailer's crc so far: CRC32C of the
+                             header and of each record staged, without
+                             its own CRC. */
+    uint32_t reserved;
     uint64_t header_op;
     uint64_t header_sequence;
     uint32_t trailer_staged;
@@ -172,6 +180,9 @@ struct vsr_io_clients_reader {
     uint64_t file_size;   /* UINT64_MAX until known. */
     uint32_t expected;    /* Records announced by the header. */
     uint32_t seen;
+    uint32_t digest; /* CRC32C of the header and of each record
+                             parsed, without its own CRC: the trailer's. */
+    uint32_t reserved;
     uint64_t sequence; /* Base sequence to install at the end. */
     int32_t status;    /* Parse failure status, or OK. */
     uint32_t stream;   /* Library stream index for FETCH, or NONE. */
