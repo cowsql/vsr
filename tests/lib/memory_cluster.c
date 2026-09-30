@@ -1664,7 +1664,14 @@ size_t mem_cluster_run(struct mem_cluster *cluster, size_t budget)
                 const struct mem_step step = mem_node_event(node, NULL);
                 CHECK(step.result == VSR_OK || step.result == VSR_AGAIN);
                 actions++;
-                progress = true;
+                /* A refused input whose admission attempt exhausted the
+                 * work budget reports MORE conservatively; the drain it
+                 * asks for may then find nothing runnable. Such an idle,
+                 * silent drain is not progress: re-offering the input after
+                 * it would spin until time or a completion, which is what
+                 * the contract tells a host to wait for. */
+                if (step.emitted != 0 || (step.flags & VSR_UPDATE_MORE) != 0)
+                    progress = true;
             }
             /* MORE may mean a budget-limited poll encountered an input whose
              * dependency is an outstanding effect. Fair completion service
