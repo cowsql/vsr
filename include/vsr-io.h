@@ -388,16 +388,16 @@ struct vsr_io_limits {
  * core limits), one stream chunk plus framing, and the largest store record
  * plus two blocks of alignment, so a frame fits one slab, a straddling
  * frame is copied into a fresh one, and a cold LOAD reads its records into
- * one slab. slabs must be at least links + streams * (stream_window + 1) +
- * 4 * replicas + 5 + caller_slabs. The pool has three shares: the engine's
- * reserve of links + streams * stream_window + 4 * replicas + 1 slabs (a
- * send slab per link for its frame headers, the chunk reads of every
- * stream window, per replica a cold-load or recovery read slab and three
- * snapshot staging slabs, one reassembly slab), the caller's share, and
- * the ring's, at least streams + 4 slabs; whatever part of the first two
- * is not held stays out of the ring, since the kernel returns a provided
- * slab only once it has filled it. More slabs than the minimum buy
- * receive throughput.
+ * one slab. slabs must be at least 2 * links + streams * (stream_window +
+ * 1) + 4 * replicas + 5 + caller_slabs. The pool has three shares: the
+ * engine's reserve of links + streams * stream_window + 4 * replicas + 1
+ * slabs (a send slab per link for its frame headers, the chunk reads of
+ * every stream window, per replica a cold-load or recovery read slab and
+ * three snapshot staging slabs, one reassembly slab), the caller's share,
+ * and the ring's, at least links + streams + 4 slabs (one per link
+ * receiving); whatever part of the first two is not held stays out of the
+ * ring, since the kernel returns a provided slab only once it has filled
+ * it. More slabs than the minimum buy receive throughput.
  * file_slots covers the listeners, every link, one per stream (the file a
  * served stream reads), and per replica the log plus one transient
  * clients file. buffer_regions covers one region for the payload pool plus

@@ -393,7 +393,7 @@ static void test_layout(void)
     /* Every table grows the region. */
     o = base;
     o.limits.links = 8;
-    o.limits.slabs = SLABS + 4;
+    o.limits.slabs = SLABS + 8;
     o.limits.file_slots = 16;
     check_layout(&o);
     o = base;
@@ -403,6 +403,7 @@ static void test_layout(void)
     o.limits.replicas = 3;
     o.limits.buffer_regions = 4;
     o.limits.file_slots = 14;
+    o.limits.slabs = SLABS + 4;
     check_layout(&o);
     o = base;
     o.limits.caller_slabs = 0;
@@ -520,25 +521,31 @@ static void test_layout(void)
     CHECK(layout_of(&o) == VSR_OK);
 
     /* ELIMIT: minimum slabs = the reserve (links + streams * window + 4 *
-     * replicas + 1) + streams + 4 + caller_slabs = 4 + 6 + 8 + 5 + caller
-     * (decision E1). */
+     * replicas + 1) + the ring's links + streams + 4 + caller_slabs = 2 * 4
+     * + 6 + 8 + 5 + caller (decision E1). */
     o = base;
-    o.limits.slabs = 25;
+    o.limits.slabs = 29;
     CHECK(layout_of(&o) == VSR_OK);
-    o.limits.slabs = 24;
+    o.limits.slabs = 28;
     CHECK(layout_of(&o) == VSR_ELIMIT);
     o = base;
-    o.limits.caller_slabs = SLABS - 23;
+    o.limits.caller_slabs = SLABS - 27;
     CHECK(layout_of(&o) == VSR_OK);
-    o.limits.caller_slabs = SLABS - 22;
+    o.limits.caller_slabs = SLABS - 26;
+    CHECK(layout_of(&o) == VSR_ELIMIT);
+    o = base;
+    o.limits.links = 5; /* One more link: two slabs more. */
+    o.limits.slabs = 31;
+    CHECK(layout_of(&o) == VSR_OK);
+    o.limits.slabs = 30;
     CHECK(layout_of(&o) == VSR_ELIMIT);
     o = base;
     o.limits.replicas = 3;
     o.limits.buffer_regions = 4;
     o.limits.file_slots = 14;
-    o.limits.slabs = 29;
+    o.limits.slabs = 33;
     CHECK(layout_of(&o) == VSR_OK);
-    o.limits.slabs = 28;
+    o.limits.slabs = 32;
     CHECK(layout_of(&o) == VSR_ELIMIT);
     o = base;
     o.limits.slabs = 32769;

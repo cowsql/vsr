@@ -120,7 +120,7 @@ with `VSR_ELIMIT`:
 | Slots | `vsr_io_slots_size`: `listeners + 7 * links + streams * (stream_window + 2) + replicas * (inflight_writes + 8) + 8`; per link a receive, a shutdown, a connect and `VSR_IO_LINK_SENDS` (4) sends awaiting NOTIF | `slots.c` |
 | Deadlines | `links + nodes + 4 * replicas + streams` | `engine.c` |
 | Pool reserve | `links + streams * stream_window + 4 * replicas + 1` slabs, never provided while internal users do not hold them | `engine.c`, `pool.c`, decision E1 |
-| Minimum slabs | `links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs` (the reserve, the ring's `streams + 4`, the caller's share) | `vsr-io.h`, decisions 54 and E1 |
+| Minimum slabs | `2 * links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs` (the reserve, the ring's `links + streams + 4`, the caller's share) | `vsr-io.h`, decisions 54 and E1 |
 | Send queue | `link_queue` entries per node | `link.c`, decision 38 |
 | Versions table | `max_entries` | `store.c` |
 | Client table | next power of two `>= 2 * max_clients` buckets | `store.c` |
@@ -1923,7 +1923,7 @@ of `docs/io-design.md`:
 | `store.h` | `vsr_io_recovery.chain_resume` (the boundary at which the chain resumes past a block's dead tail); `VSR_IO_SEGMENT_FLUSHING`, `freeing_flush` and `flush_own` (a freed slot waits for the flush after its superblock write, which the store issues without waiting for a SYNC's target); `reclaimed`, `client_base_floor` and `client_base_pending` (the floor terms bounded by the sequence on media); `snapshot_clients` reports a record freed under the base as the base file's (sequence 0, the base offset); `vsr_io_store.replica`, the embedding replica, set by init; `vsr_io_recovery.record_run` (was `reserved`), the run of the last replayed record | 110, 111, 112, 113, 116 |
 | `vsr-io.h` | Record kinds `VSR_IO_SQE_FILES_UPDATE` and `VSR_IO_SQE_PROVIDE` (the executor contract, section 8); the engine's primitives never call the executor; `limits.batch` and `vsr_io_prepare`'s capacity at least 5 | E7 |
 | `engine.h`, `link.h`, `slots.h` (internal) | The generator (`random_state`), the queued slot clears (`clears`, `vsr_io_engine_slot_clear`, `vsr_io_engine_slot_clearing`, `vsr_io_engine_prepare_files`, `vsr_io_engine_files_complete`), the `PROVIDE` record's `provide_buffers` and user_data; `vsr_io_engine_install` removed; `VSR_IO_ENGINE_BATCH_MIN` 5; the link's `installing`, `install_slot`, `install_establish` and `VSR_IO_STAGE_INSTALL`; slot kinds `FILES` and `PROVIDE` | E7, E8, E9 |
-| `vsr-io.h`, `pool.h` (internal) | Sizing rule: minimum slabs `links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs`, and the pool's three shares; `vsr_io_slab_acquire` is ELIMIT at the caller's share, or while the engine's users hold more than the reserve and use the untaken share; the pool's `internal_taken`, the slab's `internal` flag (with `state` now 8 bits), `vsr_io_pool_handoff`, `vsr_io_pool_floor` | E1 |
+| `vsr-io.h`, `pool.h` (internal) | Sizing rule: minimum slabs `2 * links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs`, and the pool's three shares; `vsr_io_slab_acquire` is ELIMIT at the caller's share, or while the engine's users hold more than the reserve and use the untaken share; the pool's `internal_taken`, the slab's `internal` flag (with `state` now 8 bits), `vsr_io_pool_handoff`, `vsr_io_pool_floor` | E1 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -2013,9 +2013,9 @@ of `docs/io-design.md`:
   their purpose count against it until released: a reassembled stream
   chunk held by its DATA op (up to the window), a snapshot staging slab of
   a stalled capture. The internal users then take the caller's untaken
-  share and, past it, wait and retry at poll as before. The unit harness
-  of the snapshot module still gives each engine a caller share
-  (`caller_slabs = 8`); it is no longer needed for the fetch.
+  share and, past it, wait and retry at poll as before. The snapshot
+  module's unit harness runs with `caller_slabs = 0`, the configuration in
+  which a fetch used to starve its own stream link.
 - A fetch whose verification or local write failed keeps receiving the
   stream until its END (the chunks are completed and dropped at once); the
   requester has no early abort of a library stream. The files are small.

@@ -49,7 +49,7 @@
 
 #define PAGE 4096u
 #define NONE UINT32_MAX
-#define SLABS 32u
+#define SLABS 40u
 #define ENGINES 2u
 #define SOCKETS 24u
 #define FD_BASE 300

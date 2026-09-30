@@ -72,8 +72,8 @@
 /* Pool reserve per replica: a cold-load or recovery read slab, and the
  * snapshot module's writer, writer-cold and reader slabs (decision E1). */
 #define ENGINE_RESERVE_PER_REPLICA 4u
-/* One reassembly slab, and the slabs the ring keeps beyond one per stream
- * in the minimum-slabs rule. */
+/* One reassembly slab, and the slabs the ring keeps beyond one per link
+ * and one per stream in the minimum-slabs rule. */
 #define ENGINE_RESERVE_REASSEMBLY 1u
 #define ENGINE_RING_MIN 4u
 
@@ -217,12 +217,14 @@ static int check_options(const struct vsr_io_options *options)
         return VSR_ELIMIT;
     }
     /* Minimum slabs: the reserve (links + streams * stream_window + 4 *
-     * replicas + 1), the ring's streams + 4 and caller_slabs, that is
-     * links + streams * (stream_window + 1) + 4 * replicas + 5 +
+     * replicas + 1), the ring's links + streams + 4 (a slab per link
+     * receiving, one per stream, four more) and caller_slabs, that is
+     * 2 * links + streams * (stream_window + 1) + 4 * replicas + 5 +
      * caller_slabs (decisions 42, 54 and E1). */
     if (!vsr_size_add(limits->stream_window, 1, &term) ||
         !vsr_size_mul(limits->streams, term, &term) ||
         !vsr_size_add(limits->links, term, &minimum) ||
+        !vsr_size_add(minimum, limits->links, &minimum) ||
         !vsr_size_mul(limits->replicas, ENGINE_RESERVE_PER_REPLICA, &term) ||
         !vsr_size_add(minimum, term, &minimum) ||
         !vsr_size_add(minimum, ENGINE_RESERVE_REASSEMBLY + ENGINE_RING_MIN,

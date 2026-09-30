@@ -1381,12 +1381,10 @@ static struct vsr_io_options engine_options(struct engine *e, uint64_t node)
     l->batch = SQ_CAP;
     l->slabs = SLABS;
     l->slab_bytes = PAGE;
-    /* The caller's untaken share stays FREE (decision 54); the internal
-     * acquires of the links (send slabs) and of this module (staging) can
-     * take it. Without it the ring holds every slab above the reserve of
-     * replicas + 1 while idle peer links return none, and a module slab
-     * can starve a new stream link's send slab (docs section 11). */
-    l->caller_slabs = 8;
+    /* No caller share: the engine's reserve covers the links' send slabs
+     * and this module's staging (decision E1), so a fetch no longer
+     * starves its own stream link's send slab on an idle engine. */
+    l->caller_slabs = 0;
     l->file_slots = FILE_SLOTS;
     l->buffer_regions = 3;
     options.file_slot_base = FILE_SLOT_BASE;
