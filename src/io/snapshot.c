@@ -2048,6 +2048,7 @@ int vsr_io_snapshots_sync(struct vsr_io *io, uint32_t replica, uint64_t op,
     entry->caller_status = -1;
     entry->library_status = -1;
     entry->forward_due = 1;
+    entry->dir_retried = 0;
     entry->state = VSR_IO_SNAPSHOT_SYNCING;
     if (entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE && entry->fileop != NONE) {
         entry->job_next = VSR_IO_SNAPSHOT_JOB_SYNC;
@@ -2406,6 +2407,21 @@ void vsr_io_snapshots_poll(struct vsr_io *io, uint32_t replica, uint64_t now)
     if (s->dir_state == DIR_CLOSED) {
         s->dir_state = DIR_OPENING;
     }
+    if (s->dir_state == DIR_FAILED) {
+        /* The open failed (EMFILE, ENOMEM...): a SYNC waiting for the
+         * directory has it tried again once, rather than fencing the
+         * replica for good. */
+        for (uint32_t i = 0; i < s->count; ++i) {
+            struct vsr_io_snapshot *entry = &s->entries[i];
+
+            if (entry->state != VSR_IO_SNAPSHOT_FREE &&
+                entry->job == VSR_IO_SNAPSHOT_JOB_SYNC &&
+                entry->step == STEP_FSYNC_DIR && !entry->dir_retried) {
+                entry->dir_retried = 1;
+                s->dir_state = DIR_OPENING;
+            }
+        }
+    }
     base_track(io, replica);
     if (s->reader.snapshot == NONE &&
         vsr_io_store_base_wanted(&rep->store, &wanted, &sequence)) {
@@ -2512,7 +2528,10 @@ static bool prepare_entry(struct vsr_io *io, uint32_t replica, uint32_t index,
         return false;
     }
     if (step == STEP_FSYNC_DIR) {
-        if (s->dir_state == DIR_OPENING) {
+        /* A failed open is retried once for this SYNC (the poll re-arms
+         * it); only that attempt's failure fails the SYNC. */
+        if (s->dir_state == DIR_OPENING ||
+            (s->dir_state == DIR_FAILED && !entry->dir_retried)) {
             return false;
         }
         if (s->dir_state != DIR_OPEN) {

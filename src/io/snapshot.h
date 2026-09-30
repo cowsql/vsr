@@ -119,6 +119,8 @@ struct vsr_io_snapshot {
                                found by a load); 0 once unlinked. */
     uint32_t sync_failed;   /* SYNC: the fdatasync failed; reported once
                                the transient slot is closed. */
+    uint32_t dir_retried;   /* SYNC: the directory's open was retried for
+                               it; a second failure fails the SYNC. */
     uint32_t job_next;      /* JOB_SYNC to start once the RELEASE whose
                                CLOSE is in flight completes, or NONE. */
     uint32_t lease;         /* CAPTURE, FETCH: the engine lease reserved

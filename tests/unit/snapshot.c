@@ -201,8 +201,9 @@ struct engine {
     uint32_t dir_opens;
     /* Faults on the next matching record. */
     int fail_open;
-    int fail_write; /* Pool-buffer writes only (the module's). */
-    int fail_read;  /* Pool-buffer reads of clients files. */
+    uint32_t fail_dir_opens; /* This many directory opens fail -EMFILE. */
+    int fail_write;          /* Pool-buffer writes only (the module's). */
+    int fail_read;           /* Pool-buffer reads of clients files. */
     int fail_fsync;
     int fail_fsync_dir;
     int fail_rename;
@@ -505,9 +506,14 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
         }
         if ((flags & O_DIRECTORY) != 0) {
             CHECK(strcmp(sqe->addr, DIRECTORY) == 0);
+            e->dir_opens++;
+            if (e->fail_dir_opens > 0) {
+                e->fail_dir_opens--;
+                *result = -EMFILE;
+                return true;
+            }
             s->file = -2;
             s->flags = flags;
-            e->dir_opens++;
             *result = sqe->fd2;
             return true;
         }
@@ -4985,6 +4991,45 @@ static void test_review_refetch_kept(void)
     expect_idle(b);
 }
 
+/* A failed directory open is retried by the SYNC that needs it: a
+ * transient failure (EMFILE at the module's first poll) made every later
+ * SNAPSHOT_SYNC FAILED, and each fences the replica. A SYNC waits for one
+ * open of its own; if that fails too, the SYNC fails (no loop), and the
+ * next SYNC tries again. */
+static void test_review_dir_retry(void)
+{
+    struct engine *a;
+    struct vsr_id x;
+    uint32_t opens;
+
+    world_reset(123);
+    a = engine_open(0);
+    a->fail_dir_opens = 2;
+    expect_store(a, store_start(a, VSR_START_NEW), VSR_IO_NOT_FOUND);
+    store_run(a, txn_identity(a, 1, VSR_MEMBER_FULL));
+    (void)store_clients(a, 2, 2, 8);
+    CHECK(a->dir_opens == 1 && a->fail_dir_opens == 1);
+    CHECK(a->snapshots->dir_slot == NONE);
+    x = capture(a);
+    /* The SYNC's own open fails too: FAILED once, bounded. */
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_FAILED);
+    CHECK(a->dir_opens == 2 && a->fail_dir_opens == 0);
+    CHECK(entry_of(a, x)->state == VSR_IO_SNAPSHOT_WRITTEN);
+    expect_idle(a);
+    /* The next SYNC opens the directory and succeeds; the one after it
+     * reuses the open directory. */
+    opens = a->dir_opens;
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_OK);
+    CHECK(a->dir_opens == opens + 1 && a->snapshots->dir_slot != NONE);
+    CHECK(entry_of(a, x)->state == VSR_IO_SNAPSHOT_DURABLE);
+    CHECK(strcmp(clients_file(a, x, false)->durable_name,
+                 clients_file(a, x, false)->name) == 0);
+    joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_OK);
+    CHECK(a->dir_opens == opens + 1);
+    expect_idle(a);
+    engine_crash(a);
+}
+
 int main(void)
 {
     test_capture();
@@ -5001,5 +5046,6 @@ int main(void)
     test_review_sync_release();
     test_review_capture_release();
     test_review_refetch_kept();
+    test_review_dir_retry();
     return 0;
 }
