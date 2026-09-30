@@ -346,7 +346,7 @@ struct iow_world {
     uint32_t nodes;
     struct vsr_sim *sim;
     struct vsr_sim_options sim_options;
-    char directory[256]; /* IOW_URING: the stores' root. */
+    char directory[64]; /* IOW_URING: the stores' root, iow.<pid>.XXXXXX. */
     struct iow_node node[IOW_NODES];
     uint64_t incarnation;
     /* Defaults for the replicas attached next. */
