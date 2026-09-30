@@ -2722,6 +2722,7 @@ static int32_t resolve_client(const struct vsr_io_store *store,
     const struct vsr_io_client_version *version;
     uint64_t ring;
     bool live;
+    bool base;
 
     if (entry == NULL || entry->current.number == 0) {
         return VSR_IO_OK;
@@ -2733,10 +2734,14 @@ static int32_t resolve_client(const struct vsr_io_store *store,
     version = &entry->current;
     live = version->sequence != 0 &&
            record_live(store, version->offset, version->sequence);
+    /* The base file holds the current record only up to the base: a later
+     * CLIENTS record leaves base_offset naming the file's older one. */
+    base = entry->base_offset != UINT64_MAX &&
+           version->sequence <= store->client_base;
     if (live && extent_locate(store, version->offset, version->length, &ring)) {
         ref_set(&refs[0], version->offset, version->sequence, version->length,
                 version->change, version->index);
-    } else if (entry->base_offset != UINT64_MAX) {
+    } else if (base) {
         ref_set(&refs[0], entry->base_offset, 0, 0, 0, 0);
         load->base = 1;
     } else if (live) {

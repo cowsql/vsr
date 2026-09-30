@@ -5163,6 +5163,50 @@ static void test_client_freed(void)
     harness_close();
 }
 
+/* A client's record newer than the base, evicted from the ring: the
+ * load reads it from the log, not the base file's older record, which
+ * base_offset still names (it is valid only for a record at or below the
+ * base). Found by a random walk: the load returned the older record. */
+static void test_client_newer(void)
+{
+    struct config c = base_config();
+    struct vsr_id client = {0xC, 1};
+    struct vsr_id x = {0x51, 1};
+    const struct vsr_client_record *record;
+    const struct vsr_loaded *loaded;
+    struct vsr_io_piece piece;
+    uint32_t lease = NONE;
+    uint64_t number = 1;
+    uint64_t sequence = 5;
+    uint64_t op = 1;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_append(2, 1, 16));
+    store_run(txn_clients(3, 1, &client, &number, &op, 16));
+    harness_capture(x);
+    store_run(txn_publish(4, x, 1));
+    CHECK(h.store->client_base == 3 &&
+          client_of(client)->base_offset != UINT64_MAX);
+    number = 2;
+    store_run(txn_clients(5, 1, &client, &number, &op, 24));
+    while (vsr_io_store_hot(h.store, txns[5].file_offset,
+                            (uint32_t)txns[5].bytes, &piece)) {
+        store_run(txn_append(++sequence, 4, 200));
+    }
+    op = load_client(h.store->readable, client);
+    harness_run();
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    record = loaded->items;
+    CHECK(record->request.number == 2 && record->result.data.size == 24);
+    CHECK(memcmp(record->result.data.spans[0].data, txns[5].results[0], 24) ==
+          0);
+    release_lease(lease);
+    harness_close();
+}
+
 /* -------------------------------------------------------------------------
  * An independent reading of the image
  *
@@ -5979,6 +6023,14 @@ static void walk_check_client(uint32_t ci)
 
         CHECK(loaded->count == 1);
         record = loaded->items;
+        if (record->request.number != m->number || record->op != m->op) {
+            fprintf(stderr,
+                    "walk: client %u loaded number %" PRIu64 " op %" PRIu64
+                    ", the model's %" PRIu64 " op %" PRIu64
+                    " (sequence %" PRIu64 ")\n",
+                    ci, record->request.number, record->op, m->number, m->op,
+                    m->sequence);
+        }
         CHECK(record->request.number == m->number && record->op == m->op);
         CHECK(record->result.data.size == size);
         if (size > 0) {
@@ -6427,6 +6479,7 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_freeing_flush);
     RUN(test_reclaim_media);
     RUN(test_client_freed);
+    RUN(test_client_newer);
     RUN(test_walk);
     printf("store: ok\n");
     return 0;
