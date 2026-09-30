@@ -7607,6 +7607,28 @@ static void test_review_freeing_dirty(void)
     harness_close();
 }
 
+/* Decision 77: a change descriptor whose payload lies inside the
+ * descriptor area is CORRUPT even when nothing decodes the payload (a
+ * TRIM), at recovery as at a STORE. */
+static void test_review_descriptor_overlap(void)
+{
+    struct config c = plain_config();
+    unsigned char *record;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_append(2, 2, 100));
+    store_run(txn_trim(3, 2));
+    record = disk_image + txns[3].file_offset;
+    CHECK(vsr_io_get_u32(record + 48) == VSR_STORE_TRIM);
+    CHECK(vsr_io_get_u32(record + 48 + 20) == 0); /* No payload. */
+    vsr_io_put_u32(record + 48 + 16, 56); /* Inside its own descriptor. */
+    image_fix_record(txns[3].file_offset);
+    expect_corrupt(&c);
+    harness_close();
+}
+
 /* Names the test that fails; VSR_STORE_TEST in the environment runs
  * only the test of that name. */
 #define RUN(test)                                                              \
@@ -7703,6 +7725,7 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_review_short_file);
     RUN(test_review_seal_wrap_pin);
     RUN(test_review_freeing_dirty);
+    RUN(test_review_descriptor_overlap);
     printf("store: ok\n");
     return 0;
 }
