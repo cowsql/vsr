@@ -204,8 +204,9 @@ struct engine {
     bool hold_pool_writes; /* Pool-buffer writes are held. */
     bool hold_rename;
     bool hold_fsync;
-    bool hold_open;  /* Opens of clients files are held. */
-    bool hold_reads; /* Pool-buffer reads of clients files are held. */
+    bool hold_open;       /* Opens of clients files are held. */
+    bool hold_log_writes; /* The store's writes (from the tail) are held. */
+    bool hold_reads;      /* Pool-buffer reads of clients files are held. */
     struct held held[HELD_MAX];
     /* The replica's regions. */
     struct vsr_io_replica *replica;
@@ -566,6 +567,9 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
         }
         CHECK(end <= DFILE_BYTES);
         if (pool && e->hold_pool_writes) {
+            return false;
+        }
+        if (!pool && e->hold_log_writes) {
             return false;
         }
         if (pool && e->fail_write != 0) {
@@ -2783,7 +2787,7 @@ static uint64_t evict_clients(struct engine *e, uint64_t sequence)
 struct craft {
     unsigned char bytes[4096];
     uint64_t size;
-    uint64_t record_at[9]; /* Record offsets; [count] = the trailer's. */
+    uint64_t record_at[10]; /* Record offsets; [count] = the trailer's. */
 };
 
 static void craft_file(struct craft *c, struct vsr_id id, uint32_t count,
@@ -2792,7 +2796,7 @@ static void craft_file(struct craft *c, struct vsr_id id, uint32_t count,
     struct vsr_io_wire_clients_header header;
     unsigned char data[256];
 
-    CHECK(count <= 8 && result <= sizeof(data));
+    CHECK(count <= 9 && result <= sizeof(data));
     memset(c, 0, sizeof(*c));
     memset(&header, 0, sizeof(header));
     header.cluster_hi = 0x77;
@@ -3494,6 +3498,8 @@ static void test_capture_failures(void)
         while ((slab = vsr_io_pool_acquire(&a->io->pool, false)) != NONE) {
             taken[count++] = slab;
         }
+        vsr_io_deadlines_arm(&a->io->deadlines, DEADLINE_CAPTURE,
+                             VSR_NO_DEADLINE);
         for (uint32_t steps = 0; !a->snapshots->retry; ++steps) {
             step_checked(a); /* The open first, then the staging. */
             CHECK(steps < 10);
@@ -3785,18 +3791,8 @@ static void test_fetch_failures(void)
             (void)file_install(a, x, false, craft.bytes, craft.size);
             entry_mutable(a, x)->bytes = craft.size;
             break;
-        default: /* A count above max_clients. */
-            craft_file(&craft, x, 3, 8);
-            {
-                struct vsr_io_wire_clients_header header;
-                struct vsr_io_cursor cursor;
-
-                vsr_io_cursor_init_one(&cursor, craft.bytes, 64);
-                CHECK(vsr_io_codec_get_clients_header(&cursor, &header) ==
-                      VSR_OK);
-                header.count = 9;
-                vsr_io_codec_put_clients_header(&header, craft.bytes);
-            }
+        default: /* Nine well-formed records: above max_clients (8). */
+            craft_file(&craft, x, 9, 8);
             (void)file_install(a, x, false, craft.bytes, craft.size);
             entry_mutable(a, x)->bytes = craft.size;
             break;
@@ -3871,20 +3867,27 @@ static void test_fetch_failures(void)
         uint64_t op;
         uint32_t rounds = 0;
         const struct vsr_io_clients_reader *r = &b->snapshots->reader;
-        struct vsr_span bytes = {craft.bytes, 16};
+        const struct vsr_io_snapshots *s = b->snapshots;
+        const struct dfile *file = clients_file(a, x, false);
+        uint64_t at;
+        struct vsr_span bytes;
 
-        b->hold_pool_writes = true;
+        /* Mid-transfer, with window room: the next bytes of the file, as
+         * they would come, but one byte later than the reader's offset. */
         CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
-        while (r->file_offset + r->filled == 0) {
-            (void)world_run_checked(1);
-            CHECK(++rounds < 200);
+        while (r->file_offset + r->filled == 0 ||
+               s->chunks_count == s->chunks_capacity) {
+            step_checked(b);
+            step_checked(a);
+            CHECK(++rounds < 400);
         }
-        vsr_io_snapshots_stream_data(b->io, REPLICA, r->stream, 0,
-                                     r->file_offset + r->filled + 1, &bytes,
-                                     NONE);
+        CHECK(r->stage == 1 /* RECORDS */);
+        at = r->file_offset + r->filled;
+        bytes.data = file->data + at;
+        bytes.size = 16;
+        vsr_io_snapshots_stream_data(b->io, REPLICA, r->stream, 0, at + 1,
+                                     &bytes, NONE);
         CHECK(r->stage == 4 /* FAILED */);
-        b->hold_pool_writes = false;
-        world_release_held(b);
         settle();
         expect_core(b, op, VSR_IO_FAILED);
         CHECK(clients_file(b, x, false) == NULL &&
@@ -4067,6 +4070,8 @@ static void test_serve(void)
         a->hold_pool_writes = true;
         w = capture_begin(a, &hc, &capture_op);
         CHECK(held_count(a) == 4);
+        vsr_io_deadlines_arm(&a->io->deadlines, DEADLINE_CAPTURE,
+                             VSR_NO_DEADLINE);
         CHECK(fetch_start(b, &hf, x, 1, &fetch_op) == VSR_OK);
         settle();
         CHECK(a->snapshots->serves[0].state != 0 &&
@@ -4179,6 +4184,8 @@ static void test_serve(void)
         unsigned char request[16] = {1, 2, 3};
         uint32_t index = NONE;
         const struct vsr_io_forwarded *serve;
+        uint64_t serve_op;
+        uint64_t handle;
 
         a->hold_open = true;
         CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
@@ -4199,14 +4206,27 @@ static void test_serve(void)
         settle();
         serve = forwarded_take(a, VSR_IO_OP_STREAM_SERVE);
         CHECK(serve != NULL && (uint32_t)serve->rail.serve.stream == 0);
+        serve_op = serve->op.op.id;
+        handle = serve->rail.serve.stream;
+        /* The caller accepts its stream; then the library's open fails. */
+        CHECK(vsr_io_streams_served(a->io, serve_op, VSR_IO_OK) == VSR_OK);
+        settle();
+        CHECK(a->io->streams.streams[0].state == VSR_IO_STREAM_OPEN);
         a->hold_open = false;
         a->fail_open = -EIO;
         world_release_held(a);
         settle();
-        CHECK(a->io->streams.streams[0].state == VSR_IO_STREAM_SERVING);
-        CHECK(vsr_io_streams_served(a->io, serve->op.op.id, VSR_IO_NOT_FOUND) ==
-              VSR_OK);
+        CHECK(a->io->streams.streams[0].state == VSR_IO_STREAM_OPEN);
+        CHECK(vsr_io_streams_close(a->io, handle, VSR_IO_OK) == VSR_OK);
         settle();
+        {
+            const struct vsr_io_forwarded *end =
+                forwarded_take(b, VSR_IO_OP_STREAM_END);
+
+            CHECK(end != NULL && end->rail.end.stream == 77 &&
+                  end->rail.end.status == VSR_IO_OK);
+        }
+        (void)forwarded_take(a, VSR_IO_OP_STREAM_END);
         CHECK(a->io->streams.active == 0 && b->io->streams.active == 0);
         expect_idle(a);
     }
@@ -4410,7 +4430,7 @@ static void test_base_loads(void)
  * record contradicting the table (CORRUPT). Nothing stays open. */
 static void test_load_failures(void)
 {
-    for (uint32_t fault = 0; fault < 13; ++fault) {
+    for (uint32_t fault = 0; fault < 14; ++fault) {
         struct engine *e;
         struct vsr_id id = {0xC0DE, 0x100 + fault};
         struct craft craft;
@@ -4469,6 +4489,9 @@ static void test_load_failures(void)
         case 11: /* No room: eight other clients fill the table. */
             sequence = store_clients(e, sequence, 8, 8);
             expected = VSR_IO_FAILED;
+            break;
+        case 12: /* Nine records: above max_clients, refused as a file. */
+            craft_file(&craft, id, 9, 8);
             break;
         default: /* The table knows client 0x60's request 4 at another op. */
         {
