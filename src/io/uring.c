@@ -139,7 +139,7 @@ static const uint8_t required_opcodes[] = {
     IORING_OP_ACCEPT,       IORING_OP_RECV,        IORING_OP_SEND,
     IORING_OP_SEND_ZC,      IORING_OP_SENDMSG_ZC,  IORING_OP_SHUTDOWN,
     IORING_OP_URING_CMD,    IORING_OP_TIMEOUT,     IORING_OP_TIMEOUT_REMOVE,
-    IORING_OP_ASYNC_CANCEL, IORING_OP_POLL_ADD};
+    IORING_OP_ASYNC_CANCEL, IORING_OP_POLL_ADD,    IORING_OP_FILES_UPDATE};
 
 /* Entry 0 of a provided-buffer ring doubles as its header: the kernel's
  * struct io_uring_buf_ring overlays the tail on that entry's resv field.
@@ -961,6 +961,24 @@ int vsr_io_uring_translate(struct vsr_io_uring *uring,
     case VSR_IO_SQE_CANCEL:
         rc = translate_cancel(record, sqe);
         break;
+    case VSR_IO_SQE_FILES_UPDATE:
+        /* The kernel refuses a fixed file and reads the descriptors when
+         * it runs the record; the table's size is checked here, so a slot
+         * beyond it is -EINVAL whatever the kernel would answer. */
+        if ((flags & VSR_IO_SQE_FIXED_FILE) != 0) {
+            rc = -EINVAL;
+        } else if (record->addr == NULL) {
+            rc = -EFAULT;
+        } else if (record->length == 0 ||
+                   record->offset + (uint64_t)record->length >
+                       uring->files_registered) {
+            rc = -EINVAL;
+        } else {
+            fill(sqe, IORING_OP_FILES_UPDATE, -1, record->addr, record->length,
+                 record->offset);
+        }
+        break;
+    case VSR_IO_SQE_PROVIDE: /* The executor's own work, never an SQE. */
     default:
         rc = -EINVAL;
         break;
@@ -1299,14 +1317,63 @@ static uint32_t chain_length(const struct vsr_io_sqe *sqes, uint32_t count)
     return n;
 }
 
+/* A PROVIDE record the executor runs itself: no flag, not chained to a
+ * LINK record before it. Any other PROVIDE is translated, which refuses
+ * it with -EINVAL. */
+static bool provide_valid(const struct vsr_io_sqe *sqes, uint32_t i)
+{
+    return sqes[i].opcode == VSR_IO_SQE_PROVIDE && sqes[i].flags == 0 &&
+           (i == 0 || (sqes[i - 1].flags & VSR_IO_SQE_LINK) == 0);
+}
+
+static int uring_provide(void *ctx, uint16_t group,
+                         const struct vsr_io_buffer *buffers, uint32_t count);
+
+/* PROVIDE records take effect before anything of the batch reaches the
+ * kernel, so a receive armed in the same batch sees the buffers; a failed
+ * one completes through an injected NOP carrying its errno. */
+static int provide_records(struct vsr_io_uring *uring,
+                           const struct vsr_io_sqe *sqes, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i) {
+        int rc;
+
+        if (!provide_valid(sqes, i)) {
+            continue;
+        }
+        rc = uring_provide(uring, sqes[i].buffer_group, sqes[i].addr,
+                           sqes[i].length);
+        if (rc != 0) {
+            int space = ensure_space(uring, 1);
+
+            if (space != 0) {
+                return space;
+            }
+            inject_failure(ring_get_sqe(&uring->ring), &sqes[i], rc, false);
+            uring->submitted++;
+        }
+    }
+    return 0;
+}
+
 static int submit_records(struct vsr_io_uring *uring,
                           const struct vsr_io_sqe *sqes, uint32_t count)
 {
     uint32_t entries = uring->ring.sq_entries;
     uint32_t i = 0;
+    int provided = provide_records(uring, sqes, count);
 
+    if (provided != 0) {
+        return provided;
+    }
     while (i < count) {
-        uint32_t chain = chain_length(sqes + i, count - i);
+        uint32_t chain;
+
+        if (provide_valid(sqes, i)) {
+            i++;
+            continue;
+        }
+        chain = chain_length(sqes + i, count - i);
         /* A chain longer than the SQ cannot be submitted as one: every
          * record of it fails alone. */
         bool too_long = chain > entries;

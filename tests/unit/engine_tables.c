@@ -325,6 +325,19 @@ static size_t expected_metadata(const struct vsr_io_options *o)
     place(&offset, (size_t)l->replicas * sizeof(struct vsr_io_replica),
           alignof(struct vsr_io_replica));
     place(&offset, (size_t)l->file_slots * sizeof(uint32_t), alignof(uint32_t));
+    /* vsr_io_run's scratch. */
+    place(&offset, (size_t)l->batch * sizeof(struct vsr_io_sqe),
+          alignof(struct vsr_io_sqe));
+    place(&offset, (size_t)l->batch * sizeof(struct vsr_io_cqe),
+          alignof(struct vsr_io_cqe));
+    place(&offset, (size_t)l->ops * sizeof(struct vsr_io_op),
+          alignof(struct vsr_io_op));
+    place(&offset, ((size_t)l->ops + l->events) * sizeof(struct vsr_io_event),
+          alignof(struct vsr_io_event));
+    /* The queued slot clears and the PROVIDE record's buffers. */
+    place(&offset, (size_t)l->file_slots * sizeof(uint32_t), alignof(uint32_t));
+    place(&offset, (size_t)l->slabs * sizeof(struct vsr_io_buffer),
+          alignof(struct vsr_io_buffer));
     return offset;
 }
 
@@ -380,7 +393,7 @@ static void test_layout(void)
     /* Every table grows the region. */
     o = base;
     o.limits.links = 8;
-    o.limits.slabs = SLABS + 4;
+    o.limits.slabs = SLABS + 8;
     o.limits.file_slots = 16;
     check_layout(&o);
     o = base;
@@ -390,6 +403,7 @@ static void test_layout(void)
     o.limits.replicas = 3;
     o.limits.buffer_regions = 4;
     o.limits.file_slots = 14;
+    o.limits.slabs = SLABS + 4;
     check_layout(&o);
     o = base;
     o.limits.caller_slabs = 0;
@@ -506,17 +520,32 @@ static void test_layout(void)
     o.limits.slab_bytes = 2 * PAGE;
     CHECK(layout_of(&o) == VSR_OK);
 
-    /* ELIMIT: minimum slabs = links + streams * (window + 1) + 2 *
-     * replicas + 4 + caller_slabs = 4 + 6 + 4 + 4 + caller. */
+    /* ELIMIT: minimum slabs = the reserve (links + streams * window + 4 *
+     * replicas + 1) + the ring's links + streams + 4 + caller_slabs = 2 * 4
+     * + 6 + 8 + 5 + caller (decision 127). */
     o = base;
-    o.limits.slabs = 20;
+    o.limits.slabs = 29;
     CHECK(layout_of(&o) == VSR_OK);
-    o.limits.slabs = 19;
+    o.limits.slabs = 28;
     CHECK(layout_of(&o) == VSR_ELIMIT);
     o = base;
-    o.limits.caller_slabs = SLABS - 18;
+    o.limits.caller_slabs = SLABS - 27;
     CHECK(layout_of(&o) == VSR_OK);
-    o.limits.caller_slabs = SLABS - 17;
+    o.limits.caller_slabs = SLABS - 26;
+    CHECK(layout_of(&o) == VSR_ELIMIT);
+    o = base;
+    o.limits.links = 5; /* One more link: two slabs more. */
+    o.limits.slabs = 31;
+    CHECK(layout_of(&o) == VSR_OK);
+    o.limits.slabs = 30;
+    CHECK(layout_of(&o) == VSR_ELIMIT);
+    o = base;
+    o.limits.replicas = 3;
+    o.limits.buffer_regions = 4;
+    o.limits.file_slots = 14;
+    o.limits.slabs = 33;
+    CHECK(layout_of(&o) == VSR_OK);
+    o.limits.slabs = 32;
     CHECK(layout_of(&o) == VSR_ELIMIT);
     o = base;
     o.limits.slabs = 32769;
@@ -525,11 +554,11 @@ static void test_layout(void)
     o = base;
     o.stream_chunk_bytes = PAGE - 39;
     CHECK(layout_of(&o) == VSR_ELIMIT);
-    /* The listener chain fits one batch. */
+    /* The listener chain and the PROVIDE record fit one batch. */
     o = base;
-    o.limits.batch = 3;
-    CHECK(layout_of(&o) == VSR_ELIMIT);
     o.limits.batch = 4;
+    CHECK(layout_of(&o) == VSR_ELIMIT);
+    o.limits.batch = 5;
     CHECK(layout_of(&o) == VSR_OK);
     /* File slots: listeners + links + streams + 2 * replicas. */
     o = base;
@@ -681,7 +710,12 @@ static void test_init(void)
     CHECK(io->page_bytes == PAGE);
     /* Every table is initialized for the limits. */
     CHECK(io->pool.base == payload && io->pool.slabs == SLABS);
-    CHECK(io->pool.reserve == l->replicas + 1);
+    /* The reserve: a send slab per link, the stream windows' chunk reads,
+     * four per replica and one reassembly slab (decision 127). */
+    CHECK(io->pool.reserve ==
+          l->links + l->streams * l->stream_window + 4 * l->replicas + 1);
+    CHECK(io->pool.reserve == vsr_io_engine_reserve(l));
+    CHECK(io->pool.internal_taken == 0);
     CHECK(io->pool.caller_slabs == 2);
     CHECK(io->pool.region_index == REGION_BASE && io->pool.group == GROUP);
     CHECK(io->pool.free_count == SLABS);
@@ -790,11 +824,21 @@ static void test_init(void)
     CHECK(fake.wakes == 1);
     vsr_io_wake(NULL);
     CHECK(fake.wakes == 1);
-    /* Random bytes come from the executor. */
+    /* The generator was seeded from the executor once, at init; drawing
+     * from it calls nothing (decision 134), and it does not repeat. */
+    CHECK(fake.randoms == 1);
     memset(random, 0, sizeof(random));
     vsr_io_engine_random(io, random, sizeof(random));
     CHECK(fake.randoms == 1);
-    CHECK(random[0] == 1 && random[1] == 8);
+    {
+        unsigned char again[sizeof(random)];
+        unsigned char odd[3];
+
+        vsr_io_engine_random(io, again, sizeof(again));
+        CHECK(memcmp(random, again, sizeof(again)) != 0);
+        vsr_io_engine_random(io, odd, sizeof(odd));
+        CHECK(fake.randoms == 1);
+    }
     /* Close and deinit: EBUSY before close, EBUSY with a replica, closed
      * at once with nothing in flight, deinit unregisters in reverse. */
     CHECK(vsr_io_deinit(io) == VSR_EBUSY);
@@ -904,6 +948,7 @@ static void test_slabs(void)
     struct vsr_io_slab first;
     struct vsr_io_slab second;
     struct vsr_io_slab third;
+    uint32_t internal[SLABS] = {0};
     uint32_t taken;
 
     memset(&first, 0xEE, sizeof(first));
@@ -936,15 +981,35 @@ static void test_slabs(void)
     CHECK(vsr_io_slab_release(io, second.id) == VSR_OK);
     CHECK(vsr_io_slab_release(io, third.id) == VSR_OK);
     CHECK(io->pool.caller_taken == 0 && io->pool.free_count == SLABS);
-    /* The free slabs never drop to the reserve for the caller. */
-    for (uint32_t i = 0; i < SLABS - io->pool.reserve; ++i) {
-        CHECK(vsr_io_pool_acquire(&io->pool, false) != NONE);
+    /* The caller never takes the part of the reserve internal users do not
+     * hold: with it all FREE, the caller's two plus the reserve are what
+     * provision leaves, and the share is what the caller gets. */
+    CHECK(vsr_io_pool_floor(&io->pool) == io->pool.reserve + 2);
+    for (uint32_t i = 0; i < io->pool.reserve; ++i) {
+        internal[i] = vsr_io_pool_acquire(&io->pool, false);
+        CHECK(internal[i] != NONE);
     }
-    CHECK(io->pool.free_count == io->pool.reserve);
+    /* Internal users holding the whole reserve leave the share intact
+     * (decision 127): an established link's send slab no longer eats it. */
+    CHECK(io->pool.internal_taken == io->pool.reserve);
+    CHECK(vsr_io_pool_floor(&io->pool) == 2);
+    CHECK(vsr_io_slab_acquire(io, &first) == VSR_OK);
+    CHECK(vsr_io_slab_acquire(io, &second) == VSR_OK);
+    CHECK(vsr_io_slab_acquire(io, &third) == VSR_ELIMIT);
+    CHECK(vsr_io_slab_release(io, first.id) == VSR_OK);
+    CHECK(vsr_io_slab_release(io, second.id) == VSR_OK);
+    /* Beyond the reserve they eat the untaken share: nothing FREE, and the
+     * caller gets nothing until they give slabs back. */
+    for (uint32_t i = io->pool.reserve; i < SLABS; ++i) {
+        internal[i] = vsr_io_pool_acquire(&io->pool, false);
+        CHECK(internal[i] != NONE);
+    }
+    CHECK(io->pool.free_count == 0);
     CHECK(vsr_io_slab_acquire(io, &first) == VSR_ELIMIT);
-    for (uint32_t i = 0; i < SLABS - io->pool.reserve; ++i) {
-        vsr_io_pool_release(&io->pool, i);
+    for (uint32_t i = 0; i < SLABS; ++i) {
+        vsr_io_pool_release(&io->pool, internal[i]);
     }
+    CHECK(io->pool.internal_taken == 0 && io->pool.free_count == SLABS);
     CHECK(vsr_io_slab_acquire(io, &first) == VSR_OK);
     CHECK(vsr_io_slab_release(io, first.id) == VSR_OK);
     /* No acquire once closing. */

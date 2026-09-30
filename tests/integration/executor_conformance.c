@@ -1923,6 +1923,93 @@ static void scenario_fixed_files(struct fixture *f)
     CHECK(run(f, r) == -EBADF);
 }
 
+/* FILES_UPDATE (decision 133): a record installs descriptors into slots,
+ * each slot taking its own reference while the descriptor stays open and
+ * the caller's; -1 empties a slot; the count updated before a bad
+ * descriptor; -EBADF, -EINVAL (beyond the table, a fixed file), -EFAULT. */
+static void scenario_files_update(struct fixture *f)
+{
+    struct vsr_io_sqe r;
+    char buffer[16];
+    int32_t fds[2];
+    int32_t fd;
+    int32_t other;
+
+    CHECK(f->ex.ops->register_files(f->ex.ctx, 8) == 0);
+    fd = open_at(f, f->dir, "updated", O_CREAT | O_RDWR, UD(1));
+    CHECK(fd >= 0);
+    CHECK(io(f, VSR_IO_SQE_WRITE, fd, "updated", 7, 0, UD(2)) == 7);
+    fds[0] = fd;
+    r = rec(VSR_IO_SQE_FILES_UPDATE, UD(3));
+    r.offset = 3;
+    r.addr = fds;
+    r.length = 1;
+    CHECK(run(f, r) == 1);
+    memset(buffer, 0, sizeof(buffer));
+    r = io_record(VSR_IO_SQE_READ, 3, buffer, 16, 0, UD(4));
+    r.flags = VSR_IO_SQE_FIXED_FILE;
+    CHECK(run(f, r) == 7 && memcmp(buffer, "updated", 7) == 0);
+    /* The descriptor is still open; closing it leaves the slot's file. */
+    memset(buffer, 0, sizeof(buffer));
+    CHECK(io(f, VSR_IO_SQE_READ, fd, buffer, 16, 0, UD(5)) == 7);
+    CHECK(close_fd(f, fd, false) == 0);
+    r.user_data = UD(6);
+    CHECK(run(f, r) == 7);
+    /* Two slots with a bad descriptor after a good one: the count before
+     * it, the second slot untouched. */
+    other = open_at(f, f->dir, "updated", O_RDONLY, UD(7));
+    CHECK(other >= 0);
+    fds[0] = other;
+    fds[1] = 1000000;
+    r = rec(VSR_IO_SQE_FILES_UPDATE, UD(8));
+    r.offset = 4;
+    r.addr = fds;
+    r.length = 2;
+    CHECK(run(f, r) == 1);
+    r = io_record(VSR_IO_SQE_READ, 5, buffer, 16, 0, UD(9));
+    r.flags = VSR_IO_SQE_FIXED_FILE;
+    CHECK(run(f, r) == -EBADF);
+    r = io_record(VSR_IO_SQE_READ, 4, buffer, 16, 0, UD(10));
+    r.flags = VSR_IO_SQE_FIXED_FILE;
+    CHECK(run(f, r) == 7);
+    CHECK(close_fd(f, other, false) == 0);
+    /* -1 empties both. */
+    fds[0] = -1;
+    fds[1] = -1;
+    r = rec(VSR_IO_SQE_FILES_UPDATE, UD(11));
+    r.offset = 3;
+    r.addr = fds;
+    r.length = 2;
+    CHECK(run(f, r) == 2);
+    r = io_record(VSR_IO_SQE_READ, 3, buffer, 16, 0, UD(12));
+    r.flags = VSR_IO_SQE_FIXED_FILE;
+    CHECK(run(f, r) == -EBADF);
+    /* Refusals. */
+    fds[0] = 1000000;
+    r = rec(VSR_IO_SQE_FILES_UPDATE, UD(13));
+    r.offset = 3;
+    r.addr = fds;
+    r.length = 1;
+    CHECK(run(f, r) == -EBADF);
+    fds[0] = -1;
+    r.user_data = UD(14);
+    r.offset = 7;
+    r.length = 2;
+    CHECK(run(f, r) == -EINVAL);
+    r.user_data = UD(15);
+    r.offset = 8;
+    r.length = 1;
+    CHECK(run(f, r) == -EINVAL);
+    r.user_data = UD(16);
+    r.offset = 0;
+    r.flags = VSR_IO_SQE_FIXED_FILE;
+    CHECK(run(f, r) == -EINVAL);
+    r.user_data = UD(17);
+    r.flags = 0;
+    r.addr = NULL;
+    CHECK(run(f, r) == -EFAULT);
+}
+
 /* ------------------------------------------------------------------------
  * Scenarios: sockets
  * --------------------------------------------------------------------- */
@@ -2368,6 +2455,70 @@ static struct vsr_io_sqe select_record(int32_t fd, uint16_t group,
     r.buffer_group = group;
     r.op_flags = multishot ? VSR_IO_RECV_MULTISHOT : 0;
     return r;
+}
+
+/* PROVIDE (decision 133): the executor provides the buffers itself before
+ * any other record of the batch reaches the kernel, so a receive armed in
+ * the same batch takes them; it completes only when it fails (-ENOENT, a
+ * full ring's -ENOSPC, -EINVAL for a flag or a LINK before it). */
+static void scenario_provide(struct fixture *f)
+{
+    struct link l;
+    struct buffer_ring ring;
+    struct vsr_io_region memory;
+    struct vsr_io_sqe batch[3];
+    struct vsr_io_cqe cqe;
+    unsigned char *ring_memory = page_alloc(4096);
+    unsigned char *pool = page_alloc(4096);
+
+    open_link(f, &l);
+    memory.base = ring_memory;
+    memory.size = 4096;
+    CHECK(f->ex.ops->buffer_ring(f->ex.ctx, 7, 4, 0, &memory) == 0);
+    ring_model(&ring, pool, 64, 20, false);
+    batch[0] = rec(VSR_IO_SQE_PROVIDE, UD(1));
+    batch[0].buffer_group = 7;
+    batch[0].addr = ring.records;
+    batch[0].length = 2;
+    batch[1] = select_record(l.server, 7, true, UD(2));
+    submit(f, batch, 2);
+    CHECK(f->factory->peer_send(f, l.peer, "abc", 3) == 0);
+    collect(f, UD(2), &ring, (const unsigned char *)"abc", 3);
+    CHECK(f->factory->peer_send(f, l.peer, "defg", 4) == 0);
+    collect(f, UD(2), &ring, (const unsigned char *)"defg", 4);
+    CHECK(!arrives(f, UD(1), 30, &cqe)); /* No completion on success. */
+    /* Refusals complete, with provide()'s errno or -EINVAL. */
+    batch[0].user_data = UD(3);
+    batch[0].buffer_group = 9;
+    submit(f, batch, 1);
+    CHECK(take(f, UD(3)).result == -ENOENT);
+    batch[0].user_data = UD(4);
+    batch[0].buffer_group = 7;
+    batch[0].addr = &ring.records[2];
+    batch[0].length = 5; /* Four entries in the ring. */
+    submit(f, batch, 1);
+    CHECK(take(f, UD(4)).result == -ENOSPC);
+    batch[0].user_data = UD(5);
+    batch[0].length = 1;
+    batch[0].flags = VSR_IO_SQE_SKIP_SUCCESS;
+    submit(f, batch, 1);
+    CHECK(take(f, UD(5)).result == -EINVAL);
+    batch[0] = rec(VSR_IO_SQE_NOP, UD(6));
+    batch[0].flags = VSR_IO_SQE_LINK;
+    batch[1] = rec(VSR_IO_SQE_PROVIDE, UD(7));
+    batch[1].buffer_group = 7;
+    batch[1].addr = &ring.records[2];
+    batch[1].length = 1;
+    submit(f, batch, 2);
+    CHECK(take(f, UD(7)).result == -EINVAL);
+    cqe = take(f, UD(6));
+    (void)cqe; /* Its chain ended with the refused record: either way. */
+    CHECK(cancel_user_data(f, UD(2)) == 0);
+    CHECK(take(f, UD(2)).result == -ECANCELED);
+    CHECK(f->ex.ops->buffer_ring(f->ex.ctx, 7, 0, 0, NULL) == 0);
+    close_link(f, &l);
+    free(ring_memory);
+    free(pool);
 }
 
 /* RECV with BUFFER_SELECT on an INCREMENTAL ring whose buffers are smaller
@@ -3426,6 +3577,7 @@ static const struct scenario scenarios[] = {
     {"fallocate_enospc", scenario_fallocate_enospc},
     {"fixed_buffers", scenario_fixed_buffers},
     {"fixed_files", scenario_fixed_files},
+    {"files_update", scenario_files_update},
     {"socket_setup", scenario_socket_setup},
     {"socket_direct", scenario_socket_direct},
     {"connect_refused", scenario_connect_refused},
@@ -3439,6 +3591,7 @@ static const struct scenario scenarios[] = {
     {"recv_select_empty_arm", scenario_recv_select_empty_arm},
     {"recv_multishot_terminations", scenario_recv_multishot_terminations},
     {"buffer_ring_unregister_pending", scenario_buffer_ring_unregister_pending},
+    {"provide", scenario_provide},
     {"send_plain", scenario_send_plain},
     {"send_zero_copy", scenario_send_zero_copy},
     {"shutdown", scenario_shutdown},

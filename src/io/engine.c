@@ -11,12 +11,13 @@
 #include <string.h>
 
 /*
- * Engine kernel: the metadata layout, initialization and executor
+ * Engine kernel: the metadata layout, initialization, close and executor
  * registration of struct vsr_io, and the helpers every planner module
- * calls (docs/io-implementation.md, section 7). The loop entry points, the
- * replica life cycle and the op routing follow in this file once the
- * store, link, stream and snapshot modules exist (see the end of the
- * file).
+ * calls (docs/io-implementation.md, section 7). The replica life cycle
+ * lives in replica.c and the loop entry points with the op routing in
+ * loop.c: this file references no store or snapshot symbol, so a program
+ * that only drives the link and stream modules (tests/unit/stream.c with
+ * its snapshot doubles) links without snapshot.o.
  *
  * Metadata region, in offset order (docs/io-implementation.md, section 2):
  *   1. pool bookkeeping: the provided-ring memory first, page aligned at
@@ -33,6 +34,10 @@
  *   8. forwarded-op ring [limits.ops]
  *   9. replica table [limits.replicas]
  *  10. engine file-slot free list [limits.file_slots]
+ *  11. vsr_io_run's scratch: records [batch], completions [batch], ops
+ *      [ops], events [ops + events]
+ *  12. the queued slot clears [file_slots] and the PROVIDE record's
+ *      buffers [slabs]
  * Every offset is computed with checked arithmetic; the same plan carves
  * the region at init.
  */
@@ -46,13 +51,8 @@
 #define ENGINE_PAGE_BYTES 4096u
 /* Provided-ring entry bytes, per the executor contract (buffer_ring). */
 #define ENGINE_RING_ENTRY_BYTES 16u
-/* The slot table is engine-wide and sized before any replica attaches, so
- * it reserves this many record writes per replica; vsr_io_attach refuses
- * a store configured with more (vsr_io_store_options.inflight_writes). */
-#define ENGINE_INFLIGHT_WRITES_MAX 8u
-/* Longest LINK chain the engine prepares (listener setup: SOCKET, BIND,
- * LISTEN, ACCEPT); a chain never spans batches. */
-#define ENGINE_BATCH_MIN 4u
+#define ENGINE_INFLIGHT_WRITES_MAX VSR_IO_ENGINE_INFLIGHT_WRITES_MAX
+#define ENGINE_BATCH_MIN VSR_IO_ENGINE_BATCH_MIN
 /* Frame header plus stream chunk header around one chunk payload. */
 #define ENGINE_STREAM_FRAMING                                                  \
     (VSR_IO_FRAME_HEADER_BYTES + sizeof(struct vsr_io_wire_stream_chunk))
@@ -64,9 +64,18 @@
 #define ENGINE_FILE_SLOTS_END ((uint64_t)INT32_MAX + 1)
 #define ENGINE_BUFFER_REGIONS_END (UINT64_C(1) << 16)
 
-enum engine_state { ENGINE_RUNNING, ENGINE_CLOSING, ENGINE_CLOSED };
-
-enum lease_state { LEASE_FREE, LEASE_QUEUED, LEASE_LEASED };
+#define ENGINE_RUNNING VSR_IO_ENGINE_RUNNING
+#define ENGINE_CLOSING VSR_IO_ENGINE_CLOSING
+#define ENGINE_CLOSED VSR_IO_ENGINE_CLOSED
+#define LEASE_FREE VSR_IO_LEASE_STATE_FREE
+#define LEASE_QUEUED VSR_IO_LEASE_STATE_QUEUED
+/* Pool reserve per replica: a cold-load or recovery read slab, and the
+ * snapshot module's writer, writer-cold and reader slabs (decision 127). */
+#define ENGINE_RESERVE_PER_REPLICA 4u
+/* One reassembly slab, and the slabs the ring keeps beyond one per link
+ * and one per stream in the minimum-slabs rule. */
+#define ENGINE_RESERVE_REASSEMBLY 1u
+#define ENGINE_RING_MIN 4u
 
 /* Invariant checks in debug builds; a violation traps (see pool.c). */
 #ifdef NDEBUG
@@ -95,6 +104,13 @@ struct engine_plan {
     size_t forwarded;
     size_t replicas;
     size_t file_slots;
+    size_t run_sqes;
+    size_t run_cqes;
+    size_t run_ops;
+    size_t run_events;
+    uint32_t run_events_count;
+    size_t clears;
+    size_t provide;
     size_t total;
     size_t alignment;
     size_t payload;
@@ -200,14 +216,19 @@ static int check_options(const struct vsr_io_options *options)
     if (options->listen_count > VSR_IO_LISTENERS_MAX) {
         return VSR_ELIMIT;
     }
-    /* Minimum slabs: links + streams * (stream_window + 1) + 2 * replicas
-     * + 4 + caller_slabs (decisions 42 and 54). */
+    /* Minimum slabs: the reserve (links + streams * stream_window + 4 *
+     * replicas + 1), the ring's links + streams + 4 (a slab per link
+     * receiving, one per stream, four more) and caller_slabs, that is
+     * 2 * links + streams * (stream_window + 1) + 4 * replicas + 5 +
+     * caller_slabs (decisions 42, 54 and 127). */
     if (!vsr_size_add(limits->stream_window, 1, &term) ||
         !vsr_size_mul(limits->streams, term, &term) ||
         !vsr_size_add(limits->links, term, &minimum) ||
-        !vsr_size_mul(limits->replicas, 2, &term) ||
+        !vsr_size_add(minimum, limits->links, &minimum) ||
+        !vsr_size_mul(limits->replicas, ENGINE_RESERVE_PER_REPLICA, &term) ||
         !vsr_size_add(minimum, term, &minimum) ||
-        !vsr_size_add(minimum, 4, &minimum) ||
+        !vsr_size_add(minimum, ENGINE_RESERVE_REASSEMBLY + ENGINE_RING_MIN,
+                      &minimum) ||
         !vsr_size_add(minimum, limits->caller_slabs, &minimum) ||
         minimum > limits->slabs || limits->replicas > ENGINE_REPLICAS_MAX ||
         limits->batch < ENGINE_BATCH_MIN) {
@@ -306,9 +327,25 @@ static int engine_plan(const struct vsr_io_options *options,
         !place(&offset, bytes, alignof(struct vsr_io_replica),
                &plan->replicas) ||
         !vsr_size_mul(limits->file_slots, sizeof(uint32_t), &bytes) ||
-        !place(&offset, bytes, alignof(uint32_t), &plan->file_slots)) {
+        !place(&offset, bytes, alignof(uint32_t), &plan->file_slots) ||
+        !vsr_size_mul(limits->batch, sizeof(struct vsr_io_sqe), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_sqe), &plan->run_sqes) ||
+        !vsr_size_mul(limits->batch, sizeof(struct vsr_io_cqe), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_cqe), &plan->run_cqes) ||
+        !vsr_size_mul(limits->ops, sizeof(struct vsr_io_op), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_op), &plan->run_ops) ||
+        !vsr_size_add(limits->ops, limits->events, &capacity) ||
+        capacity > UINT32_MAX ||
+        !vsr_size_mul(capacity, sizeof(struct vsr_io_event), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_event),
+               &plan->run_events) ||
+        !vsr_size_mul(limits->file_slots, sizeof(uint32_t), &bytes) ||
+        !place(&offset, bytes, alignof(uint32_t), &plan->clears) ||
+        !vsr_size_mul(limits->slabs, sizeof(struct vsr_io_buffer), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_buffer), &plan->provide)) {
         return VSR_ELIMIT;
     }
+    plan->run_events_count = (uint32_t)capacity;
     plan->total = offset;
     plan->alignment = ENGINE_PAGE_BYTES;
     return VSR_OK;
@@ -400,6 +437,61 @@ static void bind_deadlines(struct vsr_io *io)
         io->streams.streams[i].deadline =
             deadline_base(limits, VSR_IO_DEADLINE_STREAM) + i;
     }
+    for (uint32_t i = 0; i < limits->replicas; ++i) {
+        struct vsr_io_replica *replica = &io->replicas[i];
+
+        replica->deadline_core =
+            deadline_base(limits, VSR_IO_DEADLINE_CORE) + i;
+        replica->deadline_flush =
+            deadline_base(limits, VSR_IO_DEADLINE_FLUSH) + i;
+        replica->deadline_sync =
+            deadline_base(limits, VSR_IO_DEADLINE_SYNC) + i;
+        replica->deadline_capture =
+            deadline_base(limits, VSR_IO_DEADLINE_CAPTURE) + i;
+    }
+}
+
+uint32_t vsr_io_engine_reserve(const struct vsr_io_limits *limits)
+{
+    /* check_options bounded the sum by limits->slabs (<= 32768). */
+    return limits->links + limits->streams * limits->stream_window +
+           ENGINE_RESERVE_PER_REPLICA * limits->replicas +
+           ENGINE_RESERVE_REASSEMBLY;
+}
+
+/* The generator (decision 134): xoshiro256**, seeded once from the
+ * executor's entropy at init, so that nothing the primitives reach calls
+ * the executor; a simulation stays deterministic by its seed. The values
+ * are unique, not secret: a keyed handshake needing secret nonces would
+ * draw them from an entropy pool the loop refills. */
+static uint64_t rotate(uint64_t x, int k)
+{
+    return (x << k) | (x >> (64 - k));
+}
+
+static uint64_t random_next(struct vsr_io *io)
+{
+    uint64_t *s = io->random_state;
+    uint64_t result = rotate(s[1] * 5u, 7) * 9u;
+    uint64_t t = s[1] << 17;
+
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = rotate(s[3], 45);
+    return result;
+}
+
+static void random_seed(struct vsr_io *io)
+{
+    uint64_t *s = io->random_state;
+
+    io->ex.ops->random(io->ex.ctx, s, sizeof(io->random_state));
+    if ((s[0] | s[1] | s[2] | s[3]) == 0) {
+        s[0] = UINT64_C(0x9E3779B97F4A7C15); /* The all-zero state sticks. */
+    }
 }
 
 /* The pool region and its provided-buffer ring, in that order; a failed
@@ -474,8 +566,9 @@ int vsr_io_init(const struct vsr_io_options *options,
     io->state = ENGINE_RUNNING;
     io->page_bytes = ENGINE_PAGE_BYTES;
     vsr_io_pool_init(&io->pool, payload->base, plan.payload, &options->limits,
-                     options->limits.replicas + 1, options->buffer_region_base,
-                     options->buffer_group, base + plan.pool, plan.pool_bytes);
+                     vsr_io_engine_reserve(&options->limits),
+                     options->buffer_region_base, options->buffer_group,
+                     base + plan.pool, plan.pool_bytes);
     vsr_io_slots_init(&io->slots, base + plan.slots, plan.slots_count,
                       options->owner);
     vsr_io_deadlines_init(&io->deadlines, base + plan.deadlines,
@@ -484,7 +577,6 @@ int vsr_io_init(const struct vsr_io_options *options,
                       &options->limits, options->limits.slab_bytes);
     vsr_io_streams_init(&io->streams, base + plan.streams, plan.streams_bytes,
                         &options->limits, options->stream_chunk_bytes);
-    bind_deadlines(io);
     io->replicas = (struct vsr_io_replica *)(void *)(base + plan.replicas);
     memset(io->replicas, 0,
            (size_t)options->limits.replicas * sizeof(*io->replicas));
@@ -493,6 +585,7 @@ int vsr_io_init(const struct vsr_io_options *options,
         io->replicas[i].index = i;
         io->replicas[i].state = VSR_IO_REPLICA_FREE;
     }
+    bind_deadlines(io);
     io->replicas_count = 0;
     io->file_slot_next = options->file_slot_base;
     io->file_slots_free = (uint32_t *)(void *)(base + plan.file_slots);
@@ -506,6 +599,17 @@ int vsr_io_init(const struct vsr_io_options *options,
     memset(&io->stats, 0, sizeof(io->stats));
     /* The executor is opaque to the engine; nothing in it needs the ring. */
     io->uring = NULL;
+    io->releases_rejected = 0;
+    io->events_rejected = 0;
+    io->run_sqes = (struct vsr_io_sqe *)(void *)(base + plan.run_sqes);
+    io->run_cqes = (struct vsr_io_cqe *)(void *)(base + plan.run_cqes);
+    io->run_ops = (struct vsr_io_op *)(void *)(base + plan.run_ops);
+    io->run_events = (struct vsr_io_event *)(void *)(base + plan.run_events);
+    io->run_events_capacity = plan.run_events_count;
+    io->clears = (uint32_t *)(void *)(base + plan.clears);
+    io->clears_count = 0;
+    io->provide_buffers = (struct vsr_io_buffer *)(void *)(base + plan.provide);
+    random_seed(io);
     rc = register_pool(io);
     if (rc != VSR_OK) {
         return rc;
@@ -514,12 +618,14 @@ int vsr_io_init(const struct vsr_io_options *options,
     return VSR_OK;
 }
 
-/* Closing completes once every slot is free and every link is FREE
- * (decision 49); the loop re-checks after each completion. */
-static void check_closed(struct vsr_io *io)
+/* Closing completes once every slot is free, every link FREE and no
+ * stream active (decisions 49 and 97); the loop re-checks after each
+ * completion batch, poll and prepare. */
+void vsr_io_engine_check_closed(struct vsr_io *io)
 {
     if (io->state != ENGINE_CLOSING ||
-        io->slots.free_count != io->slots.count) {
+        io->slots.free_count != io->slots.count || io->streams.active != 0 ||
+        io->clears_count != 0) {
         return;
     }
     for (uint32_t i = 0; i < io->links.links_count; ++i) {
@@ -531,6 +637,9 @@ static void check_closed(struct vsr_io *io)
     io->stats.closed = 1;
 }
 
+/* The link and stream shutdowns may come in either order (decision 101):
+ * every stream ends CANCELLED on this engine whichever runs first. The
+ * links go first, as section 7.7 lists them. */
 int vsr_io_close(struct vsr_io *io)
 {
     if (io == NULL) {
@@ -541,8 +650,10 @@ int vsr_io_close(struct vsr_io *io)
     }
     if (io->state == ENGINE_RUNNING) {
         io->state = ENGINE_CLOSING;
+        vsr_io_links_shutdown(io);
+        vsr_io_streams_shutdown(io);
     }
-    check_closed(io);
+    vsr_io_engine_check_closed(io);
     return VSR_OK;
 }
 
@@ -555,7 +666,7 @@ int vsr_io_deinit(struct vsr_io *io)
     if (io == NULL) {
         return VSR_EINVAL;
     }
-    if (io->state != ENGINE_CLOSED) {
+    if (io->state != ENGINE_CLOSED || io->replicas_count > 0) {
         return VSR_EBUSY;
     }
     ex = &io->ex;
@@ -638,8 +749,9 @@ static uint32_t ring_slot(uint32_t head, uint32_t count, uint32_t capacity)
 }
 
 /* A rail's descriptor lives in the ring entry, so op.data of a rail op
- * points into it; the entry is reused only after the poll that dequeues
- * it, which is the lifetime vsr-io.h gives such descriptors. */
+ * points into it; the entry is reused by the first producer after the
+ * poll that dequeues it, which vsr-io.h bounds by the caller's next call
+ * into the engine (decision 132). */
 struct vsr_io_forwarded *
 vsr_io_forward(struct vsr_io *io, struct vsr_io_replica *replica, uint32_t kind)
 {
@@ -709,6 +821,12 @@ uint32_t vsr_io_lease_alloc(struct vsr_io_replica *replica, uint32_t slab,
         lease->generation = (uint16_t)(lease->generation + 1u);
         lease->region.used = 0;
         replica->leases_free--;
+        if (slab != NONE) {
+            /* The bytes are the lease's now (a cold LOAD result, a
+             * reassembled MESSAGE): the reserve is free again for the
+             * internal user that acquired the slab (decision 127). */
+            vsr_io_pool_handoff(&replica->io->pool, slab);
+        }
         return i;
     }
     ENGINE_ASSERT(false);
@@ -815,13 +933,17 @@ bool vsr_io_engine_deliver(struct vsr_io *io, struct vsr_io_replica *replica,
     return true;
 }
 
+/* A replica whose STOP was submitted is not resolved: its core refuses
+ * MESSAGEs (they are dropped and counted, decision 75) and its files are
+ * not served any more (NOT_FOUND), so the served streams that would hold
+ * its detach off end (decision 130). */
 struct vsr_io_replica *vsr_io_engine_replica(struct vsr_io *io,
                                              struct vsr_id cluster)
 {
     for (uint32_t i = 0; i < io->options.limits.replicas; ++i) {
         struct vsr_io_replica *replica = &io->replicas[i];
 
-        if (replica->state != VSR_IO_REPLICA_FREE &&
+        if (replica->state != VSR_IO_REPLICA_FREE && replica->stopping == 0 &&
             replica->options.cluster.hi == cluster.hi &&
             replica->options.cluster.lo == cluster.lo) {
             return replica;
@@ -856,36 +978,135 @@ void vsr_io_engine_slot_free(struct vsr_io *io, uint32_t slot)
     io->file_slots_free_count++;
 }
 
+void vsr_io_engine_slot_clear(struct vsr_io *io, uint32_t slot)
+{
+    ENGINE_ASSERT(slot >= io->options.file_slot_base &&
+                  slot < io->file_slot_next);
+    ENGINE_ASSERT(io->clears_count < io->options.limits.file_slots);
+    io->clears[io->clears_count] = slot;
+    io->clears_count++;
+}
+
+bool vsr_io_engine_slot_clearing(const struct vsr_io *io, uint32_t slot)
+{
+    for (uint32_t i = 0; i < io->clears_count; ++i) {
+        if (io->clears[i] == slot) {
+            return true;
+        }
+    }
+    for (uint32_t i = 0; i < io->slots.count; ++i) {
+        if (io->slots.slots[i].kind == VSR_IO_SLOT_FILES &&
+            io->slots.slots[i].owner == slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The descriptor a clear installs: none. */
+static const int32_t engine_empty_fd = -1;
+
+void vsr_io_engine_prepare_files(struct vsr_io *io, struct vsr_io_sqe *sqes,
+                                 uint32_t capacity, uint32_t *count)
+{
+    while (io->clears_count > 0 && *count < capacity) {
+        uint32_t file = io->clears[io->clears_count - 1];
+        uint32_t slot =
+            vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_FILES, 1, file, 0, 0);
+        struct vsr_io_sqe *sqe;
+
+        if (slot == NONE) {
+            return;
+        }
+        io->clears_count--;
+        sqe = &sqes[*count];
+        memset(sqe, 0, sizeof(*sqe));
+        sqe->opcode = VSR_IO_SQE_FILES_UPDATE;
+        sqe->fd = -1;
+        sqe->offset = file;
+        sqe->addr = &engine_empty_fd;
+        sqe->length = 1;
+        sqe->user_data = vsr_io_slots_user_data(&io->slots, slot);
+        (*count)++;
+    }
+}
+
+/* Whatever the result, the slot holds no file the engine still wants: a
+ * failed clear leaves at most a file a later install replaces. */
+void vsr_io_engine_files_complete(struct vsr_io *io, uint32_t slot,
+                                  const struct vsr_io_cqe *cqe)
+{
+    uint32_t file = io->slots.slots[slot].owner;
+
+    (void)cqe;
+    vsr_io_slots_consumed(&io->slots, slot, false);
+    vsr_io_engine_slot_free(io, file);
+}
+
+uint64_t vsr_io_engine_provide_user_data(const struct vsr_io *io)
+{
+    return VSR_IO_USER_DATA(io->options.owner,
+                            (uint64_t)VSR_IO_SLOT_PROVIDE << 48);
+}
+
 void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size)
 {
-    io->ex.ops->random(io->ex.ctx, bytes, size);
+    unsigned char *out = bytes;
+
+    while (size > 0) {
+        uint64_t value = random_next(io);
+        size_t take = size < sizeof(value) ? size : sizeof(value);
+
+        memcpy(out, &value, take);
+        out += take;
+        size -= take;
+    }
 }
 
-int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd)
+/* -------------------------------------------------------------------------
+ * Nodes, authorizations and adopted sockets: thin over the link module,
+ * which holds the tables and every rule (decisions 72, 73 and 86).
+ * ---------------------------------------------------------------------- */
+
+int vsr_io_node_set(struct vsr_io *io, uint64_t node,
+                    const struct vsr_io_address *address)
 {
-    return io->ex.ops->update_file(io->ex.ctx, slot, fd);
+    if (io == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_node_set(io, node, address);
 }
 
-/*
- * Part 2 of this file, once the store, link, stream and snapshot modules
- * exist, adds on top of the structures above:
- *   - vsr_io_replica_size and vsr_io_replica_layout: the core arena, the
- *     event, message and completion rings, the step scratch arrays, the
- *     lease table and decode regions (input_leases + events, each
- *     max(message_region, load_region) bytes), the store and snapshot
- *     bookkeeping, and the tail region;
- *   - vsr_io_attach, vsr_io_detach, vsr_io_replica_status,
- *     vsr_io_replica_core, vsr_io_replica_find, with the replica deadline
- *     handles bound as base[kind] + index and the store's inflight_writes
- *     checked against ENGINE_INFLIGHT_WRITES_MAX;
- *   - vsr_io_node_set, vsr_io_node_clear, vsr_io_authorize, vsr_io_adopt
- *     and vsr_io_node_status over the link module;
- *   - vsr_io_complete, vsr_io_poll (with the event order of section 7.1,
- *     the op routing of 7.3 and the drain of the forwarded ring),
- *     vsr_io_submit, vsr_io_prepare (provision, links, streams, per
- *     replica store and snapshots, the earliest deadline) and vsr_io_run;
- *   - close completion: vsr_io_close calls the link and stream shutdowns
- *     and check_closed runs after every completion;
- *   - STATUS emission once per poll with STATE_CHANGED and once at
- *     STOPPED, and the replica state transitions of 7.7.
- */
+int vsr_io_node_clear(struct vsr_io *io, uint64_t node)
+{
+    if (io == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_node_clear(io, node);
+}
+
+int vsr_io_authorize(struct vsr_io *io, struct vsr_id cluster, uint64_t replica,
+                     uint64_t node)
+{
+    if (io == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_authorize(io, cluster, replica, node);
+}
+
+int vsr_io_adopt(struct vsr_io *io, int fd, uint64_t node, uint32_t flags)
+{
+    if (io == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_adopt(io, fd, node, flags);
+}
+
+int vsr_io_node_status(const struct vsr_io *io, uint64_t node,
+                       struct vsr_io_node_status *status)
+{
+    if (io == NULL || status == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_node_status(io, node, status);
+}

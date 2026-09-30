@@ -49,7 +49,7 @@
 
 #define PAGE 4096u
 #define NONE UINT32_MAX
-#define SLABS 32u
+#define SLABS 40u
 #define ENGINES 2u
 #define SOCKETS 24u
 #define FD_BASE 300
@@ -819,6 +819,37 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
                       sock->send_count, sock->send_zero_copy);
         }
         break;
+    case VSR_IO_SQE_FILES_UPDATE: {
+        /* The takeover (decision 135): the slot takes the socket, the raw
+         * descriptor stays until the CLOSE chained behind this record. */
+        int32_t fd;
+
+        e->updates++;
+        CHECK(sqe->length == 1 && sqe->addr != NULL);
+        CHECK(sqe->offset >= FILE_SLOT_BASE &&
+              sqe->offset < FILE_SLOT_BASE + FILE_SLOTS);
+        if (e->fail_update != 0) {
+            result = e->fail_update;
+            e->fail_update = 0;
+            break;
+        }
+        memcpy(&fd, sqe->addr, sizeof(fd));
+        index = sock_by_slot(e->index, (int)sqe->offset);
+        if (index != NONE) {
+            world.socks[index].slot = -1;
+            sock_drop(index);
+        }
+        result = 1;
+        if (fd >= 0) {
+            index = sock_by_fd(e->index, fd);
+            if (index == NONE) {
+                result = -EBADF;
+                break;
+            }
+            world.socks[index].slot = (int)sqe->offset;
+        }
+        break;
+    }
     case VSR_IO_SQE_CLOSE:
         index = record_sock(e, sqe);
         if (index == NONE) {
@@ -1148,6 +1179,8 @@ static void engine_step(struct engine *e)
         }
         if (io->slots.slots[slot].kind == VSR_IO_SLOT_STREAM) {
             vsr_io_streams_complete(io, slot, &cq[i]);
+        } else if (io->slots.slots[slot].kind == VSR_IO_SLOT_FILES) {
+            vsr_io_engine_files_complete(io, slot, &cq[i]);
         } else {
             vsr_io_links_complete(io, slot, &cq[i]);
         }
@@ -1169,6 +1202,7 @@ static void engine_step(struct engine *e)
     count = 0;
     vsr_io_links_prepare(io, sqes, SQ_CAP, &count);
     vsr_io_streams_prepare(io, sqes, SQ_CAP, &count);
+    vsr_io_engine_prepare_files(io, sqes, SQ_CAP, &count);
     sends_resume(e);
     for (uint32_t i = 0; i < count; ++i) {
         execute(e, &sqes[i], &chain_failed);

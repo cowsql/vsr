@@ -11,10 +11,13 @@
  * section 9). It wraps any vsr_io_executor, forwards every record to it and,
  * from one seeded generator, injects faults the executor contract permits:
  *
- * - eio_ppm: a READ, WRITE, READV, WRITEV or FSYNC completion with a
- *   non-negative result completes -EIO instead. The operation itself ran:
- *   a WRITE's bytes are in the file (durable only as far as a later flush
- *   makes them), a READ's buffer holds the file's bytes, an FSYNC flushed.
+ * - eio_ppm: a READ, WRITE, READV, WRITEV, FSYNC or FILES_UPDATE
+ *   completion with a non-negative result completes -EIO instead (a
+ *   PROVIDE record, which completes only when it fails, passes through
+ *   untouched). The operation itself ran: a FILES_UPDATE's slots hold
+ *   their files, a WRITE's bytes are in the file (durable only as far as
+ *   a later flush makes them), a READ's buffer holds the file's bytes, an
+ *   FSYNC flushed.
  *   As with a real device, a caller may assume nothing about what a
  *   failed write left in the file: the bytes may be there, so recovery
  *   may find the record intact, and nothing the failed FSYNC covered may

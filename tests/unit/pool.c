@@ -82,6 +82,7 @@ static void check_pool(const struct vsr_io_pool *pool)
     uint32_t held = 0;
     uint32_t listed = 0;
     uint32_t lent = 0;
+    uint32_t internal = 0;
     uint32_t floor;
     bool seen[MAX_SLABS];
 
@@ -94,19 +95,21 @@ static void check_pool(const struct vsr_io_pool *pool)
         case VSR_IO_SLAB_FREE:
             CHECK(slab->refs == 0);
             CHECK(slab->consumed == 0);
-            CHECK(slab->caller == 0);
+            CHECK(slab->caller == 0 && slab->internal == 0);
             free++;
             break;
         case VSR_IO_SLAB_KERNEL:
             CHECK(slab->consumed <= pool->slab_bytes);
-            CHECK(slab->caller == 0);
+            CHECK(slab->caller == 0 && slab->internal == 0);
             kernel++;
             break;
         case VSR_IO_SLAB_HELD:
             CHECK(slab->refs > 0);
             CHECK(slab->consumed == 0);
-            CHECK(slab->caller <= 1);
+            CHECK(slab->caller <= 1 && slab->internal <= 1);
+            CHECK(slab->caller + slab->internal <= 1);
             lent += slab->caller;
+            internal += slab->internal;
             held++;
             break;
         default:
@@ -128,7 +131,11 @@ static void check_pool(const struct vsr_io_pool *pool)
     CHECK(listed == pool->free_count);
     CHECK(lent == pool->caller_taken);
     CHECK(lent <= pool->caller_slabs);
-    floor = pool->reserve + pool->caller_slabs - lent;
+    CHECK(internal == pool->internal_taken);
+    /* The unheld parts of both shares stay FREE (decisions 54 and 127). */
+    floor = (pool->reserve > internal ? pool->reserve - internal : 0) +
+            pool->caller_slabs - lent;
+    CHECK(vsr_io_pool_floor(pool) == floor);
     CHECK(pool->pending == (free > floor ? free - floor : 0));
 }
 
@@ -521,6 +528,8 @@ struct model {
     uint32_t refs[MAX_SLABS];
     uint32_t consumed[MAX_SLABS];
     uint16_t state[MAX_SLABS];
+    bool internal[MAX_SLABS]; /* Acquired internally, not handed over. */
+    uint32_t internal_count;
     uint16_t ring[MAX_SLABS]; /* Provided ids, in the kernel's order. */
     uint32_t ring_head;
     uint32_t ring_count;
@@ -560,7 +569,9 @@ static void model_check(const struct model *m, const struct vsr_io_pool *pool)
         CHECK(pool->entries[id].refs == m->refs[id]);
         CHECK(pool->entries[id].consumed == m->consumed[id]);
         CHECK(pool->entries[id].caller == (model_lent(m, id) ? 1 : 0));
+        CHECK(pool->entries[id].internal == (m->internal[id] ? 1 : 0));
     }
+    CHECK(pool->internal_taken == m->internal_count);
     CHECK(pool->caller_slabs == m->caller_slabs);
     CHECK(pool->caller_taken == m->lent_count);
     CHECK(pool->ring_registered == m->registered);
@@ -582,7 +593,20 @@ static void model_unref(struct model *m, uint32_t id)
     m->dropped++;
     if (m->refs[id] == 0 && m->state[id] == VSR_IO_SLAB_HELD) {
         m->state[id] = VSR_IO_SLAB_FREE;
+        if (m->internal[id]) {
+            m->internal[id] = false;
+            m->internal_count--;
+        }
     }
+}
+
+/* The unheld parts of the reserve and of the caller's share. */
+static uint32_t model_floor(const struct model *m)
+{
+    uint32_t left =
+        m->reserve > m->internal_count ? m->reserve - m->internal_count : 0;
+
+    return left + m->caller_slabs - m->lent_count;
 }
 
 static void model_drop(struct model *m, struct vsr_io_pool *pool,
@@ -620,7 +644,7 @@ static void step_provide(struct model *m, struct vsr_io_pool *pool,
     struct vsr_io_buffer buffers[MAX_SLABS];
     uint32_t capacity = test_random_bounded(random, 5);
     uint32_t free = model_count(m, VSR_IO_SLAB_FREE);
-    uint32_t floor = m->reserve + m->caller_slabs - m->lent_count;
+    uint32_t floor = model_floor(m);
     uint32_t spare = free > floor ? free - floor : 0;
     uint32_t expected =
         m->registered ? (capacity < spare ? capacity : spare) : 0;
@@ -684,9 +708,10 @@ static void step_acquire(struct model *m, struct vsr_io_pool *pool,
 {
     bool caller = test_random_bounded(random, 2) == 0;
     uint32_t free = model_count(m, VSR_IO_SLAB_FREE);
-    bool expected = caller
-                        ? m->lent_count < m->caller_slabs && free > m->reserve
-                        : free > 0;
+    uint32_t left =
+        m->reserve > m->internal_count ? m->reserve - m->internal_count : 0;
+    bool expected =
+        caller ? m->lent_count < m->caller_slabs && free > left : free > 0;
     uint32_t id = vsr_io_pool_acquire(pool, caller);
 
     if (!expected) {
@@ -702,6 +727,22 @@ static void step_acquire(struct model *m, struct vsr_io_pool *pool,
         m->taken++;
     } else {
         model_take(m, id);
+        m->internal[id] = true;
+        m->internal_count++;
+    }
+}
+
+/* A slab of any state is handed over to a lease: only an internally
+ * acquired one stops counting. */
+static void step_handoff(struct model *m, struct vsr_io_pool *pool,
+                         struct test_random *random)
+{
+    uint32_t id = test_random_bounded(random, m->slabs);
+
+    vsr_io_pool_handoff(pool, id);
+    if (m->internal[id]) {
+        m->internal[id] = false;
+        m->internal_count--;
     }
 }
 
@@ -765,7 +806,7 @@ static void run_model(struct test_random *random, uint32_t steps)
     pool.ring_registered = true;
     model_check(&m, &pool);
     for (uint32_t step = 0; step < steps; ++step) {
-        switch (test_random_bounded(random, 10)) {
+        switch (test_random_bounded(random, 11)) {
         case 0:
         case 1:
             step_provide(&m, &pool, random);
@@ -802,6 +843,9 @@ static void run_model(struct test_random *random, uint32_t steps)
         case 8:
             step_caller_release(&m, &pool, random);
             break;
+        case 9:
+            step_handoff(&m, &pool, random);
+            break;
         default:
             step_ring(&m, &pool, random);
             break;
@@ -822,7 +866,7 @@ static void run_model(struct test_random *random, uint32_t steps)
     vsr_io_pool_ring_lost(&pool);
     CHECK(m.taken == m.dropped);
     CHECK(pool.free_count == m.slabs && pool.kernel_count == 0);
-    CHECK(pool.caller_taken == 0);
+    CHECK(pool.caller_taken == 0 && pool.internal_taken == 0);
     for (uint32_t id = 0; id < m.slabs; ++id) {
         CHECK(pool.entries[id].state == VSR_IO_SLAB_FREE);
         CHECK(pool.entries[id].refs == 0);
@@ -901,28 +945,63 @@ static void test_caller_share(void)
     CHECK(pool.kernel_count == 4);
     check_pool(&pool);
 
-    /* Internal users may take the share and the reserve alike; the caller,
-     * holding none, then gets nothing until the FREE count is above the
-     * reserve again. */
+    /* Internal users take the reserve first and are never refused while a
+     * slab is FREE, so beyond the reserve they eat into the share; the
+     * caller gets a slab whenever the FREE count exceeds the part of the
+     * reserve internal users do not hold (decision 127). */
     for (int i = 0; i < 4; ++i) {
         internal[i] = vsr_io_pool_acquire(&pool, false);
         CHECK(internal[i] != VSR_IO_INDEX_NONE);
         CHECK(pool.entries[internal[i]].caller == 0);
+        CHECK(pool.entries[internal[i]].internal == 1);
+        CHECK(pool.internal_taken == (uint32_t)i + 1);
+        check_pool(&pool);
     }
     CHECK(vsr_io_pool_acquire(&pool, false) == VSR_IO_INDEX_NONE);
     CHECK(vsr_io_pool_acquire(&pool, true) == VSR_IO_INDEX_NONE);
     vsr_io_pool_release(&pool, internal[0]);
     vsr_io_pool_release(&pool, internal[1]);
-    CHECK(pool.free_count == 2 && pool.pending == 0);
-    CHECK(vsr_io_pool_acquire(&pool, true) == VSR_IO_INDEX_NONE);
-    vsr_io_pool_release(&pool, internal[2]);
+    /* Two internal holders are the whole reserve: the FREE two are the
+     * caller's share. */
+    CHECK(pool.internal_taken == 2 && pool.free_count == 2);
+    CHECK(pool.pending == 0 && vsr_io_pool_floor(&pool) == 2);
     d = vsr_io_pool_acquire(&pool, true);
-    CHECK(d != VSR_IO_INDEX_NONE && pool.free_count == 2);
+    CHECK(d != VSR_IO_INDEX_NONE && pool.free_count == 1);
+    check_pool(&pool);
+    /* One internal holder back: one reserve slab and the other share slab
+     * stay FREE. */
+    vsr_io_pool_release(&pool, internal[2]);
+    CHECK(pool.internal_taken == 1 && pool.free_count == 2);
+    CHECK(vsr_io_pool_floor(&pool) == 2 && pool.pending == 0);
+    c = vsr_io_pool_acquire(&pool, true);
+    CHECK(c != VSR_IO_INDEX_NONE && pool.free_count == 1);
+    CHECK(vsr_io_pool_acquire(&pool, true) == VSR_IO_INDEX_NONE);
+    check_pool(&pool);
     vsr_io_pool_release(&pool, internal[3]);
-    CHECK(pool.free_count == 3 && pool.pending == 0);
+    CHECK(pool.internal_taken == 0 && pool.free_count == 2);
+    CHECK(pool.pending == 0);
     CHECK(vsr_io_pool_provide(&pool, buffers, MAX_SLABS) == 0);
     CHECK(vsr_io_pool_caller_release(&pool, d));
+    CHECK(vsr_io_pool_caller_release(&pool, c));
     CHECK(pool.free_count == 4 && pool.pending == 0);
+    check_pool(&pool);
+
+    /* A slab handed over to a lease stops counting: the reserve is whole
+     * again for the internal user, and the slab, once released, is FREE
+     * above the floor for the ring. */
+    internal[0] = vsr_io_pool_acquire(&pool, false);
+    CHECK(pool.internal_taken == 1 && vsr_io_pool_floor(&pool) == 3);
+    vsr_io_pool_handoff(&pool, internal[0]);
+    CHECK(pool.entries[internal[0]].internal == 0);
+    CHECK(pool.internal_taken == 0 && vsr_io_pool_floor(&pool) == 4);
+    vsr_io_pool_handoff(&pool, internal[0]); /* Idempotent. */
+    CHECK(pool.internal_taken == 0);
+    check_pool(&pool);
+    vsr_io_pool_retain(&pool, internal[0]); /* The lease's reference. */
+    vsr_io_pool_release(&pool, internal[0]);
+    vsr_io_pool_release(&pool, internal[0]);
+    CHECK(pool.entries[internal[0]].state == VSR_IO_SLAB_FREE);
+    CHECK(pool.internal_taken == 0 && pool.free_count == 4);
     check_pool(&pool);
 
     /* No share: the caller never acquires, and provision goes down to the
@@ -951,6 +1030,7 @@ static void test_caller_release(void)
     uint32_t free_id = VSR_IO_INDEX_NONE;
     uint32_t a;
     uint32_t a2;
+    uint32_t a3;
     uint16_t k;
 
     setup_share(&pool, 6, 1, 3);
@@ -986,21 +1066,26 @@ static void test_caller_release(void)
     CHECK(!vsr_io_pool_caller_release(&pool, a));
     check_pool(&pool);
     /* The share is back although the slab is not FREE: the caller may take
-     * another, down to the reserve, and the ring gets nothing. */
+     * the FREE slabs beyond the part of the reserve the internal user does
+     * not hold (none: it holds the whole reserve), and the ring gets
+     * nothing. */
     CHECK(vsr_io_pool_provide(&pool, buffers + 2, MAX_SLABS) == 0);
     a2 = vsr_io_pool_acquire(&pool, true);
     CHECK(a2 != VSR_IO_INDEX_NONE && a2 != a);
     CHECK(pool.free_count == 1);
+    a3 = vsr_io_pool_acquire(&pool, true);
+    CHECK(a3 != VSR_IO_INDEX_NONE && pool.free_count == 0);
     CHECK(vsr_io_pool_acquire(&pool, true) == VSR_IO_INDEX_NONE);
     check_pool(&pool);
-    /* The send's NOTIF: FREE, but within the floor of 1 + 3 - 1. */
+    /* The send's NOTIF: FREE, but within the floor of 0 + 3 - 2. */
     vsr_io_pool_release(&pool, a);
     CHECK(pool.entries[a].state == VSR_IO_SLAB_FREE);
-    CHECK(pool.free_count == 2 && pool.pending == 0);
+    CHECK(pool.free_count == 1 && pool.pending == 0);
     CHECK(vsr_io_pool_provide(&pool, buffers + 2, MAX_SLABS) == 0);
     check_pool(&pool);
 
     CHECK(vsr_io_pool_caller_release(&pool, a2));
+    CHECK(vsr_io_pool_caller_release(&pool, a3));
     vsr_io_pool_release(&pool, internal);
     vsr_io_pool_release(&pool, k);
     vsr_io_pool_ring_lost(&pool);

@@ -730,6 +730,49 @@ static void start_close(struct vsr_sim_node *node, uint32_t index)
     vsr_sim_exec_complete(node, index, error, 0, 0);
 }
 
+/* FILES_UPDATE: from `offset`, each slot takes its own reference on the
+ * object a descriptor names (-1 empties the slot); the descriptors stay
+ * open, as the kernel's fget leaves them. The result is the count updated
+ * before the first failure, or that failure. */
+static void start_files_update(struct vsr_sim_node *node, uint32_t index)
+{
+    struct vsr_sim_op *op = node->ops[index];
+    const struct vsr_io_sqe *sqe = &op->sqe;
+    const uint32_t refused = VSR_IO_SQE_FIXED_FILE | VSR_IO_SQE_FIXED_BUFFER |
+                             VSR_IO_SQE_BUFFER_SELECT | VSR_IO_SQE_DIRECT;
+    uint32_t done = 0;
+    int error = 0;
+
+    if ((sqe->flags & refused) != 0 ||
+        sqe->offset + (uint64_t)sqe->length > node->slots_count) {
+        vsr_sim_exec_complete(node, index, -EINVAL, 0, 0);
+        return;
+    }
+    for (uint32_t i = 0; i < sqe->length; ++i) {
+        uint32_t slot = (uint32_t)sqe->offset + i;
+        int32_t fd;
+        uint32_t object = 0;
+
+        memcpy(&fd, op->raw + (size_t)i * sizeof(fd), sizeof(fd));
+        if (fd != -1) {
+            error = vsr_sim_exec_resolve(node, fd, false, &object);
+            if (error != 0) {
+                break;
+            }
+            vsr_sim_object(node, object)->refs++;
+        }
+        if (node->slots[slot] >= 0) {
+            uint32_t old = (uint32_t)node->slots[slot];
+
+            node->slots[slot] = -1;
+            vsr_sim_object_release(node, old);
+        }
+        node->slots[slot] = fd == -1 ? -1 : (int32_t)object;
+        done++;
+    }
+    vsr_sim_exec_complete(node, index, done > 0 ? (int32_t)done : error, 0, 0);
+}
+
 /* ------------------------------------------------------------------------
  * Submission
  * --------------------------------------------------------------------- */
@@ -851,6 +894,19 @@ static void prepare(struct vsr_sim_node *node, struct vsr_sim_op *op)
             memcpy(&op->target, sqe->addr2, sizeof(op->target));
         }
         break;
+    case VSR_IO_SQE_FILES_UPDATE:
+        /* The kernel reads the descriptors when it runs the record; the
+         * copy stands for that read (the caller keeps them valid). */
+        if (sqe->addr == NULL) {
+            op->error = -EFAULT;
+        } else if (sqe->length == 0 || sqe->length > VSR_SIM_MAX_DIRECT) {
+            op->error = -EINVAL;
+        } else {
+            op->raw_length = sqe->length * (uint32_t)sizeof(int32_t);
+            op->raw = vsr_sim_alloc(op->raw_length);
+            memcpy(op->raw, sqe->addr, op->raw_length);
+        }
+        break;
     default:
         break;
     }
@@ -955,9 +1011,41 @@ static void start(struct vsr_sim_node *node, uint32_t index)
     case VSR_IO_SQE_CANCEL:
         start_cancel(node, index);
         return;
+    case VSR_IO_SQE_FILES_UPDATE:
+        start_files_update(node, index);
+        return;
+    case VSR_IO_SQE_PROVIDE: /* Executed at submission, never an op. */
     default:
         vsr_sim_exec_complete(node, index, -EINVAL, 0, 0);
         return;
+    }
+}
+
+static int provide(void *ctx, uint16_t group,
+                   const struct vsr_io_buffer *buffers, uint32_t count);
+
+/* PROVIDE records take effect before any other record of the batch
+ * starts; they complete only when they fail. One that carries a flag or
+ * follows a LINK record is -EINVAL. */
+static void provide_records(struct vsr_sim_node *node, void *ctx,
+                            const struct vsr_io_sqe *sqes, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i) {
+        const struct vsr_io_sqe *sqe = &sqes[i];
+        int rc;
+
+        if (sqe->opcode != VSR_IO_SQE_PROVIDE) {
+            continue;
+        }
+        if (sqe->flags != 0 ||
+            (i > 0 && (sqes[i - 1].flags & VSR_IO_SQE_LINK) != 0)) {
+            rc = -EINVAL;
+        } else {
+            rc = provide(ctx, sqe->buffer_group, sqe->addr, sqe->length);
+        }
+        if (rc != 0) {
+            post(node, sqe->user_data, rc, 0, 0);
+        }
     }
 }
 
@@ -1007,11 +1095,18 @@ static int submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
             return -EINVAL;
         }
     }
+    provide_records(node, ctx, sqes, count);
     indices = vsr_sim_alloc(sizeof(*indices) * ((size_t)count + 1));
     for (uint32_t i = 0; i < count; ++i) {
-        uint32_t index = op_alloc(node);
-        struct vsr_sim_op *op = node->ops[index];
+        uint32_t index;
+        struct vsr_sim_op *op;
 
+        if (sqes[i].opcode == VSR_IO_SQE_PROVIDE) {
+            indices[i] = VSR_SIM_NONE;
+            continue;
+        }
+        index = op_alloc(node);
+        op = node->ops[index];
         op->sqe = sqes[i];
         op->sequence = ++sim->sequence;
         op->state = VSR_SIM_OP_PENDING;
@@ -1039,7 +1134,8 @@ static int submit_and_wait(void *ctx, const struct vsr_io_sqe *sqes,
     for (uint32_t i = 0; i < count; ++i) {
         /* Chain members start when their predecessor completes; a head
          * is still PENDING here unless an earlier record ended it. */
-        if (node->ops[indices[i]]->state == VSR_SIM_OP_PENDING) {
+        if (indices[i] != VSR_SIM_NONE &&
+            node->ops[indices[i]]->state == VSR_SIM_OP_PENDING) {
             start(node, indices[i]);
         }
     }

@@ -92,9 +92,12 @@
  * Descriptors (decision 72): a link's socket is a RAW descriptor until the
  * engine takes it over, and an engine FILE SLOT from then on. A dialed link
  * issues SOCKET, then CONNECT on the raw descriptor; a listener runs a plain
- * multishot ACCEPT; vsr_io_adopt brings a raw descriptor. The takeover
- * installs the descriptor into the slot through vsr_io_engine_install: at
- * the CONNECT or ACCEPT completion in TRUSTED mode, at the caller's OK
+ * multishot ACCEPT; vsr_io_adopt brings a raw descriptor. The takeover is a
+ * record (decision 135): a FILES_UPDATE of the raw descriptor into an engine
+ * slot, LINKed to a CLOSE of the raw descriptor (SKIP_SUCCESS), issued on
+ * the connect slot from prepare; the link issues nothing else until it
+ * completes, and a failed one closes the link like any failure. It starts
+ * at the CONNECT or ACCEPT completion in TRUSTED mode, at the caller's OK
  * HANDSHAKE completion in EXTERNAL mode (the preamble is exchanged on the
  * raw descriptor before the op is emitted, and the caller owns it until the
  * completion), and at adopt. Every later record is FIXED_FILE on the slot,
@@ -197,7 +200,9 @@ enum vsr_io_link_stage {
     VSR_IO_STAGE_PREAMBLE_RECV, /* EXTERNAL acceptor: 8-byte RECV pending. */
     VSR_IO_STAGE_HANDSHAKE,     /* EXTERNAL: op emitted, or to emit when
                                    handshake_op is 0. */
-    VSR_IO_STAGE_NODELAY        /* Tag of the TCP_NODELAY record's slot. */
+    VSR_IO_STAGE_NODELAY,       /* Tag of the TCP_NODELAY record's slot. */
+    VSR_IO_STAGE_INSTALL        /* The takeover's FILES_UPDATE (and the
+                                   raw CLOSE chained to it) in flight. */
 };
 
 struct vsr_io_link {
@@ -215,18 +220,22 @@ struct vsr_io_link {
     uint64_t nonce;          /* Own HELLO nonce. */
     uint64_t handshake_op;   /* EXTERNAL: op id of the HANDSHAKE, or 0. */
     struct vsr_io_address peer;
-    uint32_t connect_slot; /* SOCKET/CONNECT slot, or the EXTERNAL preamble
+    uint32_t connect_slot;  /* SOCKET/CONNECT slot, or the EXTERNAL preamble
                               send or receive. */
-    bool hello_sent;       /* Own HELLO queued into the send slab. */
-    bool hello_seen;       /* Peer's HELLO accepted. */
-    bool torn_down;        /* CLOSING: the teardown records were emitted. */
-    bool recv_starved;     /* RECV ended -ENOBUFS; re-arm once provided. */
-    bool recv_paused;      /* STREAM link holding a frame the stream module
+    bool hello_sent;        /* Own HELLO queued into the send slab. */
+    bool hello_seen;        /* Peer's HELLO accepted. */
+    bool torn_down;         /* CLOSING: the teardown records were emitted. */
+    bool recv_starved;      /* RECV ended -ENOBUFS; re-arm once provided. */
+    bool recv_paused;       /* STREAM link holding a frame the stream module
                               could not take: the RECV is cancelled and not
                               re-armed until every held byte is carved. */
-    bool recv_cancelled;   /* The pause's CANCEL of recv_slot was issued. */
-    bool nodelay_set;      /* TCP_NODELAY record issued (or not wanted). */
-    int32_t error;         /* Reason for closing, or 0. */
+    bool recv_cancelled;    /* The pause's CANCEL of recv_slot was issued. */
+    bool nodelay_set;       /* TCP_NODELAY record issued (or not wanted). */
+    bool install_establish; /* Established once the takeover completes. */
+    uint32_t installing;    /* The takeover (decision 135): 0 none, 1 its
+                              record to issue, 2 in flight. */
+    uint32_t install_slot;  /* The engine file slot being installed. */
+    int32_t error;          /* Reason for closing, or 0. */
     unsigned char preamble[VSR_IO_PREAMBLE_BYTES]; /* EXTERNAL acceptor's
                                                        8-byte receive. */
     /* Receive side. */

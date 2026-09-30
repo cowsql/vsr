@@ -41,7 +41,7 @@
 
 #define PAGE 4096u
 #define NONE UINT32_MAX
-#define SLABS 24u
+#define SLABS 32u
 #define OWNER 0x5Au
 #define FILE_SLOT_BASE 100u
 #define BASE_SLOT                                                              \
