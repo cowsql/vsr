@@ -363,10 +363,15 @@ struct vsr_io_limits {
  * plus two blocks of alignment, so a frame fits one slab, a straddling
  * frame is copied into a fresh one, and a cold LOAD reads its records into
  * one slab. slabs must be at least links + streams * (stream_window + 1) +
- * 2 * replicas + 4 + caller_slabs: beyond what receives consume, every
- * established link holds one slab for its frame headers, streams hold their
- * windows, each replica needs one for cold loads and one for capture
- * staging, and the caller's share stays out of the ring.
+ * 4 * replicas + 5 + caller_slabs. The pool has three shares: the engine's
+ * reserve of links + streams * stream_window + 4 * replicas + 1 slabs (a
+ * send slab per link for its frame headers, the chunk reads of every
+ * stream window, per replica a cold-load or recovery read slab and three
+ * snapshot staging slabs, one reassembly slab), the caller's share, and
+ * the ring's, at least streams + 4 slabs; whatever part of the first two
+ * is not held stays out of the ring, since the kernel returns a provided
+ * slab only once it has filled it. More slabs than the minimum buy
+ * receive throughput.
  * file_slots covers the listeners, every link, one per stream (the file a
  * served stream reads), and per replica the log plus one transient
  * clients file. buffer_regions covers one region for the payload pool plus
@@ -783,10 +788,9 @@ struct vsr_io_stream_write {
  * The caller holds at most limits.caller_slabs slabs at once, and the
  * engine never hands the part of that share the caller does not hold to
  * the kernel, which returns a provided slab only once it has filled it.
- * acquire returns OK, ELIMIT once the caller holds caller_slabs slabs or
- * the free slabs are down to the engine's reserve of replicas + 1 (its own
- * cold loads, reassembly and staging may use the share meanwhile), or
- * EINVAL.
+ * acquire returns OK, ELIMIT once the caller holds caller_slabs slabs (or,
+ * transiently, while the engine's own users hold more than its reserve and
+ * use the untaken share), or EINVAL (a closing engine included).
  * ---------------------------------------------------------------------- */
 
 struct vsr_io_slab {

@@ -198,4 +198,10 @@ void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size);
  * link module calls it when it takes a socket over (decision 72). */
 int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd);
 
+/* The pool's reserve for the limits (decision E1): one send slab per
+ * link, the chunk reads of every stream window, per replica a cold-load
+ * or recovery read slab and the snapshot module's writer, writer-cold and
+ * reader slabs, and one reassembly slab. */
+uint32_t vsr_io_engine_reserve(const struct vsr_io_limits *limits);
+
 #endif /* VSR_IO_ENGINE_H */

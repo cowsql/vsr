@@ -73,12 +73,26 @@ static struct vsr_io_slab_entry *entry(struct vsr_io_pool *pool, uint32_t id)
     return &pool->entries[id];
 }
 
-/* Provision keeps this many slabs FREE: the reserve plus the part of the
- * caller's share the caller does not hold (decision 54). reserve < slabs
- * and caller_slabs <= slabs <= 32768, so the sum cannot wrap. */
+/* The part of the reserve internal users do not hold. */
+static uint32_t reserve_left(const struct vsr_io_pool *pool)
+{
+    return pool->reserve > pool->internal_taken
+               ? pool->reserve - pool->internal_taken
+               : 0;
+}
+
+/* Provision keeps this many slabs FREE: the part of the reserve internal
+ * users do not hold plus the part of the caller's share the caller does not
+ * hold (decisions 54 and E1). reserve < slabs and caller_slabs <= slabs <=
+ * 32768, so the sum cannot wrap. */
 static uint32_t provision_floor(const struct vsr_io_pool *pool)
 {
-    return pool->reserve + (pool->caller_slabs - pool->caller_taken);
+    return reserve_left(pool) + (pool->caller_slabs - pool->caller_taken);
+}
+
+uint32_t vsr_io_pool_floor(const struct vsr_io_pool *pool)
+{
+    return provision_floor(pool);
 }
 
 static void update_pending(struct vsr_io_pool *pool)
@@ -97,6 +111,11 @@ static void free_push(struct vsr_io_pool *pool, uint32_t id)
      * flag and returns the share first. */
     POOL_ASSERT(slab->caller == 0);
     POOL_ASSERT(pool->free_count + pool->kernel_count < pool->slabs);
+    if (slab->internal != 0) {
+        POOL_ASSERT(pool->internal_taken > 0);
+        slab->internal = 0;
+        pool->internal_taken--;
+    }
     slab->state = VSR_IO_SLAB_FREE;
     slab->consumed = 0;
     slab->next = pool->free_head;
@@ -180,7 +199,7 @@ uint32_t vsr_io_pool_acquire(struct vsr_io_pool *pool, bool caller)
 
     if (pool->free_count == 0 ||
         (caller && (pool->caller_taken == pool->caller_slabs ||
-                    pool->free_count <= pool->reserve))) {
+                    pool->free_count <= reserve_left(pool)))) {
         return VSR_IO_INDEX_NONE;
     }
     id = free_pop(pool);
@@ -188,11 +207,28 @@ uint32_t vsr_io_pool_acquire(struct vsr_io_pool *pool, bool caller)
     slab->state = VSR_IO_SLAB_HELD;
     slab->refs = 1;
     slab->caller = caller ? 1 : 0;
+    slab->internal = caller ? 0 : 1;
     if (caller) {
         pool->caller_taken++;
-        update_pending(pool);
+    } else {
+        pool->internal_taken++;
     }
+    update_pending(pool);
     return id;
+}
+
+void vsr_io_pool_handoff(struct vsr_io_pool *pool, uint32_t id)
+{
+    struct vsr_io_slab_entry *slab = entry(pool, id);
+
+    if (slab->internal == 0) {
+        return;
+    }
+    POOL_ASSERT(slab->state == VSR_IO_SLAB_HELD);
+    POOL_ASSERT(pool->internal_taken > 0);
+    slab->internal = 0;
+    pool->internal_taken--;
+    update_pending(pool);
 }
 
 void vsr_io_pool_retain(struct vsr_io_pool *pool, uint32_t id)

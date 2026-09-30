@@ -68,6 +68,14 @@ enum engine_state { ENGINE_RUNNING, ENGINE_CLOSING, ENGINE_CLOSED };
 
 enum lease_state { LEASE_FREE, LEASE_QUEUED, LEASE_LEASED };
 
+/* Pool reserve per replica: a cold-load or recovery read slab, and the
+ * snapshot module's writer, writer-cold and reader slabs (decision E1). */
+#define ENGINE_RESERVE_PER_REPLICA 4u
+/* One reassembly slab, and the slabs the ring keeps beyond one per stream
+ * in the minimum-slabs rule. */
+#define ENGINE_RESERVE_REASSEMBLY 1u
+#define ENGINE_RING_MIN 4u
+
 /* Invariant checks in debug builds; a violation traps (see pool.c). */
 #ifdef NDEBUG
 #define ENGINE_ASSERT(condition) ((void)sizeof(condition))
@@ -200,14 +208,17 @@ static int check_options(const struct vsr_io_options *options)
     if (options->listen_count > VSR_IO_LISTENERS_MAX) {
         return VSR_ELIMIT;
     }
-    /* Minimum slabs: links + streams * (stream_window + 1) + 2 * replicas
-     * + 4 + caller_slabs (decisions 42 and 54). */
+    /* Minimum slabs: the reserve (links + streams * stream_window + 4 *
+     * replicas + 1), the ring's streams + 4 and caller_slabs, that is
+     * links + streams * (stream_window + 1) + 4 * replicas + 5 +
+     * caller_slabs (decisions 42, 54 and E1). */
     if (!vsr_size_add(limits->stream_window, 1, &term) ||
         !vsr_size_mul(limits->streams, term, &term) ||
         !vsr_size_add(limits->links, term, &minimum) ||
-        !vsr_size_mul(limits->replicas, 2, &term) ||
+        !vsr_size_mul(limits->replicas, ENGINE_RESERVE_PER_REPLICA, &term) ||
         !vsr_size_add(minimum, term, &minimum) ||
-        !vsr_size_add(minimum, 4, &minimum) ||
+        !vsr_size_add(minimum, ENGINE_RESERVE_REASSEMBLY + ENGINE_RING_MIN,
+                      &minimum) ||
         !vsr_size_add(minimum, limits->caller_slabs, &minimum) ||
         minimum > limits->slabs || limits->replicas > ENGINE_REPLICAS_MAX ||
         limits->batch < ENGINE_BATCH_MIN) {
@@ -402,6 +413,14 @@ static void bind_deadlines(struct vsr_io *io)
     }
 }
 
+uint32_t vsr_io_engine_reserve(const struct vsr_io_limits *limits)
+{
+    /* check_options bounded the sum by limits->slabs (<= 32768). */
+    return limits->links + limits->streams * limits->stream_window +
+           ENGINE_RESERVE_PER_REPLICA * limits->replicas +
+           ENGINE_RESERVE_REASSEMBLY;
+}
+
 /* The pool region and its provided-buffer ring, in that order; a failed
  * ring registration undoes the region. Listener setup waits for the first
  * prepare (decision 45). */
@@ -474,8 +493,9 @@ int vsr_io_init(const struct vsr_io_options *options,
     io->state = ENGINE_RUNNING;
     io->page_bytes = ENGINE_PAGE_BYTES;
     vsr_io_pool_init(&io->pool, payload->base, plan.payload, &options->limits,
-                     options->limits.replicas + 1, options->buffer_region_base,
-                     options->buffer_group, base + plan.pool, plan.pool_bytes);
+                     vsr_io_engine_reserve(&options->limits),
+                     options->buffer_region_base, options->buffer_group,
+                     base + plan.pool, plan.pool_bytes);
     vsr_io_slots_init(&io->slots, base + plan.slots, plan.slots_count,
                       options->owner);
     vsr_io_deadlines_init(&io->deadlines, base + plan.deadlines,
@@ -709,6 +729,12 @@ uint32_t vsr_io_lease_alloc(struct vsr_io_replica *replica, uint32_t slab,
         lease->generation = (uint16_t)(lease->generation + 1u);
         lease->region.used = 0;
         replica->leases_free--;
+        if (slab != NONE) {
+            /* The bytes are the lease's now (a cold LOAD result, a
+             * reassembled MESSAGE): the reserve is free again for the
+             * internal user that acquired the slab (decision E1). */
+            vsr_io_pool_handoff(&replica->io->pool, slab);
+        }
         return i;
     }
     ENGINE_ASSERT(false);

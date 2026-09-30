@@ -24,12 +24,19 @@
  *           caller (vsr_io_slab_acquire), link send slabs, capture staging
  * A KERNEL slab with incremental consumption also carries refs for the
  * frames already delivered from it; it becomes FREE only when the kernel
- * has left it AND refs are zero. A slab returns to the ring only from FREE,
- * and only while the free count exceeds the provision floor, reserve +
- * caller_slabs - caller_taken (decision 54): the reserve lets cold loads,
- * reassembly and staging always obtain one eventually, and the caller's
- * untaken share stays FREE because the kernel returns a provided slab only
- * once it has filled it.
+ * has left it AND refs are zero.
+ *
+ * Shares (decisions 54 and E1): the pool is split between the ring, the
+ * caller (caller_slabs) and the engine's RESERVE, the slabs its own users
+ * acquire (link send slabs, reassembly, stream chunk reads, cold loads,
+ * recovery reads, snapshot staging). The pool counts the slabs internal
+ * users acquired and still hold (internal_taken; a slab handed over to a
+ * lease stops counting, see handoff), and a slab returns to the ring only
+ * from FREE, and only while the free count exceeds the provision floor:
+ * the part of the reserve internal users do not hold plus the part of the
+ * caller's share the caller does not hold. The kernel returns a provided
+ * slab only once it has filled it, so a share left to the ring would never
+ * come back on an idle engine.
  *
  * Ids are the provided-buffer ids (0..slabs-1) and double as slab indexes;
  * the pool region is registered as ONE region with the executor, so a
@@ -46,7 +53,10 @@ enum vsr_io_slab_state {
 struct vsr_io_slab_entry {
     uint32_t refs;
     uint32_t consumed; /* KERNEL: bytes delivered so far by RECV CQEs. */
-    uint16_t state;    /* enum vsr_io_slab_state */
+    uint8_t state;     /* enum vsr_io_slab_state */
+    uint8_t internal;  /* 1 while acquired by an internal user and not
+                          handed over to a lease: counts in internal_taken
+                          until it is FREE again. */
     uint16_t caller;   /* 1 while taken by vsr_io_slab_acquire. */
     uint32_t next;     /* Free-list link; VSR_IO_INDEX_NONE ends it. */
 };
@@ -58,19 +68,21 @@ struct vsr_io_pool {
     uint32_t slabs;
     uint32_t free_head;
     uint32_t free_count;
-    uint32_t kernel_count; /* Slabs currently in the ring. */
-    uint32_t reserve;      /* Free slabs never provided. */
-    uint32_t caller_slabs; /* The caller's share (vsr_io_limits). */
-    uint32_t caller_taken; /* Slabs the caller holds, <= caller_slabs. */
-    uint32_t pending;      /* FREE slabs above the provision floor: what the
+    uint32_t kernel_count;   /* Slabs currently in the ring. */
+    uint32_t reserve;        /* The engine's share: kept FREE while its
+                              internal users do not hold it. */
+    uint32_t internal_taken; /* Slabs internal users acquired and hold. */
+    uint32_t caller_slabs;   /* The caller's share (vsr_io_limits). */
+    uint32_t caller_taken;   /* Slabs the caller holds, <= caller_slabs. */
+    uint32_t pending;        /* FREE slabs above the provision floor: what the
                               next prepare provides. */
-    uint32_t region_index; /* Executor buffer region of the pool. */
-    uint16_t group;        /* Buffer group of the ring. */
-    uint16_t ring_entries; /* Power of two >= slabs. */
-    bool ring_registered;  /* Set by the engine once buffer_ring succeeded,
+    uint32_t region_index;   /* Executor buffer region of the pool. */
+    uint16_t group;          /* Buffer group of the ring. */
+    uint16_t ring_entries;   /* Power of two >= slabs. */
+    bool ring_registered;    /* Set by the engine once buffer_ring succeeded,
                               cleared by ring_lost; provide hands out
                               nothing while clear. */
-    bool starved;          /* A RECV ended with -ENOBUFS that was_starved
+    bool starved;            /* A RECV ended with -ENOBUFS that was_starved
                               has not reported yet. */
     struct vsr_io_slab_entry *entries; /* [slabs] */
     void *ring_memory;                 /* Provided-ring memory, page aligned:
@@ -86,9 +98,10 @@ struct vsr_io_pool {
  * power-of-two ring) or on overflow. */
 int vsr_io_pool_size(const struct vsr_io_limits *limits, size_t page_bytes,
                      size_t *bytes, size_t *alignment);
-/* base/size is the payload region; memory the bookkeeping region. reserve
- * slabs are never provided, nor the caller's share of limits->caller_slabs
- * while the caller does not hold it. Every slab starts FREE. */
+/* base/size is the payload region; memory the bookkeeping region. The
+ * reserve (while internal users do not hold it) and the caller's share of
+ * limits->caller_slabs (while the caller does not hold it) are never
+ * provided; reserve + caller_slabs < slabs. Every slab starts FREE. */
 void vsr_io_pool_init(struct vsr_io_pool *pool, void *base, size_t size,
                       const struct vsr_io_limits *limits, uint32_t reserve,
                       uint32_t region_index, uint16_t group, void *memory,
@@ -116,10 +129,22 @@ static inline bool vsr_io_pool_contains(const struct vsr_io_pool *pool,
 
 /* Takes a FREE slab as HELD with one reference; INDEX_NONE when none is
  * free. `caller` marks a slab taken through vsr_io_slab_acquire, which never
- * takes the reserve nor more than the share: INDEX_NONE (ELIMIT) once
- * caller_taken == caller_slabs or free_count <= reserve, while internal
- * users (cold loads, reassembly, staging) may take every FREE slab. */
+ * takes the part of the reserve internal users do not hold nor more than
+ * the share: INDEX_NONE (ELIMIT) once caller_taken == caller_slabs or
+ * free_count <= reserve - internal_taken (0 once internal users hold the
+ * whole reserve). Internal users (link send slabs, reassembly, stream chunk
+ * reads, cold loads, staging) may take every FREE slab and count in
+ * internal_taken until the slab is FREE again or handed over. */
 uint32_t vsr_io_pool_acquire(struct vsr_io_pool *pool, bool caller);
+/* An internally acquired slab now belongs to a lease (a cold LOAD result, a
+ * reassembled MESSAGE): it stops counting in internal_taken, so the reserve
+ * is again available to the internal users it is sized for, while the
+ * lease keeps the slab HELD like a received one. No-op for any other
+ * slab. */
+void vsr_io_pool_handoff(struct vsr_io_pool *pool, uint32_t id);
+/* The provision floor: FREE slabs provision leaves, the reserve's part
+ * internal users do not hold plus the caller's untaken share. */
+uint32_t vsr_io_pool_floor(const struct vsr_io_pool *pool);
 void vsr_io_pool_retain(struct vsr_io_pool *pool, uint32_t id);
 /* Drops one reference; a slab reaching zero outside the ring becomes FREE
  * and is queued for provision. Never the caller's own reference. */

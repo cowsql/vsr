@@ -119,8 +119,8 @@ with `VSR_ELIMIT`:
 | Single write | `write_behind_bytes + record limit + block_bytes <= 1 GiB`; `segment_bytes + 2 * block_bytes <= UINT32_MAX` | `store.c`, decision 70 |
 | Slots | `vsr_io_slots_size`: `listeners + 7 * links + streams * (stream_window + 2) + replicas * (inflight_writes + 8) + 8`; per link a receive, a shutdown, a connect and `VSR_IO_LINK_SENDS` (4) sends awaiting NOTIF | `slots.c` |
 | Deadlines | `links + nodes + 4 * replicas + streams` | `engine.c` |
-| Pool reserve | `replicas + 1` slabs never provided to the kernel | `pool.c` |
-| Minimum slabs | `links + streams * (stream_window + 1) + 2 * replicas + 4 + caller_slabs` | `vsr-io.h`, decision 54 |
+| Pool reserve | `links + streams * stream_window + 4 * replicas + 1` slabs, never provided while internal users do not hold them | `engine.c`, `pool.c`, decision E1 |
+| Minimum slabs | `links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs` (the reserve, the ring's `streams + 4`, the caller's share) | `vsr-io.h`, decisions 54 and E1 |
 | Send queue | `link_queue` entries per node | `link.c`, decision 38 |
 | Versions table | `max_entries` | `store.c` |
 | Client table | next power of two `>= 2 * max_clients` buckets | `store.c` |
@@ -194,19 +194,29 @@ the pool records what it provided and what completions returned.
   the kernel consumes each provided buffer from its start, in order, until
   `BUFFER_MORE` is clear. A slab is FREE again only when the kernel left it
   (`recv_end`) and `refs` is zero.
+- Shares (decision E1): the engine's `reserve` (`vsr_io_engine_reserve`:
+  a send slab per link, every stream window's chunk reads, four per
+  replica, one reassembly slab), the caller's `caller_slabs` and the
+  ring's. `internal_taken` counts the slabs internal users acquired and
+  still hold (flag `internal`); `vsr_io_pool_handoff` clears it for a slab
+  that now belongs to an engine lease (`vsr_io_lease_alloc` calls it: a
+  cold LOAD result, a reassembled MESSAGE).
 - Provision: `vsr_io_pool_provide` hands FREE slabs to the ring during
-  prepare while `free_count > reserve + caller_slabs - caller_taken`
-  (decision 54: the part of the caller's share it does not hold stays
-  FREE); `starved` remembers `-ENOBUFS`, across a ring loss too, so
-  receives are re-armed once the ring holds a buffer again.
+  prepare while `free_count` exceeds the floor `max(reserve -
+  internal_taken, 0) + caller_slabs - caller_taken` (`vsr_io_pool_floor`:
+  the unheld parts of both shares stay FREE); `starved` remembers
+  `-ENOBUFS`, across a ring loss too, so receives are re-armed once the
+  ring holds a buffer again.
 - Caller slabs: `vsr_io_pool_acquire(pool, true)` fails once
-  `caller_taken == caller_slabs` or `free_count <= reserve`; internal
-  acquires may take every FREE slab. The caller's release goes through
-  `vsr_io_pool_caller_release`, which rejects an id the caller does not
-  hold (EINVAL for `vsr_io_slab_release`).
+  `caller_taken == caller_slabs` or `free_count <= max(reserve -
+  internal_taken, 0)`; internal acquires may take every FREE slab (beyond
+  the reserve, the caller's untaken share). The caller's release goes
+  through `vsr_io_pool_caller_release`, which rejects an id the caller does
+  not hold (EINVAL for `vsr_io_slab_release`).
 - Invariants: `free_count + kernel_count + held == slabs`; a KERNEL slab is
   never handed to `acquire`; a slab in the ring is never written by the
-  engine; `caller_taken` counts the slabs flagged `caller`, all HELD.
+  engine; `caller_taken` counts the slabs flagged `caller` and
+  `internal_taken` those flagged `internal`, all HELD, never both.
 - Tests: `tests/unit/pool`: state transitions including incremental
   consumption with many frames per slab, reserve and caller-share
   enforcement, starvation flag, ring loss, the largest ring of 32768 ids,
@@ -1889,6 +1899,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | `vsr_io_uring_init` names its refusals: `-ENOSYS` (no io_uring, or a kernel older than the baseline, including one whose setup refuses a flag with `EINVAL`), `-EPERM`, `-EINVAL` | 104 |
 | `snapshot.h` (internal) | The module's structures as implemented: `vsr_io_snapshots_size`/`init` take the engine limits (`stream_window`, `streams`) and `max_clients`; `vsr_io_snapshots_region_bytes`; a registry entry carries the file size, the job and its step, the record in flight, the kept and transient slots, `on_disk`, `sync_failed`, `job_next`, the reserved `lease` and the copied `result`; the writer, the reader, the chunk ring, the serves, the file-operation table, the directory slot and `pending_base`; the ops are `RETRY` without an engine lease; an OK CAPTURE or FETCH completion carries the lease; a DROP of an id the registry lacks is taken; a file with a CAPTURE outstanding is not served; the weak hook stubs left stream.c | 105, 106, 107, 108, 109 |
 | `store.h` | `vsr_io_recovery.chain_resume` (the boundary at which the chain resumes past a block's dead tail); `VSR_IO_SEGMENT_FLUSHING`, `freeing_flush` and `flush_own` (a freed slot waits for the flush after its superblock write, which the store issues without waiting for a SYNC's target); `reclaimed`, `client_base_floor` and `client_base_pending` (the floor terms bounded by the sequence on media); `snapshot_clients` reports a record freed under the base as the base file's (sequence 0, the base offset); `vsr_io_store.replica`, the embedding replica, set by init; `vsr_io_recovery.record_run` (was `reserved`), the run of the last replayed record | 110, 111, 112, 113, 116 |
+| `vsr-io.h`, `pool.h` (internal) | Sizing rule: minimum slabs `links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs`, and the pool's three shares; `vsr_io_slab_acquire` is ELIMIT at the caller's share, or while the engine's users hold more than the reserve and use the untaken share; the pool's `internal_taken`, the slab's `internal` flag (with `state` now 8 bits), `vsr_io_pool_handoff`, `vsr_io_pool_floor` | E1 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1973,17 +1984,14 @@ of `docs/io-design.md`:
   - Short-send lengths depend on socket buffers (6144 of 8 MiB with a
     4096-byte `SO_SNDBUF` on the ring, 262144 in the simulation); only
     shortness is contract.
-- The pool's reserve (`replicas + 1` free slabs, decision 54's floor) does
-  not count the snapshot module's staging slabs (the writer's and its cold
-  slab, the reader's: up to three per replica) nor the link send slab a new
-  stream link takes. With every other slab provided to the ring and idle
-  links returning none, a fetch's reader slab can take the last free slab
-  before its stream link's send slab: the handshake stalls and the fetch
-  ends RETRY at the inactivity timer, and the same can happen again. The
-  unit harness gives each engine a caller share (`caller_slabs = 8`) to
-  model a pool with slack. Counting three slabs per replica and one per
-  stream in the reserve (and the minimum-slabs rule) would close it; the
-  module already answers RETRY at once when a slab is missing.
+- The pool's reserve (decision E1) covers every internal holder that
+  acquires a fresh slab, once each; slabs that stay with a holder past
+  their purpose count against it until released: a reassembled stream
+  chunk held by its DATA op (up to the window), a snapshot staging slab of
+  a stalled capture. The internal users then take the caller's untaken
+  share and, past it, wait and retry at poll as before. The unit harness
+  of the snapshot module still gives each engine a caller share
+  (`caller_slabs = 8`); it is no longer needed for the fetch.
 - A fetch whose verification or local write failed keeps receiving the
   stream until its END (the chunks are completed and dropped at once); the
   requester has no early abort of a library stream. The files are small.

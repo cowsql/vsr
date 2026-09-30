@@ -506,17 +506,26 @@ static void test_layout(void)
     o.limits.slab_bytes = 2 * PAGE;
     CHECK(layout_of(&o) == VSR_OK);
 
-    /* ELIMIT: minimum slabs = links + streams * (window + 1) + 2 *
-     * replicas + 4 + caller_slabs = 4 + 6 + 4 + 4 + caller. */
+    /* ELIMIT: minimum slabs = the reserve (links + streams * window + 4 *
+     * replicas + 1) + streams + 4 + caller_slabs = 4 + 6 + 8 + 5 + caller
+     * (decision E1). */
     o = base;
-    o.limits.slabs = 20;
+    o.limits.slabs = 25;
     CHECK(layout_of(&o) == VSR_OK);
-    o.limits.slabs = 19;
+    o.limits.slabs = 24;
     CHECK(layout_of(&o) == VSR_ELIMIT);
     o = base;
-    o.limits.caller_slabs = SLABS - 18;
+    o.limits.caller_slabs = SLABS - 23;
     CHECK(layout_of(&o) == VSR_OK);
-    o.limits.caller_slabs = SLABS - 17;
+    o.limits.caller_slabs = SLABS - 22;
+    CHECK(layout_of(&o) == VSR_ELIMIT);
+    o = base;
+    o.limits.replicas = 3;
+    o.limits.buffer_regions = 4;
+    o.limits.file_slots = 14;
+    o.limits.slabs = 29;
+    CHECK(layout_of(&o) == VSR_OK);
+    o.limits.slabs = 28;
     CHECK(layout_of(&o) == VSR_ELIMIT);
     o = base;
     o.limits.slabs = 32769;
@@ -681,7 +690,12 @@ static void test_init(void)
     CHECK(io->page_bytes == PAGE);
     /* Every table is initialized for the limits. */
     CHECK(io->pool.base == payload && io->pool.slabs == SLABS);
-    CHECK(io->pool.reserve == l->replicas + 1);
+    /* The reserve: a send slab per link, the stream windows' chunk reads,
+     * four per replica and one reassembly slab (decision E1). */
+    CHECK(io->pool.reserve == l->links + l->streams * l->stream_window +
+                                  4 * l->replicas + 1);
+    CHECK(io->pool.reserve == vsr_io_engine_reserve(l));
+    CHECK(io->pool.internal_taken == 0);
     CHECK(io->pool.caller_slabs == 2);
     CHECK(io->pool.region_index == REGION_BASE && io->pool.group == GROUP);
     CHECK(io->pool.free_count == SLABS);
@@ -904,6 +918,7 @@ static void test_slabs(void)
     struct vsr_io_slab first;
     struct vsr_io_slab second;
     struct vsr_io_slab third;
+    uint32_t internal[SLABS];
     uint32_t taken;
 
     memset(&first, 0xEE, sizeof(first));
@@ -936,15 +951,35 @@ static void test_slabs(void)
     CHECK(vsr_io_slab_release(io, second.id) == VSR_OK);
     CHECK(vsr_io_slab_release(io, third.id) == VSR_OK);
     CHECK(io->pool.caller_taken == 0 && io->pool.free_count == SLABS);
-    /* The free slabs never drop to the reserve for the caller. */
-    for (uint32_t i = 0; i < SLABS - io->pool.reserve; ++i) {
-        CHECK(vsr_io_pool_acquire(&io->pool, false) != NONE);
+    /* The caller never takes the part of the reserve internal users do not
+     * hold: with it all FREE, the caller's two plus the reserve are what
+     * provision leaves, and the share is what the caller gets. */
+    CHECK(vsr_io_pool_floor(&io->pool) == io->pool.reserve + 2);
+    for (uint32_t i = 0; i < io->pool.reserve; ++i) {
+        internal[i] = vsr_io_pool_acquire(&io->pool, false);
+        CHECK(internal[i] != NONE);
     }
-    CHECK(io->pool.free_count == io->pool.reserve);
+    /* Internal users holding the whole reserve leave the share intact
+     * (decision E1): an established link's send slab no longer eats it. */
+    CHECK(io->pool.internal_taken == io->pool.reserve);
+    CHECK(vsr_io_pool_floor(&io->pool) == 2);
+    CHECK(vsr_io_slab_acquire(io, &first) == VSR_OK);
+    CHECK(vsr_io_slab_acquire(io, &second) == VSR_OK);
+    CHECK(vsr_io_slab_acquire(io, &third) == VSR_ELIMIT);
+    CHECK(vsr_io_slab_release(io, first.id) == VSR_OK);
+    CHECK(vsr_io_slab_release(io, second.id) == VSR_OK);
+    /* Beyond the reserve they eat the untaken share: nothing FREE, and the
+     * caller gets nothing until they give slabs back. */
+    for (uint32_t i = io->pool.reserve; i < SLABS; ++i) {
+        internal[i] = vsr_io_pool_acquire(&io->pool, false);
+        CHECK(internal[i] != NONE);
+    }
+    CHECK(io->pool.free_count == 0);
     CHECK(vsr_io_slab_acquire(io, &first) == VSR_ELIMIT);
-    for (uint32_t i = 0; i < SLABS - io->pool.reserve; ++i) {
-        vsr_io_pool_release(&io->pool, i);
+    for (uint32_t i = 0; i < SLABS; ++i) {
+        vsr_io_pool_release(&io->pool, internal[i]);
     }
+    CHECK(io->pool.internal_taken == 0 && io->pool.free_count == SLABS);
     CHECK(vsr_io_slab_acquire(io, &first) == VSR_OK);
     CHECK(vsr_io_slab_release(io, first.id) == VSR_OK);
     /* No acquire once closing. */
