@@ -903,6 +903,7 @@ static uint64_t harness_start(uint32_t mode)
     CHECK(h.store->state == VSR_IO_STORE_READY);
     expect_completion(op, VSR_IO_NOT_FOUND);
     expect_no_completion();
+    disk.flushes = 0; /* The tests count the flushes after the creation's. */
     return op;
 }
 
@@ -2171,9 +2172,17 @@ static void test_create(void)
     CHECK(h.store->state == VSR_IO_STORE_CREATING);
     expect_no_completion();
     harness_complete(at);
-    CHECK(h.store->state == VSR_IO_STORE_READY);
     CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_OPEN);
     CHECK(h.store->segments[0].header_write == NONE);
+    /* FDATASYNC: the superblocks and the header are flushed before the
+     * store is READY; a crash losing them would leave a CORRUPT log. */
+    CHECK(h.store->state == VSR_IO_STORE_CREATING);
+    expect_no_completion();
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_FSYNC);
+    CHECK(at != NONE && disk.flushes == 0);
+    harness_complete(at);
+    CHECK(h.store->state == VSR_IO_STORE_READY && disk.flushes == 1);
     expect_completion(op, VSR_IO_NOT_FOUND);
     expect_no_completion();
     read_header(0, &header);
@@ -2225,6 +2234,10 @@ static void test_recover_missing(void)
     }
     CHECK(h.store->stores_count == 1);
     harness_complete(at);
+    /* The flush of the creation (FDATASYNC), then READY. */
+    CHECK(h.store->state == VSR_IO_STORE_CREATING);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_FSYNC));
     CHECK(h.store->state == VSR_IO_STORE_READY);
     expect_completion(store_op, VSR_IO_OK);
     expect_no_completion();

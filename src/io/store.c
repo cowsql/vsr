@@ -2366,6 +2366,19 @@ static void write_error(struct vsr_io_store *store, int32_t error)
     reclaim_apply(store);
 }
 
+/* The empty store exists, its superblocks and first header on media (in
+ * FDATASYNC mode a flush after the header's write saw to it, since a
+ * crash that lost them would leave a log recovery calls CORRUPT): what
+ * NEW and JOIN expect. */
+static void creation_done(struct vsr_io_store *store)
+{
+    store->state = VSR_IO_STORE_READY;
+    if (store->recovery.load_op != 0) {
+        complete(store, store->recovery.load_op, VSR_IO_NOT_FOUND, NONE, NULL);
+        store->recovery.load_op = 0;
+    }
+}
+
 /* A record or header write completed: the segment opens when its header
  * is on disk, then `written` follows the contiguous completed prefix. */
 static void write_done(struct vsr_io_store *store, uint32_t index,
@@ -2385,12 +2398,10 @@ static void write_done(struct vsr_io_store *store, uint32_t index,
             segment->phase = VSR_IO_SEGMENT_OPEN;
         }
         if (store->state == VSR_IO_STORE_CREATING) {
-            /* The empty store exists: what NEW and JOIN expect. */
-            store->state = VSR_IO_STORE_READY;
-            if (store->recovery.load_op != 0) {
-                complete(store, store->recovery.load_op, VSR_IO_NOT_FOUND, NONE,
-                         NULL);
-                store->recovery.load_op = 0;
+            if (store->options.sync_mode == VSR_IO_SYNC_FDATASYNC) {
+                store->flush_own = 1; /* READY once it is on media. */
+            } else {
+                creation_done(store);
             }
         }
     }
@@ -2440,6 +2451,9 @@ static void flush_done(struct vsr_io_store *store, uint64_t covered,
     }
     if (covered > store->flushed) {
         store->flushed = covered;
+    }
+    if (store->state == VSR_IO_STORE_CREATING) {
+        creation_done(store);
     }
     if (store->freeing_flush == FREEING_FLUSH_INFLIGHT) {
         /* The superblock naming the new start segment is on media: the
@@ -4377,6 +4391,9 @@ void vsr_io_store_prepare(struct vsr_io *io, uint32_t replica,
             issued = prepare_create(io, replica, store, sqe);
             if (!issued && store->current != NONE && !wrote) {
                 issued = wrote = prepare_write(io, replica, store, sqe);
+            }
+            if (!issued) {
+                issued = prepare_flush(io, replica, store, sqe);
             }
             break;
         case VSR_IO_STORE_READY:
