@@ -103,6 +103,11 @@ static void expect_ok(const struct iow_rstream *r, uint64_t length)
                 " received %" PRIu64 " (want %" PRIu64 ") mismatch %d\n",
                 r->cookie, r->status, r->end_bytes, r->received, length,
                 r->mismatch);
+        for (uint32_t i = 0; i < iow.nodes; ++i) {
+            if (iow.node[i].open) {
+                iow_dump_node(&iow.node[i]);
+            }
+        }
         CHECK(false);
     }
 }
@@ -204,7 +209,12 @@ static void test_backpressure(void)
     struct iow_stream_request request = iow_pattern(55, 60000, 4096);
     uint32_t released = 0;
 
-    pair(2, 2, NULL);
+    iow_open_sim(2, seed(2), NULL);
+    /* The source ends once the socket takes its bytes and lingers
+     * handshake_timeout_ns (decision 96): the drip must fit in it. */
+    iow.handshake_timeout_ns = 5000 * IOW_MS;
+    iow_node_open(0);
+    iow_node_open(1);
     a = &iow.node[0];
     b = &iow.node[1];
     a->hold_data = true;
@@ -262,6 +272,42 @@ static void test_backpressure(void)
     CHECK(iow_run_until(sources_ended, b, 1000 * IOW_MS));
     s = source_of(b, 55);
     CHECK(s != NULL && s->status == VSR_IO_OK && s->written == s->writes);
+    iow_close_node(a);
+    iow_close_node(b);
+    iow_close();
+}
+
+/* A requester whose caller holds its DATA ops while a 200 KB transfer
+ * lands in its socket at once: the window blocks the third chunk and the
+ * link pauses, but the receive already armed delivers the rest of the
+ * burst before the pause's CANCEL takes effect, one run per slab. With
+ * eight held runs a stream link closed -ENOBUFS and the transfer ended
+ * RETRY (the residual of decision 99); a stream link holds up to the
+ * pool's worth of runs (decision G4), so the caller releases its DATA ops
+ * and every byte arrives. The linger is long here: this is about the
+ * requester's link, not the source's timer. */
+static void test_burst(void)
+{
+    struct iow_node *a;
+    struct iow_node *b;
+    struct iow_rstream *r;
+    struct iow_stream_request request = iow_pattern(66, 200000, 65536);
+
+    iow_open_sim(2, seed(10), NULL);
+    iow.handshake_timeout_ns = 5000 * IOW_MS;
+    iow_node_open(0);
+    iow_node_open(1);
+    a = &iow.node[0];
+    b = &iow.node[1];
+    a->hold_data = true;
+    r = iow_stream_open(a, 2, cookie(), &request);
+    iow_run_for(100 * IOW_MS);
+    CHECK(a->held_data_count == iow.io_limits.stream_window);
+    CHECK(!r->ended);
+    iow_release_data(a);
+    CHECK(iow_run_until(one_ended, r, 5000 * IOW_MS));
+    expect_ok(r, request.length);
+    CHECK(iow_run_until(sources_ended, b, 5000 * IOW_MS));
     iow_close_node(a);
     iow_close_node(b);
     iow_close();
@@ -496,7 +542,13 @@ static void test_loss(void)
     r = iow_stream_open(a, 2, cookie(), &request);
     request.hold = 0;
     for (uint32_t i = 0; i < 100000 && r->received < 20000; ++i) {
-        CHECK(iow_round());
+        if (!iow_round()) {
+            fprintf(stderr, "ended %d status %d received %" PRIu64 "\n",
+                    r->ended, r->status, r->received);
+            iow_dump_node(a);
+            iow_dump_node(b);
+            CHECK(false);
+        }
     }
     vsr_sim_reset(iow.sim, 0, 1);
     CHECK(iow_run_until(one_ended, r, 2000 * IOW_MS));
@@ -701,6 +753,7 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IONBF, 0);
     RUN(test_transfers);
     RUN(test_backpressure);
+    RUN(test_burst);
     RUN(test_early_ends);
     RUN(test_idle_source);
     RUN(test_loss);
