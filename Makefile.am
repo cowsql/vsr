@@ -65,7 +65,7 @@ UNIT_TESTS += tests/unit/crc32c tests/unit/cursor tests/unit/codec \
   tests/unit/pool tests/unit/slots tests/unit/deadline tests/unit/client \
   tests/unit/uring_translate tests/unit/sim_world tests/unit/engine_tables \
   tests/unit/faulty_executor tests/unit/link tests/unit/store tests/unit/stream \
-  tests/unit/snapshot
+  tests/unit/snapshot tests/unit/engine
 INTEGRATION_TESTS = tests/integration/replication tests/integration/normal_contract \
   tests/integration/reads tests/integration/checkpoints tests/integration/epochs
 INTEGRATION_TESTS += tests/integration/lifecycle tests/integration/transitions \
@@ -136,6 +136,8 @@ tests_unit_faulty_executor_SOURCES = tests/unit/faulty_executor.c \
 tests_unit_faulty_executor_LDADD = $(LIBVSR)
 tests_unit_store_SOURCES = tests/unit/store.c
 tests_unit_store_LDADD = $(LIBVSR)
+tests_unit_engine_SOURCES = tests/unit/engine.c
+tests_unit_engine_LDADD = $(LIBVSR)
 tests_unit_stream_SOURCES = tests/unit/stream.c tests/lib/random.c tests/lib/random.h
 tests_unit_stream_LDADD = $(LIBVSR)
 tests_unit_snapshot_SOURCES = tests/unit/snapshot.c tests/lib/random.c tests/lib/random.h
