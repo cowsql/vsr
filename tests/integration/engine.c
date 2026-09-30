@@ -687,6 +687,61 @@ static void test_minimum(void)
 }
 
 /* -------------------------------------------------------------------------
+ * A full send queue
+ * ---------------------------------------------------------------------- */
+
+/* A RECONFIGURE adds a fourth member whose node is not running yet: the
+ * epoch transition broadcasts START_EPOCH to both groups, and every SEND
+ * to the missing node fails. With its node's send queue one message deep,
+ * each rebroadcast evicts the queued START_EPOCH (not on the wire) with
+ * RETRY; the epochs extension restarts its broadcast at any failed SEND,
+ * so an eviction completed within the same poll fed the RETRY back at
+ * once and the poll never ended. Evicted SENDs wait retry_ns like refused
+ * ones (decision 129): the members poll finitely, and once the fourth
+ * node runs (JOIN) it completes the transition and the group of four
+ * commits. */
+static void test_queue_full(void)
+{
+    struct iow_group g;
+    struct iow_app *primary;
+    struct iow_app *fourth;
+    struct replies_seen seen;
+    struct vsr_io_stats before;
+    struct vsr_io_stats after;
+    uint64_t committed;
+
+    iow_open_sim(4, seed(8), NULL);
+    iow.io_limits.link_queue = 1;
+    g = iow_group_open(3, iow_cluster(10));
+    iow_group_commit(&g, 2);
+    iow_authorize(iow_cluster(10), 4, 4);
+    primary = iow_group_primary(&g);
+    CHECK(primary != NULL);
+    vsr_io_get_stats(primary->node->io, &before);
+    seen.app = primary;
+    seen.replies = primary->replies + 1;
+    (void)iow_reconfigure(primary, 9, 1, 1, 4);
+    CHECK(iow_run_until(replies_seen, &seen, 5000 * IOW_MS));
+    CHECK(primary->last_reply_status == VSR_REPLY_OK);
+    iow_run_for(1000 * IOW_MS);
+    vsr_io_get_stats(primary->node->io, &after);
+    /* Retries paced by retry_ns: at most a few hundred per second. */
+    CHECK(after.messages_retried - before.messages_retried < 2000);
+    fourth =
+        iow_attach(iow_node_open(3), 0, iow_cluster(10), 4, 3, VSR_START_JOIN);
+    g.apps[3] = fourth;
+    g.count = 4;
+    CHECK(iow_run_until(iow_group_normal, &g, 20000 * IOW_MS));
+    iow_group_commit(&g, 3);
+    committed = committed_of(iow_group_primary(&g));
+    for (uint32_t i = 0; i < 4; ++i) {
+        wait_caught_up(g.apps[i], committed);
+    }
+    iow_group_close(&g);
+    iow_close();
+}
+
+/* -------------------------------------------------------------------------
  * A peer that stays away
  * ---------------------------------------------------------------------- */
 
@@ -824,6 +879,7 @@ int main(int argc, char **argv)
     RUN(test_minimum);
     RUN(test_two_groups);
     RUN(test_learner_down);
+    RUN(test_queue_full);
 #undef RUN
     return 0;
 }
