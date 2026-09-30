@@ -1027,7 +1027,14 @@ int vsr_io_streams_write(struct vsr_io *io,
         if (total != write->buffers.size) {
             return VSR_EINVAL;
         }
-    } else if (write->kind != VSR_IO_WRITE_FILE) {
+    } else if (write->kind != VSR_IO_WRITE_FILE ||
+               (stream->owner == VSR_IO_STREAM_CALLER &&
+                write->slot >= io->options.file_slot_base &&
+                write->slot - io->options.file_slot_base <
+                    io->options.limits.file_slots)) {
+        /* A caller's range reads a slot of the caller's: an engine slot
+         * (a socket, the store's log) would stream the engine's own bytes
+         * to the peer (decision 103). The library reads engine slots. */
         return VSR_EINVAL;
     }
     if (stream->writes_count == window) {
@@ -1058,19 +1065,28 @@ int vsr_io_streams_close(struct vsr_io *io, uint64_t handle, int32_t status)
 {
     struct vsr_io_stream *stream = stream_resolve(io, handle);
 
-    if (stream == NULL || stream->direction != VSR_IO_INBOUND) {
+    /* The status goes out in the END frame, whose decoder refuses anything
+     * but an enum vsr_io_status (a protocol error at the requester). */
+    if (stream == NULL || stream->direction != VSR_IO_INBOUND ||
+        status < VSR_IO_OK || status > VSR_IO_CANCELLED) {
         return VSR_EINVAL;
     }
     if (stream->state == VSR_IO_STREAM_ENDING) {
-        /* Lost or cancelled under the caller; its END op is on its way. */
-        return stream->accepted && !stream->end_due && !stream->ended
-                   ? VSR_OK
-                   : VSR_EINVAL;
+        /* Ended under the caller (lost, cancelled, a file read failed),
+         * which it cannot know before the END op: that op is on its way
+         * and carries the engine's status. A refused stream or a second
+         * close was the caller's own doing (decision 102). */
+        if (!stream->accepted || stream->closed || stream->ended) {
+            return VSR_EINVAL;
+        }
+        stream->closed = 1;
+        return VSR_OK;
     }
     if (stream->state != VSR_IO_STREAM_OPEN) {
         return VSR_EINVAL;
     }
     stream->state = VSR_IO_STREAM_ENDING;
+    stream->closed = 1;
     stream->end_due = 1;
     stream->status = status;
     stream_touch(io, stream);
@@ -1118,22 +1134,38 @@ int vsr_io_streams_data_done(struct vsr_io *io, uint64_t op)
 {
     struct vsr_io_stream *stream;
     struct vsr_io_stream_unit *unit;
-    uint32_t index = (uint32_t)((op >> STREAM_INDEX_BITS) & STREAM_INDEX_MAX);
+    uint32_t sequence =
+        (uint32_t)((op >> STREAM_INDEX_BITS) & STREAM_INDEX_MAX);
+    uint32_t position;
 
     if (vsr_io_streams_op_kind(op) != VSR_IO_STREAM_OP_DATA) {
         return VSR_EINVAL;
     }
     stream = stream_resolve(io, op);
-    if (stream == NULL || stream->direction != VSR_IO_OUTBOUND ||
-        index >= io->streams.window) {
+    if (stream == NULL || stream->direction != VSR_IO_OUTBOUND) {
         return VSR_EINVAL;
     }
-    unit = &stream->units[index];
-    if (unit->state != VSR_IO_UNIT_DATA) {
+    /* Units sit behind the head in sequence order (allocation is
+     * sequential, the head moves over freed ones only), so the chunk's
+     * distance from the head unit's sequence is its ring position. */
+    position =
+        (sequence - (stream->chunks - stream->units_used)) & STREAM_INDEX_MAX;
+    if (position >= stream->units_used) {
+        return VSR_EINVAL;
+    }
+    unit = unit_at(stream, io->streams.window, position);
+    if (unit->state != VSR_IO_UNIT_DATA ||
+        (unit->sequence & STREAM_INDEX_MAX) != sequence) {
         return VSR_EINVAL;
     }
     unit_release(io, stream, unit);
     units_trim(io, stream);
+    /* A caller call re-arms the clock (decision 97): the poll after this
+     * completion drains deadlines before the link retries the frame the
+     * window held. Once ENDING the requester waits untimed. */
+    if (stream->state == VSR_IO_STREAM_REQUESTED) {
+        stream_touch(io, stream);
+    }
     return VSR_OK;
 }
 
@@ -1253,9 +1285,14 @@ static bool requester_chunk(struct vsr_io *io, struct vsr_io_stream *stream,
     unit->slab = slab;
     unit->length = (uint32_t)payload.size;
     unit->offset = offset;
+    unit->sequence = stream->chunks++;
     stream->offset += payload.size;
     stream_touch(io, stream);
-    op = op_id(VSR_IO_STREAM_OP_DATA, stream, at, index);
+    /* The id names the chunk, not its ring slot, so the id of a completed
+     * op does not come back with the chunk that reuses the slot; the ring
+     * holds fewer than 65536 units, so 16 bits tell every live one. */
+    op = op_id(VSR_IO_STREAM_OP_DATA, stream, at,
+               unit->sequence & STREAM_INDEX_MAX);
     if (stream->owner == VSR_IO_STREAM_LIBRARY) {
         vsr_io_snapshots_stream_data(io, (uint32_t)stream->replica, at, op,
                                      offset, &payload, slab);
@@ -1358,7 +1395,11 @@ void vsr_io_streams_link_lost(struct vsr_io *io, uint32_t index, int32_t error)
         return;
     }
     stream->link_gone = 1;
-    stream_loss_effects(io, stream, VSR_IO_RETRY);
+    /* vsr_io_close shuts the links down before the streams (section 7.7):
+     * a link closed by that shutdown ends its stream CANCELLED, as the
+     * stream shutdown would, not RETRY as for a loss (decision 101). */
+    stream_loss_effects(io, stream,
+                        io->links.closing ? VSR_IO_CANCELLED : VSR_IO_RETRY);
 }
 
 void vsr_io_streams_sent(struct vsr_io *io, uint32_t index,
@@ -1478,10 +1519,12 @@ void vsr_io_streams_complete(struct vsr_io *io, uint32_t slot,
     }
     if (cqe->result <= 0 ||
         (uint32_t)cqe->result > unit->length - unit->filled) {
-        /* A read error, or the file ends inside the write's range. */
-        unit_release(io, stream, unit);
-        units_trim(io, stream);
+        /* A read error, or the file ends inside the write's range. The
+         * unit stays in the ring for the abort: the END's byte count stops
+         * at the first chunk the link never took, which may be this one
+         * (decision 97); the abort releases it (its slot is NONE). */
         source_fail(io, stream, VSR_IO_FAILED);
+        STREAMS_ASSERT(unit->state == VSR_IO_UNIT_FREE);
         stream_drive(io, stream);
         return;
     }

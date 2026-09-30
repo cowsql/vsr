@@ -1877,7 +1877,9 @@ static void check_segment(const struct vsr_limits *limits, int mode,
     struct vsr_io_segment_state state;
     struct vsr_store_identity identity;
     struct vsr_hard_state hard;
-    struct vsr_checkpoint *checkpoint = (struct vsr_checkpoint *)1;
+    /* Not NULL, so the decoder must be the one to clear it. */
+    static struct vsr_checkpoint poison;
+    struct vsr_checkpoint *checkpoint = &poison;
     struct vsr_io_bump region;
     size_t limit;
     size_t written;
