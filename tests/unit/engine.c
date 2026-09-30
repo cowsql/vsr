@@ -2,6 +2,7 @@
 
 #include "io/engine.h"
 #include "lib/check.h"
+#include "lib/pure_executor.h"
 #include "vsr-io.h"
 #include "vsr-sim.h"
 
@@ -154,6 +155,7 @@ struct node {
     bool registered;
     struct vsr_io *io;
     struct wrap wrap;
+    struct pure_executor pure; /* Between the engine and the wrapper. */
     struct vsr_io_executor ex;
     struct app apps[REPLICAS];
     /* Events waiting for the next submit. */
@@ -191,6 +193,22 @@ struct world {
 };
 
 static struct world world;
+
+/* A call into the engine with the purity guard armed (decision E7): an
+ * executor call from anything it reaches aborts the test, naming the
+ * call. Used for the four primitives, the routing seam, the modules' polls
+ * the routing tests drive, vsr_io_close and the node calls. */
+static int pure_result;
+
+#define PURE(node, call)                                                       \
+    (pure_executor_arm(&(node)->pure), pure_result = (call),                   \
+     pure_executor_disarm(&(node)->pure), pure_result)
+#define PURE_VOID(node, call)                                                  \
+    do {                                                                       \
+        pure_executor_arm(&(node)->pure);                                      \
+        call;                                                                  \
+        pure_executor_disarm(&(node)->pure);                                   \
+    } while (0)
 
 static uint64_t wrap_now(void *ctx)
 {
@@ -418,6 +436,9 @@ static void node_executor(struct node *n)
     CHECK(n->wrap.inner.ops != NULL);
     n->ex.ops = &wrap_ops;
     n->ex.ctx = &n->wrap;
+    /* The engine's executor: the purity guard over the wrapper, armed
+     * around every primitive call (decision E7). */
+    n->ex = pure_executor_init(&n->pure, n->ex, true);
     if (!n->registered) {
         /* The tables are executor-wide, registered once per executor. */
         CHECK(n->ex.ops->register_files(n->ex.ctx,
@@ -790,7 +811,7 @@ static void submit_pending(struct node *n)
     if (n->pending_count == 0) {
         return;
     }
-    rc = vsr_io_submit(n->io, n->pending, n->pending_count, &consumed);
+    rc = PURE(n, vsr_io_submit(n->io, n->pending, n->pending_count, &consumed));
     if (rc != VSR_OK && rc != VSR_AGAIN) {
         fprintf(stderr, "submit refused event %u: %d\n", consumed, rc);
         CHECK(false);
@@ -826,7 +847,7 @@ static void iterate(struct node *n)
     }
     for (uint32_t i = 0; i < reaped; ++i) {
         if (VSR_IO_OWNER(cqes[i].user_data) == OWNER) {
-            CHECK(vsr_io_complete(n->io, &cqes[i], 1) == VSR_OK);
+            CHECK(PURE(n, vsr_io_complete(n->io, &cqes[i], 1)) == VSR_OK);
         } else if (foreign_count < CQES) {
             foreign[foreign_count++] = cqes[i];
         }
@@ -837,8 +858,8 @@ static void iterate(struct node *n)
         uint32_t flags = 0;
         uint32_t before;
 
-        CHECK(vsr_io_poll(n->io, now, ops, n->hold_ops != 0 ? 0 : OPS, &k,
-                          &flags) == VSR_OK);
+        CHECK(PURE(n, vsr_io_poll(n->io, now, ops, n->hold_ops != 0 ? 0 : OPS,
+                                  &k, &flags)) == VSR_OK);
         for (uint32_t i = 0; i < k; ++i) {
             app_op(n, &ops[i]);
         }
@@ -853,7 +874,8 @@ static void iterate(struct node *n)
          * (a hot loop between the core and an at-once completion). */
         CHECK(++rounds < 10000);
     }
-    CHECK(vsr_io_prepare(n->io, now, sqes, BATCH, &count, &deadline) == VSR_OK);
+    CHECK(PURE(n, vsr_io_prepare(n->io, now, sqes, BATCH, &count, &deadline)) ==
+          VSR_OK);
     if (n->pending_count > 0) {
         deadline = now;
     }
@@ -1131,7 +1153,7 @@ static bool node_closed(void *ctx)
  * teardown. */
 static void close_io(struct node *n)
 {
-    CHECK(vsr_io_close(n->io) == VSR_OK);
+    CHECK(PURE(n, vsr_io_close(n->io)) == VSR_OK);
     vsr_io_wake(n->io);
 }
 
@@ -1227,11 +1249,14 @@ static void pump(struct node *n)
 
     for (uint32_t r = 0; r < REPLICAS; ++r) {
         if (n->apps[r].attached) {
-            vsr_io_store_poll(n->io, n->apps[r].replica->index, now);
-            vsr_io_snapshots_poll(n->io, n->apps[r].replica->index, now);
+            PURE_VOID(n,
+                      vsr_io_store_poll(n->io, n->apps[r].replica->index, now));
+            PURE_VOID(n, vsr_io_snapshots_poll(n->io, n->apps[r].replica->index,
+                                               now));
         }
     }
-    CHECK(vsr_io_prepare(n->io, now, sqes, BATCH, &count, &deadline) == VSR_OK);
+    CHECK(PURE(n, vsr_io_prepare(n->io, now, sqes, BATCH, &count, &deadline)) ==
+          VSR_OK);
     CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) == 0);
     (void)vsr_sim_advance(world.sim);
     reaped = n->ex.ops->reap(n->ex.ctx, cqes, CQES);
@@ -1241,7 +1266,7 @@ static void pump(struct node *n)
     }
     for (uint32_t i = 0; i < reaped; ++i) {
         if (VSR_IO_OWNER(cqes[i].user_data) == OWNER) {
-            CHECK(vsr_io_complete(n->io, &cqes[i], 1) == VSR_OK);
+            CHECK(PURE(n, vsr_io_complete(n->io, &cqes[i], 1)) == VSR_OK);
         }
     }
 }
@@ -1419,7 +1444,7 @@ static struct vsr_op make_op(uint32_t type, uint64_t id, const void *data,
 
 static void route(struct app *app, const struct vsr_op *ops, uint32_t count)
 {
-    vsr_io_engine_route(app->replica, ops, count);
+    PURE_VOID(app->node, vsr_io_engine_route(app->replica, ops, count));
 }
 
 static struct vsr_store_read client_read(uint64_t sequence, uint64_t client)
@@ -1574,8 +1599,9 @@ static void test_route_kinds(void)
     /* SEND: to an authorized member it waits in its node's queue (the
      * link completes it); to an unknown member RETRY at once. */
     address = node_address(1);
-    CHECK(vsr_io_node_set(n->io, 2, &address) == VSR_OK);
-    CHECK(vsr_io_authorize(n->io, app->options.core.cluster, 2, 2) == VSR_OK);
+    CHECK(PURE(n, vsr_io_node_set(n->io, 2, &address)) == VSR_OK);
+    CHECK(PURE(n, vsr_io_authorize(n->io, app->options.core.cluster, 2, 2)) ==
+          VSR_OK);
     node2 = vsr_io_links_node_index(&n->io->links, 2);
     CHECK(node2 != VSR_IO_INDEX_NONE);
     memset(&message, 0, sizeof(message));
@@ -1597,8 +1623,8 @@ static void test_route_kinds(void)
         uint64_t deadline = 0;
         uint32_t count = 0;
 
-        CHECK(vsr_io_prepare(n->io, now, sqes, BATCH, &count, &deadline) ==
-              VSR_OK);
+        CHECK(PURE(n, vsr_io_prepare(n->io, now, sqes, BATCH, &count,
+                                     &deadline)) == VSR_OK);
         CHECK(deadline <= rep->deferred[rep->deferred_head].due);
         CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) == 0);
     }
@@ -1864,7 +1890,7 @@ static void test_attach_errors(void)
     fake.io = n->io;
     CHECK(vsr_io_detach(&fake) == VSR_EINVAL);
     CHECK(vsr_io_detach(app->replica) == VSR_EBUSY);
-    CHECK(vsr_io_close(n->io) == VSR_EBUSY);
+    CHECK(PURE(n, vsr_io_close(n->io)) == VSR_EBUSY);
     /* Accessors tolerate NULL. */
     memset(&core, 0xEE, sizeof(core));
     memset(&store, 0xEE, sizeof(store));
@@ -1917,74 +1943,84 @@ static void test_entry_errors(void)
     /* poll */
     CHECK(vsr_io_poll(NULL, 1, ops, 4, &count, &flags) == VSR_EINVAL);
     CHECK(count == 0 && flags == 0);
-    CHECK(vsr_io_poll(n->io, 1, ops, 4, NULL, &flags) == VSR_EINVAL);
-    CHECK(vsr_io_poll(n->io, 1, ops, 4, &count, NULL) == VSR_EINVAL);
-    CHECK(vsr_io_poll(n->io, 1, NULL, 4, &count, &flags) == VSR_EINVAL);
-    CHECK(vsr_io_poll(n->io, VSR_NO_DEADLINE, ops, 4, &count, &flags) ==
+    CHECK(PURE(n, vsr_io_poll(n->io, 1, ops, 4, NULL, &flags)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_poll(n->io, 1, ops, 4, &count, NULL)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_poll(n->io, 1, NULL, 4, &count, &flags)) ==
           VSR_EINVAL);
-    CHECK(vsr_io_poll(n->io, 1, NULL, 0, &count, &flags) == VSR_OK);
+    CHECK(PURE(n, vsr_io_poll(n->io, VSR_NO_DEADLINE, ops, 4, &count,
+                              &flags)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_poll(n->io, 1, NULL, 0, &count, &flags)) == VSR_OK);
     /* The clock never goes back for the core. */
-    CHECK(vsr_io_poll(n->io, 5000, ops, 4, &count, &flags) == VSR_OK);
+    CHECK(PURE(n, vsr_io_poll(n->io, 5000, ops, 4, &count, &flags)) == VSR_OK);
     CHECK(n->io->now == 5000);
-    CHECK(vsr_io_poll(n->io, 4000, ops, 4, &count, &flags) == VSR_OK);
+    CHECK(PURE(n, vsr_io_poll(n->io, 4000, ops, 4, &count, &flags)) == VSR_OK);
     CHECK(n->io->now == 5000);
     /* prepare */
     CHECK(vsr_io_prepare(NULL, 1, sqes, BATCH, &count, &deadline) ==
           VSR_EINVAL);
-    CHECK(vsr_io_prepare(n->io, 1, NULL, BATCH, &count, &deadline) ==
+    CHECK(PURE(n, vsr_io_prepare(n->io, 1, NULL, BATCH, &count, &deadline)) ==
           VSR_EINVAL);
-    CHECK(vsr_io_prepare(n->io, 1, sqes, BATCH, NULL, &deadline) == VSR_EINVAL);
-    CHECK(vsr_io_prepare(n->io, 1, sqes, BATCH, &count, NULL) == VSR_EINVAL);
-    CHECK(vsr_io_prepare(n->io, VSR_NO_DEADLINE, sqes, BATCH, &count,
-                         &deadline) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_prepare(n->io, 1, sqes, BATCH, NULL, &deadline)) ==
+          VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_prepare(n->io, 1, sqes, BATCH, &count, NULL)) ==
+          VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_prepare(n->io, VSR_NO_DEADLINE, sqes, BATCH, &count,
+                                 &deadline)) == VSR_EINVAL);
     /* A LINK chain never spans batches: four records at least. */
-    CHECK(vsr_io_prepare(n->io, 1, sqes, VSR_IO_ENGINE_BATCH_MIN - 1, &count,
-                         &deadline) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_prepare(n->io, 1, sqes, VSR_IO_ENGINE_BATCH_MIN - 1,
+                                 &count, &deadline)) == VSR_EINVAL);
     CHECK(count == 0 && deadline == VSR_NO_DEADLINE);
     /* complete: a foreign owner, a bad index and a free slot are dropped
      * and counted by the slot table. */
     memset(&cqe, 0, sizeof(cqe));
     CHECK(vsr_io_complete(NULL, &cqe, 1) == VSR_EINVAL);
-    CHECK(vsr_io_complete(n->io, NULL, 1) == VSR_EINVAL);
-    CHECK(vsr_io_complete(n->io, NULL, 0) == VSR_OK);
+    CHECK(PURE(n, vsr_io_complete(n->io, NULL, 1)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_complete(n->io, NULL, 0)) == VSR_OK);
     rejected = n->io->slots.rejected;
     memset(&cqe, 0, sizeof(cqe));
     cqe.user_data = VSR_IO_USER_DATA(APP_OWNER, 5);
-    CHECK(vsr_io_complete(n->io, &cqe, 1) == VSR_OK);
+    CHECK(PURE(n, vsr_io_complete(n->io, &cqe, 1)) == VSR_OK);
     cqe.user_data = VSR_IO_USER_DATA(OWNER, UINT64_C(0xFFFFFF) << 24);
-    CHECK(vsr_io_complete(n->io, &cqe, 1) == VSR_OK);
+    CHECK(PURE(n, vsr_io_complete(n->io, &cqe, 1)) == VSR_OK);
     cqe.user_data = VSR_IO_USER_DATA(OWNER, (uint64_t)VSR_IO_SLOT_WRITE << 48);
-    CHECK(vsr_io_complete(n->io, &cqe, 1) == VSR_OK);
+    CHECK(PURE(n, vsr_io_complete(n->io, &cqe, 1)) == VSR_OK);
     CHECK(n->io->slots.rejected == rejected + 3);
     /* run */
     CHECK(vsr_io_run(NULL, NULL) == VSR_EINVAL);
     /* Nodes: thin over the link module. */
     address = node_address(1);
     CHECK(vsr_io_node_set(NULL, 2, &address) == VSR_EINVAL);
-    CHECK(vsr_io_node_set(n->io, VSR_IO_NO_NODE, &address) == VSR_EINVAL);
-    CHECK(vsr_io_node_set(n->io, 2, &address) == VSR_OK);
-    CHECK(vsr_io_node_set(n->io, 3, NULL) == VSR_OK); /* Caller-dialed. */
-    CHECK(vsr_io_node_set(n->io, 4, &address) == VSR_OK);
-    CHECK(vsr_io_node_set(n->io, 5, &address) == VSR_OK);
-    CHECK(vsr_io_node_set(n->io, 6, &address) == VSR_ELIMIT); /* 4 nodes. */
+    CHECK(PURE(n, vsr_io_node_set(n->io, VSR_IO_NO_NODE, &address)) ==
+          VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_node_set(n->io, 2, &address)) == VSR_OK);
+    CHECK(PURE(n, vsr_io_node_set(n->io, 3, NULL)) ==
+          VSR_OK); /* Caller-dialed. */
+    CHECK(PURE(n, vsr_io_node_set(n->io, 4, &address)) == VSR_OK);
+    CHECK(PURE(n, vsr_io_node_set(n->io, 5, &address)) == VSR_OK);
+    CHECK(PURE(n, vsr_io_node_set(n->io, 6, &address)) ==
+          VSR_ELIMIT); /* 4 nodes. */
     CHECK(vsr_io_authorize(NULL, cluster_of(1), 2, 2) == VSR_EINVAL);
-    CHECK(vsr_io_authorize(n->io, cluster_of(1), 2, 9) == VSR_EINVAL);
-    CHECK(vsr_io_authorize(n->io, cluster_of(1), 2, 2) == VSR_OK);
-    CHECK(vsr_io_authorize(n->io, cluster_of(1), 2, VSR_IO_NO_NODE) == VSR_OK);
+    CHECK(PURE(n, vsr_io_authorize(n->io, cluster_of(1), 2, 9)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_authorize(n->io, cluster_of(1), 2, 2)) == VSR_OK);
+    CHECK(PURE(n, vsr_io_authorize(n->io, cluster_of(1), 2, VSR_IO_NO_NODE)) ==
+          VSR_OK);
     CHECK(vsr_io_node_status(NULL, 2, &status) == VSR_EINVAL);
-    CHECK(vsr_io_node_status(n->io, 2, NULL) == VSR_EINVAL);
-    CHECK(vsr_io_node_status(n->io, 9, &status) == VSR_EINVAL);
-    CHECK(vsr_io_node_status(n->io, 2, &status) == VSR_OK);
+    CHECK(PURE(n, vsr_io_node_status(n->io, 2, NULL)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_node_status(n->io, 9, &status)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_node_status(n->io, 2, &status)) == VSR_OK);
     CHECK(status.state == VSR_IO_NODE_UNLINKED && status.links == 0);
     CHECK(vsr_io_node_clear(NULL, 2) == VSR_EINVAL);
-    CHECK(vsr_io_node_clear(n->io, 9) == VSR_EINVAL);
-    CHECK(vsr_io_node_clear(n->io, 5) == VSR_OK);
-    CHECK(vsr_io_node_status(n->io, 5, &status) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_node_clear(n->io, 9)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_node_clear(n->io, 5)) == VSR_OK);
+    CHECK(PURE(n, vsr_io_node_status(n->io, 5, &status)) == VSR_EINVAL);
     CHECK(vsr_io_adopt(NULL, 3, 2, 0) == VSR_EINVAL);
-    CHECK(vsr_io_adopt(n->io, -1, 2, 0) == VSR_EINVAL);
-    CHECK(vsr_io_adopt(n->io, 3, 9, 0) == VSR_EINVAL); /* Unknown node. */
-    CHECK(vsr_io_adopt(n->io, 3, 1, 0) == VSR_EINVAL); /* The engine. */
-    CHECK(vsr_io_adopt(n->io, 3, 2, VSR_IO_ADOPT_OUTBOUND) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_adopt(n->io, -1, 2, 0)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_adopt(n->io, 3, 9, 0)) ==
+          VSR_EINVAL); /* Unknown node. */
+    CHECK(PURE(n, vsr_io_adopt(n->io, 3, 1, 0)) ==
+          VSR_EINVAL); /* The engine. */
+    CHECK(PURE(n, vsr_io_adopt(n->io, 3, 2, VSR_IO_ADOPT_OUTBOUND)) ==
+          VSR_EINVAL);
     close_node(n);
     world_close();
 }
@@ -2008,11 +2044,11 @@ static void test_submit_errors(void)
     n = node_open(0);
     app = app_attach(n, 0, cluster_of(1), 1, 1, VSR_START_NEW);
     CHECK(run_until(app_normal, app, 20000));
-    CHECK(vsr_io_submit(n->io, events, 1, NULL) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, events, 1, NULL)) == VSR_EINVAL);
     CHECK(vsr_io_submit(NULL, events, 1, &consumed) == VSR_EINVAL);
     CHECK(consumed == 0);
-    CHECK(vsr_io_submit(n->io, NULL, 1, &consumed) == VSR_EINVAL);
-    CHECK(vsr_io_submit(n->io, NULL, 0, &consumed) == VSR_OK);
+    CHECK(PURE(n, vsr_io_submit(n->io, NULL, 1, &consumed)) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, NULL, 0, &consumed)) == VSR_OK);
     /* The core's own event types, a stranger's replica, malformed leases,
      * an unknown kind: EINVAL at their index. */
     memset(events, 0, sizeof(events));
@@ -2022,34 +2058,34 @@ static void test_submit_errors(void)
         events[i].event.type = VSR_EVENT_CHECKPOINT;
     }
     events[1].event.type = VSR_EVENT_TIME;
-    CHECK(vsr_io_submit(n->io, events, 2, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, events, 2, &consumed)) == VSR_EINVAL);
     CHECK(consumed == 1);
     event = events[0];
     event.event.type = VSR_EVENT_MESSAGE;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event = events[0];
     event.replica = NULL;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     memset(&fake, 0, sizeof(fake));
     fake.io = n->io;
     event.replica = &fake;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event.replica = &n->io->replicas[1]; /* FREE. */
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event = events[0];
     event.event.type = VSR_EVENT_COMPLETE;
     event.event.id = 999;
     event.event.lease = VSR_IO_LEASE_ENGINE | 1;
     event.event.data = &event;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event.event.lease = 0; /* Data without a lease. */
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event.event.lease = 5; /* A lease without data. */
     event.event.data = NULL;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event = events[0];
     event.kind = 99;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     CHECK(consumed == 0);
     /* A REQUEST without a client, or without its body. */
     make_request(app, 1, 1, &event);
@@ -2062,7 +2098,7 @@ static void test_submit_errors(void)
     CHECK(slot != NULL);
     slot->request.id.client.hi = 0;
     slot->request.id.client.lo = 0;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     lease_release(app, slot->id);
     /* A full queue: AGAIN at the first event that does not fit, before
      * any admission. */
@@ -2070,22 +2106,23 @@ static void test_submit_errors(void)
         events[i] = events[0];
     }
     CHECK(app->replica->events_count == 1); /* The CHECKPOINT above. */
-    CHECK(vsr_io_submit(n->io, events, EVENTS + 1, &consumed) == VSR_AGAIN);
+    CHECK(PURE(n, vsr_io_submit(n->io, events, EVENTS + 1, &consumed)) ==
+          VSR_AGAIN);
     CHECK(consumed == EVENTS - 1);
     CHECK(app->replica->events_count == EVENTS);
     make_request(app, 1, 1, &event);
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_AGAIN);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_AGAIN);
     CHECK(app->replica->store.clients_count == 0);
     run_for(5 * MS);
     CHECK(app->replica->events_count == 0);
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_OK);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_OK);
     /* Admission: max_clients (4) incarnations, in flight or indexed. */
     for (uint64_t c = 2; c <= 4; ++c) {
         make_request(app, c, 1, &event);
-        CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_OK);
+        CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_OK);
     }
     make_request(app, 5, 1, &event);
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_ELIMIT);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_ELIMIT);
     CHECK(consumed == 0);
     {
         struct replies_at_least want = {app, 4};
@@ -2095,56 +2132,56 @@ static void test_submit_errors(void)
     CHECK(app->replies_ok == 4);
     /* Four clients with records: a fifth is still refused, a known one
      * is not. */
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_ELIMIT);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_ELIMIT);
     lease_release(app, event.event.lease);
     make_request(app, 2, 2, &event);
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_OK);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_OK);
     /* Rails with ids that are not outstanding. */
     memset(&event, 0, sizeof(event));
     event.kind = VSR_IO_EVENT_COMPLETE;
     event.event.type = VSR_EVENT_COMPLETE;
     event.event.id = 12345; /* A HANDSHAKE id never issued. */
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event.event.id = VSR_IO_STREAM_OP_SERVE | 3;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event.event.id = VSR_IO_STREAM_OP_DATA | 3;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     memset(&event, 0, sizeof(event));
     event.kind = VSR_IO_EVENT_STREAM_OPEN;
     event.event.id = 1;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     memset(&open, 0, sizeof(open));
     open.node = 9; /* Unknown. */
     event.event.data = &open;
     event.event.lease = 1;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event.kind = VSR_IO_EVENT_STREAM_WRITE;
     event.event.data = NULL;
     event.event.lease = 0;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     memset(&write, 0, sizeof(write));
     write.stream = 77;
     write.kind = VSR_IO_WRITE_FILE;
     write.slot = 100;
     write.length = 1;
     event.event.data = &write;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event.kind = VSR_IO_EVENT_STREAM_CLOSE;
     event.event.id = 77;
     event.event.data = NULL;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     /* STOP: the caller's other events are refused from then on, a
      * COMPLETE and another STOP are not. */
     memset(&event, 0, sizeof(event));
     event.replica = app->replica;
     event.kind = VSR_IO_EVENT_CORE;
     event.event.type = VSR_EVENT_STOP;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_OK);
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_OK);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_OK);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_OK);
     event.event.type = VSR_EVENT_CHECKPOINT;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     make_request(app, 3, 2, &event);
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     lease_release(app, event.event.lease);
     CHECK(run_until(app_stopped, app, 20000));
     /* STOPPED: every core event is refused. */
@@ -2152,10 +2189,10 @@ static void test_submit_errors(void)
     event.replica = app->replica;
     event.kind = VSR_IO_EVENT_CORE;
     event.event.type = VSR_EVENT_STOP;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     event.event.type = VSR_EVENT_COMPLETE;
     event.event.id = 1;
-    CHECK(vsr_io_submit(n->io, &event, 1, &consumed) == VSR_EINVAL);
+    CHECK(PURE(n, vsr_io_submit(n->io, &event, 1, &consumed)) == VSR_EINVAL);
     detach_app(app);
     close_node(n);
     world_close();
@@ -2234,10 +2271,10 @@ static void test_status_and_flags(void)
     CHECK(n->io->forwarded_count >= 1);
     CHECK(vsr_io_detach(app->replica) == VSR_EBUSY);
     now = n->ex.ops->now(n->ex.ctx);
-    CHECK(vsr_io_poll(n->io, now, NULL, 0, &count, &flags) == VSR_OK);
+    CHECK(PURE(n, vsr_io_poll(n->io, now, NULL, 0, &count, &flags)) == VSR_OK);
     CHECK(count == 0);
     CHECK(flags == (VSR_IO_POLL_MORE | VSR_IO_POLL_OUTPUT_FULL));
-    CHECK(vsr_io_poll(n->io, now, ops, 1, &count, &flags) == VSR_OK);
+    CHECK(PURE(n, vsr_io_poll(n->io, now, ops, 1, &count, &flags)) == VSR_OK);
     CHECK(count == 1);
     if (n->io->forwarded_count > 0) {
         CHECK(flags == (VSR_IO_POLL_MORE | VSR_IO_POLL_OUTPUT_FULL));
@@ -2245,7 +2282,8 @@ static void test_status_and_flags(void)
     while (ops[0].kind != VSR_IO_OP_STATUS) {
         CHECK(ops[0].kind == VSR_IO_OP_CORE);
         app_op(n, &ops[0]);
-        CHECK(vsr_io_poll(n->io, now, ops, 1, &count, &flags) == VSR_OK);
+        CHECK(PURE(n, vsr_io_poll(n->io, now, ops, 1, &count, &flags)) ==
+              VSR_OK);
         CHECK(count == 1);
     }
     CHECK(ops[0].replica == app->replica);
@@ -2278,11 +2316,13 @@ static void mesh(uint32_t nodes, struct vsr_id cluster)
             struct vsr_io_address address = node_address(j);
 
             if (j != i) {
-                CHECK(vsr_io_node_set(n->io, j + 1, &address) == VSR_OK);
+                CHECK(PURE(n, vsr_io_node_set(n->io, j + 1, &address)) ==
+                      VSR_OK);
             }
             if (j != i || vsr_io_links_node_index(&n->io->links, j + 1) !=
                               VSR_IO_INDEX_NONE) {
-                CHECK(vsr_io_authorize(n->io, cluster, j + 1, j + 1) == VSR_OK);
+                CHECK(PURE(n, vsr_io_authorize(n->io, cluster, j + 1, j + 1)) ==
+                      VSR_OK);
             }
         }
     }
@@ -2433,8 +2473,9 @@ static void test_group(void)
         CHECK(stats.frames_rejected == 0);
         vsr_io_replica_status(g.apps[i]->replica, &core, NULL);
         CHECK(core.committed >= 9);
-        CHECK(vsr_io_node_status(world.node[i].io, i == 0 ? 2 : 1, &status) ==
-              VSR_OK);
+        CHECK(PURE((&world.node[i]),
+                   vsr_io_node_status(world.node[i].io, i == 0 ? 2 : 1,
+                                      &status)) == VSR_OK);
         CHECK(status.state == VSR_IO_NODE_LINKED);
         CHECK(status.last_received_ns > 0);
         CHECK(g.apps[i]->applied_entries >= 9);
@@ -2575,9 +2616,9 @@ static void test_stream(void)
     a = node_open(0);
     b = node_open(1);
     address = node_address(1);
-    CHECK(vsr_io_node_set(a->io, 2, &address) == VSR_OK);
+    CHECK(PURE(a, vsr_io_node_set(a->io, 2, &address)) == VSR_OK);
     address = node_address(0);
-    CHECK(vsr_io_node_set(b->io, 1, &address) == VSR_OK);
+    CHECK(PURE(b, vsr_io_node_set(b->io, 1, &address)) == VSR_OK);
     caller_file(b);
     memset(&open, 0, sizeof(open));
     open.node = 2;
@@ -2765,25 +2806,33 @@ static void test_prepare(void)
     now = n->ex.ops->now(n->ex.ctx);
     /* The first poll steps the core with TIME alone: its RECOVERY LOAD
      * opens the store; the core's deadline is armed. */
-    CHECK(vsr_io_poll(n->io, now, ops, OPS, &count, &flags) == VSR_OK);
+    CHECK(PURE(n, vsr_io_poll(n->io, now, ops, OPS, &count, &flags)) == VSR_OK);
     CHECK(count == 0);
     CHECK(app->replica->store.state == VSR_IO_STORE_OPENING);
     /* A batch of exactly the listener chain: it fills, deadline now. */
+    /* The provision is a PROVIDE record at the end of the batch (decision
+     * E7), which the executor runs before the rest: no provide() call. */
     provides = n->wrap.provides;
-    CHECK(vsr_io_prepare(n->io, now, sqes, VSR_IO_ENGINE_BATCH_MIN, &count,
-                         &deadline) == VSR_OK);
-    CHECK(n->wrap.provides == provides + 1);
-    CHECK(n->wrap.provided == SLABS - n->io->pool.reserve - 2);
+    CHECK(PURE(n, vsr_io_prepare(n->io, now, sqes, VSR_IO_ENGINE_BATCH_MIN,
+                                 &count, &deadline)) == VSR_OK);
+    CHECK(n->wrap.provides == provides);
     CHECK(count == VSR_IO_ENGINE_BATCH_MIN && deadline == now);
-    for (uint32_t i = 0; i < count; ++i) {
+    for (uint32_t i = 0; i + 1 < count; ++i) {
         CHECK(slot_kind(sqes[i].user_data) == VSR_IO_SLOT_LISTEN);
     }
     CHECK(sqes[0].opcode == VSR_IO_SQE_SOCKET);
     CHECK(sqes[3].opcode == VSR_IO_SQE_ACCEPT);
+    CHECK(sqes[4].opcode == VSR_IO_SQE_PROVIDE && sqes[4].flags == 0);
+    CHECK(sqes[4].buffer_group == GROUP);
+    CHECK(sqes[4].length == SLABS - n->io->pool.reserve - 2);
+    CHECK(sqes[4].addr == n->io->provide_buffers);
+    CHECK(sqes[4].user_data == vsr_io_engine_provide_user_data(n->io));
+    CHECK(n->io->pool.kernel_count == sqes[4].length);
     CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) == 0);
     /* Then the store's open and the snapshot module's directory. */
-    CHECK(vsr_io_poll(n->io, now, ops, OPS, &count, &flags) == VSR_OK);
-    CHECK(vsr_io_prepare(n->io, now, sqes, BATCH, &count, &deadline) == VSR_OK);
+    CHECK(PURE(n, vsr_io_poll(n->io, now, ops, OPS, &count, &flags)) == VSR_OK);
+    CHECK(PURE(n, vsr_io_prepare(n->io, now, sqes, BATCH, &count, &deadline)) ==
+          VSR_OK);
     CHECK(count >= 2 && count < BATCH);
     for (uint32_t i = 0; i < count; ++i) {
         uint8_t kind = slot_kind(sqes[i].user_data);
@@ -2794,6 +2843,7 @@ static void test_prepare(void)
         } else if (kind == VSR_IO_SLOT_CLIENTS) {
             clients_seen = true;
         } else {
+            /* Nothing more to provide: no PROVIDE record either. */
             CHECK(kind == VSR_IO_SLOT_LISTEN || kind == VSR_IO_SLOT_RECV);
             CHECK(!store_seen && !clients_seen); /* Links first. */
         }
@@ -2867,7 +2917,7 @@ static void test_stale_completions(void)
             (slot->generation & 0xFFFFFFu) == generation) {
             continue; /* Live: a duplicate would be a new completion. */
         }
-        CHECK(vsr_io_complete(n->io, cqe, 1) == VSR_OK);
+        CHECK(PURE(n, vsr_io_complete(n->io, cqe, 1)) == VSR_OK);
         replayed++;
     }
     CHECK(replayed > 10);
@@ -3004,7 +3054,7 @@ static uint32_t run_step(void *ctx, const struct vsr_io_op *ops, uint32_t count,
     }
     if (!run->app->attached && !run->closing) {
         run->closing = true;
-        CHECK(vsr_io_close(n->io) == VSR_OK);
+        CHECK(PURE(n, vsr_io_close(n->io)) == VSR_OK);
     }
     out = n->pending_count < capacity ? n->pending_count : capacity;
     memcpy(events, n->pending, (size_t)out * sizeof(*events));
@@ -3043,8 +3093,11 @@ static void test_run(void)
 
     world_open(1, 17);
     n = node_open(0);
+    /* vsr_io_run calls the executor itself (the loop may): the blocking
+     * wrapper, without the purity guard, is the engine's here. */
     n->ex.ops = &blocking_ops;
-    n->io->ex.ops = &blocking_ops; /* The engine's copy, too. */
+    n->ex.ctx = &n->wrap;
+    n->io->ex = n->ex;
     memset(&run, 0, sizeof(run));
     run.n = n;
     run.app = app_attach(n, 0, cluster_of(1), 1, 1, VSR_START_NEW);
@@ -3067,10 +3120,11 @@ static void test_run(void)
     options.listen_count = 0;
     n = node_open_with(0, &options);
     n->ex.ops = &blocking_ops;
-    n->io->ex.ops = &blocking_ops;
+    n->ex.ctx = &n->wrap;
+    n->io->ex = n->ex;
     n->wrap.fail_submit = -EIO;
     CHECK(vsr_io_run(n->io, NULL) == -EIO);
-    CHECK(vsr_io_close(n->io) == VSR_OK);
+    CHECK(PURE(n, vsr_io_close(n->io)) == VSR_OK);
     CHECK(vsr_io_run(n->io, NULL) == VSR_OK);
     CHECK(vsr_io_deinit(n->io) == VSR_OK);
     n->open = false;
@@ -3130,9 +3184,9 @@ static void test_stream_timers(void)
     a = node_open(0);
     b = node_open(1);
     address = node_address(1);
-    CHECK(vsr_io_node_set(a->io, 2, &address) == VSR_OK);
+    CHECK(PURE(a, vsr_io_node_set(a->io, 2, &address)) == VSR_OK);
     address = node_address(0);
-    CHECK(vsr_io_node_set(b->io, 1, &address) == VSR_OK);
+    CHECK(PURE(b, vsr_io_node_set(b->io, 1, &address)) == VSR_OK);
     memset(&open, 0, sizeof(open));
     open.node = 2;
     open.request.data = request;
@@ -3234,13 +3288,15 @@ static void test_redial(void)
     node_open(1);
     world.node[1].open = false; /* Its loop does not run yet. */
     mesh(2, cluster_of(5));
-    CHECK(vsr_io_node_set(world.node[1].io, 1, NULL) == VSR_OK);
+    CHECK(PURE((&world.node[1]), vsr_io_node_set(world.node[1].io, 1, NULL)) ==
+          VSR_OK);
     memset(&g, 0, sizeof(g));
     g.count = 2;
     g.apps[0] =
         app_attach(&world.node[0], 0, cluster_of(5), 1, 3, VSR_START_NEW);
     run_for(20 * MS);
-    CHECK(vsr_io_node_status(world.node[0].io, 2, &status) == VSR_OK);
+    CHECK(PURE((&world.node[0]),
+               vsr_io_node_status(world.node[0].io, 2, &status)) == VSR_OK);
     CHECK(status.state != VSR_IO_NODE_LINKED);
     CHECK(status.last_error == -ECONNREFUSED);
     world.node[1].open = true;
@@ -3254,7 +3310,8 @@ static void test_redial(void)
     want.replies = 1;
     CHECK(run_until(replies_reached, &want, 200000));
     CHECK(primary->replies_ok == 1);
-    CHECK(vsr_io_node_status(world.node[0].io, 2, &status) == VSR_OK);
+    CHECK(PURE((&world.node[0]),
+               vsr_io_node_status(world.node[0].io, 2, &status)) == VSR_OK);
     CHECK(status.state == VSR_IO_NODE_LINKED);
     CHECK(world.node[1].links_wanted >= 1);
     group_close(&g);
@@ -3325,6 +3382,84 @@ static void test_view_change(void)
     world_close();
 }
 
+/* -------------------------------------------------------------------------
+ * Test: the primitives never call the executor (decision E7)
+ * ---------------------------------------------------------------------- */
+
+/* Every test runs with the purity guard armed around the primitives (and
+ * the routing seam, the modules' polls, close and the node calls); this one
+ * checks the guard itself, then runs a scenario across links, TRUSTED
+ * handshakes and takeovers, a stream with a FILE write, the store, a
+ * capture, a detach (whose slot clears are records) and a RECOVER, and
+ * reads the counters: the executor was called only outside them. */
+static void test_purity(void)
+{
+    struct pure_executor guard;
+    struct vsr_io_executor inner;
+    struct vsr_io_executor guarded;
+    struct group g;
+    struct app *primary;
+    struct replies_at_least want;
+    struct vsr_status core;
+    uint64_t calls[NODES];
+
+    memset(&core, 0, sizeof(core));
+    /* The guard: a call while armed is a violation, one while not is not. */
+    world_open(1, 22);
+    inner = vsr_sim_executor(world.sim, 0);
+    guarded = pure_executor_init(&guard, inner, false);
+    (void)guarded.ops->now(guarded.ctx);
+    CHECK(guard.calls == 1 && guard.violations == 0);
+    pure_executor_arm(&guard);
+    pure_executor_arm(&guard);
+    (void)guarded.ops->now(guarded.ctx);
+    pure_executor_disarm(&guard);
+    guarded.ops->wake(guarded.ctx);
+    pure_executor_disarm(&guard);
+    CHECK(guard.calls == 3 && guard.violations == 2);
+    CHECK(strcmp(guard.last, "wake") == 0);
+    world_close();
+    /* A group of three, requests, a capture at the primary. */
+    world_open(3, 23);
+    g = group_open(3, cluster_of(7));
+    for (uint32_t i = 0; i < 3; ++i) {
+        calls[i] = world.node[i].pure.calls;
+        CHECK(calls[i] > 0); /* init and attach registered. */
+        CHECK(world.node[i].pure.violations == 0);
+    }
+    primary = group_primary(&g);
+    CHECK(primary != NULL);
+    for (uint64_t c = 1; c <= 3; ++c) {
+        submit_request(primary, c, 1);
+    }
+    want.app = primary;
+    want.replies = 3;
+    CHECK(run_until(replies_reached, &want, 200000));
+    /* Successive checkpoints: each capture and publication releases the
+     * kept slot of the file before it, a slot clear made at run time. */
+    for (uint64_t round = 2; round <= 4; ++round) {
+        uint64_t checkpoint = core.checkpoint_op;
+
+        core_event(primary, VSR_EVENT_CHECKPOINT, 0, 0, NULL, 0);
+        run_for(200 * MS);
+        vsr_io_replica_status(primary->replica, &core, NULL);
+        CHECK(core.checkpoint_op > checkpoint);
+        for (uint64_t c = 1; c <= 3; ++c) {
+            submit_request(primary, c, round);
+        }
+        want.replies += 3;
+        CHECK(run_until(replies_reached, &want, 200000));
+    }
+    CHECK(primary->captures >= 3);
+    CHECK(primary->node->io->file_slots_free_count > 0);
+    for (uint32_t i = 0; i < 3; ++i) {
+        CHECK(world.node[i].pure.violations == 0);
+        CHECK(world.node[i].pure.calls > calls[i]); /* The loop's own. */
+    }
+    group_close(&g);
+    world_close();
+}
+
 int main(int argc, char **argv)
 {
     const char *only = getenv("VSR_ENGINE_TEST");
@@ -3360,6 +3495,7 @@ int main(int argc, char **argv)
     RUN(test_stream_timers);
     RUN(test_redial);
     RUN(test_view_change);
+    RUN(test_purity);
 #undef RUN
     return 0;
 }

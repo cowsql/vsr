@@ -36,6 +36,9 @@ enum vsr_io_slot_kind {
     VSR_IO_SLOT_FILE,     /* OPENAT/CLOSE/FALLOCATE/STATX/UNLINK/RENAME */
     VSR_IO_SLOT_CLIENTS,  /* Clients file read or write chunk */
     VSR_IO_SLOT_STREAM,   /* Stream file read chunk */
+    VSR_IO_SLOT_FILES,    /* FILES_UPDATE emptying an engine file slot */
+    VSR_IO_SLOT_PROVIDE,  /* PROVIDE record: user_data only, never a slot
+                             (it completes only when it fails) */
     VSR_IO_SLOT_KINDS
 };
 

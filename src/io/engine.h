@@ -46,10 +46,10 @@
  * it reserves this many record writes per replica; vsr_io_attach refuses a
  * store configured with more (decision 67). */
 #define VSR_IO_ENGINE_INFLIGHT_WRITES_MAX 8u
-/* Longest LINK chain the engine prepares (listener setup: SOCKET, BIND,
- * LISTEN, ACCEPT); a chain never spans batches, so vsr_io_prepare needs at
- * least this capacity. */
-#define VSR_IO_ENGINE_BATCH_MIN 4u
+/* The longest LINK chain the engine prepares (listener setup: SOCKET,
+ * BIND, LISTEN, ACCEPT; a chain never spans batches) plus the PROVIDE
+ * record of the pool's provision: vsr_io_prepare needs this capacity. */
+#define VSR_IO_ENGINE_BATCH_MIN 5u
 /* A store directory, NUL included, like every path the modules build. */
 #define VSR_IO_ENGINE_PATH_BYTES 4096u
 
@@ -207,6 +207,14 @@ struct vsr_io {
     uint32_t reserved;
     struct vsr_io_stats stats;
     struct vsr_io_uring *uring; /* Non-NULL when the executor is ours. */
+    uint64_t random_state[4];   /* xoshiro256**, seeded at init (E8). */
+    uint32_t *clears;           /* [limits.file_slots] engine file slots whose
+                               FILES_UPDATE (-1) is still to be issued. */
+    uint32_t clears_count;
+    uint32_t reserved3;
+    struct vsr_io_buffer *provide_buffers; /* [limits.slabs] the PROVIDE
+                                              record's buffers, read when
+                                              the batch is submitted. */
     uint64_t releases_rejected; /* RELEASE ops of a stale engine lease. */
     uint64_t events_rejected;   /* Queued events the core refused. */
     /* vsr_io_run's scratch, from the metadata region. */
@@ -254,15 +262,31 @@ bool vsr_io_engine_deliver(struct vsr_io *io, struct vsr_io_replica *replica,
                            const struct vsr_io_cursor *body, uint32_t slab);
 struct vsr_io_replica *vsr_io_engine_replica(struct vsr_io *io,
                                              struct vsr_id cluster);
-/* Engine file slots (the executor range reserved for the engine). */
+/* Engine file slots (the executor range reserved for the engine). free
+ * returns an index that holds no file (never installed, or emptied by a
+ * CLOSE with FIXED_FILE or a FILES_UPDATE); clear returns one that may
+ * still hold a file: the engine empties it with a FILES_UPDATE of -1 from
+ * its next prepare and frees the index at that record's completion, so a
+ * new file never lands in it before (decision E9). */
 uint32_t vsr_io_engine_slot_alloc(struct vsr_io *io);
 void vsr_io_engine_slot_free(struct vsr_io *io, uint32_t slot);
-/* Random bytes from the executor. */
+void vsr_io_engine_slot_clear(struct vsr_io *io, uint32_t slot);
+/* True while slot's clear is queued or in flight. */
+bool vsr_io_engine_slot_clearing(const struct vsr_io *io, uint32_t slot);
+/* The engine's own records: the FILES_UPDATE of every queued clear
+ * (continuing *count), and the completion of one (slot kind FILES).
+ * vsr_io_prepare and vsr_io_complete call them; a test that plays the
+ * engine over the modules calls them too. */
+void vsr_io_engine_prepare_files(struct vsr_io *io, struct vsr_io_sqe *sqes,
+                                 uint32_t capacity, uint32_t *count);
+void vsr_io_engine_files_complete(struct vsr_io *io, uint32_t slot,
+                                  const struct vsr_io_cqe *cqe);
+/* user_data of the PROVIDE record (kind PROVIDE, no slot). */
+uint64_t vsr_io_engine_provide_user_data(const struct vsr_io *io);
+/* Bytes from the engine's generator, seeded from the executor's entropy
+ * at vsr_io_init and never calling the executor after (decision E8):
+ * unique, not secret. */
 void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size);
-/* Installs a raw descriptor into an engine file slot (the executor's
- * update_file, which takes the descriptor over); 0 or a negative errno. The
- * link module calls it when it takes a socket over (decision 72). */
-int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd);
 
 /* The pool's reserve for the limits (decision E1): one send slab per
  * link, the chunk reads of every stream window, per replica a cold-load

@@ -33,8 +33,6 @@
 /* Step calls per replica and poll before the poll reports MORE instead:
  * the core's MORE drains are bounded, this only caps one poll. */
 #define LOOP_STEPS_MAX 256u
-/* Buffers handed to one provide call. */
-#define LOOP_PROVIDE_CHUNK 64u
 
 /* Invariant checks in debug builds; a violation traps (see pool.c). */
 #ifdef NDEBUG
@@ -87,6 +85,14 @@ static void complete_one(struct vsr_io *io, const struct vsr_io_cqe *cqe)
     struct vsr_io_slot *slot;
     uint32_t index;
 
+    /* The PROVIDE record completes only when it failed, and holds no slot:
+     * the ring is sized for every slab, so that is fatal (decision 61). */
+    if (cqe->user_data == vsr_io_engine_provide_user_data(io)) {
+        if (cqe->result < 0 && io->stats.failure == 0) {
+            io->stats.failure = cqe->result;
+        }
+        return;
+    }
     /* A foreign owner tag, a stale generation or a freed slot: dropped and
      * counted in the slot table (decision 74's module never sees it). */
     slot = vsr_io_slots_resolve(&io->slots, cqe->user_data, &index);
@@ -120,8 +126,12 @@ static void complete_one(struct vsr_io *io, const struct vsr_io_cqe *cqe)
     case VSR_IO_SLOT_STREAM:
         vsr_io_streams_complete(io, index, cqe);
         return;
+    case VSR_IO_SLOT_FILES:
+        vsr_io_engine_files_complete(io, index, cqe);
+        return;
     case VSR_IO_SLOT_FREE:
     case VSR_IO_SLOT_PEEK:
+    case VSR_IO_SLOT_PROVIDE:
     case VSR_IO_SLOT_KINDS:
     default:
         break;
@@ -1010,37 +1020,29 @@ int vsr_io_submit(struct vsr_io *io, const struct vsr_io_event *events,
  * vsr_io_prepare (7.4)
  * ---------------------------------------------------------------------- */
 
-/* Pool provision: the slabs above the provision floor go to the ring. The
- * ring is sized for every slab, so a failure is fatal (decision 61). */
-static void provide(struct vsr_io *io)
+/* Pool provision (decision E7): the slabs above the provision floor go to
+ * the ring through one PROVIDE record at the end of the batch, which the
+ * executor runs before the batch's other records, so a receive armed or
+ * re-armed in this batch already sees them. The pool counts them KERNEL
+ * from here; the record's place in the batch is set aside first. */
+static void provide_record(struct vsr_io *io, struct vsr_io_sqe *sqe,
+                           uint32_t provided)
 {
-    const struct vsr_io_executor *ex = &io->ex;
-    struct vsr_io_buffer buffers[LOOP_PROVIDE_CHUNK];
-
-    for (;;) {
-        uint32_t n =
-            vsr_io_pool_provide(&io->pool, buffers, LOOP_PROVIDE_CHUNK);
-        int rc;
-
-        if (n == 0) {
-            return;
-        }
-        rc = ex->ops->provide(ex->ctx, io->pool.group, buffers, n);
-        if (rc < 0) {
-            if (io->stats.failure == 0) {
-                io->stats.failure = rc;
-            }
-            return;
-        }
-        if (n < LOOP_PROVIDE_CHUNK) {
-            return;
-        }
-    }
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = VSR_IO_SQE_PROVIDE;
+    sqe->fd = -1;
+    sqe->buffer_group = io->pool.group;
+    sqe->addr = io->provide_buffers;
+    sqe->length = provided;
+    sqe->user_data = vsr_io_engine_provide_user_data(io);
 }
 
 int vsr_io_prepare(struct vsr_io *io, uint64_t now_ns, struct vsr_io_sqe *sqes,
                    uint32_t capacity, uint32_t *count, uint64_t *deadline_ns)
 {
+    uint32_t provided;
+    uint32_t room;
+
     if (count != NULL) {
         *count = 0;
     }
@@ -1054,15 +1056,22 @@ int vsr_io_prepare(struct vsr_io *io, uint64_t now_ns, struct vsr_io_sqe *sqes,
     if (now_ns > io->now) {
         io->now = now_ns;
     }
-    provide(io);
-    vsr_io_links_prepare(io, sqes, capacity, count);
-    vsr_io_streams_prepare(io, sqes, capacity, count);
+    provided = vsr_io_pool_provide(&io->pool, io->provide_buffers,
+                                   io->options.limits.slabs);
+    room = provided > 0 ? capacity - 1 : capacity;
+    vsr_io_links_prepare(io, sqes, room, count);
+    vsr_io_streams_prepare(io, sqes, room, count);
     for (uint32_t i = 0; i < io->options.limits.replicas; ++i) {
         if (io->replicas[i].state == VSR_IO_REPLICA_FREE) {
             continue;
         }
-        vsr_io_store_prepare(io, i, sqes, capacity, count);
-        vsr_io_snapshots_prepare(io, i, sqes, capacity, count);
+        vsr_io_store_prepare(io, i, sqes, room, count);
+        vsr_io_snapshots_prepare(io, i, sqes, room, count);
+    }
+    vsr_io_engine_prepare_files(io, sqes, room, count);
+    if (provided > 0) {
+        provide_record(io, &sqes[*count], provided);
+        (*count)++;
     }
     LOOP_ASSERT(*count <= capacity);
     *deadline_ns = vsr_io_deadlines_earliest(&io->deadlines);

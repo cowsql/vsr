@@ -543,10 +543,9 @@ int vsr_io_detach(struct vsr_io_replica *replica)
         return rc;
     }
     if (file_slot != NONE) {
-        /* The log's slot (store-phase-1: read before the close clears it);
-         * clearing an empty slot is harmless. */
-        (void)vsr_io_engine_install(io, file_slot, -1);
-        vsr_io_engine_slot_free(io, file_slot);
+        /* The log's slot (store-phase-1: read before the close clears it),
+         * emptied by the engine's next prepare (decision E9). */
+        vsr_io_engine_slot_clear(io, file_slot);
     }
     release_queued(replica, replica->messages, &replica->messages_head,
                    &replica->messages_count, replica->regions_count);

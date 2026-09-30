@@ -373,7 +373,7 @@ struct vsr_io_limits {
     uint32_t stream_window;  /* Outstanding DATA or WRITE per stream. */
     uint32_t events;         /* Queued caller events per replica. */
     uint32_t ops;            /* Forwarded ops queued for vsr_io_poll. */
-    uint32_t batch;          /* Records per vsr_io_prepare. */
+    uint32_t batch;          /* Records per vsr_io_prepare, at least 5. */
     uint32_t slabs;          /* Payload pool: slab count... */
     uint32_t slab_bytes;     /* ...and size, a multiple of the page size. */
     uint32_t caller_slabs;   /* Slabs kept for vsr_io_slab_acquire; 0: none. */
@@ -569,9 +569,11 @@ int vsr_io_poll(struct vsr_io *io, uint64_t now_ns, struct vsr_io_op *ops,
  * same max_clients on every replica, backups therefore never exceed theirs. */
 int vsr_io_submit(struct vsr_io *io, const struct vsr_io_event *events,
                   uint32_t count, uint32_t *consumed);
-/* Fills at most capacity records; *deadline_ns is the earliest engine
- * deadline or VSR_NO_DEADLINE, and must reach submit_and_wait. Records left
- * over stay queued. */
+/* Fills at most capacity records (at least 5: EINVAL below); *deadline_ns
+ * is the earliest engine deadline or VSR_NO_DEADLINE, and must reach
+ * submit_and_wait. Records left over stay queued. The four calls above
+ * never call the executor: registration work goes out as FILES_UPDATE and
+ * PROVIDE records (docs/io-design.md decision E7). */
 int vsr_io_prepare(struct vsr_io *io, uint64_t now_ns, struct vsr_io_sqe *sqes,
                    uint32_t capacity, uint32_t *count, uint64_t *deadline_ns);
 

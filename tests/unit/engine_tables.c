@@ -334,6 +334,10 @@ static size_t expected_metadata(const struct vsr_io_options *o)
           alignof(struct vsr_io_op));
     place(&offset, ((size_t)l->ops + l->events) * sizeof(struct vsr_io_event),
           alignof(struct vsr_io_event));
+    /* The queued slot clears and the PROVIDE record's buffers. */
+    place(&offset, (size_t)l->file_slots * sizeof(uint32_t), alignof(uint32_t));
+    place(&offset, (size_t)l->slabs * sizeof(struct vsr_io_buffer),
+          alignof(struct vsr_io_buffer));
     return offset;
 }
 
@@ -543,11 +547,11 @@ static void test_layout(void)
     o = base;
     o.stream_chunk_bytes = PAGE - 39;
     CHECK(layout_of(&o) == VSR_ELIMIT);
-    /* The listener chain fits one batch. */
+    /* The listener chain and the PROVIDE record fit one batch. */
     o = base;
-    o.limits.batch = 3;
-    CHECK(layout_of(&o) == VSR_ELIMIT);
     o.limits.batch = 4;
+    CHECK(layout_of(&o) == VSR_ELIMIT);
+    o.limits.batch = 5;
     CHECK(layout_of(&o) == VSR_OK);
     /* File slots: listeners + links + streams + 2 * replicas. */
     o = base;
@@ -813,11 +817,21 @@ static void test_init(void)
     CHECK(fake.wakes == 1);
     vsr_io_wake(NULL);
     CHECK(fake.wakes == 1);
-    /* Random bytes come from the executor. */
+    /* The generator was seeded from the executor once, at init; drawing
+     * from it calls nothing (decision E8), and it does not repeat. */
+    CHECK(fake.randoms == 1);
     memset(random, 0, sizeof(random));
     vsr_io_engine_random(io, random, sizeof(random));
     CHECK(fake.randoms == 1);
-    CHECK(random[0] == 1 && random[1] == 8);
+    {
+        unsigned char again[sizeof(random)];
+        unsigned char odd[3];
+
+        vsr_io_engine_random(io, again, sizeof(again));
+        CHECK(memcmp(random, again, sizeof(again)) != 0);
+        vsr_io_engine_random(io, odd, sizeof(odd));
+        CHECK(fake.randoms == 1);
+    }
     /* Close and deinit: EBUSY before close, EBUSY with a replica, closed
      * at once with nothing in flight, deinit unregisters in reverse. */
     CHECK(vsr_io_deinit(io) == VSR_EBUSY);

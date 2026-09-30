@@ -158,6 +158,7 @@ static void link_reset(struct vsr_io_link *link, struct vsr_io_vec *vecs,
     link->raw_fd = -1;
     link->stream = LINK_NONE;
     link->connect_slot = LINK_NONE;
+    link->install_slot = LINK_NONE;
     link->recv_slot = LINK_NONE;
     link->partial_slab = LINK_NONE;
     link->reassembly_slab = LINK_NONE;
@@ -1526,27 +1527,40 @@ static void link_arm_handshake(struct vsr_io *io, struct vsr_io_link *link)
                          io->now + io->options.handshake_timeout_ns);
 }
 
-/* Takes the raw descriptor over into an engine file slot; false (and the
- * link closing) when no slot is free or the executor refuses. */
-static bool link_install(struct vsr_io *io, struct vsr_io_link *link)
+/* Takes the raw descriptor over into an engine file slot (decision E9):
+ * the record goes out from the next prepare, and the link issues nothing
+ * else until it completes; `establish` establishes the link then (EXTERNAL
+ * and adopted links), a TRUSTED link goes on with its HELLOs. */
+static void link_want_install(struct vsr_io_link *link, bool establish)
 {
-    uint32_t slot = vsr_io_engine_slot_alloc(io);
-    int rc;
+    LINKS_ASSERT(link->raw_fd >= 0 && link->fd < 0 && link->installing == 0);
+    link->installing = 1;
+    link->install_establish = establish;
+}
 
-    LINKS_ASSERT(link->raw_fd >= 0 && link->fd < 0);
-    if (slot == LINK_NONE) {
-        link_close(io, link_index(io, link), -ENFILE);
-        return false;
-    }
-    rc = vsr_io_engine_install(io, slot, link->raw_fd);
-    if (rc < 0) {
-        vsr_io_engine_slot_free(io, slot);
-        link_close(io, link_index(io, link), rc);
-        return false;
+/* The takeover's completion: the slot is the link's descriptor now (the
+ * chained CLOSE ended the raw one), or the link fails with the result. A
+ * closing link only records what it has to tear down. */
+static void link_install_done(struct vsr_io *io, struct vsr_io_link *link,
+                              int32_t result)
+{
+    uint32_t slot = link->install_slot;
+
+    link->installing = 0;
+    link->install_slot = LINK_NONE;
+    if (result < 0) {
+        vsr_io_engine_slot_clear(io, slot); /* May hold the file. */
+        if (link->state != VSR_IO_LINK_CLOSING) {
+            link_close(io, link_index(io, link), result);
+        }
+        return;
     }
     link->fd = (int32_t)slot;
     link->raw_fd = -1;
-    return true;
+    if (link->state != VSR_IO_LINK_CLOSING && link->install_establish) {
+        link->install_establish = false;
+        link_establish(io, link);
+    }
 }
 
 /* A connected socket (dialed, accepted or adopted) enters the configured
@@ -1569,7 +1583,7 @@ static void link_start_handshake(struct vsr_io *io, struct vsr_io_link *link)
         link_enter_pending(io, link, VSR_IO_LINK_HELLO);
         link->preamble_seen = dialer ? VSR_IO_PREAMBLE_BYTES : 0;
         link_arm_handshake(io, link);
-        (void)link_install(io, link);
+        link_want_install(link, false);
         return;
     }
     link_enter_pending(io, link, VSR_IO_LINK_EXTERNAL);
@@ -1698,14 +1712,13 @@ int vsr_io_links_handshake_done(struct vsr_io *io, uint64_t op, int32_t status,
         }
         link_identify(io, link, node_index);
     }
-    /* The caller's protocol replaced the HELLO exchange. */
+    /* The caller's protocol replaced the HELLO exchange. The op is
+     * answered: the poll must not emit it again while the takeover runs. */
+    link->stage = VSR_IO_STAGE_NONE;
     link->hello_sent = true;
     link->hello_seen = true;
     link->preamble_seen = VSR_IO_PREAMBLE_BYTES;
-    if (!link_install(io, link)) {
-        return VSR_OK;
-    }
-    link_establish(io, link);
+    link_want_install(link, true);
     return VSR_OK;
 }
 
@@ -2174,15 +2187,12 @@ int vsr_io_links_adopt(struct vsr_io *io, int fd, uint64_t node, uint32_t flags)
         link_start_handshake(io, link);
         return VSR_OK;
     }
-    /* Authenticated by the caller: established at once. */
+    /* Authenticated by the caller: established once taken over. */
     link_enter_pending(io, link, VSR_IO_LINK_HELLO);
-    if (!link_install(io, link)) {
-        return VSR_OK;
-    }
     link->preamble_seen = VSR_IO_PREAMBLE_BYTES;
     link->hello_seen = true;
     link->hello_sent = true;
-    link_establish(io, link);
+    link_want_install(link, true);
     return VSR_OK;
 }
 
@@ -2958,11 +2968,73 @@ static bool link_prepare_teardown(struct vsr_io *io, struct vsr_io_link *link,
     return true;
 }
 
+/* The FILES_UPDATE of the raw descriptor into a fresh engine slot, LINKed
+ * to the raw descriptor's CLOSE (SKIP_SUCCESS: the slot holds its own
+ * reference); one counted completion, the FILES_UPDATE's. A failed install
+ * cancels the CLOSE, whose -ECANCELED then finds its slot freed, and the
+ * raw descriptor stays the link's. */
+static bool link_prepare_install(struct vsr_io *io, struct vsr_io_link *link,
+                                 struct batch *batch)
+{
+    struct vsr_io_sqe *sqe;
+    uint64_t user_data;
+
+    if (link->installing != 1) {
+        return true; /* In flight. */
+    }
+    if (!batch_room(batch, 2)) {
+        return false;
+    }
+    link->install_slot = vsr_io_engine_slot_alloc(io);
+    if (link->install_slot == LINK_NONE) {
+        link->installing = 0;
+        link_close(io, link_index(io, link), -ENFILE);
+        return true;
+    }
+    link->connect_slot =
+        vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_CONNECT, 1,
+                           link_index(io, link), VSR_IO_STAGE_INSTALL, 0);
+    if (link->connect_slot == LINK_NONE) {
+        vsr_io_engine_slot_free(io, link->install_slot);
+        link->install_slot = LINK_NONE;
+        return false;
+    }
+    user_data = vsr_io_slots_user_data(&io->slots, link->connect_slot);
+    sqe = batch_next(batch);
+    sqe->opcode = VSR_IO_SQE_FILES_UPDATE;
+    sqe->flags = VSR_IO_SQE_LINK;
+    sqe->fd = -1;
+    sqe->offset = link->install_slot;
+    sqe->addr = &link->raw_fd; /* Read when the record runs. */
+    sqe->length = 1;
+    sqe->user_data = user_data;
+    batch->count++;
+    sqe = batch_next(batch);
+    sqe->opcode = VSR_IO_SQE_CLOSE;
+    sqe->flags = VSR_IO_SQE_SKIP_SUCCESS;
+    sqe->fd = link->raw_fd;
+    sqe->user_data = user_data;
+    batch->count++;
+    link->installing = 2;
+    return true;
+}
+
 static bool link_prepare(struct vsr_io *io, struct vsr_io_link *link,
                          struct batch *batch)
 {
     struct vsr_io_sqe *sqe;
 
+    if (link->installing != 0) {
+        /* Nothing goes out on the descriptor before the takeover is done;
+         * a closing link whose takeover was not issued just drops it. */
+        if (link->state != VSR_IO_LINK_CLOSING) {
+            return link_prepare_install(io, link, batch);
+        }
+        if (link->installing == 2) {
+            return true;
+        }
+        link->installing = 0;
+    }
     switch (link->state) {
     case VSR_IO_LINK_CONNECTING:
         return link_prepare_dial(io, link, batch);
@@ -3090,6 +3162,10 @@ static void link_connect_complete(struct vsr_io *io, struct vsr_io_link *link,
     link->connect_slot = LINK_NONE;
     if (stage == VSR_IO_STAGE_NODELAY) {
         return; /* Best effort: the result is not even looked at. */
+    }
+    if (stage == VSR_IO_STAGE_INSTALL) {
+        link_install_done(io, link, cqe->result);
+        return;
     }
     if (link->state == VSR_IO_LINK_CLOSING) {
         if (stage == VSR_IO_STAGE_SOCKET && cqe->result >= 0) {

@@ -136,7 +136,8 @@ tests_unit_faulty_executor_SOURCES = tests/unit/faulty_executor.c \
 tests_unit_faulty_executor_LDADD = $(LIBVSR)
 tests_unit_store_SOURCES = tests/unit/store.c
 tests_unit_store_LDADD = $(LIBVSR)
-tests_unit_engine_SOURCES = tests/unit/engine.c
+tests_unit_engine_SOURCES = tests/unit/engine.c tests/lib/pure_executor.c \
+  tests/lib/pure_executor.h
 tests_unit_engine_LDADD = $(LIBVSR)
 tests_unit_stream_SOURCES = tests/unit/stream.c tests/lib/random.c tests/lib/random.h
 tests_unit_stream_LDADD = $(LIBVSR)

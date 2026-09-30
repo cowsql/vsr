@@ -1176,6 +1176,46 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
             world.socks[sock->peer].peer_closed = true;
         }
         break;
+    case VSR_IO_SQE_FILES_UPDATE: {
+        /* A link's takeover (the raw descriptor stays until the CLOSE
+         * chained behind), or a slot the engine empties for the module
+         * (decision E9), as fake_update_file did. */
+        int32_t fd;
+        struct fslot *slot;
+
+        e->updates++;
+        CHECK(sqe->length == 1 && sqe->addr != NULL);
+        CHECK(sqe->offset >= FILE_SLOT_BASE &&
+              sqe->offset < FILE_SLOT_BASE + FILE_SLOTS);
+        if (e->fail_update != 0) {
+            result = e->fail_update;
+            e->fail_update = 0;
+            break;
+        }
+        memcpy(&fd, sqe->addr, sizeof(fd));
+        index = sock_by_slot(e->index, (int)sqe->offset);
+        if (index != NONE) {
+            world.socks[index].slot = -1;
+            sock_drop(index);
+        }
+        slot = &e->fslots[sqe->offset - FILE_SLOT_BASE];
+        if (slot->file >= 0) {
+            CHECK(e->files[slot->file].refs > 0);
+            e->files[slot->file].refs--;
+            dfile_reap(&e->files[slot->file]);
+        }
+        slot->file = -1;
+        result = 1;
+        if (fd >= 0) {
+            index = sock_by_fd(e->index, fd);
+            if (index == NONE) {
+                result = -EBADF;
+                break;
+            }
+            world.socks[index].slot = (int)sqe->offset;
+        }
+        break;
+    }
     case VSR_IO_SQE_CLOSE:
         index = record_sock(e, sqe);
         if (index == NONE) {
@@ -1632,6 +1672,9 @@ static void engine_step(struct engine *e)
         case VSR_IO_SLOT_FILE:
             vsr_io_store_complete(io, record->owner, slot, &cq[i]);
             break;
+        case VSR_IO_SLOT_FILES:
+            vsr_io_engine_files_complete(io, slot, &cq[i]);
+            break;
         default:
             vsr_io_links_complete(io, slot, &cq[i]);
             break;
@@ -1658,6 +1701,7 @@ static void engine_step(struct engine *e)
     vsr_io_streams_prepare(io, sqes, SQ_CAP, &count);
     vsr_io_store_prepare(io, REPLICA, sqes, SQ_CAP, &count);
     vsr_io_snapshots_prepare(io, REPLICA, sqes, SQ_CAP, &count);
+    vsr_io_engine_prepare_files(io, sqes, SQ_CAP, &count);
     for (uint32_t i = 0; i < count; ++i) {
         execute(e, &sqes[i], &chain_failed);
     }
@@ -1805,6 +1849,9 @@ static void check_file_slots(const struct engine *e)
         for (uint32_t j = 0; j < n; ++j) {
             found = found || held[j] == slot;
         }
+        /* A slot the module gave back stays open until the engine's
+         * FILES_UPDATE empties it (decision E9). */
+        found = found || vsr_io_engine_slot_clearing(io, slot);
         if (!found) {
             fprintf(stderr,
                     "file slot %u (file %d %s) open in the model, not held "
@@ -3277,6 +3324,7 @@ static void test_capture(void)
     CHECK(pool_refs(a) == 0);
     CHECK(vsr_io_snapshots_close(a->io, REPLICA) == VSR_OK);
     CHECK(a->store->base_slot == -1);
+    settle(); /* The engine empties the given-back slots (decision E9). */
     for (uint32_t i = 0; i < DFILES; ++i) {
         /* Every clients file closed; the log is the store's. */
         CHECK(a->files[i].refs == 0 ||
@@ -4818,6 +4866,7 @@ static void test_close(void)
     CHECK(vsr_io_snapshots_close(a->io, REPLICA) == VSR_OK);
     CHECK(a->store->base_slot == -1 && a->snapshots->closed);
     CHECK(a->replica->leases_free == REGIONS);
+    settle(); /* The engine empties the given-back slots (decision E9). */
     for (uint32_t i = 0; i < DFILES; ++i) {
         CHECK(!a->files[i].used || a->files[i].refs == 0 ||
               strcmp(a->files[i].name, DIRECTORY "/log") == 0);

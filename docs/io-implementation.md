@@ -252,18 +252,24 @@ Link life cycle:
 ```
  dial:    FREE ─SOCKET, then CONNECT on the raw fd─▶ CONNECTING ─▶ HELLO
  accept:  FREE ◀─multishot ACCEPT CQE (raw fd)─ HELLO (preamble+HELLO due)
- adopt:   FREE ─vsr_io_adopt─▶ ESTABLISHED (flags 0) | HELLO (HANDSHAKE)
+ adopt:   FREE ─vsr_io_adopt─▶ HELLO ─installed─▶ ESTABLISHED (flags 0)
+                             | HELLO (HANDSHAKE)
  EXTERNAL mode: CONNECTING/accept ─preamble on the raw fd─▶ EXTERNAL
-                (HANDSHAKE op) ─caller OK, fd installed─▶ ESTABLISHED
+                (HANDSHAKE op) ─caller OK─▶ (installing) ─installed─▶
+                ESTABLISHED
  HELLO ─both HELLOs seen, mode and version match─▶ ESTABLISHED
  any ─error, timeout, revoke, close─▶ CLOSING ─recv terminated, NOTIFs in─▶ FREE
 ```
 
-Descriptors (decision 72): a link's socket is a raw descriptor
+Descriptors (decisions 72 and E9): a link's socket is a raw descriptor
 (`raw_fd`) until the engine takes it over into an engine file slot (`fd`)
-through `vsr_io_engine_install`, at the CONNECT or ACCEPT completion in
-TRUSTED mode, at the caller's OK HANDSHAKE completion in EXTERNAL mode,
-and at adopt; from then on every record is FIXED_FILE on the slot. The
+with a `FILES_UPDATE` record LINKed to the raw descriptor's `CLOSE`
+(`SKIP_SUCCESS`), issued from prepare on the connect slot
+(`VSR_IO_STAGE_INSTALL`, `installing`, `install_slot`) at the CONNECT or
+ACCEPT completion in TRUSTED mode, at the caller's OK HANDSHAKE completion
+in EXTERNAL mode, and at adopt; the link issues nothing until it
+completes, then every record is FIXED_FILE on the slot. A failed takeover
+closes the link and gives the slot back (`vsr_io_engine_slot_clear`). The
 listening socket is DIRECT into an explicit engine slot; the accept itself
 is a plain multishot ACCEPT delivering raw descriptors. Listener state
 (`vsr_io_listener`: SETUP, ACTIVE, REARM, CANCEL, CLOSING) lives in a
@@ -1639,8 +1645,11 @@ In order, each stopping when `capacity` or a table is exhausted (leftovers
 stay queued and the engine sets `*deadline_ns = now_ns` so the loop
 returns immediately and prepares again):
 
-1. Pool provision: `provide()` executor call for the slabs
-   `vsr_io_pool_provide` returns (not a record).
+1. Pool provision (decision E7): the slabs `vsr_io_pool_provide` returns
+   go into `provide_buffers`, and one place is set aside for their
+   `PROVIDE` record, which ends the batch (the executor runs it before the
+   rest, so a receive re-armed in this batch sees the buffers). No
+   executor call: the four primitives make none.
 2. `vsr_io_links_prepare`: listener setup on the first call (SOCKET
    DIRECT into an engine slot, BIND, LISTEN, then a plain multishot
    ACCEPT, one chain per listen address, LINKed with SKIP_SUCCESS on all
@@ -1659,7 +1668,14 @@ returns immediately and prepares again):
    `vsr_io_snapshots_prepare` (the directory open, clients file opens,
    reads, writes, STATX, fsyncs, closes, renames, unlinks, at most
    `VSR_IO_SNAPSHOT_FILEOPS` in flight; the same `count` continues).
-5. `*deadline_ns = vsr_io_deadlines_earliest()`.
+5. `vsr_io_engine_prepare_files`: a `FILES_UPDATE` of -1 for every
+   engine file slot given back (slot kind FILES, owner the slot; decision
+   E9), then the `PROVIDE` record.
+6. `*deadline_ns = vsr_io_deadlines_earliest()`, or the earliest deferred
+   completion's due time (decision E3), or `now_ns` when the batch filled.
+
+`capacity` must be at least 5 (`VSR_IO_ENGINE_BATCH_MIN`: the listener
+chain, which never spans batches, and the `PROVIDE` record).
 
 ### 7.5 vsr_io_complete
 
@@ -1708,9 +1724,11 @@ marks the replica STOPPED; queued sends for it complete `CANCELLED` at
 that point (the core has already consumed their completions or will
 consume them as CANCELLED). `vsr_io_detach`: `EBUSY` unless STOPPED and
 `vsr_io_store_close` and `vsr_io_snapshots_close` both return OK (no write,
-flush or file operation in flight); then `update_file(slot, -1)` for the
-log, directory and any clients file, `update_buffer(index, NULL)` for the
-tail, and the replica entry is freed. The core is left in the caller's
+flush or file operation in flight); then the log's, the directory's and
+any clients file's slots are given back (`vsr_io_engine_slot_clear`, a
+`FILES_UPDATE` of -1 each from the next prepare, decision E9),
+`update_buffer(index, NULL)` unregisters the tail (teardown may call the
+executor, decision E7), and the replica entry is freed. The core is left in the caller's
 region for `vsr_deinit`.
 
 `vsr_io_close`: state closing; `vsr_io_links_shutdown` (CANCEL of every
@@ -1903,6 +1921,8 @@ of `docs/io-design.md`:
 | `vsr-io.h` | `vsr_io_uring_init` names its refusals: `-ENOSYS` (no io_uring, or a kernel older than the baseline, including one whose setup refuses a flag with `EINVAL`), `-EPERM`, `-EINVAL` | 104 |
 | `snapshot.h` (internal) | The module's structures as implemented: `vsr_io_snapshots_size`/`init` take the engine limits (`stream_window`, `streams`) and `max_clients`; `vsr_io_snapshots_region_bytes`; a registry entry carries the file size, the job and its step, the record in flight, the kept and transient slots, `on_disk`, `sync_failed`, `job_next`, the reserved `lease` and the copied `result`; the writer, the reader, the chunk ring, the serves, the file-operation table, the directory slot and `pending_base`; the ops are `RETRY` without an engine lease; an OK CAPTURE or FETCH completion carries the lease; a DROP of an id the registry lacks is taken; a file with a CAPTURE outstanding is not served; the weak hook stubs left stream.c | 105, 106, 107, 108, 109 |
 | `store.h` | `vsr_io_recovery.chain_resume` (the boundary at which the chain resumes past a block's dead tail); `VSR_IO_SEGMENT_FLUSHING`, `freeing_flush` and `flush_own` (a freed slot waits for the flush after its superblock write, which the store issues without waiting for a SYNC's target); `reclaimed`, `client_base_floor` and `client_base_pending` (the floor terms bounded by the sequence on media); `snapshot_clients` reports a record freed under the base as the base file's (sequence 0, the base offset); `vsr_io_store.replica`, the embedding replica, set by init; `vsr_io_recovery.record_run` (was `reserved`), the run of the last replayed record | 110, 111, 112, 113, 116 |
+| `vsr-io.h` | Record kinds `VSR_IO_SQE_FILES_UPDATE` and `VSR_IO_SQE_PROVIDE` (the executor contract, section 8); the engine's primitives never call the executor; `limits.batch` and `vsr_io_prepare`'s capacity at least 5 | E7 |
+| `engine.h`, `link.h`, `slots.h` (internal) | The generator (`random_state`), the queued slot clears (`clears`, `vsr_io_engine_slot_clear`, `vsr_io_engine_slot_clearing`, `vsr_io_engine_prepare_files`, `vsr_io_engine_files_complete`), the `PROVIDE` record's `provide_buffers` and user_data; `vsr_io_engine_install` removed; `VSR_IO_ENGINE_BATCH_MIN` 5; the link's `installing`, `install_slot`, `install_establish` and `VSR_IO_STAGE_INSTALL`; slot kinds `FILES` and `PROVIDE` | E7, E8, E9 |
 | `vsr-io.h`, `pool.h` (internal) | Sizing rule: minimum slabs `links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs`, and the pool's three shares; `vsr_io_slab_acquire` is ELIMIT at the caller's share, or while the engine's users hold more than the reserve and use the untaken share; the pool's `internal_taken`, the slab's `internal` flag (with `state` now 8 bits), `vsr_io_pool_handoff`, `vsr_io_pool_floor` | E1 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.

@@ -36,6 +36,8 @@
  *  10. engine file-slot free list [limits.file_slots]
  *  11. vsr_io_run's scratch: records [batch], completions [batch], ops
  *      [ops], events [ops + events]
+ *  12. the queued slot clears [file_slots] and the PROVIDE record's
+ *      buffers [slabs]
  * Every offset is computed with checked arithmetic; the same plan carves
  * the region at init.
  */
@@ -107,6 +109,8 @@ struct engine_plan {
     size_t run_ops;
     size_t run_events;
     uint32_t run_events_count;
+    size_t clears;
+    size_t provide;
     size_t total;
     size_t alignment;
     size_t payload;
@@ -332,7 +336,11 @@ static int engine_plan(const struct vsr_io_options *options,
         capacity > UINT32_MAX ||
         !vsr_size_mul(capacity, sizeof(struct vsr_io_event), &bytes) ||
         !place(&offset, bytes, alignof(struct vsr_io_event),
-               &plan->run_events)) {
+               &plan->run_events) ||
+        !vsr_size_mul(limits->file_slots, sizeof(uint32_t), &bytes) ||
+        !place(&offset, bytes, alignof(uint32_t), &plan->clears) ||
+        !vsr_size_mul(limits->slabs, sizeof(struct vsr_io_buffer), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_buffer), &plan->provide)) {
         return VSR_ELIMIT;
     }
     plan->run_events_count = (uint32_t)capacity;
@@ -449,6 +457,41 @@ uint32_t vsr_io_engine_reserve(const struct vsr_io_limits *limits)
            ENGINE_RESERVE_REASSEMBLY;
 }
 
+/* The generator (decision E8): xoshiro256**, seeded once from the
+ * executor's entropy at init, so that nothing the primitives reach calls
+ * the executor; a simulation stays deterministic by its seed. The values
+ * are unique, not secret: a keyed handshake needing secret nonces would
+ * draw them from an entropy pool the loop refills. */
+static uint64_t rotate(uint64_t x, int k)
+{
+    return (x << k) | (x >> (64 - k));
+}
+
+static uint64_t random_next(struct vsr_io *io)
+{
+    uint64_t *s = io->random_state;
+    uint64_t result = rotate(s[1] * 5u, 7) * 9u;
+    uint64_t t = s[1] << 17;
+
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = rotate(s[3], 45);
+    return result;
+}
+
+static void random_seed(struct vsr_io *io)
+{
+    uint64_t *s = io->random_state;
+
+    io->ex.ops->random(io->ex.ctx, s, sizeof(io->random_state));
+    if ((s[0] | s[1] | s[2] | s[3]) == 0) {
+        s[0] = UINT64_C(0x9E3779B97F4A7C15); /* The all-zero state sticks. */
+    }
+}
+
 /* The pool region and its provided-buffer ring, in that order; a failed
  * ring registration undoes the region. Listener setup waits for the first
  * prepare (decision 45). */
@@ -561,6 +604,10 @@ int vsr_io_init(const struct vsr_io_options *options,
     io->run_ops = (struct vsr_io_op *)(void *)(base + plan.run_ops);
     io->run_events = (struct vsr_io_event *)(void *)(base + plan.run_events);
     io->run_events_capacity = plan.run_events_count;
+    io->clears = (uint32_t *)(void *)(base + plan.clears);
+    io->clears_count = 0;
+    io->provide_buffers = (struct vsr_io_buffer *)(void *)(base + plan.provide);
+    random_seed(io);
     rc = register_pool(io);
     if (rc != VSR_OK) {
         return rc;
@@ -575,7 +622,8 @@ int vsr_io_init(const struct vsr_io_options *options,
 void vsr_io_engine_check_closed(struct vsr_io *io)
 {
     if (io->state != ENGINE_CLOSING ||
-        io->slots.free_count != io->slots.count || io->streams.active != 0) {
+        io->slots.free_count != io->slots.count || io->streams.active != 0 ||
+        io->clears_count != 0) {
         return;
     }
     for (uint32_t i = 0; i < io->links.links_count; ++i) {
@@ -927,14 +975,89 @@ void vsr_io_engine_slot_free(struct vsr_io *io, uint32_t slot)
     io->file_slots_free_count++;
 }
 
-void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size)
+void vsr_io_engine_slot_clear(struct vsr_io *io, uint32_t slot)
 {
-    io->ex.ops->random(io->ex.ctx, bytes, size);
+    ENGINE_ASSERT(slot >= io->options.file_slot_base &&
+                  slot < io->file_slot_next);
+    ENGINE_ASSERT(io->clears_count < io->options.limits.file_slots);
+    io->clears[io->clears_count] = slot;
+    io->clears_count++;
 }
 
-int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd)
+bool vsr_io_engine_slot_clearing(const struct vsr_io *io, uint32_t slot)
 {
-    return io->ex.ops->update_file(io->ex.ctx, slot, fd);
+    for (uint32_t i = 0; i < io->clears_count; ++i) {
+        if (io->clears[i] == slot) {
+            return true;
+        }
+    }
+    for (uint32_t i = 0; i < io->slots.count; ++i) {
+        if (io->slots.slots[i].kind == VSR_IO_SLOT_FILES &&
+            io->slots.slots[i].owner == slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The descriptor a clear installs: none. */
+static const int32_t engine_empty_fd = -1;
+
+void vsr_io_engine_prepare_files(struct vsr_io *io, struct vsr_io_sqe *sqes,
+                                 uint32_t capacity, uint32_t *count)
+{
+    while (io->clears_count > 0 && *count < capacity) {
+        uint32_t file = io->clears[io->clears_count - 1];
+        uint32_t slot =
+            vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_FILES, 1, file, 0, 0);
+        struct vsr_io_sqe *sqe;
+
+        if (slot == NONE) {
+            return;
+        }
+        io->clears_count--;
+        sqe = &sqes[*count];
+        memset(sqe, 0, sizeof(*sqe));
+        sqe->opcode = VSR_IO_SQE_FILES_UPDATE;
+        sqe->fd = -1;
+        sqe->offset = file;
+        sqe->addr = &engine_empty_fd;
+        sqe->length = 1;
+        sqe->user_data = vsr_io_slots_user_data(&io->slots, slot);
+        (*count)++;
+    }
+}
+
+/* Whatever the result, the slot holds no file the engine still wants: a
+ * failed clear leaves at most a file a later install replaces. */
+void vsr_io_engine_files_complete(struct vsr_io *io, uint32_t slot,
+                                  const struct vsr_io_cqe *cqe)
+{
+    uint32_t file = io->slots.slots[slot].owner;
+
+    (void)cqe;
+    vsr_io_slots_consumed(&io->slots, slot, false);
+    vsr_io_engine_slot_free(io, file);
+}
+
+uint64_t vsr_io_engine_provide_user_data(const struct vsr_io *io)
+{
+    return VSR_IO_USER_DATA(io->options.owner,
+                            (uint64_t)VSR_IO_SLOT_PROVIDE << 48);
+}
+
+void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size)
+{
+    unsigned char *out = bytes;
+
+    while (size > 0) {
+        uint64_t value = random_next(io);
+        size_t take = size < sizeof(value) ? size : sizeof(value);
+
+        memcpy(out, &value, take);
+        out += take;
+        size -= take;
+    }
 }
 
 /* -------------------------------------------------------------------------

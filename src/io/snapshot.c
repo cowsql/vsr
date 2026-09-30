@@ -453,11 +453,11 @@ static void retry_later(struct vsr_io *io, struct vsr_io_replica *rep)
                          io->now + SNAPSHOT_RETRY_NS);
 }
 
-/* Frees an engine file slot the module holds, clearing its descriptor. */
+/* Gives back an engine file slot the module holds: the engine empties it
+ * with a FILES_UPDATE record and frees it then (decision E9). */
 static void slot_drop(struct vsr_io *io, uint32_t slot)
 {
-    (void)vsr_io_engine_install(io, slot, -1);
-    vsr_io_engine_slot_free(io, slot);
+    vsr_io_engine_slot_clear(io, slot);
 }
 
 /* -------------------------------------------------------------------------

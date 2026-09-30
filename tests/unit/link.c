@@ -726,6 +726,37 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
             world.socks[sock->peer].peer_closed = true;
         }
         break;
+    case VSR_IO_SQE_FILES_UPDATE: {
+        /* The takeover (decision E9): the slot takes the socket, the raw
+         * descriptor stays until the CLOSE chained behind this record. */
+        int32_t fd;
+
+        e->updates++;
+        CHECK(sqe->length == 1 && sqe->addr != NULL);
+        CHECK(sqe->offset >= FILE_SLOT_BASE &&
+              sqe->offset < FILE_SLOT_BASE + FILE_SLOTS);
+        if (e->fail_update != 0) {
+            result = e->fail_update;
+            e->fail_update = 0;
+            break;
+        }
+        memcpy(&fd, sqe->addr, sizeof(fd));
+        index = sock_by_slot(e->index, (int)sqe->offset);
+        if (index != NONE) {
+            world.socks[index].slot = -1;
+            sock_drop(index);
+        }
+        result = 1;
+        if (fd >= 0) {
+            index = sock_by_fd(e->index, fd);
+            if (index == NONE) {
+                result = -EBADF;
+                break;
+            }
+            world.socks[index].slot = (int)sqe->offset;
+        }
+        break;
+    }
     case VSR_IO_SQE_CLOSE:
         index = record_sock(e, sqe);
         if (index == NONE) {
@@ -1032,7 +1063,12 @@ static void engine_step(struct engine *e)
     for (uint32_t i = 0; i < cq_count; ++i) {
         uint32_t slot;
 
-        if (vsr_io_slots_resolve(&io->slots, cq[i].user_data, &slot) != NULL) {
+        if (vsr_io_slots_resolve(&io->slots, cq[i].user_data, &slot) == NULL) {
+            continue;
+        }
+        if (io->slots.slots[slot].kind == VSR_IO_SLOT_FILES) {
+            vsr_io_engine_files_complete(io, slot, &cq[i]);
+        } else {
             vsr_io_links_complete(io, slot, &cq[i]);
         }
     }
@@ -1046,6 +1082,7 @@ static void engine_step(struct engine *e)
         CHECK(fake_provide(e, GROUP, buffers, count) == 0);
     }
     vsr_io_links_prepare(io, sqes, SQ_CAP, &count);
+    vsr_io_engine_prepare_files(io, sqes, SQ_CAP, &count);
     for (uint32_t i = 0; i < count; ++i) {
         execute(e, &sqes[i], &chain_failed);
     }
@@ -2210,7 +2247,8 @@ static void test_adopt_and_close(void)
     CHECK(vsr_io_links_authorize(a->io, cluster, 2, 2) == VSR_OK);
     world_settle();
     CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
-    /* flags 0: established at once, installed, receive armed. */
+    /* flags 0: established once the takeover record completed (decision
+     * E9), installed, receive armed. */
     peer = sock_alloc(TEST_OWNER);
     engine_side = sock_alloc(0);
     world.socks[peer].raw_fd = fd_alloc();
@@ -2220,9 +2258,11 @@ static void test_adopt_and_close(void)
     log_clear(a);
     CHECK(vsr_io_links_adopt(a->io, world.socks[engine_side].raw_fd, 2, 0) ==
           VSR_OK);
+    CHECK(node_state(a, 2) == VSR_IO_NODE_PENDING);
+    CHECK(a->updates == 0);
+    world_settle();
     CHECK(node_state(a, 2) == VSR_IO_NODE_LINKED);
     CHECK(a->updates == 1);
-    world_settle();
     CHECK(log_count(a, VSR_IO_SQE_SEND) == 0);
     CHECK(log_count(a, VSR_IO_SQE_RECV) == 1);
     CHECK(peer_read(peer, bytes, sizeof(bytes)) == 0);
@@ -2317,7 +2357,9 @@ static void test_adopt_and_close(void)
     CHECK(vsr_io_links_adopt(a->io, world.socks[engine_side].raw_fd, 2, 0) ==
           VSR_OK);
     world_settle();
-    CHECK(log_count(a, VSR_IO_SQE_CLOSE) == 1);
+    /* The CLOSE chained to the failed FILES_UPDATE is cancelled; the
+     * teardown's closes the raw descriptor (decision E9). */
+    CHECK(log_count(a, VSR_IO_SQE_CLOSE) == 2);
     CHECK(peer_eof(peer));
     check_quiet(a);
     CHECK(a->io->links.nodes[0].last_error == -EBADF);
