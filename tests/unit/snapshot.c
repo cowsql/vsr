@@ -4053,7 +4053,8 @@ static void test_fetch_failures(void)
         caller_done(b, op, VSR_IO_FAILED, NULL);
         settle();
         expect_core(b, op, VSR_IO_FAILED);
-        CHECK(clients_file(b, x, false) == NULL); /* Not adopted: private. */
+        /* The core's hold of the earlier FETCHes (test_review_refetch_kept). */
+        CHECK(clients_file(b, x, false) != NULL && entry_of(b, x) != NULL);
         expect_idle(b);
     }
 }
@@ -4949,6 +4950,41 @@ static void test_review_sync_release(void)
     engine_crash(a);
 }
 
+/* A FETCH of an id the module already holds transfers nothing, so its
+ * caller's failure removes nothing: the file of an earlier successful FETCH
+ * is the core's hold (docs/vsr-api.md: successful CAPTURE/FETCH objects
+ * remain available until DROP; a repeated FETCH shares that hold). Only a
+ * file this op's own stream wrote is a private partial object. */
+static void test_review_refetch_kept(void)
+{
+    struct engine *b = &world.engines[1];
+    struct vsr_id x = fetch_setup(122, 8);
+    struct task_holder h;
+    uint64_t op;
+    uint64_t sequence;
+
+    fetch(b, x, 1);
+    CHECK(clients_file(b, x, false) != NULL);
+    CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+    settle();
+    CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+    caller_done(b, op, VSR_IO_FAILED, NULL);
+    settle();
+    expect_core(b, op, VSR_IO_FAILED);
+    CHECK(clients_file(b, x, false) != NULL && entry_of(b, x) != NULL &&
+          entry_of(b, x)->state == VSR_IO_SNAPSHOT_WRITTEN);
+    expect_idle(b);
+    /* The hold is intact: the file restores. */
+    joint_run(b, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_OK);
+    sequence = 2;
+    op = submit(b, txn_restore(b, sequence, x, 5, VSR_MEMBER_FULL));
+    settle();
+    expect_store(b, op, VSR_IO_OK);
+    CHECK(b->store->clients_count == 8 &&
+          b->store->base_slot == entry_of(b, x)->file_slot);
+    expect_idle(b);
+}
+
 int main(void)
 {
     test_capture();
@@ -4964,5 +5000,6 @@ int main(void)
     test_close();
     test_review_sync_release();
     test_review_capture_release();
+    test_review_refetch_kept();
     return 0;
 }

@@ -125,7 +125,9 @@ struct vsr_io_snapshot {
                                when the op was taken; the caller's
                                checkpoint is copied into its region and the
                                OK completion carries it. NONE otherwise. */
-    uint32_t reserved;
+    uint32_t transferred;   /* FETCH: this op's stream wrote the file, a
+                               private object until the op completes OK (a
+                               held file a FETCH found is the core's). */
     const struct vsr_snapshot_task *task; /* The core op's task, pinned
                                              until the op completes. */
     const struct vsr_checkpoint *result;  /* The caller's checkpoint copied

@@ -441,6 +441,7 @@ static void op_complete(struct vsr_io_replica *rep,
     entry->op = 0;
     entry->op_type = 0;
     entry->task = NULL;
+    entry->transferred = 0;
     vsr_io_engine_complete_core(rep, &completion);
 }
 
@@ -1366,6 +1367,7 @@ static void fetch_finish(struct vsr_io *io, uint32_t replica, int32_t status)
     if (status == VSR_IO_OK) {
         entry->state = VSR_IO_SNAPSHOT_WRITTEN;
         entry->on_disk = 1;
+        entry->transferred = 1;
         entry->forward_due = 1;
         return;
     }
@@ -1854,9 +1856,11 @@ static void fetch_settle(struct vsr_io *io, uint32_t replica,
         op_complete(rep, entry, VSR_IO_OK);
         return;
     }
-    /* A fetched file the caller failed on is a private partial object
-     * (vsr.h), unless the store adopted it meanwhile. */
-    if (entry->on_disk && entry->sequence == 0) {
+    /* A file this op fetched is a private partial object when its caller
+     * fails (vsr.h), unless the store adopted it meanwhile; a held file the
+     * FETCH found is the core's (a repeated FETCH shares the hold of the
+     * one that fetched it, docs/vsr-api.md) and stays. */
+    if (entry->on_disk && entry->transferred && entry->sequence == 0) {
         if (entry->readers == 0 && entry->job == VSR_IO_SNAPSHOT_JOB_NONE) {
             discard_start(entry);
             return;
