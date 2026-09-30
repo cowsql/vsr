@@ -2854,6 +2854,26 @@ static void test_prepare(void)
     CHECK(deadline <= app->replica->core_deadline);
     CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) == 0);
     CHECK(run_until(app_normal, app, 20000));
+    /* Decision 122: an outcome the snapshot module decides arms the
+     * replica's CAPTURE deadline at the engine's time; prepare's deadline
+     * (computed after every module prepared) returns the loop at once, and
+     * the next poll consumes it. Armed here by hand: no unit scenario
+     * makes the module decide one in its prepare. */
+    {
+        uint64_t at = n->io->now;
+        uint32_t k = 0;
+
+        vsr_io_deadlines_arm(&n->io->deadlines, app->replica->deadline_capture,
+                             at);
+        CHECK(PURE(n, vsr_io_prepare(n->io, at, sqes, BATCH, &count,
+                                     &deadline)) == VSR_OK);
+        CHECK(deadline == at);
+        CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) >=
+              0);
+        CHECK(PURE(n, vsr_io_poll(n->io, at, ops, OPS, &k, &flags)) ==
+              VSR_OK);
+        CHECK(vsr_io_deadlines_earliest(&n->io->deadlines) > at);
+    }
     stop_app(app);
     detach_app(app);
     close_node(n);
