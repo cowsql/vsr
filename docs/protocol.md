@@ -146,6 +146,17 @@ checkpoint and committed log without requiring a separate result flush.
 RECONFIGURE is an ordinary client request whose body names the next membership.
 Its boundary is committed by the old group. START_EPOCH and NEW_EPOCH describe
 that committed boundary; an uncommitted proposal cannot introduce an epoch.
+Before the primary enters the epoch the boundary opens, it issues the
+boundary's COMMIT in the old epoch's envelope to every peer that is up to date
+with the boundary, one whose PREPARE of it went out and was not rewound since,
+which includes the quorum that acknowledged it: such a peer learns the
+commitment by the ordinary path and installs without a transfer. A peer that
+is behind or unreachable is not waited for, since its remaining batches would
+first need acknowledging and an unreachable peer's never are; it learns the
+boundary from the handoff announcement and transfers the history it already
+holds. The wait is therefore bounded by the completion of sends already in
+flight, never by a peer. No other entry's commitment is notified or applied
+conditionally on a send: a COMMIT can follow it at any time.
 The next epoch starts at view zero and the next log position after the boundary.
 Its membership may be disjoint and may change `f` or member roles. Commitment
 of the boundary can be learned in any state, including VIEW_CHANGE or during

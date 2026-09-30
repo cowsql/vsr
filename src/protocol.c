@@ -1175,6 +1175,42 @@ static bool network_poll(struct vsr *v)
     return false;
 }
 
+/* Whether notifying this committed entry must first wait for the primary to
+ * issue its COMMIT to the old group. A committed RECONFIGURE ends the epoch:
+ * its notification enters the next one at once, after which the primary's
+ * envelope no longer reaches the old group, so a peer that has not been sent
+ * the boundary's commitment learns it from the handoff announcement instead
+ * and transfers the history it already holds. The COMMIT is therefore issued
+ * first to every peer that is up to date with the boundary: one whose PREPARE
+ * of it went out and was not rewound since, which includes the quorum that
+ * acknowledged it. Such a peer's COMMIT is one send, issued as soon as its
+ * send in flight completes, so this waits for nothing but completions. A
+ * peer that is behind is not waited for: it would need the rest of its
+ * batches acknowledged first, and an unreachable one never is, since its
+ * SENDs fail and its cursor rewinds to its last acknowledgment; both learn
+ * the boundary from the announcement. No other entry waits: a COMMIT can
+ * follow ordinary commitment at any time, and application must not depend
+ * on any send to any peer (regression dead_backup_apply). */
+static bool boundary_commit_pending(const struct vsr *v,
+                                    const struct vsr_entry *entry)
+{
+    const struct vsr_protocol *p = vsr_protocol_const(v);
+    if (entry->type != VSR_REQUEST_RECONFIGURE ||
+        entry->epoch != p->current.epoch ||
+        v->status.state != VSR_STATE_NORMAL ||
+        v->status.primary != v->options.replica)
+        return false;
+    for (uint32_t i = 0; i < p->current.count; ++i) {
+        const struct vsr_peer *peer = &p->peers[i];
+        uint64_t reached =
+            peer->sent > peer->prepared ? peer->sent : peer->prepared;
+        if (i != p->self && reached >= entry->op &&
+            peer->commit_sent < entry->op)
+            return true;
+    }
+    return false;
+}
+
 static bool apply_poll(struct vsr *v)
 {
     struct vsr_protocol *p = vsr_protocol(v);
@@ -1683,35 +1719,27 @@ bool vsr_protocol_poll(struct vsr *v)
     if (commit_poll(v))
         return true;
     if (p->notified_commit < p->stable_commit) {
-        /* A boundary announcement changes the membership immediately. Issue
-         * the final old-group commit first, while its envelope is still valid. */
-        bool commits_sent = true;
-        if (v->status.state == VSR_STATE_NORMAL &&
-            v->status.primary == v->options.replica) {
-            for (uint32_t i = 0; i < p->current.count; ++i)
-                if (i != p->self && p->peers[i].commit_sent < p->stable_commit)
-                    commits_sent = false;
+        uint64_t next = p->notified_commit + 1;
+        if (next < p->readable_begin) {
+            /* A durably published checkpoint already covers the
+             * compacted prefix, whether or not its trim is durable yet. */
+            p->notified_commit = p->readable_begin - 1;
+            return true;
         }
-        if (!commits_sent) {
+        struct vsr_log_slot *s = vsr_protocol_log_find(v, next);
+        if (s == NULL) {
+            if (vsr_protocol_load_log(v, next, p->stable_commit + 1))
+                return true;
+        } else if (boundary_commit_pending(v, &s->entry)) {
+            /* The boundary changes the membership the moment it is
+             * notified: issue the final old-group commit first, while its
+             * envelope is still valid. */
             if (network_poll(v))
                 return true;
         } else {
-            uint64_t next = p->notified_commit + 1;
-            if (next < p->readable_begin) {
-                /* A durably published checkpoint already covers the
-                 * compacted prefix, whether or not its trim is durable yet. */
-                p->notified_commit = p->readable_begin - 1;
-                return true;
-            }
-            struct vsr_log_slot *s = vsr_protocol_log_find(v, next);
-            if (s == NULL) {
-                if (vsr_protocol_load_log(v, next, p->stable_commit + 1))
-                    return true;
-            } else {
-                p->notified_commit = next;
-                vsr_extension_committed(v, &s->entry);
-                return true;
-            }
+            p->notified_commit = next;
+            vsr_extension_committed(v, &s->entry);
+            return true;
         }
     }
     if (routes_poll(v))
