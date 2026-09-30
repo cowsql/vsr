@@ -7105,8 +7105,8 @@ static void test_review_recovery_crash(void)
     disk.flags = 0;
     disk.base_slot = -1;
     harness_open_keep(&c, true);
-    op = open_load(VSR_START_RECOVER);
-    at = run_until(VSR_IO_SQE_FSYNC);
+    (void)open_load(VSR_START_RECOVER);
+    (void)run_until(VSR_IO_SQE_FSYNC);
     CHECK(h.store->recovery.sequence == 6);
     disk_crash(true);
     harness_open_keep(&c, true);
@@ -7119,7 +7119,7 @@ static void test_review_recovery_crash(void)
     plain_run(6, 6);
     disk_crash(false);
     harness_open_keep(&c, true);
-    op = open_load(VSR_START_RECOVER);
+    (void)open_load(VSR_START_RECOVER);
     at = run_until(VSR_IO_SQE_WRITE);
     CHECK(h.pending[at].sqe.offset < 2 * BLOCK && h.store->run == 2);
     disk.tear_armed = 1;
@@ -7136,7 +7136,7 @@ static void test_review_recovery_crash(void)
     /* Lost with the unflushed blocks before the flush after it. */
     disk_crash(false);
     harness_open_keep(&c, true);
-    op = open_load(VSR_START_RECOVER);
+    (void)open_load(VSR_START_RECOVER);
     at = run_until(VSR_IO_SQE_WRITE);
     CHECK(h.pending[at].sqe.offset < 2 * BLOCK && h.store->run == 3);
     harness_complete(at);
@@ -7175,7 +7175,6 @@ static void test_review_recovery_crash(void)
     expect_recovered(&c, 6);
     CHECK(h.store->run == 2);
     harness_close();
-    (void)op;
 }
 
 /* -------------------------------------------------------------------------
