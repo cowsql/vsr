@@ -3587,6 +3587,18 @@ static void recovery_scan_end(struct vsr_io_store *store)
             return;
         }
     }
+    /* Every op of the recovered log was replayed: the start segment's
+     * header names the log as of its first record, whose earlier ops the
+     * freed segments held, and freeing kept every revision from the
+     * sequence on media on (decision S16). A row older than that (media
+     * corruption of flushed records the floor does not cover) lacks ops
+     * and is CORRUPT rather than served with holes (decision S18). */
+    for (uint64_t op = store->log_begin; op < store->log_end; ++op) {
+        if (op_current(store, op) == NULL) {
+            recovery_fail(store, VSR_IO_CORRUPT);
+            return;
+        }
+    }
     /* Stale headers (never visited) and abandoned successors (visited
      * after the last record, so still naming it) free their slots
      * (decision 48); the rest of the chain is SEALED but for the segment

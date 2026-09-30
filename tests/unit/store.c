@@ -5217,6 +5217,7 @@ static void test_client_newer(void)
  * ---------------------------------------------------------------------- */
 
 #define CHECKED_SLOTS 8u
+#define CHECKED_OPS 4096u /* Ops the checker tracks: the walk's. */
 
 struct checked_header {
     bool valid;
@@ -5241,6 +5242,9 @@ struct checked {
     uint32_t slots;
     uint64_t start_segment;
     uint64_t number[CHECKED_SLOTS]; /* Live segment by slot; 0 when free. */
+    uint64_t log_begin; /* The log: the start header's, then as the chain's */
+    uint64_t log_end;   /* APPEND, TRUNCATE and TRIM changes move it. */
+    uint8_t appended[CHECKED_OPS]; /* Op appended by a replayed record. */
     bool identity;
     bool hard;
 };
@@ -5363,6 +5367,52 @@ static void checked_sweep(const unsigned char *data, uint64_t from,
     }
 }
 
+/* A replayed change as the log sees it (section 6.3): an APPEND at the
+ * log's end, a TRUNCATE dropping the ops from `first`, a TRIM moving the
+ * begin (an empty log starts at the first op either names); IDENTITY and
+ * HARD_STATE are the state a log with records needs. The walk never
+ * RESTOREs, whose begin is in its payload. */
+static void checked_change(struct checked *c, uint32_t type, uint32_t count,
+                           uint64_t first)
+{
+    if ((type == VSR_STORE_APPEND || type == VSR_STORE_TRIM) &&
+        c->log_begin == 0 && c->log_end == 0) {
+        c->log_begin = first;
+        c->log_end = first;
+    }
+    switch (type) {
+    case VSR_STORE_APPEND:
+        for (uint64_t op = first; op < first + count; ++op) {
+            CHECK(op < CHECKED_OPS);
+            c->appended[op] = 1;
+        }
+        c->log_end = first + count;
+        break;
+    case VSR_STORE_TRUNCATE:
+        for (uint64_t op = first; op < c->log_end && op < CHECKED_OPS; ++op) {
+            c->appended[op] = 0;
+        }
+        if (first < c->log_end) {
+            c->log_end = first;
+        }
+        break;
+    case VSR_STORE_TRIM:
+        first = first < c->log_end ? first : c->log_end;
+        if (first > c->log_begin) {
+            c->log_begin = first;
+        }
+        break;
+    case VSR_STORE_IDENTITY:
+        c->identity = true;
+        break;
+    case VSR_STORE_HARD_STATE:
+        c->hard = true;
+        break;
+    default:
+        break;
+    }
+}
+
 /* The chain through the data of `slot` (step 5 of 6.4): a PAD to its
  * block's end skips, a valid record continues when it is the next
  * sequence with a run not below the last one; anything else inside a
@@ -5412,10 +5462,11 @@ static void checked_scan(struct checked *c, uint32_t slot, uint64_t generation)
         c->last_slot = slot;
         c->resume = slot_offset(slot) + round_up(at + length, BLOCK);
         for (uint32_t i = 0; i < count; ++i) {
-            uint32_t type = vsr_io_get_u32(data + at + 48 + 24 * i);
+            const unsigned char *change = data + at + 48 + 24 * i;
 
-            c->identity = c->identity || type == VSR_STORE_IDENTITY;
-            c->hard = c->hard || type == VSR_STORE_HARD_STATE;
+            checked_change(c, vsr_io_get_u32(change),
+                           vsr_io_get_u32(change + 4),
+                           vsr_io_get_u64(change + 8));
         }
         at += length;
     }
@@ -5519,6 +5570,8 @@ static void checked_image(struct checked *c)
     c->run = headers[slot].run;
     c->identity = (headers[slot].flags & VSR_IO_SEGMENT_STATE) != 0;
     c->hard = c->identity;
+    c->log_begin = vsr_io_get_u64(disk_image + slot_offset(slot) + 64);
+    c->log_end = vsr_io_get_u64(disk_image + slot_offset(slot) + 72);
     c->last_slot = slot;
     c->resume = slot_offset(slot) + h.header_bytes;
     for (;;) {
@@ -5555,6 +5608,12 @@ static void checked_image(struct checked *c)
     }
     if (c->sequence > 0 && !(c->identity && c->hard)) {
         return;
+    }
+    /* Every op of the recovered log was replayed (decision S18). */
+    for (uint64_t op = c->log_begin; op < c->log_end; ++op) {
+        if (op >= CHECKED_OPS || c->appended[op] == 0) {
+            return;
+        }
     }
     for (uint32_t s = 0; s < c->slots; ++s) {
         /* Visited and not an abandoned successor. */
