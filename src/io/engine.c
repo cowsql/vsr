@@ -796,6 +796,15 @@ void vsr_io_engine_complete_core(struct vsr_io_replica *replica,
     queued->kind = VSR_IO_EVENT_CORE;
 }
 
+void vsr_io_engine_advance(struct vsr_io *io, uint64_t now_ns)
+{
+    vsr_io_deadlines_rebase(&io->deadlines,
+                            now_ns > io->now ? now_ns - io->now : 0);
+    if (now_ns > io->now) {
+        io->now = now_ns;
+    }
+}
+
 /* The deferred ring is due in order: io->now never decreases and retry_ns
  * is the replica's. It holds one entry per outstanding core op at most,
  * like the completion ring (an op is in one of them or in neither). */

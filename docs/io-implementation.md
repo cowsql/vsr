@@ -239,9 +239,14 @@ dropped and counted.
 
 Purpose: the one timer mechanism of the engine (decision 40). Handles are
 dense per kind and bound once at init; arm and pop are heap operations.
+While `rebasing` is set (the engine sets it for the length of
+`vsr_io_complete`), an armed entry is marked; `vsr_io_deadlines_rebase`
+moves every marked entry by the time that passed and clears the marks, and
+a later arm or disarm outside `rebasing` unmarks it (G2).
 
 - Tests: `tests/unit/deadline`: earliest after random arms and disarms
-  equals a linear scan; pop order; re-arming a popped periodic entry.
+  equals a linear scan; pop order; re-arming a popped periodic entry;
+  rebase of marked entries only, once, saturating (`test_rebase`).
 
 ### Links (`src/io/link.h`)
 
@@ -1589,7 +1594,9 @@ no transaction waits.
 
 ```
  vsr_io_poll(io, now, ops, capacity, count, flags)      (src/io/loop.c)
-   io->now = max(io->now, now); wake_pending = 0; forwarded_overflow = 0
+   vsr_io_engine_advance(now): the timers armed while completions were
+       processed move by now - io->now (G2); io->now = max(io->now, now)
+   wake_pending = 0; forwarded_overflow = 0
    while deadlines_pop(now, kind, index): dispatch (LINK/DIAL ->
        vsr_io_links_deadline, STREAM -> vsr_io_streams_deadline,
        FLUSH/SYNC -> nothing: store_poll below checks its own,
@@ -1711,6 +1718,7 @@ In order, each stopping when `capacity` or a table is exhausted (leftovers
 stay queued and the engine sets `*deadline_ns = now_ns` so the loop
 returns immediately and prepares again):
 
+0. `vsr_io_engine_advance(now_ns)`, as the poll does (G2).
 1. Pool provision (decision 133): the slabs `vsr_io_pool_provide` returns
    go into `provide_buffers`, and one place is set aside for their
    `PROVIDE` record, which ends the batch (the executor runs it before the
@@ -1762,7 +1770,11 @@ module consumes the slot (`vsr_io_slots_consumed` with the record's MORE,
 or `vsr_io_slots_free` for a zero-copy send refused before the kernel took
 it), since it knows what each completion means (decision 74). Nothing
 steps a core here; every effect is queued for the next poll, and a
-time-based effect uses `io->now`, the last poll time.
+time-based effect uses `io->now`, the last poll time: the deadlines armed
+during the call are marked (`deadlines.rebasing`) and the next poll or
+prepare moves them by the time that passed since (`vsr_io_engine_advance`,
+G2), so an engine that slept without a deadline does not arm a timer
+already past.
 
 ### 7.6 Leases
 
@@ -2028,6 +2040,7 @@ of `docs/io-design.md`:
 | `engine.h` (internal) | The replica's priority ring, deferred ring (`vsr_io_deferred`), copies of path and members, `stopping`, `step_events_capacity`, `tail_region`; the engine's `releases_rejected`, `events_rejected` and `vsr_io_run` scratch arrays (in the layout); lease states FREE, QUEUED, LEASED; `vsr_io_engine_route`, `vsr_io_engine_check_closed`, `vsr_io_engine_reserve`; the engine split into `engine.c` (kernel), `replica.c` and `loop.c` | 128, 129, 130, 131 |
 | `vsr-io.h`, `pool.h` (internal) | Sizing rule: minimum slabs `2 * links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs`, and the pool's three shares; `vsr_io_slab_acquire` is ELIMIT at the caller's share, or while the engine's users hold more than the reserve and use the untaken share; the pool's `internal_taken`, the slab's `internal` flag (with `state` now 8 bits), `vsr_io_pool_handoff`, `vsr_io_pool_floor` | 127 |
 | `engine.h`, `link.c` (internal) | `vsr_io_engine_complete_later` (the deferred ring's producer, moved from loop.c's `complete_now` into the kernel); a SEND evicted from a full node queue completes through it | G1 |
+| `deadline.h`, `engine.h` (internal) | `vsr_io_deadline_entry.rebase` (was `reserved`), `vsr_io_deadlines.rebasing` and `marked`, `vsr_io_deadlines_rebase`; `vsr_io_engine_advance`, which `vsr_io_poll` and `vsr_io_prepare` call instead of setting `io->now` | G2 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

@@ -297,6 +297,11 @@ uint64_t vsr_io_engine_provide_user_data(const struct vsr_io *io);
  * unique, not secret. */
 void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size);
 
+/* Brings the engine's clock to now_ns (never back) at a poll or prepare,
+ * first moving the timers armed while completions were processed by the
+ * time that passed since the last poll (decision G2). */
+void vsr_io_engine_advance(struct vsr_io *io, uint64_t now_ns);
+
 /* The pool's reserve for the limits (decision 127): one send slab per
  * link, the chunk reads of every stream window, per replica a cold-load
  * or recovery read slab and the snapshot module's writer, writer-cold and

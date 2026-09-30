@@ -656,6 +656,80 @@ static void test_edges(void)
     check_model(&set);
 }
 
+/* Decision G2: entries armed while `rebasing` is set move by the delta of
+ * the next rebase, once; entries armed outside it, re-armed outside it
+ * since, or disarmed, do not; a delta of zero only clears the marks; the
+ * move saturates below VSR_NO_DEADLINE; the heap order holds after. */
+static void test_rebase(uint64_t seed)
+{
+    struct vsr_io_deadlines set;
+    struct test_random random;
+    uint32_t a = handle_of(VSR_IO_DEADLINE_LINK, 1);
+    uint32_t b = handle_of(VSR_IO_DEADLINE_LINK, 2);
+    uint32_t c = handle_of(VSR_IO_DEADLINE_STREAM, 0);
+    uint32_t d = handle_of(VSR_IO_DEADLINE_DIAL, 3);
+    uint32_t e = handle_of(VSR_IO_DEADLINE_CORE, 0);
+
+    open_set(&set);
+    CHECK(set.rebasing == 0 && set.marked == 0);
+    model_arm(&set, e, 500); /* Armed at a poll: stays. */
+    set.rebasing = 1;
+    model_arm(&set, a, 100);
+    model_arm(&set, b, 200);
+    model_arm(&set, c, 300);
+    model_arm(&set, d, VSR_NO_DEADLINE - 10);
+    model_arm(&set, c, VSR_NO_DEADLINE); /* Disarmed: unmarked. */
+    set.rebasing = 0;
+    model_arm(&set, b, 250); /* Re-armed at a poll: unmarked. */
+    CHECK(set.marked == 2);
+    vsr_io_deadlines_rebase(&set, 1000);
+    model[a] = 1100;
+    model[d] = VSR_NO_DEADLINE - 1;
+    check_model(&set);
+    CHECK(set.marked == 0);
+    /* Once only. */
+    vsr_io_deadlines_rebase(&set, 1000);
+    check_model(&set);
+    /* Zero clears the marks and moves nothing. */
+    set.rebasing = 1;
+    model_arm(&set, a, 42);
+    set.rebasing = 0;
+    CHECK(set.marked == 1);
+    vsr_io_deadlines_rebase(&set, 0);
+    CHECK(set.marked == 0);
+    check_model(&set);
+    vsr_io_deadlines_rebase(&set, 77);
+    check_model(&set);
+    /* Random marks and deltas against the model. */
+    test_random_seed(&random, seed, 0x5EBA5E);
+    for (uint32_t round = 0; round < 200; ++round) {
+        uint64_t delta = test_random_bounded(&random, 1000);
+        bool marked[CAPACITY];
+
+        memset(marked, 0, sizeof(marked));
+        for (uint32_t i = 0; i < 12; ++i) {
+            uint32_t h = test_random_bounded(&random, CAPACITY);
+            bool mark = test_random_bounded(&random, 2) == 0;
+            uint64_t when = test_random_bounded(&random, 8) == 0
+                                ? VSR_NO_DEADLINE
+                                : 1000u + test_random_bounded(&random, 5000);
+
+            set.rebasing = mark ? 1u : 0u;
+            model_arm(&set, h, when);
+            marked[h] = mark && when != VSR_NO_DEADLINE;
+        }
+        set.rebasing = 0;
+        vsr_io_deadlines_rebase(&set, delta);
+        for (uint32_t h = 0; h < CAPACITY; ++h) {
+            if (marked[h]) {
+                model[h] += delta;
+            }
+        }
+        check_model(&set);
+        CHECK(set.marked == 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     uint64_t seed = 1;
@@ -673,5 +747,6 @@ int main(int argc, char **argv)
     test_exhaustive();
     test_all_ties();
     test_edges();
+    test_rebase(seed);
     return 0;
 }
