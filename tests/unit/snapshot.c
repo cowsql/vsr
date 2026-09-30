@@ -205,6 +205,7 @@ struct engine {
     uint32_t fail_dir_opens; /* This many directory opens fail -EMFILE. */
     int fail_write;          /* Pool-buffer writes only (the module's). */
     int fail_read;           /* Pool-buffer reads of clients files. */
+    bool long_read; /* The next such read claims a page more than asked. */
     int fail_fsync;
     int fail_fsync_dir;
     int fail_rename;
@@ -636,6 +637,19 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
             e->fail_read != 0) {
             *result = e->fail_read;
             e->fail_read = 0;
+            return true;
+        }
+        if (pool && strcmp(f->name, DIRECTORY "/log") != 0 && e->long_read &&
+            sqe->offset < f->size) {
+            /* A broken executor: the bytes asked for, and a count a page
+             * longer. */
+            e->long_read = false;
+            if (end > f->size) {
+                end = f->size;
+            }
+            memcpy(mutable_of(sqe->addr), f->data + sqe->offset,
+                   end - sqe->offset);
+            *result = (int32_t)(end - sqe->offset + PAGE);
             return true;
         }
         if (pool && strcmp(f->name, DIRECTORY "/log") == 0 &&
@@ -5229,6 +5243,150 @@ static void test_review_witness_promotion(void)
     engine_crash(e);
 }
 
+/* The serve hook refuses, without opening anything, an entry whose file
+ * is not on disk (the transient entry of a DROP of an id the registry
+ * lacked) and one being discarded (a fetched file whose caller failed):
+ * a reader there would outlive the entry. */
+static void test_review_serve_refusals(void)
+{
+    struct engine *a = &world.engines[0];
+    struct engine *b = &world.engines[1];
+    struct vsr_id x = fetch_setup(132, 2);
+    struct vsr_id unknown = {0xABC, 7};
+    struct vsr_io_wire_library_request request;
+    struct task_holder h;
+    uint64_t op;
+
+    memset(&request, 0, sizeof(request));
+    request.magic = VSR_IO_LIBRARY_MAGIC;
+    request.version = VSR_IO_LIBRARY_REQUEST_VERSION;
+    request.kind = VSR_IO_LIBRARY_CLIENTS;
+    request.cluster_hi = 0x77;
+    request.cluster_lo = 0x99;
+    request.replica = 1;
+    request.snapshot_hi = unknown.hi;
+    request.snapshot_lo = unknown.lo;
+    CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &h, unknown, &op) == VSR_OK);
+    CHECK(entry_of(a, unknown) != NULL && !entry_of(a, unknown)->on_disk);
+    CHECK(vsr_io_snapshots_serve(a->io, 1, &request) == VSR_IO_NOT_FOUND);
+    CHECK(a->snapshots->serves[1].state == 0);
+    settle();
+    CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_DROP, op) != NULL);
+    caller_done(a, op, VSR_IO_OK, NULL);
+    settle();
+    expect_core(a, op, VSR_IO_OK);
+    /* b fetched x; its caller fails: the discard is under way. */
+    CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+    settle();
+    CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+    caller_done(b, op, VSR_IO_FAILED, NULL);
+    CHECK(entry_of(b, x)->job == VSR_IO_SNAPSHOT_JOB_DISCARD);
+    request.replica = 2;
+    request.snapshot_hi = x.hi;
+    request.snapshot_lo = x.lo;
+    CHECK(vsr_io_snapshots_serve(b->io, 1, &request) == VSR_IO_NOT_FOUND);
+    CHECK(b->snapshots->serves[1].state == 0);
+    settle();
+    expect_core(b, op, VSR_IO_FAILED);
+    CHECK(clients_file(b, x, false) == NULL && entry_of(b, x) == NULL);
+    expect_idle(a);
+    expect_idle(b);
+}
+
+/* A kept slot is not closed under a cold read of the store's: after a
+ * PUBLISH of the latest capture moved the base on, the old base's slot
+ * stays open while a CLIENT load still reads it, and closes once the read
+ * is over (106). */
+static void test_review_release_cold_read(void)
+{
+    struct engine *b = &world.engines[1];
+    struct vsr_id x = fetch_setup(133, 8);
+    const struct vsr_io_snapshot *old;
+    const struct vsr_loaded *loaded;
+    const struct vsr_client_record *record;
+    uint32_t lease = NONE;
+    uint64_t load_op;
+    uint64_t op;
+    struct vsr_id y;
+
+    (void)restore_fetched(b, x, 2);
+    y = capture(b);
+    settle();
+    old = entry_of(b, x);
+    CHECK(old->file_slot >= 0 && b->store->base_slot == old->file_slot);
+    b->hold_reads = true;
+    load_op = load_client(b, b->store->readable, client_n(3));
+    settle();
+    CHECK(held_count(b) == 1 && b->store->cold_active != 0);
+    op = submit(b, txn_publish(b, b->store->readable + 1, y, 5));
+    settle();
+    expect_store(b, op, VSR_IO_OK);
+    CHECK(b->store->client_base_id.hi == y.hi &&
+          b->store->client_base_id.lo == y.lo);
+    CHECK(b->store->base_slot == entry_of(b, y)->file_slot);
+    CHECK(old->file_slot >= 0 && old->job == VSR_IO_SNAPSHOT_JOB_NONE);
+    b->hold_reads = false;
+    world_release_held(b);
+    settle();
+    loaded = expect_loaded(b, load_op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    record = loaded->items;
+    CHECK(record->request.client.hi == 0x43 && record->op == 23);
+    release_lease(b, lease);
+    settle();
+    CHECK(old->file_slot < 0 && clients_file(b, x, false)->refs == 0);
+    expect_idle(b);
+}
+
+/* A base load never reads a file being dropped: a RESTORE of an id whose
+ * DROP waits for a served stream to end waits for the unlink and then
+ * finds no file (CORRUPT). The core never restores what it dropped; the
+ * module does not rely on it. */
+static void test_review_load_dropping(void)
+{
+    struct engine *a = &world.engines[0];
+    struct engine *b = &world.engines[1];
+    struct vsr_id x = fetch_setup(134, 8);
+    struct task_holder h;
+    struct task_holder hd;
+    uint64_t op;
+    uint64_t drop_op;
+    uint64_t restore_op;
+    uint32_t rounds = 0;
+
+    a->hold_reads = true;
+    CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+    while (held_count(a) == 0) {
+        (void)world_run_checked(1);
+        CHECK(++rounds < 200);
+    }
+    CHECK(joint_start(a, VSR_OP_SNAPSHOT_DROP, &hd, x, &drop_op) == VSR_OK);
+    settle();
+    CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_DROP, drop_op) != NULL);
+    caller_done(a, drop_op, VSR_IO_OK, NULL);
+    settle();
+    expect_core(a, drop_op, VSR_IO_OK);
+    CHECK(entry_of(a, x)->state == VSR_IO_SNAPSHOT_DROPPING);
+    restore_op = submit(
+        a, txn_restore(a, a->store->readable + 1, x, 5, VSR_MEMBER_FULL));
+    settle_retry();
+    expect_no_store(a);
+    CHECK(entry_of(a, x)->job == VSR_IO_SNAPSHOT_JOB_NONE &&
+          a->snapshots->reader.snapshot == NONE);
+    a->hold_reads = false;
+    world_release_held(a);
+    settle();
+    expect_store(a, restore_op, VSR_IO_CORRUPT);
+    CHECK(clients_file(a, x, false) == NULL);
+    CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+    task_result(&h, x);
+    caller_done(b, op, VSR_IO_OK, &h.checkpoint);
+    settle();
+    expect_checkpoint(b, op, x, &h);
+    expect_idle(a);
+    expect_idle(b);
+}
+
 /* A serve that finds no engine file slot for its open ends the stream
  * RETRY: an OK close with nothing written would be a truncated file at the
  * requester, CORRUPT there. The refusal is decided in the module's prepare,
@@ -5274,6 +5432,167 @@ static void test_review_serve_no_slot(void)
     expect_idle(b);
 }
 
+/* Results whose length is not a multiple of 8: every reader checks each
+ * record's CRC over its padded bytes. A capture, a fetch, a RESTORE, a
+ * CLIENT load from the base file and a capture of the restored table. */
+static void test_review_odd_results(void)
+{
+    struct engine *a;
+    struct engine *b;
+    struct vsr_id x;
+    struct vsr_id y;
+
+    world_reset(136);
+    two_engines();
+    a = &world.engines[0];
+    b = &world.engines[1];
+    expect_store(a, store_start(a, VSR_START_NEW), VSR_IO_NOT_FOUND);
+    store_run(a, txn_identity(a, 1, VSR_MEMBER_FULL));
+    (void)store_clients(a, 2, 3, 13);
+    expect_store(b, store_start(b, VSR_START_NEW), VSR_IO_NOT_FOUND);
+    store_run(b, txn_identity(b, 1, VSR_MEMBER_FULL));
+    x = capture(a);
+    (void)restore_fetched(b, x, 2);
+    CHECK(b->store->clients_count == 3);
+    CHECK(records_equal(clients_file(a, x, false), x, clients_file(b, x, false),
+                        x));
+    {
+        uint32_t lease = NONE;
+        uint64_t op = load_client(b, b->store->readable, client_n(1));
+        const struct vsr_loaded *loaded;
+        const struct vsr_client_record *record;
+
+        settle();
+        loaded = expect_loaded(b, op, VSR_IO_OK, &lease);
+        record = loaded->items;
+        CHECK(loaded->count == 1 && record->request.client.hi == 0x41 &&
+              record->result.data.size == 13);
+        release_lease(b, lease);
+    }
+    y = capture(b);
+    CHECK(records_equal(clients_file(b, x, false), x, clients_file(b, y, false),
+                        y));
+    expect_idle(a);
+    expect_idle(b);
+}
+
+/* A base file that shrinks under its load (after the STATX): the read at
+ * the size once known returns 0 bytes, CORRUPT rather than a read loop. */
+static void test_review_short_file(void)
+{
+    struct engine *e;
+    struct vsr_id id = {0xC0DE, 0x300};
+    struct craft craft;
+    struct dfile *f;
+    uint64_t sequence = fresh_store(&e, 137, 0);
+    uint64_t op;
+
+    craft_file(&craft, id, 3, 8);
+    f = file_install(e, id, false, craft.bytes, craft.size);
+    e->hold_reads = true;
+    op = submit(e, txn_restore(e, sequence, id, 5, VSR_MEMBER_FULL));
+    settle();
+    CHECK(held_count(e) == 1);
+    f->size -= 20;
+    e->hold_reads = false;
+    world_release_held(e);
+    settle();
+    expect_store(e, op, VSR_IO_CORRUPT);
+    expect_idle(e);
+    engine_crash(e);
+}
+
+/* A read that reports more bytes than the slab has room for (a broken
+ * executor) is an I/O error: FAILED, and the reader never counts bytes
+ * beyond its slab. */
+static void test_review_long_read(void)
+{
+    struct engine *e;
+    struct vsr_id id = {0xC0DE, 0x301};
+    struct craft craft;
+    uint64_t sequence = fresh_store(&e, 138, 0);
+    uint64_t op;
+
+    craft_file(&craft, id, 3, 8);
+    (void)file_install(e, id, false, craft.bytes, craft.size);
+    e->long_read = true;
+    op = submit(e, txn_restore(e, sequence, id, 5, VSR_MEMBER_FULL));
+    settle();
+    expect_store(e, op, VSR_IO_FAILED);
+    expect_idle(e);
+    engine_crash(e);
+}
+
+/* A short cold read of the log is CORRUPT even when the cold slab still
+ * holds the right bytes: two clients of one CLIENTS record are read into
+ * the same slab one after the other, and the second read comes back
+ * short. */
+static void test_review_short_cold_read(void)
+{
+    struct engine *a;
+    struct task_holder h;
+    uint64_t op;
+    uint64_t sequence = fresh_store(&a, 139, 2);
+    const struct vsr_io_snapshot *entry;
+    struct vsr_id id;
+    uint32_t steps = 0;
+
+    sequence = evict_clients(a, sequence);
+    (void)sequence;
+    {
+        struct vsr_id zero = {0, 0};
+
+        task_init(&h, zero, 5, a->store->readable, 0);
+        op = next_op(a);
+        CHECK(vsr_io_snapshots_capture(a->io, REPLICA, op, &h.task) == VSR_OK);
+        entry = &a->snapshots->entries[a->snapshots->capture];
+        id = entry->id;
+    }
+    /* The first cold read issued (and executed by the model). */
+    while (!(entry->fileop != NONE && entry->step == 3 /* READ */)) {
+        step_checked(a);
+        CHECK(++steps < 20);
+    }
+    CHECK(a->snapshots->writer.next == 0);
+    a->short_log_read = true;
+    settle();
+    CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_CAPTURE, op) != NULL);
+    task_result(&h, id);
+    caller_done(a, op, VSR_IO_OK, &h.checkpoint);
+    settle();
+    expect_core(a, op, VSR_IO_CORRUPT);
+    CHECK(!a->short_log_read && clients_file(a, id, false) == NULL);
+    expect_idle(a);
+    engine_crash(a);
+}
+
+/* Chunks that arrive while the temporary file's open is out wait for it:
+ * nothing is written to a slot before its open completed. */
+static void test_review_open_held_chunks(void)
+{
+    struct engine *a = &world.engines[0];
+    struct engine *b = &world.engines[1];
+    struct vsr_id x = fetch_setup(140, 8);
+    struct task_holder h;
+    uint64_t op;
+
+    b->hold_open = true;
+    CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
+    settle();
+    CHECK(held_count(b) == 1 && b->snapshots->chunks_count > 0);
+    CHECK(clients_file(b, x, true) == NULL);
+    b->hold_open = false;
+    world_release_held(b);
+    settle();
+    CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+    task_result(&h, x);
+    caller_done(b, op, VSR_IO_OK, &h.checkpoint);
+    settle();
+    expect_checkpoint(b, op, x, &h);
+    CHECK(files_equal(clients_file(a, x, false), clients_file(b, x, false)));
+    expect_idle(b);
+}
+
 int main(void)
 {
     test_capture();
@@ -5293,6 +5612,14 @@ int main(void)
     test_review_dir_retry();
     test_review_record_integrity();
     test_review_witness_promotion();
+    test_review_serve_refusals();
+    test_review_release_cold_read();
+    test_review_load_dropping();
     test_review_serve_no_slot();
+    test_review_odd_results();
+    test_review_short_file();
+    test_review_long_read();
+    test_review_short_cold_read();
+    test_review_open_held_chunks();
     return 0;
 }
