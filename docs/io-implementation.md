@@ -1948,10 +1948,11 @@ with node 0 talking to node 1.
 | `uring_refusals` | integration | `INTEGRATION_TESTS` (skips without a ring or seccomp) | `vsr_io_uring_init` on emulated kernels, each in a forked child under a seccomp filter: no io_uring (`ENOSYS`) and io_uring disabled (`EPERM`) pass through; Linux 6.1 (setup refuses `NO_SQARRAY`, old features), 6.11 (no `MIN_TIMEOUT`), 6.14 (no `READV_FIXED`) and a kernel without networking are `-ENOSYS`, answered by a supervisor thread through `SECCOMP_RET_USER_NOTIF`; no descriptor stays open; a nonexistent SQPOLL CPU stays `-EINVAL` (decision 104) |
 | `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise) as the default, SQPOLL and NAPI rings, then over the sim and the default ring again through the fault-injecting wrapper | Section 8 |
 | `engine` (unit) | unit | `UNIT_TESTS`, with `tests/lib/pure_executor.c` | Over one simulated world and the sim executor, with `tests/lib/pure_executor` armed around every primitive, module poll and node call (decision 133): routing of every core op kind, LOADs before STOREs in one update, lease life cycle and stale RELEASEs, attach and detach errors and while busy, every public function's refusals, submit statuses and queue order, STATUS emission and poll flags, a three-replica group committing, capture and fetch, streams and their timers, prepare's order, capacity and deadline, stale and duplicate completions, EXTERNAL handshakes, `vsr_io_run`, redials, a view change and a replicated replica's interval flush; `tests/unit/engine_tables` covers layout, reserve and minimum-slab boundaries |
-| `engine` | integration | `INTEGRATION_TESTS` | Over the sim: attach NEW, RECOVER, JOIN; empty-store checks; a three-replica group commits, replies, checkpoints, fetches, restarts; STATUS emission; close and detach sequencing; max_clients admission at the primary |
-| `streams`, `snapshots` | integration | `INTEGRATION_TESTS` | Section 3 |
+| `engine` | integration | `INTEGRATION_TESTS`, over `tests/lib/io_world` | Over the sim, the purity guard armed around every primitive, every APPLY, INSTALL and reply checked against one history per cluster (exactly once): attach NEW, RECOVER (a retry answered from the recovered table), NEW over a used log (IDENTITY), RECOVER over an empty directory; a three-replica group's life (crash and RECOVER of a backup and of the primary, a lost disk recovered through the group with a snapshot fetch, a JOIN learner warmed and admitted by RECONFIGURE); max_clients admission at the primary and at a backup; STOP, detach and close with work in flight; the minimum slab and file-slot counts with `caller_slabs = 0`; two groups on three engines through a crash; a learner's node crashing; a full node send queue during an epoch transition (G1); a replicated backup's write errors under CONTINUE. `IOW_TEST`, `IOW_SEED`, `IOW_TRACE` |
+| `streams` | integration | same | Caller streams both ways filling the stream tables (BUFFERS pieces around the chunk size, FILE writes, empty, one-byte and one-chunk streams), every byte checked; backpressure (a dripping requester, the window on both sides); early ends (refused SERVE, CLOSE FAILED halfway, a FILE range past the end, an unanswered SERVE, CLOSE NOT_FOUND); an idle source's accept (G2); engines closing, resets and crashes; split and corrupt segments; streams beside a group that never changes view |
+| `snapshots` | integration | same | A JOIN learner fetching a member's clients file (byte for byte) and the application's image over a caller stream beside it, RESTORE and INSTALL, recovery of the anchor's file after a crash (90); durable files and drops over repeated checkpoints; a corrupt source's FETCH completing FAILED, never fencing (123); a SYNC failed in the module's prepare waking the loop at once (122) |
 | `iocluster`, `iocluster_extended` | fuzzy (seeded) | `FUZZY_TESTS`; `SEED COUNT STEPS [trace\|quiet] [PROFILE] [SEEDS]` as `tests/fuzzy/cluster`; the extended program sets a wider default profile | Below |
-| `uring_faults` | integration | `INTEGRATION_TESTS` (skips without a ring) | A three-replica group over real rings under the fault-injecting wrapper executor: transient `-EIO` on writes, short sends, delayed NOTIFs, cancelled receives; recovery after a crash simulated by `vsr_io_deinit` without flush |
+| `uring_faults` | integration | `INTEGRATION_TESTS` (skips without a ring), over `tests/lib/io_world` | A three-replica group over real rings on abstract AF_UNIX sockets (G3): delayed completions and cancelled receives from the fault wrapper, a backup's crash (its ring closed and its engine abandoned, never deinit, which is EBUSY until closed) and RECOVER; failed takeovers (a chained FILES_UPDATE failing in the kernel) and failed slot clears with no descriptor leaked; a creation write error under CONTINUE (125) with STOP and detach finishing; a STOP with record writes held and the write-behind full; a replicated backup's write errors under CONTINUE, then its crash and RECOVER, catching up through the group (where a transition's comparison LOAD completing after an apply LOAD of the same entries fenced it before the core's fix) |
 
 `tests/fuzzy/iocluster` composes real engines over one simulated world:
 N nodes (3 to 5 replicas, plus 0 to 2 learners with flag 32), each an
@@ -2120,8 +2121,14 @@ of `docs/io-design.md`:
   EOF when it receives again, and a multishot receive that posts data
   and the EOF in one completion batch while a frame waits for a window
   unit closes the link `-EPIPE` with the END frame still held, ending
-  the transfer RETRY at the requester while the source reported OK. Only
-  a requester slower than `handshake_timeout_ns` per window gets there.
+  the transfer RETRY at the requester while the source reported OK. The
+  linger is not re-armed while the requester reads (the source cannot
+  see it), so what matters is not the pace per window but whether the
+  requester consumes what the socket buffer held when the source ended
+  within `handshake_timeout_ns`: a transfer that fits the buffer ends the
+  source at once, and a caller dripping its DATA completions for longer
+  gets RETRY (tests/integration/streams `test_beside_group` raises the
+  timeout for its drip).
 - Where Linux 7.2.6 and the simulation answer differently within the
   contract (the conformance and smoke logs print these, recorded and not
   checked), the engine depends on neither answer today, so the
@@ -2217,3 +2224,26 @@ of `docs/io-design.md`:
   `RETRY` would say what it is. A read reporting more bytes than asked but
   within the slab's room is parsed as data (bytes after the trailer:
   `CORRUPT`), not reported as the I/O error it is.
+- Two core defects found by tests/integration/engine over real engines are
+  open, reproduced with the memory cluster and listed in `XFAIL_TESTS`:
+  `tests/regression/dead_backup_apply` (a primary stops applying, and
+  replying, once an unreachable backup is more than `batch_entries`
+  behind, since the engine completes SENDs to a node without a link
+  RETRY and the core rewinds that peer's `sent` at every failure and
+  retry timer) and `tests/regression/held_store_deadline` (a RECOVERING
+  replica whose hard-state STORE is held, during a lost store's log
+  creation, reports a deadline already past after every TIME, which
+  spins the loop). The integration tests keep a member away for fewer
+  commits than a batch, and their harness counts spins without failing
+  on the short ones.
+- A REQUEST the core refuses when it is stepped (`EINVAL` or `ELIMIT`
+  from its validation: a RECONFIGURE naming more members than
+  `limits.members`, say) is dropped with its lease returned by a RELEASE
+  op and no REPLY (decision 129): the caller cannot tell it from a request
+  still in flight but by that RELEASE.
+- Decision G2 moves the timers armed during `vsr_io_complete`, not the
+  times a completion records (`link->last_active_ns`, a node's
+  `next_dial_ns`, a stream's last touch): they stay at the previous
+  poll's time, which only makes a lazily checked timer (the idle timeout)
+  count from a little earlier than the completion. Recording the poll's
+  time instead needs the same rebase for those fields.
