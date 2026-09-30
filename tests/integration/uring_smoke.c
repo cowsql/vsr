@@ -2,7 +2,9 @@
  * the public vsr_io_uring_* API and the executor ops. It exercises every
  * opcode and flag against the kernel: files in a temporary directory under
  * the build tree, loopback TCP, provided-buffer rings, zero-copy sends,
- * links, cancellation, timeouts and a wake from another thread. The shared
+ * links, cancellation, timeouts and a wake from another thread, over each
+ * ring variant (default, SQPOLL, NAPI, both; a variant the machine refuses
+ * with EPERM is reported and skipped). The shared
  * sim-and-ring contract suite is tests/integration/executor_conformance;
  * this file checks the ring alone and records what the kernel does where
  * the contract leaves room. Exits 77 (skip) only when the kernel has no
@@ -11,6 +13,7 @@
 #define _GNU_SOURCE
 #include "config.h"
 
+#include "io/uring.h" /* The UAPI, for the NAPI read-back alone. */
 #include "lib/check.h"
 #include "vsr-io.h"
 
@@ -28,6 +31,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -42,6 +46,24 @@ struct fixture {
 static struct vsr_io_cqe stash[STASH];
 static uint32_t stashed;
 
+/* The ring every test runs over: main runs the whole suite over the
+ * default task-work ring, then with an SQPOLL thread (idling after 10 ms,
+ * so the tests' pauses take the NEED_WAKEUP path), then with NAPI busy
+ * polling registered (loopback sockets carry no NAPI id: the registration
+ * and the waits run with NAPI on, no device queue is polled), then with
+ * both, where the SQ thread does the busy polling. */
+struct variant {
+    const char *name;
+    uint32_t sqpoll_idle_ms;
+    uint32_t napi_busy_poll_us;
+};
+
+static const struct variant variants[] = {{"default", 0, 0},
+                                          {"SQPOLL", 10, 0},
+                                          {"NAPI", 0, 20},
+                                          {"SQPOLL+NAPI", 10, 20}};
+static struct variant variant;
+
 static struct vsr_io_uring_options options(void)
 {
     struct vsr_io_uring_options o;
@@ -51,7 +73,9 @@ static struct vsr_io_uring_options options(void)
     o.cq_entries = 128;
     o.file_slots = 16;
     o.buffer_regions = 4;
+    o.sqpoll_idle_ms = variant.sqpoll_idle_ms;
     o.sqpoll_cpu = UINT32_MAX;
+    o.napi_busy_poll_us = variant.napi_busy_poll_us;
     return o;
 }
 
@@ -1461,36 +1485,45 @@ static void test_wake(void)
     close_fixture(&f);
 }
 
-/* SQPOLL and NAPI are options; a machine may refuse SQPOLL to the user. */
-static void test_variants(void)
+/* What the variant itself changes. SQPOLL: a submission reaches the kernel
+ * without an enter while the SQ thread is awake, and after it idled (the
+ * NEED_WAKEUP path) the next one wakes it. NAPI: the kernel answers a
+ * registration with the settings it replaces, so registering the same
+ * ones again reads back what init registered, a 20 us busy poll with
+ * dynamic tracking. */
+static void test_variant(void)
 {
     struct vsr_io_uring_options o = options();
     struct fixture f;
-    int rc;
 
-    o.sqpoll_idle_ms = 10;
-    rc = open_fixture(&f, &o);
-    printf("SQPOLL ring: %d\n", rc);
-    if (rc == 0) {
+    CHECK(open_fixture(&f, &o) == 0);
+    if (variant.sqpoll_idle_ms > 0) {
+        struct timespec idle = {0, 50 * 1000000L};
         struct vsr_io_sqe r;
 
         submit1(&f, rec(VSR_IO_SQE_NOP, 400));
         CHECK(take(&f, 400).result == 0);
+        CHECK(nanosleep(&idle, NULL) == 0);
         r = rec(VSR_IO_SQE_TIMEOUT, 401);
         r.offset = 10 * MS;
         CHECK(run(&f, r) == -ETIME);
+        CHECK(nanosleep(&idle, NULL) == 0);
         wake_during(&f, 1, 0);
-        close_fixture(&f);
     }
-    o = options();
-    o.napi_busy_poll_us = 20;
-    rc = open_fixture(&f, &o);
-    printf("NAPI ring: %d\n", rc);
-    if (rc == 0) {
-        submit1(&f, rec(VSR_IO_SQE_NOP, 402));
-        CHECK(take(&f, 402).result == 0);
-        close_fixture(&f);
+    if (variant.napi_busy_poll_us > 0) {
+        struct io_uring_napi napi;
+
+        memset(&napi, 0, sizeof(napi));
+        napi.busy_poll_to = variant.napi_busy_poll_us;
+        napi.opcode = IO_URING_NAPI_REGISTER_OP;
+        napi.op_param = IO_URING_NAPI_TRACKING_DYNAMIC;
+        CHECK(syscall(SYS_io_uring_register, vsr_io_uring_fd(&f.ex),
+                      IORING_REGISTER_NAPI, &napi, 1) == 0);
+        CHECK(napi.busy_poll_to == variant.napi_busy_poll_us &&
+              napi.prefer_busy_poll == 0 &&
+              napi.op_param == IO_URING_NAPI_TRACKING_DYNAMIC);
     }
+    close_fixture(&f);
 }
 
 /* ------------------------------------------------------------------------
@@ -1634,29 +1667,40 @@ static void test_pressure(void)
 
 int main(void)
 {
-    struct vsr_io_uring_options o = options();
-    struct fixture f;
-    int rc;
-
     setvbuf(stdout, NULL, _IONBF, 0);
-    rc = open_fixture(&f, &o);
-    if (rc == -ENOSYS || rc == -EPERM) {
-        printf("skip: no usable io_uring (%s)\n", strerror(-rc));
-        return 77;
-    }
-    if (rc != 0) {
-        printf("init failed: %s\n", strerror(-rc));
-    }
-    CHECK(rc == 0);
-    close_fixture(&f);
+    for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); ++i) {
+        struct vsr_io_uring_options o;
+        struct fixture f;
+        int rc;
 
-    test_layout();
-    test_basics();
-    test_files();
-    test_network();
-    test_timeouts();
-    test_wake();
-    test_variants();
-    test_pressure();
+        variant = variants[i];
+        o = options();
+        rc = open_fixture(&f, &o);
+        if (i == 0 && (rc == -ENOSYS || rc == -EPERM)) {
+            printf("skip: no usable io_uring (%s)\n", strerror(-rc));
+            return 77;
+        }
+        if (i > 0 && rc == -EPERM) {
+            /* SQPOLL may be refused to an unprivileged user. */
+            printf("%s ring: refused (%s), skipped\n", variant.name,
+                   strerror(-rc));
+            continue;
+        }
+        if (rc != 0) {
+            printf("%s ring: init failed: %s\n", variant.name, strerror(-rc));
+        }
+        CHECK(rc == 0);
+        close_fixture(&f);
+        printf("%s ring\n", variant.name);
+
+        test_layout();
+        test_basics();
+        test_files();
+        test_network();
+        test_timeouts();
+        test_wake();
+        test_variant();
+        test_pressure();
+    }
     return 0;
 }

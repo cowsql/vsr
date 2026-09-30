@@ -1,5 +1,15 @@
 /* SPDX-License-Identifier: (GPL-2.0 WITH Linux-syscall-note) OR MIT */
 /*
+ * VSR vendoring note: this is Linux 7.2.6's include/uapi/linux/io_uring.h as
+ * installed by `make headers_install` (Debian's linux-libc-dev 7.2.6-1,
+ * /usr/include/linux/io_uring.h, sha256
+ * 8488b223988fe798a9c1c81d13a550a27cac1f096bdd016ef9eb5e51adaf46a7),
+ * copied unchanged but for this note and one line: the zero-copy receive
+ * header is included as "io_uring/zcrx.h", the copy vendored beside this
+ * file, instead of <linux/io_uring/zcrx.h>, so the build never reads the
+ * system's io_uring headers. See src/io/uapi/README.md.
+ */
+/*
  * Header file for the io_uring interface.
  *
  * Copyright (C) 2019 Jens Axboe
@@ -10,6 +20,8 @@
 
 #include <linux/fs.h>
 #include <linux/types.h>
+#include "io_uring/zcrx.h" /* VSR: vendored, see above. */
+
 /*
  * this file is shared with liburing and that has to autodetect
  * if linux/time_types.h is available or not, it can
@@ -50,7 +62,7 @@ struct io_uring_sqe {
 	};
 	__u32	len;		/* buffer size or number of iovecs */
 	union {
-		__kernel_rwf_t	rw_flags;
+		__u32		rw_flags;
 		__u32		fsync_flags;
 		__u16		poll_events;	/* compatibility */
 		__u32		poll32_events;	/* word-reversed for BE */
@@ -94,6 +106,10 @@ struct io_uring_sqe {
 			__u16	addr_len;
 			__u16	__pad3[1];
 		};
+		struct {
+			__u8	write_stream;
+			__u8	__pad4[3];
+		};
 	};
 	union {
 		struct {
@@ -101,9 +117,9 @@ struct io_uring_sqe {
 			__u64	__pad2[1];
 		};
 		struct {
-			__u64   attr_ptr; /* pointer to attribute information */
-			__u64   attr_type_mask; /* bit mask of attributes */
-                };
+			__u64	attr_ptr; /* pointer to attribute information */
+			__u64	attr_type_mask; /* bit mask of attributes */
+		};
 		__u64	optval;
 		/*
 		 * If the ring is initialized with IORING_SETUP_SQE128, then
@@ -114,7 +130,7 @@ struct io_uring_sqe {
 };
 
 /* sqe->attr_type_mask flags */
-#define IORING_RW_ATTR_FLAG_PI  (1U << 0)
+#define IORING_RW_ATTR_FLAG_PI	(1U << 0)
 /* PI attribute information */
 struct io_uring_attr_pi {
 		__u16	flags;
@@ -229,8 +245,8 @@ enum io_uring_sqe_flags_bit {
 #define IORING_SETUP_CQE_MIXED		(1U << 18)
 
 /*
- *  Allow both 64b and 128b SQEs. If a 128b SQE is posted, it will use a 128b
- *  opcode.
+ * Allow both 64b and 128b SQEs. If a 128b SQE is posted, it will have
+ * a 128b opcode.
  */
 #define IORING_SETUP_SQE_MIXED		(1U << 19)
 
@@ -321,9 +337,13 @@ enum io_uring_op {
  * sqe->uring_cmd_flags		top 8bits aren't available for userspace
  * IORING_URING_CMD_FIXED	use registered buffer; pass this flag
  *				along with setting sqe->buf_index.
+ * IORING_URING_CMD_MULTISHOT	must be used with buffer select, like other
+ *				multishot commands. Not compatible with
+ *				IORING_URING_CMD_FIXED, for now.
  */
 #define IORING_URING_CMD_FIXED	(1U << 0)
-#define IORING_URING_CMD_MASK	IORING_URING_CMD_FIXED
+#define IORING_URING_CMD_MULTISHOT	(1U << 1)
+#define IORING_URING_CMD_MASK	(IORING_URING_CMD_FIXED | IORING_URING_CMD_MULTISHOT)
 
 
 /*
@@ -478,6 +498,10 @@ enum io_uring_msg_ring_flags {
  * IORING_NOP_INJECT_RESULT	Inject result from sqe->result
  */
 #define IORING_NOP_INJECT_RESULT	(1U << 0)
+#define IORING_NOP_FILE			(1U << 1)
+#define IORING_NOP_FIXED_FILE		(1U << 2)
+#define IORING_NOP_FIXED_BUFFER		(1U << 3)
+#define IORING_NOP_TW			(1U << 4)
 #define IORING_NOP_CQE32		(1U << 5)
 
 /*
@@ -818,7 +842,7 @@ struct io_uring_task_restriction {
 	__u16 flags;
 	__u16 nr_res;
 	__u32 resv[3];
-	struct io_uring_restriction restrictions[0];
+	__DECLARE_FLEX_ARRAY(struct io_uring_restriction, restrictions);
 };
 
 struct io_uring_clock_register {
@@ -859,7 +883,7 @@ struct io_uring_buf_ring {
 			__u16	resv3;
 			__u16	tail;
 		};
-		struct io_uring_buf	bufs[0];
+		__DECLARE_FLEX_ARRAY(struct io_uring_buf, bufs);
 	};
 };
 
@@ -902,12 +926,40 @@ struct io_uring_buf_status {
 	__u32	resv[8];
 };
 
+enum io_uring_napi_op {
+	/* register/ungister backward compatible opcode */
+	IO_URING_NAPI_REGISTER_OP = 0,
+
+	/* opcodes to update napi_list when static tracking is used */
+	IO_URING_NAPI_STATIC_ADD_ID = 1,
+	IO_URING_NAPI_STATIC_DEL_ID = 2
+};
+
+enum io_uring_napi_tracking_strategy {
+	/* value must be 0 for backward compatibility */
+	IO_URING_NAPI_TRACKING_DYNAMIC = 0,
+	IO_URING_NAPI_TRACKING_STATIC = 1,
+	IO_URING_NAPI_TRACKING_INACTIVE = 255
+};
+
 /* argument for IORING_(UN)REGISTER_NAPI */
 struct io_uring_napi {
 	__u32	busy_poll_to;
 	__u8	prefer_busy_poll;
-	__u8	pad[3];
-	__u64	resv;
+
+	/* a io_uring_napi_op value */
+	__u8	opcode;
+	__u8	pad[2];
+
+	/*
+	 * for IO_URING_NAPI_REGISTER_OP, it is a
+	 * io_uring_napi_tracking_strategy value.
+	 *
+	 * for IO_URING_NAPI_STATIC_ADD_ID/IO_URING_NAPI_STATIC_DEL_ID
+	 * it is the napi id to add/del from napi_list.
+	 */
+	__u32	op_param;
+	__u32	resv;
 };
 
 /*
@@ -1015,107 +1067,6 @@ struct io_timespec {
 	__u64		tv_sec;
 	__u64		tv_nsec;
 };
-
-/* Zero copy receive refill queue entry */
-struct io_uring_zcrx_rqe {
-	__u64	off;
-	__u32	len;
-	__u32	__pad;
-};
-
-struct io_uring_zcrx_cqe {
-	__u64	off;
-	__u64	__pad;
-};
-
-/* The bit from which area id is encoded into offsets */
-#define IORING_ZCRX_AREA_SHIFT	48
-#define IORING_ZCRX_AREA_MASK	(~(((__u64)1 << IORING_ZCRX_AREA_SHIFT) - 1))
-
-struct io_uring_zcrx_offsets {
-	__u32	head;
-	__u32	tail;
-	__u32	rqes;
-	__u32	__resv2;
-	__u64	__resv[2];
-};
-
-enum io_uring_zcrx_area_flags {
-	IORING_ZCRX_AREA_DMABUF		= 1,
-};
-
-struct io_uring_zcrx_area_reg {
-	__u64	addr;
-	__u64	len;
-	__u64	rq_area_token;
-	__u32	flags;
-	__u32	dmabuf_fd;
-	__u64	__resv2[2];
-};
-
-enum zcrx_reg_flags {
-	ZCRX_REG_IMPORT	= 1,
-	/*
-	 * Register a zcrx instance without a net device. All data will be
-	 * copied. The refill queue entries might not be automatically
-	 * consumed and need to be flushed, see ZCRX_CTRL_FLUSH_RQ.
-	 */
-	ZCRX_REG_NODEV		= 2,
-};
-
-enum zcrx_features {
-	/*
-	 * The user can ask for the desired rx page size by passing the
-	 * value in struct io_uring_zcrx_ifq_reg::rx_buf_len.
-	 */
-	ZCRX_FEATURE_RX_PAGE_SIZE	= 1 << 0,
-};
-
-/*
- * Argument for IORING_REGISTER_ZCRX_IFQ
- */
-struct io_uring_zcrx_ifq_reg {
-	__u32	if_idx;
-	__u32	if_rxq;
-	__u32	rq_entries;
-	__u32	flags;
-
-	__u64	area_ptr; /* pointer to struct io_uring_zcrx_area_reg */
-	__u64	region_ptr; /* struct io_uring_region_desc * */
-
-	struct io_uring_zcrx_offsets offsets;
-	__u32	zcrx_id;
-	__u32	rx_buf_len;
-	__u64	__resv[3];
-};
-
-enum zcrx_ctrl_op {
-	ZCRX_CTRL_FLUSH_RQ,
-	ZCRX_CTRL_EXPORT,
-
-	__ZCRX_CTRL_LAST,
-};
-
-struct zcrx_ctrl_flush_rq {
-	__u64		__resv[6];
-};
-
-struct zcrx_ctrl_export {
-	__u32		zcrx_fd;
-	__u32 		__resv1[11];
-};
-
-struct zcrx_ctrl {
-	__u32	zcrx_id;
-	__u32	op; /* see enum zcrx_ctrl_op */
-	__u64	__resv[2];
-
-	union {
-		struct zcrx_ctrl_export		zc_export;
-		struct zcrx_ctrl_flush_rq	zc_flush;
-	};
-};
-
 
 #ifdef __cplusplus
 }

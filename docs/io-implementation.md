@@ -40,7 +40,10 @@ simulation and `vsr_client_` in the client.
    snapshot.h        snapshot.c   clients files and the joint snapshot ops
    engine.h          engine.c     struct vsr_io, replicas, entry points
    uring.h           uring.c      vsr_io_uring_* over the io_uring syscalls
-   uapi/io_uring.h                the kernel's UAPI header, vendored
+   uapi/io_uring.h                the kernel's UAPI header, vendored: Linux
+   uapi/io_uring/zcrx.h           7.2.6's headers_install output (from
+                                  linux-libc-dev 7.2.6-1), one include
+                                  redirected; uapi/README.md
  src/sim/           the simulated world
    sim.h             world.c net.c disk.c exec.c
  src/client/        the client bookkeeping
@@ -753,9 +756,11 @@ Section 7.
 Section 8 is the contract; `uring.c` realizes it on Linux >= 6.18 (design
 section 2) through the raw `io_uring_setup`, `io_uring_enter` and
 `io_uring_register` syscalls over the vendored UAPI header
-`src/io/uapi/io_uring.h` (decision 52); there is no liburing and no other
-library. Specifics: the executor state and its tables live in the caller's
-page-aligned region; the rings and the SQE array are the kernel's pages,
+`src/io/uapi/io_uring.h`, Linux 7.2.6's (decision 52; `src/io/uapi/README.md`
+says where it comes from and how to refresh it, and `uring.c` asserts the
+layout of every structure it hands the kernel); there is no liburing and no
+other library. Specifics: the executor state and its tables live in the
+caller's page-aligned region; the rings and the SQE array are the kernel's pages,
 mapped from the ring descriptor by init (one mapping for both rings,
 `IORING_FEAT_SINGLE_MMAP`, one for the SQEs) and unmapped by deinit before
 the descriptor is closed, not caller memory through `NO_MMAP`, because the
@@ -777,7 +782,10 @@ completions). Init checks once that the feature bits it relies on
 (`SINGLE_MMAP`, `NODROP`, `EXT_ARG`, `MIN_TIMEOUT`, `REG_REG_RING`,
 `RSRC_TAGS`, `CQE_SKIP`, `LINKED_FILE`) are set and that `IORING_REGISTER_PROBE` reports
 every opcode the translation table emits, and fails with `-ENOSYS`
-otherwise (decision 53); nothing is probed after that and there is no
+otherwise (decision 53); a setup refused with `-EINVAL` is classified by
+the feature bits of a plain one-entry ring, `-ENOSYS` when they lack a
+required one (a kernel before 6.6 refuses `NO_SQARRAY` so), else
+`-EINVAL` (decision 104); nothing is probed after that and there is no
 fallback. `submit_and_wait` translates the records into the SQ (a full SQ
 is drained by an enter, under `SQPOLL` by `SQ_WAIT`), publishes the tail
 and enters once with `GETEVENTS` and no minimum so completions already due
@@ -794,7 +802,8 @@ eventfd wake is a multishot `POLL_ADD` whose completions are consumed in
 `REGISTER_BUFFERS2` sparse and `BUFFERS_UPDATE` with tags,
 `REGISTER_PBUF_RING`/`UNREGISTER_PBUF_RING` with `IOU_PBUF_RING_INC` for
 incremental rings and `PBUF_STATUS` for the kernel's head, `REGISTER_NAPI`
-when requested; `provide` writes `struct io_uring_buf` entries then
+when requested (`IO_URING_NAPI_REGISTER_OP` with dynamic tracking, the ring
+learning the NAPI ids of the sockets it polls); `provide` writes `struct io_uring_buf` entries then
 publishes the ring tail with a release store. A vectored zero-copy send
 from a registered region is `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`
 and a `struct msghdr` naming the record's vectors, kept in a per-SQE-slot
@@ -821,10 +830,18 @@ worker) still completes then, so the caller sees such records complete
 before deinit.
 
 Tests: `tests/integration/executor_conformance` (section 8) run over this
-executor; `tests/unit/uring_translate` for the record-to-SQE table with a
-fake SQE buffer (every opcode and flag combination, rejection of
-out-of-region fixed buffers); `tests/integration/uring_smoke` for the ring
-against the kernel.
+executor, as the default ring and as the `uring-sqpoll` (SQ thread idling
+after 10 ms) and `uring-napi` (20 us busy poll) columns;
+`tests/unit/uring_translate` for the record-to-SQE table with a fake SQE
+buffer (every opcode and flag combination, rejection of out-of-region
+fixed buffers); `tests/integration/uring_refusals` for init's refusals on
+emulated older kernels (section 9); `tests/integration/uring_smoke` for
+the ring against the kernel, the whole suite over the default, SQPOLL,
+NAPI and SQPOLL+NAPI rings (a variant refused with `EPERM` is reported
+and skipped). Loopback
+sockets carry no NAPI id, so the NAPI runs cover the registration (read
+back from the kernel) and every path with busy polling enabled, not the
+polling of a device queue.
 
 ### Simulation (`src/sim/sim.h`)
 
@@ -1659,7 +1676,8 @@ with node 0 talking to node 1.
 | --- | --- | --- | --- |
 | `cursor`, `codec`, `pool`, `slots`, `deadline`, `link`, `stream`, `store`, `snapshot`, `sim_world`, `client`, `uring_translate` | unit | `UNIT_TESTS`, each `tests_unit_NAME_SOURCES = tests/unit/NAME.c`, `_LDADD = $(LIBVSR)` | Section 3 |
 | `frame`, `recovery` | fuzzy (libFuzzer) | `if FUZZING` programs and the `fuzz` target, with corpora under `tests/fuzzy/corpus/frame` and `corpus/recovery` | Decoder and recovery never crash; recovered prefixes satisfy the invariants |
-| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise), then over both again through the fault-injecting wrapper | Section 8 |
+| `uring_refusals` | integration | `INTEGRATION_TESTS` (skips without a ring or seccomp) | `vsr_io_uring_init` on emulated kernels, each in a forked child under a seccomp filter: no io_uring (`ENOSYS`) and io_uring disabled (`EPERM`) pass through; Linux 6.1 (setup refuses `NO_SQARRAY`, old features), 6.11 (no `MIN_TIMEOUT`), 6.14 (no `READV_FIXED`) and a kernel without networking are `-ENOSYS`, answered by a supervisor thread through `SECCOMP_RET_USER_NOTIF`; no descriptor stays open; a nonexistent SQPOLL CPU stays `-EINVAL` (decision 104) |
+| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise) as the default, SQPOLL and NAPI rings, then over the sim and the default ring again through the fault-injecting wrapper | Section 8 |
 | `engine` | integration | `INTEGRATION_TESTS` | Over the sim: attach NEW, RECOVER, JOIN; empty-store checks; a three-replica group commits, replies, checkpoints, fetches, restarts; STATUS emission; close and detach sequencing; max_clients admission at the primary |
 | `streams`, `snapshots` | integration | `INTEGRATION_TESTS` | Section 3 |
 | `iocluster`, `iocluster_extended` | fuzzy (seeded) | `FUZZY_TESTS`; `SEED COUNT STEPS [trace\|quiet] [PROFILE] [SEEDS]` as `tests/fuzzy/cluster`; the extended program sets a wider default profile | Below |
@@ -1744,6 +1762,7 @@ of `docs/io-design.md`:
 | `stream.h` (internal) | `vsr_io_stream_unit.sequence` (was `reserved`) and `vsr_io_stream.chunks`: a DATA op id's unit field is the chunk's sequence, not its slot | 100 |
 | `stream.h` (internal) | `vsr_io_streams_link_lost` ends a stream CANCELLED while the link module shuts down; `vsr_io_stream.closed`: `vsr_io_streams_close` is OK once per accepted stream until its END op (also after an end under the caller, a read failure included), EINVAL for a status outside enum vsr_io_status; `vsr_io_streams_write` is EINVAL for a caller stream's FILE range on an engine file slot; `vsr_io_streams_data_done` re-arms the requester's clock | 101, 102, 103, 97 |
 | `vsr-io.h` | Bulk streams: CANCELLED on the closing engine whichever shutdown runs first; STREAM_CLOSE once, OK until STREAM_END also after an end under the caller, its status an enum vsr_io_status; STREAM_WRITE EINVAL once the stream ended; a FILE range on one of the engine's slots EINVAL | 101, 102, 103 |
+| `vsr-io.h` | `vsr_io_uring_init` names its refusals: `-ENOSYS` (no io_uring, or a kernel older than the baseline, including one whose setup refuses a flag with `EINVAL`), `-EPERM`, `-EINVAL` | 104 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1791,3 +1810,30 @@ of `docs/io-design.md`:
   unit closes the link `-EPIPE` with the END frame still held, ending
   the transfer RETRY at the requester while the source reported OK. Only
   a requester slower than `handshake_timeout_ns` per window gets there.
+- Where Linux 7.2.6 and the simulation answer differently within the
+  contract (the conformance and smoke logs print these, recorded and not
+  checked), the engine depends on neither answer today, so the
+  simulation is left as it is:
+  - A CANCEL of a disk record: the simulation never cancels disk work
+    (`-EALREADY`, and the record completes); the kernel cancels a write it
+    queued for a worker and had not started (a 1 MiB buffered write on
+    btrfs: the CANCEL 0, the write `-ECANCELED`). The engine cancels only
+    socket records (receives, accepts, connects, by `user_data`); code
+    that ever cancels a disk record must take `-ECANCELED` as well, which
+    the simulation would not exercise.
+  - CANCEL `BY_FD` without `ALL`: the simulation cancels the earliest
+    match, the kernel cancelled the later of two receives (its hash
+    order); the contract leaves it unspecified and the engine never
+    cancels by descriptor.
+  - `update_buffer` of a region a pending record uses: `-EBUSY` in the
+    simulation, 0 on the ring, the kernel keeping the old registration
+    until the record completes (decision 65); the engine registers its
+    pool region once, at init.
+  - Direct I/O alignment is the filesystem's: btrfs and tmpfs serve a
+    misaligned `O_DIRECT` read buffered, the simulation refuses it with
+    `-EINVAL` like ext4 and XFS; the engine aligns everything, and the
+    `odirect_*` conformance rows skip on such a filesystem (they need a
+    build tree on ext4 or XFS to run over the ring).
+  - Short-send lengths depend on socket buffers (6144 of 8 MiB with a
+    4096-byte `SO_SNDBUF` on the ring, 262144 in the simulation); only
+    shortness is contract.
