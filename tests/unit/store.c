@@ -5978,12 +5978,27 @@ static void walk_settle(void)
     walk_drain();
 }
 
+/* Room for one more op: the core never has more than `operations` ops
+ * outstanding (the store sizes its queues and completion ring by it), so
+ * the walk takes the completions, or waits for them, first. */
+static void walk_room(void)
+{
+    if (walk.expected_count + 1 >= limits.operations) {
+        walk_drain();
+    }
+    if (walk.expected_count + 1 >= limits.operations) {
+        walk_settle();
+    }
+}
+
 /* Submits a transaction: packed at once it is snapshotted now, held it
  * is driven until it is. */
 static void walk_submit(const struct txn *t)
 {
-    uint64_t op = submit(t);
+    uint64_t op;
 
+    walk_room();
+    op = submit(t);
     walk_expect(op, WALK_STORE, t->store.sequence);
     walk_apply(t->store.sequence);
     walk.stats.stores++;
@@ -6089,8 +6104,17 @@ static void walk_publish(void)
 
 static void walk_reclaim(uint64_t oldest)
 {
+    walk_room();
     walk_expect(submit_reclaim(oldest), WALK_RECLAIM, oldest);
     walk.stats.reclaims++;
+}
+
+/* A SYNC of `sequence`. */
+static void walk_sync(uint64_t sequence)
+{
+    walk_room();
+    walk_expect(submit_sync(sequence), WALK_SYNC, sequence);
+    walk.stats.syncs++;
 }
 
 /* What the core does so that slots free: once no slot is free, a fresh
@@ -6300,16 +6324,17 @@ static void walk_crash(uint8_t arg)
         uint8_t action = walk_byte();
         uint8_t shape = walk_byte();
         const struct txn *t = walk_txn(action % 9, shape);
-        uint64_t op = submit(t);
+        uint64_t op;
+
+        walk_room();
+        op = submit(t);
 
         walk_expect(op, WALK_STORE, t->store.sequence);
         walk_apply(t->store.sequence);
         walk.stats.stores++;
     }
     if ((arg & 2) != 0 && h.store->readable > 0) {
-        walk_expect(submit_sync(h.store->readable), WALK_SYNC,
-                    h.store->readable);
-        walk.stats.syncs++;
+        walk_sync(h.store->readable);
     }
     if ((arg & 4) != 0) {
         disk.tear_armed = 1;
@@ -6451,8 +6476,7 @@ static void walk_step(uint8_t action, uint8_t arg)
             uint64_t sequence =
                 h.store->readable > arg % 3 ? h.store->readable - arg % 3 : 1;
 
-            walk_expect(submit_sync(sequence), WALK_SYNC, sequence);
-            walk.stats.syncs++;
+            walk_sync(sequence);
             if ((arg & 4) != 0) {
                 walk_settle();
             }
@@ -6596,6 +6620,33 @@ static void test_walk(void)
     CHECK(total.torn > 0 && total.lost > 0 && total.captures > 0);
 }
 
+/* A walk that submits more SYNCs than the core's `operations` bound
+ * before it lets them complete, and more RECLAIMs than the walk expects
+ * at once: it waits as the core would (the recovery fuzzer's first
+ * crash was the store refusing the seventeenth SYNC). */
+static void test_walk_bounds(void)
+{
+    uint8_t bytes[1 + 2 * (3 + 40 + 70)];
+    size_t n = 0;
+
+    bytes[n++] = 0; /* FDATASYNC, the smallest configuration. */
+    for (uint32_t i = 0; i < 3; ++i) {
+        bytes[n++] = 2; /* Transaction 1 (IDENTITY), then APPENDs. */
+        bytes[n++] = 0;
+    }
+    for (uint32_t i = 0; i < 40; ++i) {
+        bytes[n++] = 10; /* A SYNC of the packed sequence, not waited. */
+        bytes[n++] = 0;
+    }
+    for (uint32_t i = 0; i < 70; ++i) {
+        bytes[n++] = 11; /* A RECLAIM of the packed sequence. */
+        bytes[n++] = 0;
+    }
+    CHECK(n == sizeof(bytes));
+    walk_run(bytes, n);
+    CHECK(!walk.failed && walk.stats.syncs == 40 && walk.stats.reclaims >= 70);
+}
+
 /* Names the test that fails; VSR_STORE_TEST in the environment runs
  * only the test of that name. */
 #define RUN(test)                                                              \
@@ -6675,6 +6726,7 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_client_freed);
     RUN(test_client_newer);
     RUN(test_walk);
+    RUN(test_walk_bounds);
     printf("store: ok\n");
     return 0;
 }
