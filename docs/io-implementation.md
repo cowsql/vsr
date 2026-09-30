@@ -1775,17 +1775,19 @@ Opcodes:
 | TIMEOUT | fires at `offset` ns (absolute in the executor clock with `ABSOLUTE`, else relative to submission) with `-ETIME`; `-ECANCELED` when cancelled; the sim adds the clock jitter fault |
 | TIMEOUT_UPDATE | `addr2` points at the target `user_data` (u64), `offset` the new expiry; result 0 or `-ENOENT` |
 | CANCEL | targets `offset` as `user_data`, or every record on `fd` with `BY_FD` (the records holding the object `fd` names now, as io_uring compares files; `-EBADF` when `fd` is closed); `ALL` cancels every match, else one match, which one is unspecified (decision 65); result the count with `ALL`, 0 when one was cancelled, `-ENOENT` when none, `-EALREADY` when the target is already completing. Cancelled records complete with `-ECANCELED` (multishot ones terminate) |
+| FILES_UPDATE | io_uring's `FILES_UPDATE` (decision E7): installs the `length` descriptors of `addr` (`int32_t`, `-1` empties a slot) into the registered slots from `offset`; each slot takes its own reference and the descriptors stay open and the caller's (a slot's previous file is released); the descriptors are read when the record runs, so they stay valid until it completes; result the count updated before the first failure, else `-EBADF` (a bad descriptor), `-EINVAL` (slots beyond the table or before registration, `length` 0, `FIXED_FILE`, `FIXED_BUFFER`, `BUFFER_SELECT`, `DIRECT`), `-EFAULT` (`addr` NULL). In a LINK chain its success is a non-negative result |
+| PROVIDE | The executor's own work, never a kernel operation (decision E7): appends the `length` `vsr_io_buffer`s at `addr` to ring `buffer_group` exactly as `provide` does, before any other record of the same `submit_and_wait` batch reaches the kernel, so a receive armed in the batch takes them; the array is read during the call; no completion when it succeeds, one with `provide`'s errno (`-ENOENT`, `-ENOSPC`, `-EINVAL`) when it fails; a flag or a LINK record before it is `-EINVAL` (it is never part of a chain) |
 
 Registration (all synchronous, all executor-wide):
 
 | Call | Semantics |
 | --- | --- |
 | `register_files(slots)` | Sparse table of `slots` empty entries; once per executor, a second call is `-EBUSY` |
-| `update_file(slot, fd)` | Installs `fd` (the executor owns it; `CLOSE` with `FIXED_FILE` or `update_file(slot, -1)` closes it, though records pending on it keep the object as under CLOSE); `-EBADF` for a bad `fd`, `-EINVAL` for a slot outside the table or before registration (decisions 58 and 65) |
+| `update_file(slot, fd)` | Installs `fd` (the executor owns it; `CLOSE` with `FIXED_FILE` or `update_file(slot, -1)` closes it, though records pending on it keep the object as under CLOSE); `-EBADF` for a bad `fd`, `-EINVAL` for a slot outside the table or before registration (decisions 58 and 65). A synchronous registration call: the engine installs through `FILES_UPDATE` records instead (decision E7) |
 | `register_buffers(regions)` | Sparse table; once, a second call is `-EBUSY` |
 | `update_buffer(index, region)` | Installs or clears (`NULL`) a region; `-EINVAL` for an index outside the table or before registration; replacing a region a pending record uses is a caller error: the sim reports `-EBUSY`, the ring returns 0 and the kernel keeps the old registration alive until those records complete (decision 65) |
 | `buffer_ring(group, entries, flags, memory)` | Registers ring `group` with `entries` (power of two) over `memory` (page-aligned, `16 * entries` bytes, the caller's until the ring is unregistered by passing `entries == 0`); `INCREMENTAL` selects incremental consumption; a group already registered: `-EEXIST`; unregistering an unknown group: `-ENOENT`. Unregistering with receives pending on the group is allowed: the buffers are the caller's again at once and each pending receive terminates with `-ENOBUFS` at its next delivery (decisions 58 and 65) |
-| `provide(group, buffers, count)` | Appends buffers to the ring tail; a full ring: `-ENOSPC`; an unknown group: `-ENOENT`; ids are the caller's, 16-bit |
+| `provide(group, buffers, count)` | Appends buffers to the ring tail; a full ring: `-ENOSPC`; an unknown group: `-ENOENT`; ids are the caller's, 16-bit. The engine provides through `PROVIDE` records instead (decision E7); the call serves a caller's own rings |
 | `submit_and_wait(sqes, count, want, min_wait_ns, deadline_ns)` | Submits all `count` records (a full submission queue is drained internally), then waits per the header; result 0 on return by completions, deadline or wake (a timeout is a normal return, never `-ETIME`), or a fatal negative errno from the ring; a record whose `user_data` is `UINT64_MAX` (reserved) is refused with `-EINVAL` before anything is submitted, as is `want` above the CQ size (decision 68) |
 | `reap(cqes, capacity)` | Moves up to `capacity` completions; never blocks |
 | `now()` | Monotonic nanoseconds; the sim's node clock |
@@ -1793,7 +1795,9 @@ Registration (all synchronous, all executor-wide):
 | `wake()` | Thread-safe; a blocked or the next `submit_and_wait` returns; idempotent |
 
 The conformance suite: for each executor, a scenario per row above
-(including every termination case of multishot records, incremental
+(including `FILES_UPDATE`'s references, partial counts and refusals, and a
+`PROVIDE` taken by a receive armed in the same batch, silent on success,
+completing on failure; including every termination case of multishot records, incremental
 consumption with buffers smaller than one delivery, `-ENOBUFS` and
 re-arm, both zero-copy completions with and without `FIXED_BUFFER`, short
 sends into a full socket buffer, LINK success and failure, CANCEL of each

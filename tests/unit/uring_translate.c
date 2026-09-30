@@ -43,6 +43,7 @@ static void reset(void)
     /* regions[1] registered but empty; index 2 is past the table. */
     uring.buffers = regions;
     uring.buffers_registered = 2;
+    uring.files_registered = 8;
     for (size_t i = 0; i < sizeof(directs) / sizeof(directs[0]); ++i) {
         directs[i].user_data = 0;
         directs[i].slot = -1;
@@ -109,6 +110,38 @@ static void test_nop(void)
     CHECK(tr(rec(VSR_IO_SQE_NOP), &sqe) == 0);
     CHECK(sqe.opcode == IORING_OP_NOP && sqe.flags == 0 &&
           sqe.user_data == UINT64_C(0x0102030405060708));
+}
+
+/* FILES_UPDATE is the kernel's own; PROVIDE is the executor's work and
+ * never an SQE (decision E7). */
+static void test_files_update(void)
+{
+    struct io_uring_sqe sqe;
+    struct vsr_io_sqe r = rec(VSR_IO_SQE_FILES_UPDATE);
+    int32_t fds[2] = {-1, -1};
+
+    r.offset = 6;
+    r.addr = fds;
+    r.length = 2;
+    CHECK(tr(r, &sqe) == 0);
+    CHECK(sqe.opcode == IORING_OP_FILES_UPDATE && sqe.fd == -1);
+    CHECK(sqe.addr == ptr(fds) && sqe.len == 2 && sqe.off == 6);
+    CHECK(sqe.flags == 0 && sqe.user_data == r.user_data);
+    r.flags = VSR_IO_SQE_LINK;
+    CHECK(tr(r, &sqe) == 0 && sqe.flags == IOSQE_IO_LINK);
+    r.flags = VSR_IO_SQE_FIXED_FILE;
+    CHECK(rejected(r) == -EINVAL);
+    r.flags = 0;
+    r.offset = 7; /* Beyond the eight registered slots. */
+    CHECK(rejected(r) == -EINVAL);
+    r.offset = 0;
+    r.length = 0;
+    CHECK(rejected(r) == -EINVAL);
+    r.length = 1;
+    r.addr = NULL;
+    CHECK(rejected(r) == -EFAULT);
+    r = rec(VSR_IO_SQE_PROVIDE);
+    CHECK(rejected(r) == -EINVAL);
 }
 
 static void test_read_write(void)
@@ -650,6 +683,10 @@ static struct vsr_io_sqe sweep_record(uint8_t opcode)
         r.length = AF_INET;
         r.op_flags = SOCK_STREAM;
         break;
+    case VSR_IO_SQE_FILES_UPDATE: /* region_memory: zeroed descriptors. */
+        r.addr = region_memory;
+        r.length = 1;
+        break;
     case VSR_IO_SQE_GETSOCKOPT: /* SOL_SOCKET is the only level served. */
         r.op_flags = (uint32_t)SOL_SOCKET << 16 | SO_KEEPALIVE;
         r.addr = region_memory;
@@ -676,6 +713,7 @@ static struct vsr_io_sqe sweep_record(uint8_t opcode)
     case VSR_IO_SQE_SETSOCKOPT:
     case VSR_IO_SQE_TIMEOUT:
     case VSR_IO_SQE_CANCEL:
+    case VSR_IO_SQE_PROVIDE:
     default:
         r.addr = region_memory;
         r.length = 8;
@@ -703,13 +741,16 @@ static void test_sweep(void)
                                      VSR_IO_SQE_ACCEPT};
     uint32_t accepted = 0;
 
-    for (uint32_t opcode = 0; opcode <= VSR_IO_SQE_CANCEL + 1; ++opcode) {
+    for (uint32_t opcode = 0; opcode <= VSR_IO_SQE_PROVIDE + 1; ++opcode) {
         for (uint32_t flags = 0; flags < 128; ++flags) {
             struct vsr_io_sqe r = sweep_record((uint8_t)opcode);
             struct io_uring_sqe sqe;
             bool fixed = (flags & VSR_IO_SQE_FIXED_BUFFER) != 0;
             bool select = (flags & VSR_IO_SQE_BUFFER_SELECT) != 0;
-            bool invalid = opcode > VSR_IO_SQE_CANCEL || flags >= 64 ||
+            /* PROVIDE is never an SQE; FILES_UPDATE takes no fixed file. */
+            bool invalid = opcode >= VSR_IO_SQE_PROVIDE || flags >= 64 ||
+                           (opcode == VSR_IO_SQE_FILES_UPDATE &&
+                            (flags & VSR_IO_SQE_FIXED_FILE)) ||
                            (select && opcode != VSR_IO_SQE_RECV) ||
                            (fixed && !one_of((uint8_t)opcode, fixed_buffer,
                                              sizeof(fixed_buffer))) ||
@@ -792,6 +833,7 @@ int main(void)
 {
     reset();
     test_nop();
+    test_files_update();
     test_read_write();
     test_files();
     test_sockets();

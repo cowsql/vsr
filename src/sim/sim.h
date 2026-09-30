@@ -138,7 +138,8 @@ struct vsr_sim_op {
     uint32_t peer;    /* CONNECT: target node. */
     struct vsr_sim_key key;
     struct vsr_io_vec *vecs;
-    unsigned char *raw; /* CONNECT, BIND: the socket address. */
+    unsigned char *raw; /* CONNECT, BIND: the socket address;
+                           FILES_UPDATE: the descriptors. */
     uint32_t raw_length;
     uint32_t vec_count;
     uint32_t option_length;

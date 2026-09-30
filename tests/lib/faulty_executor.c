@@ -109,11 +109,14 @@ static bool shortenable(const struct vsr_io_sqe *sqe)
     return false;
 }
 
+/* A FILES_UPDATE failed this way may have updated its slots all the same,
+ * as a failed write may have written; a PROVIDE never completes when it
+ * succeeds, so it is never faulted. */
 static bool eio_eligible(uint8_t opcode)
 {
     return opcode == VSR_IO_SQE_READ || opcode == VSR_IO_SQE_WRITE ||
            opcode == VSR_IO_SQE_READV || opcode == VSR_IO_SQE_WRITEV ||
-           opcode == VSR_IO_SQE_FSYNC;
+           opcode == VSR_IO_SQE_FSYNC || opcode == VSR_IO_SQE_FILES_UPDATE;
 }
 
 /* Completions whose relative order the caller relies on: those of one

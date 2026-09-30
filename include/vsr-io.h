@@ -115,8 +115,17 @@ enum vsr_io_sqe_opcode {
                            relative; completes with -ETIME when it fires;
                            for callers: the engine arms none for itself */
     VSR_IO_SQE_TIMEOUT_UPDATE, /* addr2: target user_data as uint64; offset */
-    VSR_IO_SQE_CANCEL          /* offset: target user_data; op_flags: BY_FD (all
+    VSR_IO_SQE_CANCEL,         /* offset: target user_data; op_flags: BY_FD (all
                             operations on fd), ALL (every match) */
+    VSR_IO_SQE_FILES_UPDATE,   /* offset: first registered slot; addr:
+                                  int32_t descriptors[length], -1 clears a
+                                  slot; each slot takes its own reference
+                                  and the descriptors stay open; result:
+                                  the count updated */
+    VSR_IO_SQE_PROVIDE         /* buffer_group; addr: vsr_io_buffer[length]:
+                                  provided by the executor itself before the
+                                  batch's other records; no completion on
+                                  success */
 };
 
 enum vsr_io_sqe_flags {
@@ -200,6 +209,23 @@ enum vsr_io_buffer_ring_flags {
 };
 
 /*
+ * Two record kinds are registration work rather than kernel operations, so
+ * that a planner emits it as data like any other record (docs/io-design.md
+ * decision E7: the engine's primitives never call the executor).
+ * FILES_UPDATE installs descriptors into registered slots from `offset`
+ * (io_uring's FILES_UPDATE): each slot takes its own reference, the
+ * descriptors stay open and the caller's, -1 empties a slot; the result is
+ * the number of slots updated before the first failure, or -EBADF for a
+ * bad first descriptor, -EINVAL for slots beyond the table (or before
+ * registration), -EFAULT for a NULL addr; FIXED_FILE, FIXED_BUFFER,
+ * BUFFER_SELECT and DIRECT are -EINVAL. PROVIDE appends the `length`
+ * buffers at addr to ring `buffer_group` as provide() does, before any
+ * other record of the same submit_and_wait batch reaches the kernel, so a
+ * receive armed in the batch sees them; it produces no completion when it
+ * succeeds and one with provide()'s errno when it fails; it takes no flags
+ * and never follows a LINK record (-EINVAL). The buffers array is read
+ * during the call.
+ *
  * All functions except wake are called only by the owner thread. Errors are
  * negative errno values. Registered files, buffer regions, and buffer rings
  * are executor-wide resources shared by every user of the executor; the
