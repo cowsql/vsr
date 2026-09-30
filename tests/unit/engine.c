@@ -173,7 +173,13 @@ struct node {
     uint64_t stream_written;
     uint64_t served_handle;
     uint64_t external_peer; /* EXTERNAL: the node an inbound link is. */
+    bool hold_serve;        /* Leave STREAM_SERVE unanswered... */
+    uint64_t held_serve;    /* ...this one. */
+    bool hold_data;         /* Keep STREAM_DATA completions back. */
+    uint64_t held_data[PENDING];
+    uint32_t held_data_count;
     uint64_t handshakes;
+    uint64_t links_wanted;
     struct vsr_io_handshake_done handshake_done;
 };
 
@@ -440,6 +446,10 @@ static struct node *node_open_with(uint32_t index,
     n->served_handle = 0;
     n->external_peer = 0;
     n->handshakes = 0;
+    n->links_wanted = 0;
+    n->hold_serve = false;
+    n->hold_data = false;
+    n->held_data_count = 0;
     node_executor(n);
     options = custom != NULL ? *custom : engine_options(n);
     options.executor = n->ex;
@@ -709,6 +719,10 @@ static void app_op(struct node *n, const struct vsr_io_op *op)
 
         n->stream_serves++;
         n->served_handle = serve->stream;
+        if (n->hold_serve) {
+            n->held_serve = op->op.id; /* The stream times out first. */
+            return;
+        }
         memset(&event, 0, sizeof(event));
         event.kind = VSR_IO_EVENT_COMPLETE;
         event.event.type = VSR_EVENT_COMPLETE;
@@ -722,6 +736,11 @@ static void app_op(struct node *n, const struct vsr_io_op *op)
 
         n->stream_data++;
         n->stream_data_bytes += data->bytes.size;
+        if (n->hold_data) {
+            CHECK(n->held_data_count < PENDING);
+            n->held_data[n->held_data_count++] = op->op.id;
+            return;
+        }
         memset(&event, 0, sizeof(event));
         event.kind = VSR_IO_EVENT_COMPLETE;
         event.event.type = VSR_EVENT_COMPLETE;
@@ -753,6 +772,8 @@ static void app_op(struct node *n, const struct vsr_io_op *op)
         return;
     }
     case VSR_IO_OP_LINK_WANTED:
+        n->links_wanted++; /* The test dials nothing itself. */
+        return;
     default:
         fprintf(stderr, "unexpected rail op kind %u\n", op->kind);
         CHECK(false);
@@ -1567,6 +1588,20 @@ static void test_route_kinds(void)
     route(app, ops, 2);
     CHECK(n->io->links.nodes[node2].queue_count == 1);
     CHECK(!completion_queued(rep, 30));
+    /* The refused SEND's RETRY waits retry_ns (decision E3), and prepare
+     * wakes the loop for it. */
+    CHECK(rep->deferred_count == 1);
+    {
+        struct vsr_io_sqe sqes[BATCH];
+        uint64_t now = n->ex.ops->now(n->ex.ctx);
+        uint64_t deadline = 0;
+        uint32_t count = 0;
+
+        CHECK(vsr_io_prepare(n->io, now, sqes, BATCH, &count, &deadline) ==
+              VSR_OK);
+        CHECK(deadline <= rep->deferred[rep->deferred_head].due);
+        CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) == 0);
+    }
     CHECK(take_completion(n, rep, 31, VSR_IO_RETRY) == VSR_IO_INDEX_NONE);
     /* REPLY: forwarded; one other than OK ends the incarnation's admission
      * (decision 44), OK leaves it. */
@@ -3042,6 +3077,254 @@ static void test_run(void)
     world_close();
 }
 
+/* -------------------------------------------------------------------------
+ * Tests: bounds, timers and the close
+ * ---------------------------------------------------------------------- */
+
+/* A forwarded ring of two entries: an update's capacity is bounded by the
+ * room left in it, so every op of every update is routed at once; the
+ * poll reports OUTPUT_FULL and MORE while ops wait, and nothing is lost. */
+static void test_small_ring(void)
+{
+    struct vsr_io_options options;
+    struct node *n;
+    struct app *app;
+    struct replies_at_least want;
+
+    world_open(1, 18);
+    options = engine_options(&world.node[0]);
+    options.limits.ops = 2;
+    n = node_open_with(0, &options);
+    app = app_attach(n, 0, cluster_of(1), 1, 1, VSR_START_NEW);
+    CHECK(run_until(app_normal, app, 20000));
+    for (uint64_t c = 1; c <= 4; ++c) {
+        submit_request(app, c, 1);
+    }
+    want.app = app;
+    want.replies = 4;
+    CHECK(run_until(replies_reached, &want, 20000));
+    CHECK(app->replies_ok == 4 && app->applied_entries >= 4);
+    stop_app(app);
+    detach_app(app);
+    close_node(n);
+    world_close();
+}
+
+/* Stream timers and the close: a SERVE the caller never answers ends both
+ * sides RETRY at the inactivity timer (the STREAM deadline dispatched by
+ * the poll); a requester's DATA op the caller holds keeps the stream, and
+ * so the closing engine, alive until it is completed (the engine is not
+ * closed while a stream is active). */
+static void test_stream_timers(void)
+{
+    struct node *a;
+    struct node *b;
+    struct vsr_io_address address;
+    struct vsr_io_event event;
+    struct vsr_io_stream_open open;
+    struct vsr_io_stream_write write;
+    struct vsr_span span;
+    static const unsigned char request[] = "timer";
+
+    world_open(2, 19);
+    a = node_open(0);
+    b = node_open(1);
+    address = node_address(1);
+    CHECK(vsr_io_node_set(a->io, 2, &address) == VSR_OK);
+    address = node_address(0);
+    CHECK(vsr_io_node_set(b->io, 1, &address) == VSR_OK);
+    memset(&open, 0, sizeof(open));
+    open.node = 2;
+    open.request.data = request;
+    open.request.size = sizeof(request);
+    memset(&event, 0, sizeof(event));
+    event.kind = VSR_IO_EVENT_STREAM_OPEN;
+    event.event.id = 11;
+    event.event.data = &open;
+    event.event.lease = 1;
+    b->hold_serve = true;
+    queue_event(a, &event);
+    CHECK(run_until(stream_served, b, 100000));
+    CHECK(run_until(stream_ended, a, 100000));
+    CHECK(a->stream_end_status == VSR_IO_RETRY && a->stream_end_bytes == 0);
+    /* The source ended too, but its SERVE is the caller's until it
+     * completes it: the refusal then frees the stream, with no END op
+     * for a stream the caller never accepted (decision 97). */
+    run_for(300 * MS);
+    CHECK(a->io->streams.active == 0 && b->io->streams.active == 1);
+    CHECK(b->held_serve != 0);
+    memset(&event, 0, sizeof(event));
+    event.kind = VSR_IO_EVENT_COMPLETE;
+    event.event.type = VSR_EVENT_COMPLETE;
+    event.event.id = b->held_serve;
+    event.event.status = VSR_IO_RETRY;
+    queue_event(b, &event);
+    run_for(10 * MS);
+    CHECK(b->io->streams.active == 0 && b->stream_ends == 0);
+    memset(&event, 0, sizeof(event));
+    event.kind = VSR_IO_EVENT_STREAM_OPEN;
+    event.event.data = &open;
+    event.event.lease = 1;
+    /* A stream whose DATA the requester's caller holds, then the close. */
+    b->hold_serve = false;
+    b->stream_serves = 0;
+    a->stream_ends = 0;
+    a->hold_data = true;
+    event.event.id = 12;
+    queue_event(a, &event);
+    CHECK(run_until(stream_served, b, 100000));
+    span.data = request;
+    span.size = sizeof(request);
+    memset(&write, 0, sizeof(write));
+    write.stream = b->served_handle;
+    write.write = 1;
+    write.kind = VSR_IO_WRITE_BUFFERS;
+    write.buffers.spans = &span;
+    write.buffers.size = span.size;
+    write.buffers.count = 1;
+    memset(&event, 0, sizeof(event));
+    event.kind = VSR_IO_EVENT_STREAM_WRITE;
+    event.event.data = &write;
+    event.event.lease = 2;
+    queue_event(b, &event);
+    memset(&event, 0, sizeof(event));
+    event.kind = VSR_IO_EVENT_STREAM_CLOSE;
+    event.event.id = b->served_handle;
+    queue_event(b, &event);
+    for (uint32_t i = 0; i < 100000 && a->held_data_count == 0; ++i) {
+        CHECK(run_round());
+    }
+    CHECK(a->held_data_count == 1);
+    close_io(a);
+    run_for(500 * MS);
+    CHECK(!node_closed(a));
+    CHECK(a->io->streams.active == 1);
+    /* The caller completes its DATA op: the stream ends, the engine
+     * closes. */
+    memset(&event, 0, sizeof(event));
+    event.kind = VSR_IO_EVENT_COMPLETE;
+    event.event.type = VSR_EVENT_COMPLETE;
+    event.event.id = a->held_data[0];
+    event.event.status = VSR_IO_OK;
+    a->hold_data = false;
+    a->held_data_count = 0;
+    queue_event(a, &event);
+    CHECK(run_until(node_closed, a, 100000));
+    CHECK(a->stream_ends == 1);
+    CHECK(vsr_io_deinit(a->io) == VSR_OK);
+    a->open = false;
+    close_node(b);
+    world_close();
+}
+
+/* A peer that is not listening yet: the dial is refused, the node backs
+ * off, and the DIAL deadline the poll dispatches redials it once it
+ * listens; the group then commits. The peer itself never dials (it has
+ * the primary's node caller-dialed and only emits LINK_WANTED), so the
+ * redial is the only way the link comes up. */
+static void test_redial(void)
+{
+    struct group g;
+    struct app *primary;
+    struct replies_at_least want;
+    struct vsr_io_node_status status;
+
+    world_open(2, 20);
+    node_open(0);
+    node_open(1);
+    world.node[1].open = false; /* Its loop does not run yet. */
+    mesh(2, cluster_of(5));
+    CHECK(vsr_io_node_set(world.node[1].io, 1, NULL) == VSR_OK);
+    memset(&g, 0, sizeof(g));
+    g.count = 2;
+    g.apps[0] =
+        app_attach(&world.node[0], 0, cluster_of(5), 1, 3, VSR_START_NEW);
+    run_for(20 * MS);
+    CHECK(vsr_io_node_status(world.node[0].io, 2, &status) == VSR_OK);
+    CHECK(status.state != VSR_IO_NODE_LINKED);
+    CHECK(status.last_error == -ECONNREFUSED);
+    world.node[1].open = true;
+    g.apps[1] =
+        app_attach(&world.node[1], 0, cluster_of(5), 2, 3, VSR_START_NEW);
+    CHECK(run_until(group_normal, &g, 200000));
+    primary = group_primary(&g);
+    CHECK(primary == g.apps[0]);
+    submit_request(primary, 1, 1);
+    want.app = primary;
+    want.replies = 1;
+    CHECK(run_until(replies_reached, &want, 200000));
+    CHECK(primary->replies_ok == 1);
+    CHECK(vsr_io_node_status(world.node[0].io, 2, &status) == VSR_OK);
+    CHECK(status.state == VSR_IO_NODE_LINKED);
+    CHECK(world.node[1].links_wanted >= 1);
+    group_close(&g);
+    world_close();
+}
+
+struct new_view {
+    const struct group *g;
+    uint32_t except;
+    uint64_t view;
+};
+
+static bool view_changed(void *ctx)
+{
+    const struct new_view *want = ctx;
+
+    for (uint32_t i = 0; i < want->g->count; ++i) {
+        const struct app *app = want->g->apps[i];
+
+        if (i == want->except) {
+            continue;
+        }
+        if (app->status.state != VSR_STATE_NORMAL ||
+            app->status.view <= want->view ||
+            app->status.primary == want->except + 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* TIME reaches the cores at every poll: once the primary is cut off, the
+ * others' view timers expire, they change view and the new primary
+ * commits; the old one rejoins when the partition heals. */
+static void test_view_change(void)
+{
+    struct group g;
+    struct app *primary;
+    struct new_view want;
+    struct replies_at_least replies;
+    uint32_t old;
+
+    world_open(3, 21);
+    g = group_open(3, cluster_of(6));
+    primary = group_primary(&g);
+    CHECK(primary != NULL);
+    old = primary->node->index;
+    want.g = &g;
+    want.except = old;
+    want.view = primary->status.view;
+    vsr_sim_isolate(world.sim, old, 1);
+    CHECK(run_until(view_changed, &want, 400000));
+    primary = NULL;
+    for (uint32_t i = 0; i < g.count; ++i) {
+        if (i != old && g.apps[i]->status.primary == i + 1) {
+            primary = g.apps[i];
+        }
+    }
+    CHECK(primary != NULL);
+    submit_request(primary, 1, 1);
+    replies.app = primary;
+    replies.replies = primary->replies + 1;
+    CHECK(run_until(replies_reached, &replies, 400000));
+    CHECK(primary->last_reply_status == VSR_REPLY_OK);
+    vsr_sim_isolate(world.sim, old, 0);
+    CHECK(run_until(group_normal, &g, 400000));
+    group_close(&g);
+    world_close();
+}
+
 int main(int argc, char **argv)
 {
     const char *only = getenv("VSR_ENGINE_TEST");
@@ -3073,6 +3356,10 @@ int main(int argc, char **argv)
     RUN(test_stale_completions);
     RUN(test_external);
     RUN(test_run);
+    RUN(test_small_ring);
+    RUN(test_stream_timers);
+    RUN(test_redial);
+    RUN(test_view_change);
 #undef RUN
     return 0;
 }
