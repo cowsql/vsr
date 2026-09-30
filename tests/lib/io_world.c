@@ -996,15 +996,17 @@ static void wait_address(const struct iow_node *n)
     for (uint32_t i = 0; i < 5000; ++i) {
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         int rc;
+        int error;
 
         CHECK(fd >= 0);
         rc = bind(fd, (const struct sockaddr *)&n->address.sockaddr,
                   (socklen_t)n->address.length);
+        error = rc == 0 ? 0 : errno;
         CHECK(close(fd) == 0);
         if (rc == 0) {
             return;
         }
-        CHECK(errno == EADDRINUSE);
+        CHECK(error == EADDRINUSE);
         CHECK(usleep(1000) == 0);
     }
     CHECK(false);
@@ -1543,11 +1545,11 @@ static void app_install(struct iow_app *app, const struct vsr_op *op)
 static void app_drop(struct iow_app *app, const struct vsr_op *op)
 {
     const struct vsr_snapshot_task *task = op->data;
-    struct iow_snapshot *s;
 
     app->drops++;
     if (task != NULL && task->checkpoint != NULL) {
-        s = snapshot_find(app, task->checkpoint->id);
+        struct iow_snapshot *s = snapshot_find(app, task->checkpoint->id);
+
         if (s != NULL) {
             s->used = false;
         }

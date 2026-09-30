@@ -330,11 +330,6 @@ static void corrupt_files(const struct iow_app *app)
     }
 }
 
-struct fetch_failures {
-    const struct iow_node *n;
-    uint64_t closes;
-};
-
 /* Every member's clients file is damaged on its disk: a learner's fetch
  * receives bytes that fail verification and the FETCH completes FAILED,
  * never CORRUPT (that would latch the learner's snapshot failure for the

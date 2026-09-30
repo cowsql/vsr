@@ -166,10 +166,10 @@ static void test_transfers(void)
         CHECK(iow_run_until(sources_ended, a, 1000 * IOW_MS));
         CHECK(iow_run_until(sources_ended, b, 1000 * IOW_MS));
         for (uint32_t i = 0; i < IOW_STREAMS; ++i) {
-            struct iow_sstream *s = &a->sstreams[i];
-
             for (uint32_t side = 0; side < 2; ++side) {
-                s = side == 0 ? &a->sstreams[i] : &b->sstreams[i];
+                struct iow_sstream *s =
+                    side == 0 ? &a->sstreams[i] : &b->sstreams[i];
+
                 if (s->used) {
                     CHECK(s->status == VSR_IO_OK);
                     CHECK(s->written == s->writes);
@@ -224,6 +224,8 @@ static void test_backpressure(void)
         iow_run_for(20 * IOW_MS);
         CHECK(a->held_data_count <= iow.io_limits.stream_window);
         s = source_of(b, 55);
+        /* iow_run_for may have ended the stream. */
+        /* cppcheck-suppress knownConditionTrueFalse */
         if (s != NULL && !r->ended) {
             /* The source never has more than a window queued ahead. */
             CHECK(s->writes - s->written <= iow.io_limits.stream_window);
@@ -656,12 +658,6 @@ static void test_faults(void)
 /* -------------------------------------------------------------------------
  * Streams beside a replicated group
  * ---------------------------------------------------------------------- */
-
-struct view_watch {
-    struct iow_group *g;
-    uint64_t view;
-    bool changed;
-};
 
 /* A stream never delays the protocol: while the primary's node sends a
  * backup a large stream whose requester drips its DATA completions (the
