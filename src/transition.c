@@ -993,6 +993,12 @@ static bool compare_chunk(struct vsr *v)
      * entry past it. The overlap is bounded by the chunk, which is bounded
      * by batch_entries, so the count below fits. */
     uint32_t overlap = (uint32_t)(overlap_end - target->next);
+    /* A comparison load in flight answers for the entries at
+     * append_offset: nothing moves until it completes, or a concurrent
+     * load that cached those entries would let the chunk be replaced and
+     * the stale answer be compared at the new chunk's offset. */
+    if (target->compare_id != 0)
+        return false;
     while (target->append_offset < overlap) {
         const struct vsr_entry *entry = &target->entries[target->append_offset];
         struct vsr_log_slot *local = vsr_protocol_log_find(v, entry->op);
@@ -1012,8 +1018,6 @@ static bool compare_chunk(struct vsr *v)
         target->phase = TARGET_APPEND;
         return true;
     }
-    if (target->compare_id != 0)
-        return false;
     return target_load(v, v->status.stored_sequence,
                        target->next + target->append_offset, overlap_end,
                        overlap - target->append_offset, TAG_COMPARE_LOAD,

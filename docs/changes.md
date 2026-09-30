@@ -241,4 +241,9 @@ poll so a pin the next poll consumes is not evicted and reloaded),
 `regression/anchor_behind_applied` (a selected offer's checkpoint below the
 applied position is not installed behind applied entries), and
 `regression/reply_restore` (a reply decided before a `RESTORE` replaced the
-client base is decided again from the restored revision).
+client base is decided again from the restored revision), and
+`integration/uring_faults` (`test_write_errors`: a transition's comparison
+waits for its own comparison LOAD instead of advancing through entries a
+concurrent apply LOAD cached, which let the chunk be replaced and the stale
+load be compared at the new chunk's offset, fencing a healthy replica with
+`VSR_FAILURE_INVARIANT` when LOADs completed out of order).
