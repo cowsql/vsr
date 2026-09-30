@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -42,14 +43,36 @@
 
 struct iow_world iow;
 
-static _Alignas(
-    4096) unsigned char engine_memory[IOW_NODES][BANKS][ENGINE_BYTES];
-static _Alignas(
-    4096) unsigned char payload_memory[IOW_NODES][BANKS][PAYLOAD_BYTES];
-static _Alignas(4096) unsigned char replica_memory[IOW_NODES][BANKS]
-                                                  [IOW_REPLICAS][REPLICA_BYTES];
-static _Alignas(
-    4096) unsigned char tail_memory[IOW_NODES][BANKS][IOW_REPLICAS][TAIL_BYTES];
+/* Memory banks, mapped anonymously on first use and kept for the process:
+ * io_uring pins only anonymous memory for its registered buffers (a large
+ * static array can begin inside .data's last, file-backed page), and a
+ * crashed ring's teardown may still hold its pages for a while. */
+enum bank_kind {
+    BANK_ENGINE,
+    BANK_PAYLOAD,
+    BANK_REPLICA,
+    BANK_TAIL,
+    BANKS_KINDS
+};
+
+static const size_t bank_bytes[BANKS_KINDS] = {ENGINE_BYTES, PAYLOAD_BYTES,
+                                               REPLICA_BYTES, TAIL_BYTES};
+static unsigned char *banks[BANKS_KINDS][IOW_NODES][BANKS][IOW_REPLICAS];
+
+static unsigned char *bank(uint32_t kind, uint32_t node, uint32_t index,
+                           uint32_t replica)
+{
+    unsigned char **slot = &banks[kind][node][index][replica];
+
+    if (*slot == NULL) {
+        void *p = mmap(NULL, bank_bytes[kind], PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+
+        CHECK(p != MAP_FAILED);
+        *slot = p;
+    }
+    return *slot;
+}
 static unsigned char stream_memory[IOW_NODES][IOW_STREAMS][IOW_STREAM_BYTES];
 static unsigned char file_bytes[IOW_FILE_BYTES];
 static struct faulty_executor faulty_memory[IOW_NODES];
@@ -328,17 +351,28 @@ static int hook_update_buffer(void *ctx, uint32_t index,
                               const struct vsr_io_region *region)
 {
     struct iow_hook *h = ctx;
+    int rc = h->inner.ops->update_buffer(h->inner.ctx, index, region);
 
-    return h->inner.ops->update_buffer(h->inner.ctx, index, region);
+    if (rc != 0) {
+        fprintf(stderr, "update_buffer %u %p %zu: %d\n", index,
+                region != NULL ? region->base : NULL,
+                region != NULL ? region->size : 0, rc);
+    }
+    return rc;
 }
 
 static int hook_buffer_ring(void *ctx, uint16_t group, uint32_t entries,
                             uint32_t flags, const struct vsr_io_region *memory)
 {
     struct iow_hook *h = ctx;
+    int rc =
+        h->inner.ops->buffer_ring(h->inner.ctx, group, entries, flags, memory);
 
-    return h->inner.ops->buffer_ring(h->inner.ctx, group, entries, flags,
-                                     memory);
+    if (rc != 0) {
+        fprintf(stderr, "buffer_ring %u %u %u: %d\n", group, entries, flags,
+                rc);
+    }
+    return rc;
 }
 
 static int hook_provide(void *ctx, uint16_t group,
@@ -476,7 +510,7 @@ static void ring_close(struct iow_node *n)
 }
 
 /* The node's executor stack; the tables are registered as a process would
- * before the engine's init (a ring registers its own at creation). */
+ * before the engine's init. */
 static void node_executor(struct iow_node *n)
 {
     struct vsr_io_executor below;
@@ -500,10 +534,8 @@ static void node_executor(struct iow_node *n)
     n->ex.ops = &hook_ops;
     n->ex.ctx = &n->hook;
     n->ex = pure_executor_init(&n->pure, n->ex, true);
-    if (iow.backend == IOW_SIM) {
-        CHECK(n->ex.ops->register_files(n->ex.ctx, table_slots()) == 0);
-        CHECK(n->ex.ops->register_buffers(n->ex.ctx, table_regions()) == 0);
-    }
+    CHECK(n->ex.ops->register_files(n->ex.ctx, table_slots()) == 0);
+    CHECK(n->ex.ops->register_buffers(n->ex.ctx, table_regions()) == 0);
 }
 
 void iow_node_faulty(uint32_t index, const struct faulty_executor_options *o)
@@ -542,8 +574,9 @@ static uint64_t round_up(uint64_t value, uint64_t multiple)
     return (value + multiple - 1) / multiple * multiple;
 }
 
-/* Store options for the world's limits and block size. */
-static void default_store(void)
+/* Store options for the world's limits and block size; write_behind 0
+ * takes the default of eight blocks. */
+static void store_sized(uint64_t write_behind)
 {
     struct vsr_io_store_options *o = &iow.store;
     uint64_t max_record = 0;
@@ -562,7 +595,8 @@ static void default_store(void)
     o->max_clients = 8;
     o->inflight_writes = 2;
     o->segment_bytes = round_up(header_bytes + 8 * max_record, block);
-    o->write_behind_bytes = (uint64_t)8 * block;
+    o->write_behind_bytes =
+        write_behind != 0 ? write_behind : (uint64_t)8 * block;
     o->cache_bytes =
         round_up(o->write_behind_bytes + iow.limits.pinned_payload_bytes +
                      2 * max_record + 2 * header_bytes + block,
@@ -572,13 +606,18 @@ static void default_store(void)
     o->on_write_error = VSR_IO_WRITE_ERROR_FENCE;
 }
 
+static void default_store(void)
+{
+    store_sized(0);
+}
+
 /* Recomputes the store's derived sizes after a test changed the limits,
- * the block size or write_behind_bytes. */
+ * the block size or write_behind_bytes, keeping the test's policies. */
 static void store_resize(void)
 {
     struct vsr_io_store_options keep = iow.store;
 
-    default_store();
+    store_sized(keep.write_behind_bytes);
     iow.store.max_clients = keep.max_clients;
     iow.store.sync_mode = keep.sync_mode;
     iow.store.on_write_error = keep.on_write_error;
@@ -820,11 +859,19 @@ static void engine_init(struct iow_node *n, const struct vsr_io_options *custom)
     CHECK(vsr_io_layout(&options, &layout) == VSR_OK);
     CHECK(layout.metadata.size <= ENGINE_BYTES);
     CHECK(layout.payload.size <= PAYLOAD_BYTES);
-    metadata.base = engine_memory[n->index][n->bank];
+    metadata.base = bank(BANK_ENGINE, n->index, n->bank, 0);
     metadata.size = layout.metadata.size;
-    payload.base = payload_memory[n->index][n->bank];
+    payload.base = bank(BANK_PAYLOAD, n->index, n->bank, 0);
     payload.size = layout.payload.size;
-    CHECK(vsr_io_init(&options, &metadata, &payload, &n->io) == VSR_OK);
+    {
+        int rc = vsr_io_init(&options, &metadata, &payload, &n->io);
+
+        if (rc != VSR_OK) {
+            fprintf(stderr, "node %u: vsr_io_init %d (%s)\n", n->index, rc,
+                    rc < 0 && rc > -4096 ? strerror(-rc) : "");
+        }
+        CHECK(rc == VSR_OK);
+    }
     n->open = true;
     n->crashed = false;
     n->incarnation++;
@@ -2434,9 +2481,9 @@ struct iow_app *iow_attach_with(struct iow_node *n, uint32_t r)
     CHECK(layout.metadata.size <= REPLICA_BYTES);
     CHECK(layout.metadata.alignment <= 4096);
     CHECK(layout.tail.size <= TAIL_BYTES && layout.tail.alignment <= 4096);
-    metadata.base = replica_memory[n->index][n->bank][r];
+    metadata.base = bank(BANK_REPLICA, n->index, n->bank, r);
     metadata.size = REPLICA_BYTES;
-    tail.base = tail_memory[n->index][n->bank][r];
+    tail.base = bank(BANK_TAIL, n->index, n->bank, r);
     tail.size = layout.tail.size;
     rc = vsr_io_attach(n->io, &app->options, &metadata, &tail, &app->replica);
     if (rc != VSR_OK) {
@@ -2753,6 +2800,17 @@ void iow_dump_node(const struct iow_node *n)
             n->index, n->open, stats.replicas, stats.links, stats.links_pending,
             stats.streams, stats.slabs_free, stats.closed, stats.failure,
             n->pending_count);
+    for (uint32_t j = 0; j < iow.nodes; ++j) {
+        struct vsr_io_node_status st;
+
+        if (j != n->index && vsr_io_node_status(n->io, j + 1, &st) == VSR_OK) {
+            fprintf(
+                stderr,
+                "  peer node %u: state %u links %u error %d next dial %" PRIu64
+                "\n",
+                j + 1, st.state, st.links, st.last_error, st.next_dial_ns);
+        }
+    }
     fprintf(stderr,
             "  engine: file slots next %u free %u of %u; slots free %u/%u; "
             "forwarded %u\n",

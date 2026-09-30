@@ -76,7 +76,7 @@ INTEGRATION_TESTS += tests/integration/failures tests/integration/view_change_ed
 INTEGRATION_TESTS += tests/integration/uring_smoke \
   tests/integration/uring_refusals tests/integration/executor_conformance
 INTEGRATION_TESTS += tests/integration/engine tests/integration/streams \
-  tests/integration/snapshots
+  tests/integration/snapshots tests/integration/uring_faults
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
   tests/regression/witness_prefix tests/regression/boundary_from_view_change \
@@ -173,6 +173,9 @@ tests_integration_streams_SOURCES = tests/integration/streams.c $(IO_WORLD)
 tests_integration_streams_LDADD = $(LIBVSR)
 tests_integration_snapshots_SOURCES = tests/integration/snapshots.c $(IO_WORLD)
 tests_integration_snapshots_LDADD = $(LIBVSR)
+tests_integration_uring_faults_SOURCES = tests/integration/uring_faults.c \
+  $(IO_WORLD)
+tests_integration_uring_faults_LDADD = $(LIBVSR)
 tests_integration_replication_SOURCES = tests/integration/replication.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
