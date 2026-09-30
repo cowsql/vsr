@@ -231,6 +231,9 @@ struct vsr_io_link {
                               re-armed until every held byte is carved. */
     bool recv_cancelled;    /* The pause's CANCEL of recv_slot was issued. */
     bool nodelay_set;       /* TCP_NODELAY record issued (or not wanted). */
+    bool plain_sends;       /* The socket refused a zero-copy send
+                               (-EOPNOTSUPP: AF_UNIX): plain sends only
+                               (decision G3). */
     bool install_establish; /* Established once the takeover completes. */
     uint32_t installing;    /* The takeover (decision 135): 0 none, 1 its
                               record to issue, 2 in flight. */

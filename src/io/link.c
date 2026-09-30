@@ -1054,21 +1054,25 @@ static void link_sqe_fd(const struct vsr_io_link *link, struct vsr_io_sqe *sqe)
     }
 }
 
-/* Classifies a send by the flag rule (decision 38) and fills the record. */
-static void link_send_flags(const struct vsr_io *io, struct vsr_io_send *send,
+/* Classifies a send by the flag rule (decision 38) and fills the record; a
+ * link whose socket has no zero-copy send sends plain (decision G3). */
+static void link_send_flags(const struct vsr_io *io,
+                            const struct vsr_io_link *link,
+                            struct vsr_io_send *send,
                             const struct vsr_io_vec *vecs, uint32_t count,
                             struct vsr_io_sqe *sqe)
 {
     uint64_t bytes = 0;
 
-    send->fixed = true;
+    send->fixed = !link->plain_sends;
     for (uint32_t i = 0; i < count; ++i) {
         bytes += vecs[i].length;
         if (!vsr_io_pool_contains(&io->pool, vecs[i].base, vecs[i].length)) {
             send->fixed = false;
         }
     }
-    send->zero_copy = send->fixed || bytes >= io->options.zero_copy_bytes;
+    send->zero_copy = !link->plain_sends &&
+                      (send->fixed || bytes >= io->options.zero_copy_bytes);
     sqe->op_flags = VSR_IO_SEND_VECTORED;
     if (send->zero_copy) {
         sqe->op_flags |= VSR_IO_SEND_ZERO_COPY;
@@ -1374,7 +1378,7 @@ static bool link_prepare_send(struct vsr_io *io, struct vsr_io_link *link,
     LINKS_ASSERT(link->build_bytes > 0 && link->send_slab != LINK_NONE);
     sqe->opcode = VSR_IO_SQE_SEND;
     link_sqe_fd(link, sqe);
-    link_send_flags(io, send, link->vecs, link->vec_count, sqe);
+    link_send_flags(io, link, send, link->vecs, link->vec_count, sqe);
     slot = vsr_io_slots_alloc(&io->slots, VSR_IO_SLOT_SEND,
                               send->zero_copy ? 2 : 1, link_index(io, link),
                               entry, 0);
@@ -1480,6 +1484,7 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
 {
     struct vsr_io_send *send = &link->sends[entry];
     uint64_t total = send->end - send->begin;
+    int32_t result = cqe->result;
     uint64_t sent;
 
     if ((cqe->flags & VSR_IO_CQE_NOTIF) != 0) {
@@ -1489,7 +1494,15 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
     }
     LINKS_ASSERT(send->state == SEND_INFLIGHT && link->inflight != 0);
     link->inflight = 0;
-    if (cqe->result < 0) {
+    if (result == -EOPNOTSUPP && send->zero_copy &&
+        (cqe->flags & VSR_IO_CQE_MORE) != 0) {
+        /* The socket has no zero-copy send (AF_UNIX; decision G3): nothing
+         * went out and the NOTIF follows. As a short send of nothing, the
+         * same bytes go again, plain, as every later send of the link. */
+        link->plain_sends = true;
+        result = 0;
+    }
+    if (result < 0) {
         /* A rejected zero-copy send completes once, without MORE
          * (decision 62); an accepted one still gets its NOTIF. The entry
          * is released like at a NOTIF: the link may be closing already
@@ -1501,10 +1514,10 @@ static void link_send_complete(struct vsr_io *io, struct vsr_io_link *link,
         } else {
             link_send_release(io, link, send);
         }
-        link_close(io, link_index(io, link), cqe->result);
+        link_close(io, link_index(io, link), result);
         return;
     }
-    sent = (uint64_t)cqe->result < total ? (uint64_t)cqe->result : total;
+    sent = (uint64_t)result < total ? (uint64_t)result : total;
     if (sent < total) {
         /* Short: the unsent tail of the vectors is the next build, its
          * header bytes reserved from the send's own until it goes out. */
