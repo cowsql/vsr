@@ -1295,7 +1295,10 @@ load at its head waits for the single read in flight (decision 37):
   (`vsr_io_store_snapshot_clients`) likewise reports such a record as
   one only the base file has (`sequence` 0, the base offset), which the
   snapshot module copies from the file, and leaves it out of
-  `capture_floor`.
+  `capture_floor`. A queued base read is resolved again when it is
+  issued: a PUBLISH or RESTORE packed while it waited may have moved the
+  record in the file `base_slot` names by then (or, with a newer record
+  or a RESTORE after `s`, it completes `RETRY` as at acceptance).
 - REQUEST: `retained` when the version's `sequence <= s`, else walk
   `previous` links over the APPENDs after `s`; `RETRY` when a TRUNCATE,
   TRIM or RESTORE was applied after `s` (`reindexed > s`); the entry is
@@ -1981,11 +1984,6 @@ of `docs/io-design.md`:
   model a pool with slack. Counting three slabs per replica and one per
   stream in the reserve (and the minimum-slabs rule) would close it; the
   module already answers RETRY at once when a slab is missing.
-- A CLIENT load of a file-only record is resolved against the base file
-  when it is accepted but reads through `store.base_slot` when issued; a
-  base change in between (a PUBLISH or RESTORE packed while the load
-  queued) makes it read the new file at the old offset. The store's floor
-  covers queued cold loads of the log only.
 - A fetch whose verification or local write failed keeps receiving the
   stream until its END (the chunks are completed and dropped at once); the
   requester has no early abort of a library stream. The files are small.

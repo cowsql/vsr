@@ -3125,6 +3125,21 @@ static bool prepare_load(struct vsr_io *io, uint32_t replica,
     }
     load = loads_at(store, 0);
     refs = load_refs(store, load);
+    if (load->state == LOAD_QUEUED && load->base != 0) {
+        /* A base file read resolved when accepted: a PUBLISH or RESTORE
+         * packed while it queued may have moved the record, and
+         * base_slot names the file of now, so it is resolved again. */
+        int32_t status;
+
+        load->count = 0;
+        load->base = 0;
+        status = resolve_client(store, load, refs);
+        if (status != VSR_IO_OK) {
+            complete(store, load->op, status, NONE, NULL);
+            loads_pop(store, true);
+            return false;
+        }
+    }
     if (load->state != LOAD_QUEUED || load->count == 0 ||
         load_hot(store, load, refs, &begin, &end)) {
         return false; /* Answered from poll. */

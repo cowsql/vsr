@@ -5302,6 +5302,82 @@ static void test_client_newer(void)
     harness_close();
 }
 
+/* A CLIENT load of a record the base file holds, queued behind a cold
+ * read, and a PUBLISH of a new capture packed meanwhile: the new file has
+ * the record at another offset and base_slot names it when the load is
+ * issued, so the load is resolved again then (it read the new file at
+ * the old offset and completed CORRUPT; the snapshot module's open item). */
+static void test_client_base_moved(void)
+{
+    struct config c = base_config();
+    struct vsr_id ids[3] = {{0xA, 1}, {0xB, 1}, {0xC, 1}};
+    struct vsr_id others[2];
+    struct vsr_id x1 = {0x61, 1};
+    struct vsr_id x2 = {0x62, 1};
+    uint64_t numbers[3] = {1, 1, 1};
+    uint64_t ops[3] = {1, 1, 1};
+    const struct vsr_client_record *record;
+    const struct base_feed *file;
+    const struct vsr_loaded *loaded;
+    struct vsr_io_piece piece;
+    struct vsr_id target;
+    uint32_t lease = NONE;
+    uint64_t sequence = 5;
+    uint64_t old_offset;
+    uint64_t log_op;
+    uint64_t op;
+    uint32_t index = NONE;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_append(2, 1, 16));
+    store_run(txn_clients(3, 3, ids, numbers, ops, 16));
+    harness_capture(x1);
+    store_run(txn_publish(4, x1, 1));
+    /* The file's last record is the target; the others grow before it. */
+    file = feed_of(x1, false);
+    CHECK(file != NULL && file->count == 3);
+    target = file->records[2].request.client;
+    old_offset = file->offsets[2];
+    for (uint32_t i = 0, n = 0; i < 3; ++i) {
+        if (ids[i].hi == target.hi) {
+            index = i;
+        } else {
+            others[n++] = ids[i];
+        }
+    }
+    CHECK(index != NONE);
+    numbers[0] = 2;
+    numbers[1] = 2;
+    store_run(txn_clients(sequence, 2, others, numbers, ops, 64));
+    while (vsr_io_store_hot(h.store, txns[3].file_offset,
+                            (uint32_t)txns[3].bytes, &piece)) {
+        store_run(txn_append(++sequence, 4, 200));
+    }
+    /* A cold LOG read in flight; the CLIENT load queues behind it. */
+    log_op = load_log(h.store->readable, 1, 2, 1, limits.message_bytes);
+    CHECK(harness_prepare() == 1 && pending_of(VSR_IO_SQE_READ) != NONE);
+    op = load_client(h.store->readable, target);
+    CHECK(h.store->loads_count == 2);
+    /* The new capture and its PUBLISH move the record in the base file. */
+    harness_capture(x2);
+    file = feed_of(x2, false);
+    CHECK(file->count == 3 && file->offsets[2] != old_offset);
+    expect_completion(submit(txn_publish(++sequence, x2, 1)), VSR_IO_OK);
+    harness_run();
+    loaded = expect_loaded(log_op, VSR_IO_OK, &lease);
+    release_lease(lease);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    record = loaded->items;
+    CHECK(record->request.number == 1 && record->result.data.size == 16 &&
+          memcmp(record->result.data.spans[0].data, txns[3].results[index],
+                 16) == 0);
+    release_lease(lease);
+    harness_close();
+}
+
 /* -------------------------------------------------------------------------
  * An independent reading of the image
  *
@@ -6738,6 +6814,7 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_reclaim_media);
     RUN(test_client_freed);
     RUN(test_client_newer);
+    RUN(test_client_base_moved);
     RUN(test_walk);
     RUN(test_walk_bounds);
     printf("store: ok\n");
