@@ -247,6 +247,14 @@ struct vsr_io_forwarded *vsr_io_forward(struct vsr_io *io,
  * completion; the event is fed on the next poll. */
 void vsr_io_engine_complete_core(struct vsr_io_replica *replica,
                                  const struct vsr_io_completion *completion);
+/* A completion decided at once while an op is routed (a SEND the link
+ * module refuses, or one it evicts from a full node queue for a newer
+ * SEND, a snapshot op's status, a malformed op's FAILED), with no data and
+ * no lease: queued in the replica's deferred ring and fed retry_ns later
+ * (decisions 129 and G1), since the core answers a failed SEND by sending
+ * again and a completion fed within the same poll loops. */
+void vsr_io_engine_complete_later(struct vsr_io_replica *replica, uint64_t op,
+                                  int32_t status);
 /* Engine leases. */
 uint32_t vsr_io_lease_alloc(struct vsr_io_replica *replica, uint32_t slab,
                             uint32_t pin);

@@ -796,6 +796,25 @@ void vsr_io_engine_complete_core(struct vsr_io_replica *replica,
     queued->kind = VSR_IO_EVENT_CORE;
 }
 
+/* The deferred ring is due in order: io->now never decreases and retry_ns
+ * is the replica's. It holds one entry per outstanding core op at most,
+ * like the completion ring (an op is in one of them or in neither). */
+void vsr_io_engine_complete_later(struct vsr_io_replica *replica, uint64_t op,
+                                  int32_t status)
+{
+    uint32_t capacity = replica->options.limits.operations;
+    struct vsr_io_deferred *deferred;
+
+    ENGINE_ASSERT(replica->deferred_count < capacity);
+    deferred = &replica->deferred[ring_slot(replica->deferred_head,
+                                            replica->deferred_count, capacity)];
+    deferred->due = replica->io->now + replica->options.retry_ns;
+    deferred->op = op;
+    deferred->status = status;
+    deferred->reserved = 0;
+    replica->deferred_count++;
+}
+
 /* Leases (section 7.6): an entry is a decode region plus the slab
  * reference or ring pin recorded for it. alloc records; the caller takes
  * the reference (a MESSAGE retains its receive slab, a cold LOAD hands

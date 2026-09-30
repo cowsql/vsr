@@ -168,17 +168,7 @@ int vsr_io_complete(struct vsr_io *io, const struct vsr_io_cqe *cqes,
 static void complete_now(struct vsr_io_replica *replica, uint64_t op,
                          int32_t status)
 {
-    uint32_t capacity = replica->options.limits.operations;
-    struct vsr_io_deferred *deferred;
-
-    LOOP_ASSERT(replica->deferred_count < capacity);
-    deferred = &replica->deferred[ring_at(replica->deferred_head,
-                                          replica->deferred_count, capacity)];
-    deferred->due = replica->io->now + replica->options.retry_ns;
-    deferred->op = op;
-    deferred->status = status;
-    deferred->reserved = 0;
-    replica->deferred_count++;
+    vsr_io_engine_complete_later(replica, op, status);
 }
 
 /* Moves the deferred completions that are due into the internal ring. */

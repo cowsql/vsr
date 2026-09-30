@@ -2609,6 +2609,7 @@ static void test_capacity(void)
 static struct vsr_io_lease leases[ENGINES][REGIONS];
 static struct vsr_io_queued_event messages[ENGINES][REGIONS];
 static struct vsr_io_queued_event completions[ENGINES][OPERATIONS];
+static struct vsr_io_deferred deferred[ENGINES][OPERATIONS];
 static _Alignas(16) unsigned char regions[ENGINES][REGIONS][REGION_BYTES];
 
 /* A replica shell for delivery, the way tests/unit/engine_tables.c sets
@@ -2653,6 +2654,11 @@ static struct vsr_io_replica *open_replica(struct engine *e, uint32_t index,
     replica->completions = completions[e->index];
     replica->completions_head = 0;
     replica->completions_count = 0;
+    memset(deferred[e->index], 0, sizeof(deferred[e->index]));
+    replica->deferred = deferred[e->index];
+    replica->deferred_head = 0;
+    replica->deferred_count = 0;
+    replica->options.retry_ns = 5000000;
     e->io->replicas_count++;
     return replica;
 }
@@ -3560,6 +3566,22 @@ static bool take_completion(struct vsr_io_replica *replica, uint64_t *op,
     return true;
 }
 
+/* The completion of op waits in the replica's deferred ring, due retry_ns
+ * after the engine's time (decision G1). */
+static void expect_deferred(struct vsr_io_replica *replica, uint64_t op,
+                            int32_t status)
+{
+    const struct vsr_io_deferred *d;
+
+    CHECK(replica->deferred_count > 0);
+    d = &replica->deferred[replica->deferred_head];
+    CHECK(d->op == op && d->status == status);
+    CHECK(d->due == replica->io->now + replica->options.retry_ns);
+    replica->deferred_head =
+        (replica->deferred_head + 1) % replica->options.limits.operations;
+    replica->deferred_count--;
+}
+
 /* The next completion must be `op` with `status`. */
 static void expect_completion(struct vsr_io_replica *replica, uint64_t op,
                               int32_t status)
@@ -3961,7 +3983,9 @@ static void test_send_pressure(void)
     engine_forget(p.a);
     engine_forget(p.b);
     /* A queue of eight: four on the wire, four waiting for an entry; the
-     * ninth makes the oldest waiting one yield. */
+     * ninth makes the oldest waiting one yield, its RETRY deferred like a
+     * refused SEND's (the core sends again at once on a failed SEND: fed
+     * in the same poll, an eviction evicted again, decision G1). */
     pair_open(&p, 34, 8, PAGE);
     world.hold_notifs = true;
     for (uint64_t i = 1; i <= 8; ++i) {
@@ -3971,8 +3995,9 @@ static void test_send_pressure(void)
     CHECK(world.held_count == VSR_IO_LINK_SENDS);
     CHECK(p.a->io->links.nodes[0].queue_count == 8);
     CHECK(send_fresh(p.a, 0, 9, 16, 2) == VSR_OK);
-    expect_completion(p.ra, 5, VSR_IO_RETRY);
     CHECK(p.ra->completions_count == 0);
+    expect_deferred(p.ra, 5, VSR_IO_RETRY);
+    CHECK(p.ra->deferred_count == 0);
     CHECK(p.a->io->links.nodes[0].queue_count == 8);
     drain_messages(p.rb, 1, 1, 4, 16);
     world.hold_notifs = false;
@@ -4660,12 +4685,32 @@ static void walker_send(struct walker *w, uint32_t size)
 }
 
 /* Every completion of the sender's replica: once per op, OK or RETRY. */
+/* A completion taken off the replica's deferred ring, as the engine's poll
+ * feeds it once due (a SEND evicted from a full queue, decision G1). */
+static bool take_deferred(struct vsr_io_replica *replica, uint64_t *op,
+                          int32_t *status)
+{
+    const struct vsr_io_deferred *d;
+
+    if (replica->deferred_count == 0) {
+        return false;
+    }
+    d = &replica->deferred[replica->deferred_head];
+    *op = d->op;
+    *status = d->status;
+    replica->deferred_head =
+        (replica->deferred_head + 1) % replica->options.limits.operations;
+    replica->deferred_count--;
+    return true;
+}
+
 static void walker_completions(struct walker *w)
 {
     uint64_t op = 0;
     int32_t status = 0;
 
-    while (take_completion(w->sender_replica, &op, &status)) {
+    while (take_completion(w->sender_replica, &op, &status) ||
+           take_deferred(w->sender_replica, &op, &status)) {
         CHECK(op >= 1 && op < w->next && w->status[op] == SEND_WALK_PENDING);
         CHECK(status == VSR_IO_OK || status == VSR_IO_RETRY);
         w->status[op] = (int8_t)status;

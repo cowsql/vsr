@@ -1658,11 +1658,12 @@ emits can be routed at once; a step cap of 256 per replica and poll is a
 backstop (MORE).
 
 A completion the routing decides at once (a SEND the link module refuses,
-a snapshot op's status, a malformed op's FAILED) waits in the replica's
-deferred ring for `retry_ns` before it is fed (decision 129): the core
-re-sends at once on a failed SEND, so a same-poll RETRY turned an
-unauthorized destination into a hot loop. Prepare's deadline covers the
-earliest one.
+or one it evicts from a full node queue for a newer SEND, a snapshot op's
+status, a malformed op's FAILED) waits in the replica's deferred ring for
+`retry_ns` before it is fed (decisions 129 and G1): the core re-sends at
+once on a failed SEND, so a same-poll RETRY turned an unauthorized
+destination, or a full queue, into a hot loop. Prepare's deadline covers
+the earliest one.
 
 ### 7.2 vsr_io_submit
 
@@ -1693,7 +1694,7 @@ in emission order (decision 51):
 
 | Op | Route |
 | --- | --- |
-| SEND | `vsr_io_links_send(replica, id, message, arg)`; `RETRY` returned -> COMPLETE(RETRY) deferred `retry_ns` (decision 129); OK -> queued, completed later through the replica's completion ring (decision 83) |
+| SEND | `vsr_io_links_send(replica, id, message, arg)`; `RETRY` returned -> COMPLETE(RETRY) deferred `retry_ns` (decision 129); OK -> queued, completed later through the replica's completion ring (decision 83); an older SEND the full node queue evicts for it completes RETRY deferred `retry_ns` as well (`vsr_io_engine_complete_later`, G1) |
 | LOAD RECOVERY | `vsr_io_store_open(start_mode, id, read)`; FAILED (deferred) when the store is already open |
 | LOAD, STORE, SYNC, RECLAIM | `vsr_io_store_*`; completions arrive through `next_completion`; `EINVAL` (a malformed op) -> FAILED (deferred) |
 | SNAPSHOT_CAPTURE, FETCH, SYNC, DROP | `vsr_io_snapshots_*`; a status returned -> that COMPLETE (deferred), `EINVAL` -> FAILED |
@@ -2026,6 +2027,7 @@ of `docs/io-design.md`:
 | `vsr-io.h` | `vsr_io_submit`'s refusals (AGAIN before admission, EINVAL after a STOP); a snapshot COMPLETE's lease returned by a RELEASE op at once; STATUS data a copy per op; rail descriptors valid until the caller's next engine call; `vsr_io_close` EBUSY with a replica attached; `vsr_io_attach` EINVAL for a cluster already attached, the path copied; `vsr_io_detach` EBUSY while an op naming the replica waits, the core still returned after; node table ELIMIT/EINVAL rules; `vsr_io_run`'s drops and return values | 128, 130, 132 |
 | `engine.h` (internal) | The replica's priority ring, deferred ring (`vsr_io_deferred`), copies of path and members, `stopping`, `step_events_capacity`, `tail_region`; the engine's `releases_rejected`, `events_rejected` and `vsr_io_run` scratch arrays (in the layout); lease states FREE, QUEUED, LEASED; `vsr_io_engine_route`, `vsr_io_engine_check_closed`, `vsr_io_engine_reserve`; the engine split into `engine.c` (kernel), `replica.c` and `loop.c` | 128, 129, 130, 131 |
 | `vsr-io.h`, `pool.h` (internal) | Sizing rule: minimum slabs `2 * links + streams * (stream_window + 1) + 4 * replicas + 5 + caller_slabs`, and the pool's three shares; `vsr_io_slab_acquire` is ELIMIT at the caller's share, or while the engine's users hold more than the reserve and use the untaken share; the pool's `internal_taken`, the slab's `internal` flag (with `state` now 8 bits), `vsr_io_pool_handoff`, `vsr_io_pool_floor` | 127 |
+| `engine.h`, `link.c` (internal) | `vsr_io_engine_complete_later` (the deferred ring's producer, moved from loop.c's `complete_now` into the kernel); a SEND evicted from a full node queue completes through it | G1 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 

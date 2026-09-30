@@ -1105,14 +1105,23 @@ static uint32_t node_queue_unstarted(struct vsr_io_links *links,
     return position;
 }
 
-/* Completes a queued SEND op to its replica. */
+/* Completes a queued SEND op to its replica: at once, or `later` through
+ * the replica's deferred ring (an eviction decided while a SEND is routed:
+ * the core sends again on the RETRY, so feeding it within the same poll
+ * would evict again, decision G1). */
 static void queued_complete(struct vsr_io *io,
                             const struct vsr_io_queued_send *queued,
-                            int32_t status)
+                            int32_t status, bool later)
 {
     struct vsr_io_completion completion = {queued->op, status, LINK_NONE, NULL};
 
-    vsr_io_engine_complete_core(&io->replicas[queued->replica], &completion);
+    if (later) {
+        vsr_io_engine_complete_later(&io->replicas[queued->replica], queued->op,
+                                     status);
+    } else {
+        vsr_io_engine_complete_core(&io->replicas[queued->replica],
+                                    &completion);
+    }
     if (status == VSR_IO_OK) {
         io->stats.messages_sent++;
     } else if (status == VSR_IO_RETRY) {
@@ -1124,14 +1133,15 @@ static void queued_complete(struct vsr_io *io,
  * later ones move up, and the carrier's encoder follows the message it is
  * on (never the removed one). */
 static void node_queue_remove(struct vsr_io *io, uint32_t node_index,
-                              uint32_t position, int32_t status)
+                              uint32_t position, int32_t status, bool later)
 {
     struct vsr_io_links *links = &io->links;
     struct vsr_io_node *node = &links->nodes[node_index];
     uint32_t base = node_index * links->link_queue;
 
     LINKS_ASSERT(position < node->queue_count);
-    queued_complete(io, node_queue_at(links, node_index, position), status);
+    queued_complete(io, node_queue_at(links, node_index, position), status,
+                    later);
     if (node->carrier != LINK_NONE &&
         links->links[node->carrier].encoding != LINK_NONE) {
         struct vsr_io_link *carrier = &links->links[node->carrier];
@@ -1194,13 +1204,13 @@ static void node_queue_ready(struct vsr_io *io, uint32_t node_index)
             if (queued->end <= link->notified_offset ||
                 link_live_sends(link) == 0) {
                 node_queue_remove(io, node_index, position,
-                                  links_fail_status(links));
+                                  links_fail_status(links), false);
                 continue;
             }
         } else if (node->carrier != LINK_NONE) {
             link = &links->links[node->carrier];
             if (queued->end <= link->notified_offset) {
-                node_queue_remove(io, node_index, position, VSR_IO_OK);
+                node_queue_remove(io, node_index, position, VSR_IO_OK, false);
                 continue;
             }
         }
@@ -1223,7 +1233,7 @@ static void node_queue_drop(struct vsr_io *io, uint32_t node_index, bool all)
         node->queue_count > 0 &&
         (all ||
          node_queue_at(links, node_index, node->queue_count - 1)->end == 0)) {
-        node_queue_remove(io, node_index, node->queue_count - 1, status);
+        node_queue_remove(io, node_index, node->queue_count - 1, status, false);
     }
 }
 
@@ -2244,7 +2254,9 @@ int vsr_io_links_send(struct vsr_io *io, uint32_t replica, uint64_t op,
             io->stats.messages_retried++;
             return VSR_IO_RETRY;
         }
-        node_queue_remove(io, node_index, position, VSR_IO_RETRY);
+        /* Decided while the newer SEND is routed: through the deferred
+         * ring, as a refused one (decision G1). */
+        node_queue_remove(io, node_index, position, VSR_IO_RETRY, true);
     }
     queued = node_queue_at(links, node_index, node->queue_count);
     queued->op = op;
