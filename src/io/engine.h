@@ -31,8 +31,9 @@
  *
  * Leases: an engine lease id is VSR_IO_LEASE_ENGINE | replica << 40 |
  * region << 16 | generation, so RELEASE routes by replica and region
- * without a lookup; a stale generation is an API error the engine reports
- * as EINVAL. Every lease holds one decode region and either one slab
+ * without a lookup; a RELEASE of a stale generation, or of a lease not
+ * LEASED, is counted in releases_rejected and ignored (decision E5). Every
+ * lease holds one decode region and either one slab
  * reference (MESSAGE, cold LOAD) or one ring pin (hot LOAD).
  */
 
