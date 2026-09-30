@@ -5154,8 +5154,11 @@ static void test_review_dir_retry(void)
     joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_OK);
     CHECK(a->dir_opens == opens + 1 && a->snapshots->dir_slot != NONE);
     CHECK(entry_of(a, x)->state == VSR_IO_SNAPSHOT_DURABLE);
-    CHECK(strcmp(clients_file(a, x, false)->durable_name,
-                 clients_file(a, x, false)->name) == 0);
+    {
+        const struct dfile *file = clients_file(a, x, false);
+
+        CHECK(file != NULL && strcmp(file->durable_name, file->name) == 0);
+    }
     joint_run(a, VSR_OP_SNAPSHOT_SYNC, x, VSR_IO_OK, VSR_IO_OK);
     CHECK(a->dir_opens == opens + 1);
     expect_idle(a);
