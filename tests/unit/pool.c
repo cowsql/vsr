@@ -599,8 +599,10 @@ static void model_drop(struct model *m, struct vsr_io_pool *pool,
 static void model_give_back(struct model *m, struct vsr_io_pool *pool,
                             uint32_t i)
 {
-    uint32_t id = m->lent[i];
+    uint32_t id;
 
+    CHECK(i < m->lent_count);
+    id = m->lent[i];
     m->lent[i] = m->lent[--m->lent_count];
     CHECK(vsr_io_pool_caller_release(pool, id));
     model_unref(m, id);

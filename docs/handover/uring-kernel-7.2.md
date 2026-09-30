@@ -20,7 +20,7 @@ clang-tidy 21; RLIMIT_MEMLOCK 8 MiB; `kernel.io_uring_disabled` 0.
 - `9e9f93e` Mark the refusal test's syscall pointers for clang-tidy
 - this file
 
-Placeholder decision: U1 (docs/io-design.md section 10; the contract
+Placeholder decision: 104 (docs/io-design.md section 10; the contract
 change row in docs/io-implementation.md section 10 cites it).
 
 ## 1. The vendored UAPI header
@@ -99,7 +99,7 @@ feature bits of a plain one-entry ring: every setup flag the executor uses
 predates `IORING_FEAT_MIN_TIMEOUT` (6.12), so a missing required feature
 means an old kernel (`-ENOSYS`) and a full set means options a current
 kernel refuses (`-EINVAL`, e.g. an SQPOLL CPU that does not exist).
-Decision U1; vsr-io.h now names init's refusal errno values.
+Decision 104; vsr-io.h now names init's refusal errno values.
 
 How it is tested without an older kernel: `tests/integration/uring_refusals`.
 Each scenario runs in a forked child whose main thread carries a seccomp
