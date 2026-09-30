@@ -69,7 +69,8 @@
  * REASSEMBLY slab acquired for it, and a frame is decoded only when
  * complete. The unconsumed bytes form the PARTIAL run (one slab,
  * contiguous) that carving works on, plus up to VSR_IO_LINK_HELD later
- * runs in arrival order, each holding exactly one pool reference, that
+ * runs (a STREAM link: up to the pool's slab count, decision G4) in
+ * arrival order, each holding exactly one pool reference, that
  * wait for the reassembly copy or for the partial's frame to be delivered
  * (a MESSAGE whose replica has no free region stays in place and is
  * retried at every poll). When the pool runs dry the kernel stops
@@ -82,7 +83,8 @@
  * -ECANCELED termination is not a loss) and not re-armed until every byte
  * it holds is carved, so the socket buffer fills and the TCP window, not
  * the held-run bound, throttles the source; what the kernel delivered
- * before the cancel took effect is held meanwhile. A MESSAGE is handed
+ * before the cancel took effect is held meanwhile, a run per slab it
+ * filled, which the pool's slab count bounds. A MESSAGE is handed
  * to the replica of its cluster only when
  * its `from` is authorized for the link's node (decision 67); a MESSAGE
  * that fails that check, names no replica of this engine, or is shorter
@@ -254,7 +256,9 @@ struct vsr_io_link {
     bool retry;               /* Carving stopped short of the bytes it
                                  holds (no region, no reassembly slab);
                                  poll retries. */
-    struct vsr_io_run held[VSR_IO_LINK_HELD];
+    struct vsr_io_run *held;  /* [links.held_per_link], in the links
+                                 region: a peer link uses VSR_IO_LINK_HELD
+                                 of them, a stream link all (G4). */
     /* Send side. The send slab is a ring addressed by unwrapped 64-bit
      * counters (offset = counter % slab_bytes). */
     uint32_t send_slab;   /* Pool slab holding header bytes; INDEX_NONE. */
@@ -306,6 +310,8 @@ struct vsr_io_links {
     struct vsr_io_link *links;                   /* [limits.links] */
     struct vsr_io_queued_send *queue; /* [nodes * link_queue] rings. */
     struct vsr_io_vec *vecs;          /* [links * SEND_VECTORS] */
+    struct vsr_io_run *held;          /* [links * held_per_link] */
+    uint32_t held_per_link;           /* max(VSR_IO_LINK_HELD, slabs). */
     uint32_t nodes_count;
     uint32_t authorizations_count;
     uint32_t links_count;

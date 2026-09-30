@@ -552,12 +552,14 @@ static void test_loss(void)
     }
     vsr_sim_reset(iow.sim, 0, 1);
     CHECK(iow_run_until(one_ended, r, 2000 * IOW_MS));
+    /* The bytes may all be in by then: the source only held its CLOSE. */
     CHECK(r->status == VSR_IO_RETRY && !r->mismatch);
-    CHECK(r->received < request.length);
+    CHECK(r->received <= request.length);
     CHECK(iow_run_until(sources_ended, b, 2000 * IOW_MS));
     s = source_of(b, 9);
     CHECK(s != NULL && s->status == VSR_IO_RETRY);
     s->used = false;
+    request.hold = 1; /* Mid-stream at the crash. */
     r = iow_stream_open(a, 2, cookie(), &request);
     for (uint32_t i = 0; i < 100000 && r->received < 20000; ++i) {
         CHECK(iow_round());

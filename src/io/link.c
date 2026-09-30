@@ -67,9 +67,19 @@ struct links_plan {
     size_t links;
     size_t queue;
     size_t vecs;
+    size_t held;
     size_t total;
     size_t alignment;
 };
+
+/* Held runs per link: a paused stream link keeps what the kernel delivered
+ * before its receive's CANCEL took effect, a run per slab it filled, so
+ * the pool's slab count bounds it (decision G4); a peer link uses
+ * VSR_IO_LINK_HELD of them (decision 76). */
+static uint32_t held_per_link(const struct vsr_io_limits *limits)
+{
+    return limits->slabs > VSR_IO_LINK_HELD ? limits->slabs : VSR_IO_LINK_HELD;
+}
 
 static size_t align_max(size_t a, size_t b)
 {
@@ -103,6 +113,7 @@ static bool links_plan(const struct vsr_io_limits *limits,
     plan->alignment =
         align_max(plan->alignment, alignof(struct vsr_io_queued_send));
     plan->alignment = align_max(plan->alignment, alignof(struct vsr_io_vec));
+    plan->alignment = align_max(plan->alignment, alignof(struct vsr_io_run));
     if (!vsr_size_mul(limits->nodes, sizeof(struct vsr_io_node), &bytes) ||
         !place(&offset, bytes, alignof(struct vsr_io_node), &plan->nodes) ||
         !vsr_size_mul(limits->authorizations,
@@ -117,7 +128,10 @@ static bool links_plan(const struct vsr_io_limits *limits,
                &plan->queue) ||
         !vsr_size_mul(limits->links, VSR_IO_SEND_VECTORS, &count) ||
         !vsr_size_mul(count, sizeof(struct vsr_io_vec), &bytes) ||
-        !place(&offset, bytes, alignof(struct vsr_io_vec), &plan->vecs)) {
+        !place(&offset, bytes, alignof(struct vsr_io_vec), &plan->vecs) ||
+        !vsr_size_mul(limits->links, held_per_link(limits), &count) ||
+        !vsr_size_mul(count, sizeof(struct vsr_io_run), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_run), &plan->held)) {
         return false;
     }
     plan->total = offset;
@@ -148,7 +162,7 @@ static void node_reset(struct vsr_io_node *node)
 }
 
 static void link_reset(struct vsr_io_link *link, struct vsr_io_vec *vecs,
-                       uint32_t deadline)
+                       struct vsr_io_run *held, uint32_t deadline)
 {
     memset(link, 0, sizeof(*link));
     link->state = VSR_IO_LINK_FREE;
@@ -170,6 +184,7 @@ static void link_reset(struct vsr_io_link *link, struct vsr_io_vec *vecs,
     link->deadline = deadline; /* Bound by the engine after init. */
     link->shutdown_slot = LINK_NONE;
     link->vecs = vecs;
+    link->held = held;
 }
 
 void vsr_io_links_init(struct vsr_io_links *links, void *memory, size_t size,
@@ -190,6 +205,8 @@ void vsr_io_links_init(struct vsr_io_links *links, void *memory, size_t size,
     links->links = (struct vsr_io_link *)(void *)(base + plan.links);
     links->queue = (struct vsr_io_queued_send *)(void *)(base + plan.queue);
     links->vecs = (struct vsr_io_vec *)(void *)(base + plan.vecs);
+    links->held = (struct vsr_io_run *)(void *)(base + plan.held);
+    links->held_per_link = held_per_link(limits);
     links->nodes_count = limits->nodes;
     links->authorizations_count = limits->authorizations;
     links->links_count = limits->links;
@@ -203,7 +220,8 @@ void vsr_io_links_init(struct vsr_io_links *links, void *memory, size_t size,
     }
     for (uint32_t i = 0; i < links->links_count; ++i) {
         link_reset(&links->links[i],
-                   links->vecs + (size_t)i * VSR_IO_SEND_VECTORS, LINK_NONE);
+                   links->vecs + (size_t)i * VSR_IO_SEND_VECTORS,
+                   links->held + (size_t)i * links->held_per_link, LINK_NONE);
     }
     for (uint32_t i = 0; i < VSR_IO_LISTENERS_MAX; ++i) {
         links->listener_table[i].state = VSR_IO_LISTENER_FREE;
@@ -610,7 +628,7 @@ static uint32_t link_alloc(struct vsr_io *io, uint32_t purpose,
         if (link->state != VSR_IO_LINK_FREE) {
             continue;
         }
-        link_reset(link, link->vecs, link->deadline);
+        link_reset(link, link->vecs, link->held, link->deadline);
         link->purpose = purpose;
         link->direction = direction;
         link->node_index = node_index;
@@ -795,7 +813,7 @@ static void link_try_free(struct vsr_io *io, struct vsr_io_link *link)
     if (link->fd >= 0) {
         vsr_io_engine_slot_free(io, (uint32_t)link->fd);
     }
-    link_reset(link, link->vecs, link->deadline);
+    link_reset(link, link->vecs, link->held, link->deadline);
 }
 
 /* Leaves the current state for CLOSING: counts, election and the node's
@@ -2084,14 +2102,18 @@ static void link_received(struct vsr_io *io, struct vsr_io_link *link,
                last->offset + last->length == offset) {
         last->length += bytes;
         vsr_io_pool_release(&io->pool, slab);
-    } else if (link->held_count < VSR_IO_LINK_HELD) {
+    } else if (link->held_count < (link->purpose == VSR_IO_PURPOSE_STREAM
+                                       ? io->links.held_per_link
+                                       : VSR_IO_LINK_HELD)) {
         last = &link->held[link->held_count++];
         last->slab = slab;
         last->offset = offset;
         last->length = bytes;
     } else {
-        /* Every held run is a slab the pool could not replace: the stream
-         * cannot be kept intact without unbounded memory. */
+        /* Every held run is a slab the pool could not replace: a peer
+         * link whose MESSAGE waits holds VSR_IO_LINK_HELD at most
+         * (decision 76); a stream link, a run per slab of the pool (G4),
+         * which only interleaved deliveries sharing slabs can exceed. */
         vsr_io_pool_release(&io->pool, slab);
         link_close(io, link_index(io, link), -ENOBUFS);
         return;

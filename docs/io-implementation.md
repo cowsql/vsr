@@ -430,9 +430,10 @@ carves frames:
    delivered bytes, decode it in place; else, if it continues in the same
    slab on a later CQE, wait; else (the next CQE names another slab, or
    the partial's frame is still to be delivered) the delivery joins the
-   link's HELD runs (`held[VSR_IO_LINK_HELD]`, arrival order, one pool
-   reference each, a delivery contiguous with the last run merging into
-   it). Once the partial run is consumed the first held run becomes the
+   link's HELD runs (`held`, arrival order, one pool reference each, a
+   delivery contiguous with the last run merging into it; a peer link
+   holds `VSR_IO_LINK_HELD`, a stream link `held_per_link`, the pool's
+   slab count, G4). Once the partial run is consumed the first held run becomes the
    partial; while the partial's frame is incomplete and a run is held,
    the frame is reassembled (decision 76): the partial bytes are copied
    into a reassembly slab acquired for the frame (`vsr_io_pool_acquire`
@@ -444,8 +445,7 @@ carves frames:
    run starts at the slab's offset 0, so the copy always fits; the slab
    is released once the frame is consumed. No free slab: the runs stay
    held, `retry` is set and every `vsr_io_links_poll` carves again; a
-   link needing more than `VSR_IO_LINK_HELD` runs is closed with
-   `-ENOBUFS`.
+   link needing more runs than it may hold is closed with `-ENOBUFS`.
 4. Decoding: check the body CRC over the cursor; HELLO goes to the
    handshake, stream frames to `vsr_io_streams_frame`. A MESSAGE on an
    established peer link (decisions 67 and 75): the envelope's `cluster` and
@@ -472,8 +472,10 @@ carves frames:
    `vsr_io_streams_data_done`, or the ring drained), at which point the
    next prepare re-arms the receive. The socket buffer then fills and the
    TCP window throttles the source; what the kernel delivered before the
-   cancel took effect joins the held runs, whose bound (step 3) must
-   absorb that burst (section 11). A paused link learns of a reset or an
+   cancel took effect joins the held runs, a run per slab it filled,
+   which the stream link's bound of the pool's slab count absorbs (G4;
+   the whole reap batch is carved in `vsr_io_complete`, before the caller
+   can complete a DATA op, so the burst is that batch). A paused link learns of a reset or an
    EOF only when it receives again; peer links never pause.
 5. The slab reference taken at `recv_begin` is released once every byte of
    its run has been decoded (each MESSAGE lease took its own reference)
@@ -2045,6 +2047,7 @@ of `docs/io-design.md`:
 | `engine.h`, `link.c` (internal) | `vsr_io_engine_complete_later` (the deferred ring's producer, moved from loop.c's `complete_now` into the kernel); a SEND evicted from a full node queue completes through it | G1 |
 | `deadline.h`, `engine.h` (internal) | `vsr_io_deadline_entry.rebase` (was `reserved`), `vsr_io_deadlines.rebasing` and `marked`, `vsr_io_deadlines_rebase`; `vsr_io_engine_advance`, which `vsr_io_poll` and `vsr_io_prepare` call instead of setting `io->now` | G2 |
 | `vsr-io.h`, `link.h` (internal), the simulation | Payload pool send rule: a link whose socket refuses a zero-copy send (`-EOPNOTSUPP`, AF_UNIX) sends those bytes again and everything after as plain `VECTORED` sends (`vsr_io_link.plain_sends`); executor contract, SEND: `-EOPNOTSUPP` with `MORE`, then the `NOTIF`, for a zero-copy send on `AF_UNIX`, in the simulation as in Linux | G3 |
+| `link.h` (internal) | `vsr_io_link.held` is a pointer into the links region (`vsr_io_links.held`, `held_per_link` = max(`VSR_IO_LINK_HELD`, `slabs`) runs per link); a stream link holds up to `held_per_link` runs, a peer link `VSR_IO_LINK_HELD`; the engine metadata region grows by `links * held_per_link` runs | G4 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -2094,17 +2097,15 @@ of `docs/io-design.md`:
   `NOT_FOUND`) can leave a log without a valid superblock, which the next
   open reports `CORRUPT`; the directory is not fsynced after the create
   either (the engine or the snapshot module should).
-- A paused stream link (decision 99) still holds what the kernel
-  delivered between the frame that blocked and the CANCEL taking effect,
-  within the `VSR_IO_LINK_HELD` (8) runs of decision 76: with page slabs a
-  burst above about 32 KiB reaped at once (a socket buffer holding more,
-  a multishot receive delivering up to its per-wake limit) closes the
-  link `-ENOBUFS` as before, and the transfer ends RETRY. Larger slabs
-  raise the bound in bytes; giving stream links a held capacity of the
-  pool's worth of runs (memory per link) would make the pool the only
-  bound. The unit harness bounds the burst with its socket buffer
-  (`world.inbox_limit`); a burst past the bound is not modelled as a
-  passing test.
+- A paused stream link (decision 99) holds what the kernel delivered
+  between the frame that blocked and the CANCEL taking effect, a run per
+  slab (G4: up to the pool's slab count per stream link, a
+  `slabs`-sized run array per link in the links region); only deliveries
+  of several links interleaved inside the same incremental slab can
+  still split a slab into more runs than that, and would close the link
+  `-ENOBUFS`. Meanwhile the paused link keeps the slabs it holds, which
+  the ring then lacks for the other links' receives until the caller
+  completes its DATA ops.
 - A source throttled by a paused requester makes no send progress and is
   bounded by the inactivity timer like a dead one; a requester slower
   than `handshake_timeout_ns` per window ends RETRY at the source.
