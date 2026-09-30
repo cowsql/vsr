@@ -325,6 +325,15 @@ static size_t expected_metadata(const struct vsr_io_options *o)
     place(&offset, (size_t)l->replicas * sizeof(struct vsr_io_replica),
           alignof(struct vsr_io_replica));
     place(&offset, (size_t)l->file_slots * sizeof(uint32_t), alignof(uint32_t));
+    /* vsr_io_run's scratch. */
+    place(&offset, (size_t)l->batch * sizeof(struct vsr_io_sqe),
+          alignof(struct vsr_io_sqe));
+    place(&offset, (size_t)l->batch * sizeof(struct vsr_io_cqe),
+          alignof(struct vsr_io_cqe));
+    place(&offset, (size_t)l->ops * sizeof(struct vsr_io_op),
+          alignof(struct vsr_io_op));
+    place(&offset, ((size_t)l->ops + l->events) * sizeof(struct vsr_io_event),
+          alignof(struct vsr_io_event));
     return offset;
 }
 
@@ -692,8 +701,8 @@ static void test_init(void)
     CHECK(io->pool.base == payload && io->pool.slabs == SLABS);
     /* The reserve: a send slab per link, the stream windows' chunk reads,
      * four per replica and one reassembly slab (decision E1). */
-    CHECK(io->pool.reserve == l->links + l->streams * l->stream_window +
-                                  4 * l->replicas + 1);
+    CHECK(io->pool.reserve ==
+          l->links + l->streams * l->stream_window + 4 * l->replicas + 1);
     CHECK(io->pool.reserve == vsr_io_engine_reserve(l));
     CHECK(io->pool.internal_taken == 0);
     CHECK(io->pool.caller_slabs == 2);

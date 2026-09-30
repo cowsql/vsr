@@ -39,17 +39,42 @@
 #define VSR_IO_LEASE_REPLICA_SHIFT 40
 #define VSR_IO_LEASE_REGION_SHIFT 16
 #define VSR_IO_LEASE_GENERATION_MASK UINT64_C(0xFFFF)
+/* Lease ids carry the region index in 24 bits. */
+#define VSR_IO_LEASE_REGIONS_MAX (UINT32_C(1) << 24)
+
+/* The slot table is engine-wide and sized before any replica attaches, so
+ * it reserves this many record writes per replica; vsr_io_attach refuses a
+ * store configured with more (decision 67). */
+#define VSR_IO_ENGINE_INFLIGHT_WRITES_MAX 8u
+/* Longest LINK chain the engine prepares (listener setup: SOCKET, BIND,
+ * LISTEN, ACCEPT); a chain never spans batches, so vsr_io_prepare needs at
+ * least this capacity. */
+#define VSR_IO_ENGINE_BATCH_MIN 4u
+/* A store directory, NUL included, like every path the modules build. */
+#define VSR_IO_ENGINE_PATH_BYTES 4096u
 
 enum vsr_io_replica_state {
     VSR_IO_REPLICA_FREE,
-    VSR_IO_REPLICA_OPENING, /* Store open/recovery in progress. */
-    VSR_IO_REPLICA_RUNNING,
-    VSR_IO_REPLICA_STOPPED /* STATUS STOPPED emitted; detach allowed. */
+    VSR_IO_REPLICA_OPENING, /* Attached; no STATUS emitted yet. */
+    VSR_IO_REPLICA_RUNNING, /* A STATUS was emitted. */
+    VSR_IO_REPLICA_STOPPED  /* STATUS STOPPED emitted; detach allowed. */
+};
+
+enum vsr_io_engine_state {
+    VSR_IO_ENGINE_RUNNING,
+    VSR_IO_ENGINE_CLOSING, /* vsr_io_close called; links and streams shut. */
+    VSR_IO_ENGINE_CLOSED
+};
+
+enum vsr_io_lease_state {
+    VSR_IO_LEASE_STATE_FREE,
+    VSR_IO_LEASE_STATE_QUEUED, /* Its event is not accepted by the core yet. */
+    VSR_IO_LEASE_STATE_LEASED
 };
 
 /* A decode region and its lease. */
 struct vsr_io_lease {
-    uint32_t state; /* 0 free, 1 queued (event not yet accepted), 2 leased */
+    uint32_t state; /* enum vsr_io_lease_state */
     uint32_t slab;  /* Pool slab referenced, or NONE. */
     uint32_t pin;   /* Ring pin, or NONE. */
     uint16_t generation;
@@ -65,48 +90,78 @@ struct vsr_io_queued_event {
     uint32_t kind;  /* enum vsr_io_event_kind of the wrapper. */
 };
 
+/* A completion the routing decided at once (a SEND the link module
+ * refused, a snapshot op's status, a malformed op), fed to the core once
+ * `due` passed: the replica's retry_ns after the routing (decision E3). */
+struct vsr_io_deferred {
+    uint64_t due;
+    uint64_t op;
+    int32_t status;
+    uint32_t reserved;
+};
+
 /* An in-flight incarnation admitted by vsr_io_submit lives in the store's
  * client table (inflight flag); the engine only routes. */
 
 struct vsr_io_replica {
     struct vsr_io *io;
     uint32_t index;
-    uint32_t state; /* enum vsr_io_replica_state */
-    struct vsr *core;
-    struct vsr_options options; /* Copy; seed points into `seed_region`. */
-    unsigned char *seed_region;
+    uint32_t state;             /* enum vsr_io_replica_state */
+    struct vsr *core;           /* Kept after detach for vsr_deinit. */
+    struct vsr_options options; /* Copy; seed points at seed_copy. */
+    struct vsr_membership seed_copy;
+    struct vsr_member *seed_members; /* [seed count] in the region. */
+    char *path;                      /* The store directory, copied. */
     struct vsr_io_store store;
     struct vsr_io_snapshots snapshots;
     /* Event queues, in the order vsr_io_poll feeds them: internal
-     * completions, then caller events, then MESSAGEs, then TIME. */
+     * completions, then the caller's COMPLETE and STOP events, then
+     * MESSAGEs, then the caller's other events, then TIME. */
     struct vsr_io_queued_event *completions; /* [core.limits.operations]
                                                 ring of internal COMPLETEs
-                                                (SEND, snapshot); the store
-                                                drains its own queue. */
+                                                (store, SEND, snapshot):
+                                                one per outstanding op. */
     uint32_t completions_head;
     uint32_t completions_count;
-    struct vsr_io_queued_event *events; /* [limits.events] caller ring */
+    struct vsr_io_deferred *deferred; /* [operations] ring, due in order. */
+    uint32_t deferred_head;
+    uint32_t deferred_count;
+    struct vsr_io_queued_event *priority; /* [operations + 1] caller
+                                             COMPLETE and STOP ring. */
+    uint32_t priority_head;
+    uint32_t priority_count;
+    uint32_t priority_capacity;
+    uint32_t stopping; /* A STOP was submitted: other core events are
+                          refused, MESSAGEs no longer delivered. */
+    struct vsr_io_queued_event *events; /* [limits.events] ring of the
+                                           caller's other events. */
     uint32_t events_head;
     uint32_t events_count;
     struct vsr_io_queued_event *messages; /* [regions] ring */
     uint32_t messages_head;
     uint32_t messages_count;
-    struct vsr_event *step_events; /* [regions + events + operations + 1]
-                                      scratch array for vsr_step_many */
-    struct vsr_op *step_ops;       /* [step_capacity] */
+    struct vsr_event *step_events; /* [step_events_capacity] scratch array
+                                      for vsr_step_many: every queue plus
+                                      TIME. */
+    uint32_t step_events_capacity;
+    struct vsr_op *step_ops; /* [step_capacity] */
     uint32_t step_capacity;
     uint32_t regions_count;
     struct vsr_io_lease *leases; /* [regions_count] */
     uint32_t leases_free;
     uint32_t status_pending;  /* 1: STATUS op to emit on the next poll. */
-    struct vsr_status status; /* Borrowed by the STATUS op. */
-    uint64_t core_deadline;
-    uint32_t deadline_core; /* Deadline handles. */
+    struct vsr_status status; /* Last status read for a STATUS op. */
+    uint64_t core_deadline;   /* Last update.deadline_ns. */
+    uint32_t deadline_core;   /* Deadline handles, bound at init. */
     uint32_t deadline_flush;
     uint32_t deadline_sync;
     uint32_t deadline_capture;
+    uint64_t rejected;             /* Events the core refused (EINVAL) that the
+                              engine dropped. */
     struct vsr_io_region metadata; /* The caller's regions, for detach. */
     struct vsr_io_region tail;
+    uint32_t tail_region; /* Executor buffer region of the tail. */
+    uint32_t reserved;
 };
 
 /* Forwarded op queue entry: a CORE op verbatim or an engine rail with its
@@ -120,6 +175,7 @@ struct vsr_io_forwarded {
         struct vsr_io_stream_end end;
         struct vsr_io_stream_written written;
         struct vsr_io_link_wanted wanted;
+        struct vsr_status status; /* STATUS: the replica's, at emission. */
     } rail;
 };
 
@@ -127,7 +183,7 @@ struct vsr_io {
     struct vsr_io_options options; /* Copy; listen points into listen_copy. */
     struct vsr_io_address *listen_copy;
     struct vsr_io_executor ex;
-    uint32_t state; /* 0 running, 1 closing, 2 closed */
+    uint32_t state; /* enum vsr_io_engine_state */
     uint32_t page_bytes;
     struct vsr_io_pool pool;
     struct vsr_io_slots slots;
@@ -145,11 +201,21 @@ struct vsr_io {
     uint32_t forwarded_count;
     uint32_t forwarded_overflow; /* 1 when a producer found it full; poll
                                     reports MORE. */
-    uint64_t now;                /* Last now_ns given to poll. */
+    uint64_t now;                /* Last now_ns given to poll or prepare,
+                                    never decreasing. */
     uint32_t wake_pending;       /* Set by vsr_io_wake; cleared by poll. */
     uint32_t reserved;
     struct vsr_io_stats stats;
     struct vsr_io_uring *uring; /* Non-NULL when the executor is ours. */
+    uint64_t releases_rejected; /* RELEASE ops of a stale engine lease. */
+    uint64_t events_rejected;   /* Queued events the core refused. */
+    /* vsr_io_run's scratch, from the metadata region. */
+    struct vsr_io_sqe *run_sqes;     /* [limits.batch] */
+    struct vsr_io_cqe *run_cqes;     /* [limits.batch] */
+    struct vsr_io_op *run_ops;       /* [limits.ops] */
+    struct vsr_io_event *run_events; /* [run_events_capacity] */
+    uint32_t run_events_capacity;    /* limits.ops + limits.events */
+    uint32_t reserved2;
 };
 
 /* Layout of the engine metadata region: bytes and alignment (the page,
@@ -203,5 +269,17 @@ int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd);
  * or recovery read slab and the snapshot module's writer, writer-cold and
  * reader slabs, and one reassembly slab. */
 uint32_t vsr_io_engine_reserve(const struct vsr_io_limits *limits);
+/* Closing completes once every slot is free, every link FREE and no
+ * stream active (decisions 49, 96, 101); run after every completion batch,
+ * poll and prepare. */
+void vsr_io_engine_check_closed(struct vsr_io *io);
+
+/* The routing of one core update (docs/io-implementation.md 7.3), exposed
+ * for the unit tests: every LOAD, then every STORE, then SYNC and RECLAIM,
+ * then the other ops in emission order (decision 51). The forwarded ring
+ * must have room for every forwarded op (vsr_io_poll bounds the update's
+ * capacity by it). */
+void vsr_io_engine_route(struct vsr_io_replica *replica,
+                         const struct vsr_op *ops, uint32_t count);
 
 #endif /* VSR_IO_ENGINE_H */

@@ -11,12 +11,13 @@
 #include <string.h>
 
 /*
- * Engine kernel: the metadata layout, initialization and executor
+ * Engine kernel: the metadata layout, initialization, close and executor
  * registration of struct vsr_io, and the helpers every planner module
- * calls (docs/io-implementation.md, section 7). The loop entry points, the
- * replica life cycle and the op routing follow in this file once the
- * store, link, stream and snapshot modules exist (see the end of the
- * file).
+ * calls (docs/io-implementation.md, section 7). The replica life cycle
+ * lives in replica.c and the loop entry points with the op routing in
+ * loop.c: this file references no store or snapshot symbol, so a program
+ * that only drives the link and stream modules (tests/unit/stream.c with
+ * its snapshot doubles) links without snapshot.o.
  *
  * Metadata region, in offset order (docs/io-implementation.md, section 2):
  *   1. pool bookkeeping: the provided-ring memory first, page aligned at
@@ -33,6 +34,8 @@
  *   8. forwarded-op ring [limits.ops]
  *   9. replica table [limits.replicas]
  *  10. engine file-slot free list [limits.file_slots]
+ *  11. vsr_io_run's scratch: records [batch], completions [batch], ops
+ *      [ops], events [ops + events]
  * Every offset is computed with checked arithmetic; the same plan carves
  * the region at init.
  */
@@ -46,13 +49,8 @@
 #define ENGINE_PAGE_BYTES 4096u
 /* Provided-ring entry bytes, per the executor contract (buffer_ring). */
 #define ENGINE_RING_ENTRY_BYTES 16u
-/* The slot table is engine-wide and sized before any replica attaches, so
- * it reserves this many record writes per replica; vsr_io_attach refuses
- * a store configured with more (vsr_io_store_options.inflight_writes). */
-#define ENGINE_INFLIGHT_WRITES_MAX 8u
-/* Longest LINK chain the engine prepares (listener setup: SOCKET, BIND,
- * LISTEN, ACCEPT); a chain never spans batches. */
-#define ENGINE_BATCH_MIN 4u
+#define ENGINE_INFLIGHT_WRITES_MAX VSR_IO_ENGINE_INFLIGHT_WRITES_MAX
+#define ENGINE_BATCH_MIN VSR_IO_ENGINE_BATCH_MIN
 /* Frame header plus stream chunk header around one chunk payload. */
 #define ENGINE_STREAM_FRAMING                                                  \
     (VSR_IO_FRAME_HEADER_BYTES + sizeof(struct vsr_io_wire_stream_chunk))
@@ -64,10 +62,11 @@
 #define ENGINE_FILE_SLOTS_END ((uint64_t)INT32_MAX + 1)
 #define ENGINE_BUFFER_REGIONS_END (UINT64_C(1) << 16)
 
-enum engine_state { ENGINE_RUNNING, ENGINE_CLOSING, ENGINE_CLOSED };
-
-enum lease_state { LEASE_FREE, LEASE_QUEUED, LEASE_LEASED };
-
+#define ENGINE_RUNNING VSR_IO_ENGINE_RUNNING
+#define ENGINE_CLOSING VSR_IO_ENGINE_CLOSING
+#define ENGINE_CLOSED VSR_IO_ENGINE_CLOSED
+#define LEASE_FREE VSR_IO_LEASE_STATE_FREE
+#define LEASE_QUEUED VSR_IO_LEASE_STATE_QUEUED
 /* Pool reserve per replica: a cold-load or recovery read slab, and the
  * snapshot module's writer, writer-cold and reader slabs (decision E1). */
 #define ENGINE_RESERVE_PER_REPLICA 4u
@@ -103,6 +102,11 @@ struct engine_plan {
     size_t forwarded;
     size_t replicas;
     size_t file_slots;
+    size_t run_sqes;
+    size_t run_cqes;
+    size_t run_ops;
+    size_t run_events;
+    uint32_t run_events_count;
     size_t total;
     size_t alignment;
     size_t payload;
@@ -317,9 +321,21 @@ static int engine_plan(const struct vsr_io_options *options,
         !place(&offset, bytes, alignof(struct vsr_io_replica),
                &plan->replicas) ||
         !vsr_size_mul(limits->file_slots, sizeof(uint32_t), &bytes) ||
-        !place(&offset, bytes, alignof(uint32_t), &plan->file_slots)) {
+        !place(&offset, bytes, alignof(uint32_t), &plan->file_slots) ||
+        !vsr_size_mul(limits->batch, sizeof(struct vsr_io_sqe), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_sqe), &plan->run_sqes) ||
+        !vsr_size_mul(limits->batch, sizeof(struct vsr_io_cqe), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_cqe), &plan->run_cqes) ||
+        !vsr_size_mul(limits->ops, sizeof(struct vsr_io_op), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_op), &plan->run_ops) ||
+        !vsr_size_add(limits->ops, limits->events, &capacity) ||
+        capacity > UINT32_MAX ||
+        !vsr_size_mul(capacity, sizeof(struct vsr_io_event), &bytes) ||
+        !place(&offset, bytes, alignof(struct vsr_io_event),
+               &plan->run_events)) {
         return VSR_ELIMIT;
     }
+    plan->run_events_count = (uint32_t)capacity;
     plan->total = offset;
     plan->alignment = ENGINE_PAGE_BYTES;
     return VSR_OK;
@@ -410,6 +426,18 @@ static void bind_deadlines(struct vsr_io *io)
     for (uint32_t i = 0; i < io->streams.count; ++i) {
         io->streams.streams[i].deadline =
             deadline_base(limits, VSR_IO_DEADLINE_STREAM) + i;
+    }
+    for (uint32_t i = 0; i < limits->replicas; ++i) {
+        struct vsr_io_replica *replica = &io->replicas[i];
+
+        replica->deadline_core =
+            deadline_base(limits, VSR_IO_DEADLINE_CORE) + i;
+        replica->deadline_flush =
+            deadline_base(limits, VSR_IO_DEADLINE_FLUSH) + i;
+        replica->deadline_sync =
+            deadline_base(limits, VSR_IO_DEADLINE_SYNC) + i;
+        replica->deadline_capture =
+            deadline_base(limits, VSR_IO_DEADLINE_CAPTURE) + i;
     }
 }
 
@@ -504,7 +532,6 @@ int vsr_io_init(const struct vsr_io_options *options,
                       &options->limits, options->limits.slab_bytes);
     vsr_io_streams_init(&io->streams, base + plan.streams, plan.streams_bytes,
                         &options->limits, options->stream_chunk_bytes);
-    bind_deadlines(io);
     io->replicas = (struct vsr_io_replica *)(void *)(base + plan.replicas);
     memset(io->replicas, 0,
            (size_t)options->limits.replicas * sizeof(*io->replicas));
@@ -513,6 +540,7 @@ int vsr_io_init(const struct vsr_io_options *options,
         io->replicas[i].index = i;
         io->replicas[i].state = VSR_IO_REPLICA_FREE;
     }
+    bind_deadlines(io);
     io->replicas_count = 0;
     io->file_slot_next = options->file_slot_base;
     io->file_slots_free = (uint32_t *)(void *)(base + plan.file_slots);
@@ -526,6 +554,13 @@ int vsr_io_init(const struct vsr_io_options *options,
     memset(&io->stats, 0, sizeof(io->stats));
     /* The executor is opaque to the engine; nothing in it needs the ring. */
     io->uring = NULL;
+    io->releases_rejected = 0;
+    io->events_rejected = 0;
+    io->run_sqes = (struct vsr_io_sqe *)(void *)(base + plan.run_sqes);
+    io->run_cqes = (struct vsr_io_cqe *)(void *)(base + plan.run_cqes);
+    io->run_ops = (struct vsr_io_op *)(void *)(base + plan.run_ops);
+    io->run_events = (struct vsr_io_event *)(void *)(base + plan.run_events);
+    io->run_events_capacity = plan.run_events_count;
     rc = register_pool(io);
     if (rc != VSR_OK) {
         return rc;
@@ -534,12 +569,13 @@ int vsr_io_init(const struct vsr_io_options *options,
     return VSR_OK;
 }
 
-/* Closing completes once every slot is free and every link is FREE
- * (decision 49); the loop re-checks after each completion. */
-static void check_closed(struct vsr_io *io)
+/* Closing completes once every slot is free, every link FREE and no
+ * stream active (decisions 49 and 97); the loop re-checks after each
+ * completion batch, poll and prepare. */
+void vsr_io_engine_check_closed(struct vsr_io *io)
 {
     if (io->state != ENGINE_CLOSING ||
-        io->slots.free_count != io->slots.count) {
+        io->slots.free_count != io->slots.count || io->streams.active != 0) {
         return;
     }
     for (uint32_t i = 0; i < io->links.links_count; ++i) {
@@ -551,6 +587,9 @@ static void check_closed(struct vsr_io *io)
     io->stats.closed = 1;
 }
 
+/* The link and stream shutdowns may come in either order (decision 101):
+ * every stream ends CANCELLED on this engine whichever runs first. The
+ * links go first, as section 7.7 lists them. */
 int vsr_io_close(struct vsr_io *io)
 {
     if (io == NULL) {
@@ -561,8 +600,10 @@ int vsr_io_close(struct vsr_io *io)
     }
     if (io->state == ENGINE_RUNNING) {
         io->state = ENGINE_CLOSING;
+        vsr_io_links_shutdown(io);
+        vsr_io_streams_shutdown(io);
     }
-    check_closed(io);
+    vsr_io_engine_check_closed(io);
     return VSR_OK;
 }
 
@@ -575,7 +616,7 @@ int vsr_io_deinit(struct vsr_io *io)
     if (io == NULL) {
         return VSR_EINVAL;
     }
-    if (io->state != ENGINE_CLOSED) {
+    if (io->state != ENGINE_CLOSED || io->replicas_count > 0) {
         return VSR_EBUSY;
     }
     ex = &io->ex;
@@ -841,13 +882,17 @@ bool vsr_io_engine_deliver(struct vsr_io *io, struct vsr_io_replica *replica,
     return true;
 }
 
+/* A replica whose STOP was submitted is not resolved: its core refuses
+ * MESSAGEs (they are dropped and counted, decision 75) and its files are
+ * not served any more (NOT_FOUND), so the served streams that would hold
+ * its detach off end (decision E4). */
 struct vsr_io_replica *vsr_io_engine_replica(struct vsr_io *io,
                                              struct vsr_id cluster)
 {
     for (uint32_t i = 0; i < io->options.limits.replicas; ++i) {
         struct vsr_io_replica *replica = &io->replicas[i];
 
-        if (replica->state != VSR_IO_REPLICA_FREE &&
+        if (replica->state != VSR_IO_REPLICA_FREE && replica->stopping == 0 &&
             replica->options.cluster.hi == cluster.hi &&
             replica->options.cluster.lo == cluster.lo) {
             return replica;
@@ -892,26 +937,50 @@ int vsr_io_engine_install(struct vsr_io *io, uint32_t slot, int fd)
     return io->ex.ops->update_file(io->ex.ctx, slot, fd);
 }
 
-/*
- * Part 2 of this file, once the store, link, stream and snapshot modules
- * exist, adds on top of the structures above:
- *   - vsr_io_replica_size and vsr_io_replica_layout: the core arena, the
- *     event, message and completion rings, the step scratch arrays, the
- *     lease table and decode regions (input_leases + events, each
- *     max(message_region, load_region) bytes), the store and snapshot
- *     bookkeeping, and the tail region;
- *   - vsr_io_attach, vsr_io_detach, vsr_io_replica_status,
- *     vsr_io_replica_core, vsr_io_replica_find, with the replica deadline
- *     handles bound as base[kind] + index and the store's inflight_writes
- *     checked against ENGINE_INFLIGHT_WRITES_MAX;
- *   - vsr_io_node_set, vsr_io_node_clear, vsr_io_authorize, vsr_io_adopt
- *     and vsr_io_node_status over the link module;
- *   - vsr_io_complete, vsr_io_poll (with the event order of section 7.1,
- *     the op routing of 7.3 and the drain of the forwarded ring),
- *     vsr_io_submit, vsr_io_prepare (provision, links, streams, per
- *     replica store and snapshots, the earliest deadline) and vsr_io_run;
- *   - close completion: vsr_io_close calls the link and stream shutdowns
- *     and check_closed runs after every completion;
- *   - STATUS emission once per poll with STATE_CHANGED and once at
- *     STOPPED, and the replica state transitions of 7.7.
- */
+/* -------------------------------------------------------------------------
+ * Nodes, authorizations and adopted sockets: thin over the link module,
+ * which holds the tables and every rule (decisions 72, 73 and 86).
+ * ---------------------------------------------------------------------- */
+
+int vsr_io_node_set(struct vsr_io *io, uint64_t node,
+                    const struct vsr_io_address *address)
+{
+    if (io == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_node_set(io, node, address);
+}
+
+int vsr_io_node_clear(struct vsr_io *io, uint64_t node)
+{
+    if (io == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_node_clear(io, node);
+}
+
+int vsr_io_authorize(struct vsr_io *io, struct vsr_id cluster, uint64_t replica,
+                     uint64_t node)
+{
+    if (io == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_authorize(io, cluster, replica, node);
+}
+
+int vsr_io_adopt(struct vsr_io *io, int fd, uint64_t node, uint32_t flags)
+{
+    if (io == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_adopt(io, fd, node, flags);
+}
+
+int vsr_io_node_status(const struct vsr_io *io, uint64_t node,
+                       struct vsr_io_node_status *status)
+{
+    if (io == NULL || status == NULL) {
+        return VSR_EINVAL;
+    }
+    return vsr_io_links_node_status(io, node, status);
+}
