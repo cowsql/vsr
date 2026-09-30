@@ -95,7 +95,7 @@ static void time_all(struct fixture *f, uint64_t now)
 }
 
 static struct fixture create(uint32_t count, bool witness,
-                             const struct vsr_options *template)
+                             const struct vsr_options *preset)
 {
     struct fixture f = {mem_cluster_create(), {0}, count, 0, 0, UINT32_MAX};
     struct vsr_member members[3];
@@ -108,12 +108,12 @@ static struct fixture create(uint32_t count, bool witness,
             0};
     for (uint32_t i = 0; i < count; i++) {
         struct vsr_options options = mem_options(i + 1, &group);
-        if (template != NULL) {
-            options.limits = template->limits;
-            options.heartbeat_ns = template->heartbeat_ns;
-            options.view_timeout_ns = template->view_timeout_ns;
-            options.retry_ns = template->retry_ns;
-            options.batch_delay_ns = template->batch_delay_ns;
+        if (preset != NULL) {
+            options.limits = preset->limits;
+            options.heartbeat_ns = preset->heartbeat_ns;
+            options.view_timeout_ns = preset->view_timeout_ns;
+            options.retry_ns = preset->retry_ns;
+            options.batch_delay_ns = preset->batch_delay_ns;
         }
         f.nodes[i] = mem_cluster_add(f.cluster, &options);
         CHECK(mem_node_time(f.nodes[i], 0).consumed == 1);
@@ -539,10 +539,10 @@ static struct vsr_options minimum_template(void)
  * and every accepted request still completes. */
 static void payload_backpressure(void)
 {
-    const struct vsr_options template = minimum_template();
-    struct fixture f = create(1, false, &template);
+    const struct vsr_options preset = minimum_template();
+    struct fixture f = create(1, false, &preset);
     struct mem_node *node = f.nodes[0];
-    const size_t bytes = (size_t) template.limits.command_bytes;
+    const size_t bytes = (size_t)preset.limits.command_bytes;
     struct mem_step step = request(node, 1, 1, 0, 'X', bytes + 1, 1);
     CHECK(step.result == VSR_ELIMIT && step.consumed == 0);
     CHECK(mem_node_leases(node) == 0);
@@ -635,16 +635,16 @@ static void batch_delay(void)
     for (unsigned variant = 0; variant < 3; variant++) {
         const struct vsr_member member = {1, VSR_MEMBER_FULL, 0};
         const struct vsr_membership group = {0, &member, 1, 0};
-        struct vsr_options template = mem_options(1, &group);
-        template.batch_delay_ns = 20;
-        template.limits.batch_entries = 2;
+        struct vsr_options preset = mem_options(1, &group);
+        preset.batch_delay_ns = 20;
+        preset.limits.batch_entries = 2;
         if (variant != 2) {
             /* Every other timer is later than the batching deadline. */
-            template.heartbeat_ns = 100;
-            template.view_timeout_ns = 200;
-            template.retry_ns = 50;
+            preset.heartbeat_ns = 100;
+            preset.view_timeout_ns = 200;
+            preset.retry_ns = 50;
         }
-        struct fixture f = create(1, false, &template);
+        struct fixture f = create(1, false, &preset);
         struct mem_node *node = f.nodes[0];
         uint64_t deadline = VSR_NO_DEADLINE;
         command(node, 1, 1, 'A', 1);

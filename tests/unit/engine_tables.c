@@ -63,12 +63,12 @@ struct fake {
     uint32_t submits;
 };
 
-static struct fake_call *fake_record(struct fake *fake, enum fake_kind kind)
+static struct fake_call *fake_record(struct fake *self, enum fake_kind kind)
 {
     struct fake_call *call;
 
-    CHECK(fake->count < sizeof(fake->calls) / sizeof(fake->calls[0]));
-    call = &fake->calls[fake->count++];
+    CHECK(self->count < sizeof(self->calls) / sizeof(self->calls[0]));
+    call = &self->calls[self->count++];
     memset(call, 0, sizeof(*call));
     call->kind = kind;
     return call;

@@ -39,6 +39,57 @@ _Static_assert(offsetof(struct vsr_io_vec, length) ==
 _Static_assert(sizeof(struct io_uring_sqe) == 64, "64-byte SQEs");
 _Static_assert(sizeof(struct io_uring_cqe) == 16, "16-byte CQEs");
 _Static_assert(sizeof(struct io_uring_buf) == 16, "16-byte buffer entries");
+/* The kernel's ABI as this file uses it: a refreshed UAPI header must
+ * declare these layouts unchanged (src/io/uapi/README.md). */
+#define ABI_AT(type, field, offset)                                            \
+    _Static_assert(offsetof(struct type, field) == (offset),                   \
+                   #type "." #field " at " #offset)
+ABI_AT(io_uring_sqe, opcode, 0);
+ABI_AT(io_uring_sqe, flags, 1);
+ABI_AT(io_uring_sqe, ioprio, 2);
+ABI_AT(io_uring_sqe, fd, 4);
+ABI_AT(io_uring_sqe, off, 8);
+ABI_AT(io_uring_sqe, cmd_op, 8);
+ABI_AT(io_uring_sqe, addr, 16);
+ABI_AT(io_uring_sqe, level, 16);
+ABI_AT(io_uring_sqe, optname, 20);
+ABI_AT(io_uring_sqe, len, 24);
+ABI_AT(io_uring_sqe, rw_flags, 28);
+ABI_AT(io_uring_sqe, msg_flags, 28);
+ABI_AT(io_uring_sqe, nop_flags, 28);
+ABI_AT(io_uring_sqe, user_data, 32);
+ABI_AT(io_uring_sqe, buf_index, 40);
+ABI_AT(io_uring_sqe, buf_group, 40);
+ABI_AT(io_uring_sqe, file_index, 44);
+ABI_AT(io_uring_sqe, optlen, 44);
+ABI_AT(io_uring_sqe, optval, 48);
+ABI_AT(io_uring_params, sq_off, 40);
+ABI_AT(io_uring_params, cq_off, 80);
+ABI_AT(io_uring_getevents_arg, min_wait_usec, 12);
+ABI_AT(io_uring_getevents_arg, ts, 16);
+ABI_AT(io_uring_rsrc_register, data, 16);
+ABI_AT(io_uring_rsrc_update2, tags, 16);
+ABI_AT(io_uring_rsrc_update2, nr, 24);
+ABI_AT(io_uring_buf_reg, flags, 14);
+ABI_AT(io_uring_buf_status, head, 4);
+ABI_AT(io_uring_probe, ops, 16);
+ABI_AT(io_uring_probe_op, flags, 2);
+ABI_AT(io_uring_napi, opcode, 5);
+ABI_AT(io_uring_napi, op_param, 8);
+ABI_AT(io_uring_sync_cancel_reg, timeout, 16);
+#undef ABI_AT
+_Static_assert(sizeof(struct io_uring_params) == 120 &&
+                   sizeof(struct io_uring_getevents_arg) == 24 &&
+                   sizeof(struct io_uring_rsrc_register) == 32 &&
+                   sizeof(struct io_uring_rsrc_update) == 16 &&
+                   sizeof(struct io_uring_rsrc_update2) == 32 &&
+                   sizeof(struct io_uring_buf_reg) == 40 &&
+                   sizeof(struct io_uring_buf_status) == 40 &&
+                   sizeof(struct io_uring_probe_op) == 8 &&
+                   sizeof(struct io_uring_napi) == 16 &&
+                   sizeof(struct io_uring_sync_cancel_reg) == 64 &&
+                   sizeof(struct __kernel_timespec) == 16,
+               "register and enter arguments keep the kernel's sizes");
 _Static_assert(sizeof(_Atomic uint32_t) == sizeof(uint32_t) &&
                    sizeof(_Atomic uint16_t) == sizeof(uint16_t),
                "ring words are addressed as atomics in place");
@@ -271,7 +322,7 @@ static unsigned setup_flags(const struct vsr_io_uring_options *options)
 }
 
 static int plan(const struct vsr_io_uring_options *options,
-                struct uring_plan *plan)
+                struct uring_plan *out)
 {
     size_t offset;
 
@@ -285,29 +336,29 @@ static int plan(const struct vsr_io_uring_options *options,
         options->buffer_regions > MAX_BUFFER_REGIONS) {
         return VSR_ELIMIT;
     }
-    memset(plan, 0, sizeof(*plan));
-    plan->page = page_size();
-    plan->setup = setup_flags(options);
-    plan->sq_ring = round_pow2(options->sq_entries);
-    plan->cq_ring = round_pow2(options->cq_entries);
+    memset(out, 0, sizeof(*out));
+    out->page = page_size();
+    out->setup = setup_flags(options);
+    out->sq_ring = round_pow2(options->sq_entries);
+    out->cq_ring = round_pow2(options->cq_entries);
 
     offset = sizeof(struct vsr_io_uring);
     if (!reserve(&offset, options->buffer_regions,
                  sizeof(struct vsr_io_uring_region),
-                 alignof(struct vsr_io_uring_region), &plan->buffers) ||
+                 alignof(struct vsr_io_uring_region), &out->buffers) ||
         !reserve(&offset, VSR_IO_URING_GROUPS,
                  sizeof(struct vsr_io_uring_group),
-                 alignof(struct vsr_io_uring_group), &plan->groups) ||
+                 alignof(struct vsr_io_uring_group), &out->groups) ||
         !reserve(&offset, options->cq_entries,
                  sizeof(struct vsr_io_uring_direct),
-                 alignof(struct vsr_io_uring_direct), &plan->directs) ||
-        !reserve(&offset, plan->sq_ring, sizeof(struct __kernel_timespec),
-                 alignof(struct __kernel_timespec), &plan->timespecs) ||
-        !reserve(&offset, plan->sq_ring, sizeof(struct msghdr),
-                 alignof(struct msghdr), &plan->msghdrs)) {
+                 alignof(struct vsr_io_uring_direct), &out->directs) ||
+        !reserve(&offset, out->sq_ring, sizeof(struct __kernel_timespec),
+                 alignof(struct __kernel_timespec), &out->timespecs) ||
+        !reserve(&offset, out->sq_ring, sizeof(struct msghdr),
+                 alignof(struct msghdr), &out->msghdrs)) {
         return VSR_ELIMIT;
     }
-    plan->total = offset;
+    out->total = offset;
     return VSR_OK;
 }
 
@@ -489,7 +540,6 @@ static int translate_recv(const struct vsr_io_uring *uring,
     bool multishot = (record->op_flags & VSR_IO_RECV_MULTISHOT) != 0;
     bool select = (record->flags & VSR_IO_SQE_BUFFER_SELECT) != 0;
     uint32_t msg_flags = 0;
-    int rc;
 
     if ((record->op_flags & ~known) != 0) {
         return -EINVAL;
@@ -508,7 +558,8 @@ static int translate_recv(const struct vsr_io_uring *uring,
         fill(sqe, IORING_OP_RECV, record->fd, NULL, record->length, 0);
     } else {
         if (record->flags & VSR_IO_SQE_FIXED_BUFFER) {
-            rc = check_region(uring, record);
+            int rc = check_region(uring, record);
+
             if (rc != 0) {
                 return rc;
             }
@@ -1148,7 +1199,7 @@ static uint32_t uring_reap(void *ctx, struct vsr_io_cqe *cqes,
         do {
             rc = ring_enter(ring, 0, 0, IORING_ENTER_GETEVENTS, NULL, 0);
         } while (rc == -EINTR);
-        if (rc < 0 && rc != -EAGAIN && rc != -EBUSY && uring->failure == 0) {
+        if (rc < 0 && rc != -EAGAIN && rc != -EBUSY) {
             uring->failure = rc;
         }
     }
@@ -1866,6 +1917,27 @@ static void unregister_ring_fd(struct vsr_io_uring_ring *ring)
     ring->enter_flags = 0;
 }
 
+/* io_uring_setup refused the ring with -EINVAL: bad options, or a kernel
+ * that does not know a setup flag, which is how every kernel before 6.6
+ * (NO_SQARRAY, the newest flag used) answers. Such a kernel also lacks
+ * IORING_FEAT_MIN_TIMEOUT (6.12), so the feature bits of a plain ring tell
+ * the two apart: -ENOSYS for the old kernel, as the feature check and the
+ * probe answer it, -EINVAL for options a current kernel refuses. */
+static int classify_refusal(void)
+{
+    struct io_uring_params params;
+    int fd;
+
+    memset(&params, 0, sizeof(params));
+    fd = ring_setup(1, &params);
+    if (fd < 0) {
+        return fd;
+    }
+    (void)close(fd);
+    return (params.features & REQUIRED_FEATURES) == REQUIRED_FEATURES ? -EINVAL
+                                                                      : -ENOSYS;
+}
+
 /* The one-time check of decision 53: every opcode the translation table
  * emits must be supported, else the kernel is too old. */
 static int probe_opcodes(const struct vsr_io_uring_ring *ring)
@@ -2026,6 +2098,9 @@ int vsr_io_uring_init(void *memory, size_t size,
         params.sq_thread_cpu = options->sqpoll_cpu;
     }
     rc = ring_setup(options->sq_entries, &params);
+    if (rc == -EINVAL) {
+        rc = classify_refusal();
+    }
     if (rc < 0) {
         return rc;
     }
@@ -2050,8 +2125,13 @@ int vsr_io_uring_init(void *memory, size_t size,
     if (options->napi_busy_poll_us > 0) {
         struct io_uring_napi napi;
 
+        /* Registration with dynamic tracking: the ring learns the NAPI ids
+         * of the sockets it polls (both values are 0, the layout older
+         * kernels read as padding). */
         memset(&napi, 0, sizeof(napi));
         napi.busy_poll_to = options->napi_busy_poll_us;
+        napi.opcode = IO_URING_NAPI_REGISTER_OP;
+        napi.op_param = IO_URING_NAPI_TRACKING_DYNAMIC;
         rc = ring_register(&uring->ring, IORING_REGISTER_NAPI, &napi, 1);
         if (rc < 0) {
             goto fail;
