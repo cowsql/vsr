@@ -1532,6 +1532,7 @@ static void app_core_op(struct iow_app *app, const struct vsr_op *op)
         return;
     case VSR_OP_SNAPSHOT_SYNC:
         app->syncs++;
+        app->sync_ns = iow_now();
         complete_op(app, op->id, VSR_IO_OK);
         return;
     case VSR_OP_SNAPSHOT_INSTALL:
@@ -1611,11 +1612,10 @@ struct iow_rstream *iow_stream_open(struct iow_node *n, uint64_t peer,
     s->cookie = cookie;
     s->seed = request->kind == IOW_STREAM_APPSNAP ? 0 : request->seed;
     s->status = -1;
-    memcpy(s->request, request, sizeof(*request));
-    s->request_bytes = (uint32_t)sizeof(*request);
+    s->request = *request;
     s->open.node = peer;
-    s->open.request.data = s->request;
-    s->open.request.size = s->request_bytes;
+    s->open.request.data = &s->request;
+    s->open.request.size = sizeof(s->request);
     memset(&event, 0, sizeof(event));
     event.kind = VSR_IO_EVENT_STREAM_OPEN;
     event.event.id = cookie;
@@ -1926,6 +1926,10 @@ static void app_op(struct iow_node *n, const struct vsr_io_op *op)
         app->statuses++;
         if (app->status.state == VSR_STATE_STOPPED) {
             app->stopped_statuses++;
+        }
+        if (app->status.failure.code != VSR_FAILURE_NONE &&
+            app->failed_ns == 0) {
+            app->failed_ns = iow_now();
         }
         return;
     case VSR_IO_OP_STREAM_SERVE:
@@ -2415,6 +2419,7 @@ struct iow_app *iow_attach_with(struct iow_node *n, uint32_t r)
     app->applies = app->applied_entries = app->releases = 0;
     app->captures = app->fetches = app->fetches_ok = app->installs = 0;
     app->syncs = app->drops = app->read_ready = 0;
+    app->sync_ns = app->failed_ns = 0;
     app->hold_apply = false;
     app->held_apply = 0;
     app->digest = 0;

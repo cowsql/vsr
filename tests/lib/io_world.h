@@ -151,6 +151,8 @@ struct iow_app {
     uint64_t syncs;
     uint64_t drops;
     uint64_t read_ready;
+    uint64_t sync_ns;   /* World time of the last SNAPSHOT_SYNC seen. */
+    uint64_t failed_ns; /* World time of the first STATUS with a failure. */
     /* The state machine. */
     uint64_t digest;
     uint64_t applied_op;
@@ -167,12 +169,32 @@ struct iow_app {
     bool check_history;     /* Compare digests with the cluster's. */
 };
 
+enum iow_stream_kind { IOW_STREAM_PATTERN, IOW_STREAM_APPSNAP };
+
+/* A harness stream request, as its bytes. */
+struct iow_stream_request {
+    uint32_t magic;
+    uint32_t kind;       /* enum iow_stream_kind */
+    uint64_t seed;       /* PATTERN: the bytes' seed. */
+    uint64_t length;     /* PATTERN: bytes to send. */
+    uint64_t stop;       /* PATTERN: CLOSE after this many (<= length). */
+    uint32_t piece;      /* PATTERN: bytes per WRITE. */
+    uint32_t write_kind; /* enum vsr_io_write_kind */
+    int32_t close_status;
+    int32_t refuse; /* Nonzero: complete the SERVE with it. */
+    uint32_t hold;  /* Nonzero: never CLOSE (the stream stays open). */
+    uint32_t reserved;
+    struct vsr_id snapshot; /* APPSNAP. */
+    struct vsr_id cluster;  /* APPSNAP. */
+    uint64_t replica;       /* APPSNAP. */
+};
+
 /* A requester's stream, by cookie. */
 struct iow_rstream {
     bool used;
     uint64_t cookie;
-    unsigned char request[64]; /* Pinned until END (the lease covers it). */
-    uint32_t request_bytes;
+    struct iow_stream_request request; /* Pinned until END (the lease covers
+                                          it). */
     struct vsr_io_stream_open open;
     uint64_t seed;
     uint64_t received;
@@ -208,26 +230,6 @@ struct iow_sstream {
     unsigned char *buffer; /* [IOW_STREAM_BYTES] the pattern bytes. */
     struct vsr_io_stream_write descriptors[IOW_STREAM_WRITES];
     struct vsr_span spans[IOW_STREAM_WRITES];
-};
-
-enum iow_stream_kind { IOW_STREAM_PATTERN, IOW_STREAM_APPSNAP };
-
-/* A harness stream request, as its bytes. */
-struct iow_stream_request {
-    uint32_t magic;
-    uint32_t kind;       /* enum iow_stream_kind */
-    uint64_t seed;       /* PATTERN: the bytes' seed. */
-    uint64_t length;     /* PATTERN: bytes to send. */
-    uint64_t stop;       /* PATTERN: CLOSE after this many (<= length). */
-    uint32_t piece;      /* PATTERN: bytes per WRITE. */
-    uint32_t write_kind; /* enum vsr_io_write_kind */
-    int32_t close_status;
-    int32_t refuse; /* Nonzero: complete the SERVE with it. */
-    uint32_t hold;  /* Nonzero: never CLOSE (the stream stays open). */
-    uint32_t reserved;
-    struct vsr_id snapshot; /* APPSNAP. */
-    struct vsr_id cluster;  /* APPSNAP. */
-    uint64_t replica;       /* APPSNAP. */
 };
 
 /* Targeted faults (the hook): a rule matches submitted records; its action
