@@ -948,7 +948,7 @@ static void test_slabs(void)
     struct vsr_io_slab first;
     struct vsr_io_slab second;
     struct vsr_io_slab third;
-    uint32_t internal[SLABS];
+    uint32_t internal[SLABS] = {0};
     uint32_t taken;
 
     memset(&first, 0xEE, sizeof(first));

@@ -547,7 +547,6 @@ static bool drop_invalid(struct vsr_io_replica *replica, enum segment segment)
 {
     struct vsr_io *io = replica->io;
     struct vsr_io_queued_event *queued;
-    struct vsr_io_forwarded *entry;
 
     switch (segment) {
     case SEG_INTERNAL:
@@ -572,7 +571,9 @@ static bool drop_invalid(struct vsr_io_replica *replica, enum segment segment)
                      ? &replica->priority[replica->priority_head]
                      : &replica->events[replica->events_head];
         if (queued->event.lease != 0) {
-            entry = vsr_io_forward(io, replica, VSR_IO_OP_CORE);
+            struct vsr_io_forwarded *entry =
+                vsr_io_forward(io, replica, VSR_IO_OP_CORE);
+
             if (entry == NULL) {
                 return false;
             }
@@ -818,10 +819,9 @@ int vsr_io_poll(struct vsr_io *io, uint64_t now_ns, struct vsr_io_op *ops,
     }
     *count = n;
     if (io->forwarded_count > 0) {
+        /* Ops left in the ring: ops filled (n == capacity). */
         more = true;
-        if (n == capacity) {
-            *flags |= VSR_IO_POLL_OUTPUT_FULL;
-        }
+        *flags |= VSR_IO_POLL_OUTPUT_FULL;
     }
     if (more || io->forwarded_overflow != 0) {
         *flags |= VSR_IO_POLL_MORE;
@@ -864,8 +864,6 @@ static int submit_forwarded_done(struct vsr_io *io,
                                  struct vsr_io_replica *replica,
                                  const struct vsr_event *event)
 {
-    struct vsr_io_forwarded *entry;
-
     if (event->lease != 0 && io->forwarded_count == io->options.limits.ops) {
         return VSR_AGAIN;
     }
@@ -874,7 +872,9 @@ static int submit_forwarded_done(struct vsr_io *io,
         return VSR_EINVAL;
     }
     if (event->lease != 0) {
-        entry = vsr_io_forward(io, replica, VSR_IO_OP_CORE);
+        struct vsr_io_forwarded *entry =
+            vsr_io_forward(io, replica, VSR_IO_OP_CORE);
+
         LOOP_ASSERT(entry != NULL);
         if (entry != NULL) {
             entry->op.op.type = VSR_OP_RELEASE;

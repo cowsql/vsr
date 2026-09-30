@@ -100,7 +100,6 @@ struct lease_slot {
     struct vsr_applied applied;
     struct vsr_value values[8];
     struct vsr_checkpoint checkpoint;
-    struct vsr_id query;
 };
 
 struct app {
@@ -111,7 +110,7 @@ struct app {
     struct vsr_membership seed;
     struct vsr_member members[3];
     struct vsr_io_replica_options options;
-    char path[32];
+    char path[48]; /* "c<u64>-r<u64>" fits. */
     struct lease_slot leases[LEASES];
     uint64_t next_route;
     /* Observations. */
@@ -198,11 +197,20 @@ static struct world world;
  * executor call from anything it reaches aborts the test, naming the
  * call. Used for the four primitives, the routing seam, the modules' polls
  * the routing tests drive, vsr_io_close and the node calls. */
-static int pure_result;
+static void pure_begin(struct node *n)
+{
+    pure_executor_arm(&n->pure);
+}
 
-#define PURE(node, call)                                                       \
-    (pure_executor_arm(&(node)->pure), pure_result = (call),                   \
-     pure_executor_disarm(&(node)->pure), pure_result)
+/* Evaluated after the call (its argument), which the comma operator in
+ * PURE sequences after pure_begin. */
+static int pure_end(struct node *n, int result)
+{
+    pure_executor_disarm(&n->pure);
+    return result;
+}
+
+#define PURE(node, call) (pure_begin(node), pure_end((node), (call)))
 #define PURE_VOID(node, call)                                                  \
     do {                                                                       \
         pure_executor_arm(&(node)->pure);                                      \
@@ -977,7 +985,7 @@ static struct vsr_io_store_options store_options(void)
     o.max_clients = 4;
     o.inflight_writes = 2;
     o.segment_bytes = round_up(header_bytes + 8 * max_record, BLOCK);
-    o.write_behind_bytes = 8 * BLOCK;
+    o.write_behind_bytes = (uint64_t)8 * BLOCK;
     o.cache_bytes =
         round_up(o.write_behind_bytes + core_limits.pinned_payload_bytes +
                      2 * max_record + 2 * header_bytes + BLOCK,
@@ -1831,7 +1839,8 @@ static void test_attach_errors(void)
     o.store.inflight_writes = VSR_IO_ENGINE_INFLIGHT_WRITES_MAX;
     CHECK(layout_status(n, &o) == VSR_OK);
     o = app->options;
-    o.core.limits.message_bytes = 4 * SLAB_BYTES; /* A frame beyond a slab. */
+    o.core.limits.message_bytes =
+        (uint64_t)(4u * SLAB_BYTES); /* Beyond a slab. */
     CHECK(layout_status(n, &o) == VSR_ELIMIT);
     /* Attach. */
     metadata = region_of(replica_memory[0][0], REPLICA_BYTES);
@@ -2032,7 +2041,7 @@ static void test_submit_errors(void)
 {
     struct node *n;
     struct app *app;
-    struct vsr_io_event events[EVENTS + 2];
+    struct vsr_io_event events[EVENTS + 2] = {0};
     struct vsr_io_event event;
     struct vsr_io_stream_open open;
     struct vsr_io_stream_write write;
@@ -2207,7 +2216,6 @@ static void test_refused_events(void)
     struct node *n;
     struct app *app;
     struct lease_slot *slot;
-    uint64_t route;
     uint64_t replies;
 
     world_open(1, 8);
@@ -2229,8 +2237,7 @@ static void test_refused_events(void)
     CHECK(leases_out(app) == 0);
     /* A REQUEST submitted before a STOP in the same batch. */
     replies = app->replies;
-    route = submit_request(app, 1, 1);
-    (void)route;
+    (void)submit_request(app, 1, 1);
     core_event(app, VSR_EVENT_STOP, 0, 0, NULL, 0);
     CHECK(run_until(app_stopped, app, 20000));
     CHECK(app->replies == replies);
@@ -2868,10 +2875,8 @@ static void test_prepare(void)
         CHECK(PURE(n, vsr_io_prepare(n->io, at, sqes, BATCH, &count,
                                      &deadline)) == VSR_OK);
         CHECK(deadline == at);
-        CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) >=
-              0);
-        CHECK(PURE(n, vsr_io_poll(n->io, at, ops, OPS, &k, &flags)) ==
-              VSR_OK);
+        CHECK(n->ex.ops->submit_and_wait(n->ex.ctx, sqes, count, 0, 0, 0) >= 0);
+        CHECK(PURE(n, vsr_io_poll(n->io, at, ops, OPS, &k, &flags)) == VSR_OK);
         CHECK(vsr_io_deadlines_earliest(&n->io->deadlines) > at);
     }
     stop_app(app);
