@@ -83,7 +83,7 @@ static uint32_t reserve_left(const struct vsr_io_pool *pool)
 
 /* Provision keeps this many slabs FREE: the part of the reserve internal
  * users do not hold plus the part of the caller's share the caller does not
- * hold (decisions 54 and E1). reserve < slabs and caller_slabs <= slabs <=
+ * hold (decisions 54 and 127). reserve < slabs and caller_slabs <= slabs <=
  * 32768, so the sum cannot wrap. */
 static uint32_t provision_floor(const struct vsr_io_pool *pool)
 {

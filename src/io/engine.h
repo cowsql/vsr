@@ -32,7 +32,7 @@
  * Leases: an engine lease id is VSR_IO_LEASE_ENGINE | replica << 40 |
  * region << 16 | generation, so RELEASE routes by replica and region
  * without a lookup; a RELEASE of a stale generation, or of a lease not
- * LEASED, is counted in releases_rejected and ignored (decision E5). Every
+ * LEASED, is counted in releases_rejected and ignored (decision 131). Every
  * lease holds one decode region and either one slab
  * reference (MESSAGE, cold LOAD) or one ring pin (hot LOAD).
  */
@@ -93,7 +93,7 @@ struct vsr_io_queued_event {
 
 /* A completion the routing decided at once (a SEND the link module
  * refused, a snapshot op's status, a malformed op), fed to the core once
- * `due` passed: the replica's retry_ns after the routing (decision E3). */
+ * `due` passed: the replica's retry_ns after the routing (decision 129). */
 struct vsr_io_deferred {
     uint64_t due;
     uint64_t op;
@@ -208,7 +208,7 @@ struct vsr_io {
     uint32_t reserved;
     struct vsr_io_stats stats;
     struct vsr_io_uring *uring; /* Non-NULL when the executor is ours. */
-    uint64_t random_state[4];   /* xoshiro256**, seeded at init (E8). */
+    uint64_t random_state[4];   /* xoshiro256**, seeded at init (134). */
     uint32_t *clears;           /* [limits.file_slots] engine file slots whose
                                FILES_UPDATE (-1) is still to be issued. */
     uint32_t clears_count;
@@ -268,7 +268,7 @@ struct vsr_io_replica *vsr_io_engine_replica(struct vsr_io *io,
  * CLOSE with FIXED_FILE or a FILES_UPDATE); clear returns one that may
  * still hold a file: the engine empties it with a FILES_UPDATE of -1 from
  * its next prepare and frees the index at that record's completion, so a
- * new file never lands in it before (decision E9). */
+ * new file never lands in it before (decision 135). */
 uint32_t vsr_io_engine_slot_alloc(struct vsr_io *io);
 void vsr_io_engine_slot_free(struct vsr_io *io, uint32_t slot);
 void vsr_io_engine_slot_clear(struct vsr_io *io, uint32_t slot);
@@ -285,11 +285,11 @@ void vsr_io_engine_files_complete(struct vsr_io *io, uint32_t slot,
 /* user_data of the PROVIDE record (kind PROVIDE, no slot). */
 uint64_t vsr_io_engine_provide_user_data(const struct vsr_io *io);
 /* Bytes from the engine's generator, seeded from the executor's entropy
- * at vsr_io_init and never calling the executor after (decision E8):
+ * at vsr_io_init and never calling the executor after (decision 134):
  * unique, not secret. */
 void vsr_io_engine_random(struct vsr_io *io, void *bytes, size_t size);
 
-/* The pool's reserve for the limits (decision E1): one send slab per
+/* The pool's reserve for the limits (decision 127): one send slab per
  * link, the chunk reads of every stream window, per replica a cold-load
  * or recovery read slab and the snapshot module's writer, writer-cold and
  * reader slabs, and one reassembly slab. */

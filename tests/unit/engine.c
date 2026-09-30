@@ -194,7 +194,7 @@ struct world {
 
 static struct world world;
 
-/* A call into the engine with the purity guard armed (decision E7): an
+/* A call into the engine with the purity guard armed (decision 133): an
  * executor call from anything it reaches aborts the test, naming the
  * call. Used for the four primitives, the routing seam, the modules' polls
  * the routing tests drive, vsr_io_close and the node calls. */
@@ -447,7 +447,7 @@ static void node_executor(struct node *n)
     n->ex.ops = &wrap_ops;
     n->ex.ctx = &n->wrap;
     /* The engine's executor: the purity guard over the wrapper, armed
-     * around every primitive call (decision E7). */
+     * around every primitive call (decision 133). */
     n->ex = pure_executor_init(&n->pure, n->ex, true);
     if (!n->registered) {
         /* The tables are executor-wide, registered once per executor. */
@@ -1306,7 +1306,7 @@ static void drain_store(struct vsr_io_replica *rep)
 /* Takes op's completion off the replica's internal ring (pumping the node
  * until it is there); returns its engine lease index, NONE without. */
 /* A completion the routing decided at once waits in the deferred ring
- * for the replica's retry_ns (decision E3); true when op's is there, then
+ * for the replica's retry_ns (decision 129); true when op's is there, then
  * taken off it. */
 static bool take_deferred(struct vsr_io_replica *rep, uint64_t op,
                           int32_t status)
@@ -1635,7 +1635,7 @@ static void test_route_kinds(void)
     route(app, ops, 2);
     CHECK(n->io->links.nodes[node2].queue_count == 1);
     CHECK(!completion_queued(rep, 30));
-    /* The refused SEND's RETRY waits retry_ns (decision E3), and prepare
+    /* The refused SEND's RETRY waits retry_ns (decision 129), and prepare
      * wakes the loop for it. */
     CHECK(rep->deferred_count == 1);
     {
@@ -2831,7 +2831,7 @@ static void test_prepare(void)
     CHECK(app->replica->store.state == VSR_IO_STORE_OPENING);
     /* A batch of exactly the listener chain: it fills, deadline now. */
     /* The provision is a PROVIDE record at the end of the batch (decision
-     * E7), which the executor runs before the rest: no provide() call. */
+     * 133), which the executor runs before the rest: no provide() call. */
     provides = n->wrap.provides;
     CHECK(PURE(n, vsr_io_prepare(n->io, now, sqes, VSR_IO_ENGINE_BATCH_MIN,
                                  &count, &deadline)) == VSR_OK);
@@ -3421,7 +3421,7 @@ static void test_view_change(void)
 }
 
 /* -------------------------------------------------------------------------
- * Test: the primitives never call the executor (decision E7)
+ * Test: the primitives never call the executor (decision 133)
  * ---------------------------------------------------------------------- */
 
 /* In replicated mode the core never SYNCs: the store flushes its writes

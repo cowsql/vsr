@@ -93,7 +93,7 @@
  * engine takes it over, and an engine FILE SLOT from then on. A dialed link
  * issues SOCKET, then CONNECT on the raw descriptor; a listener runs a plain
  * multishot ACCEPT; vsr_io_adopt brings a raw descriptor. The takeover is a
- * record (decision E9): a FILES_UPDATE of the raw descriptor into an engine
+ * record (decision 135): a FILES_UPDATE of the raw descriptor into an engine
  * slot, LINKed to a CLOSE of the raw descriptor (SKIP_SUCCESS), issued on
  * the connect slot from prepare; the link issues nothing else until it
  * completes, and a failed one closes the link like any failure. It starts
@@ -232,7 +232,7 @@ struct vsr_io_link {
     bool recv_cancelled;    /* The pause's CANCEL of recv_slot was issued. */
     bool nodelay_set;       /* TCP_NODELAY record issued (or not wanted). */
     bool install_establish; /* Established once the takeover completes. */
-    uint32_t installing;    /* The takeover (decision E9): 0 none, 1 its
+    uint32_t installing;    /* The takeover (decision 135): 0 none, 1 its
                               record to issue, 2 in flight. */
     uint32_t install_slot;  /* The engine file slot being installed. */
     int32_t error;          /* Reason for closing, or 0. */

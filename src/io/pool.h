@@ -26,7 +26,7 @@
  * frames already delivered from it; it becomes FREE only when the kernel
  * has left it AND refs are zero.
  *
- * Shares (decisions 54 and E1): the pool is split between the ring, the
+ * Shares (decisions 54 and 127): the pool is split between the ring, the
  * caller (caller_slabs) and the engine's RESERVE, the slabs its own users
  * acquire (link send slabs, reassembly, stream chunk reads, cold loads,
  * recovery reads, snapshot staging). The pool counts the slabs internal

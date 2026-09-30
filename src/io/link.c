@@ -1527,7 +1527,7 @@ static void link_arm_handshake(struct vsr_io *io, struct vsr_io_link *link)
                          io->now + io->options.handshake_timeout_ns);
 }
 
-/* Takes the raw descriptor over into an engine file slot (decision E9):
+/* Takes the raw descriptor over into an engine file slot (decision 135):
  * the record goes out from the next prepare, and the link issues nothing
  * else until it completes; `establish` establishes the link then (EXTERNAL
  * and adopted links), a TRUSTED link goes on with its HELLOs. */

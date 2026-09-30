@@ -462,7 +462,7 @@ static void retry_later(struct vsr_io *io, struct vsr_io_replica *rep)
 }
 
 /* Gives back an engine file slot the module holds: the engine empties it
- * with a FILES_UPDATE record and frees it then (decision E9). */
+ * with a FILES_UPDATE record and frees it then (decision 135). */
 static void slot_drop(struct vsr_io *io, uint32_t slot)
 {
     vsr_io_engine_slot_clear(io, slot);

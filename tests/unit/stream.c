@@ -820,7 +820,7 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
         }
         break;
     case VSR_IO_SQE_FILES_UPDATE: {
-        /* The takeover (decision E9): the slot takes the socket, the raw
+        /* The takeover (decision 135): the slot takes the socket, the raw
          * descriptor stays until the CLOSE chained behind this record. */
         int32_t fd;
 

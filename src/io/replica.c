@@ -553,7 +553,7 @@ int vsr_io_detach(struct vsr_io_replica *replica)
     }
     if (file_slot != NONE) {
         /* The log's slot (store-phase-1: read before the close clears it),
-         * emptied by the engine's next prepare (decision E9). */
+         * emptied by the engine's next prepare (decision 135). */
         vsr_io_engine_slot_clear(io, file_slot);
     }
     release_queued(replica, replica->messages, &replica->messages_head,

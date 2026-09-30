@@ -727,7 +727,7 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
         }
         break;
     case VSR_IO_SQE_FILES_UPDATE: {
-        /* The takeover (decision E9): the slot takes the socket, the raw
+        /* The takeover (decision 135): the slot takes the socket, the raw
          * descriptor stays until the CLOSE chained behind this record. */
         int32_t fd;
 
@@ -2248,7 +2248,7 @@ static void test_adopt_and_close(void)
     world_settle();
     CHECK(forwarded_take(a, VSR_IO_OP_LINK_WANTED) != NULL);
     /* flags 0: established once the takeover record completed (decision
-     * E9), installed, receive armed. */
+     * 135), installed, receive armed. */
     peer = sock_alloc(TEST_OWNER);
     engine_side = sock_alloc(0);
     world.socks[peer].raw_fd = fd_alloc();
@@ -2358,7 +2358,7 @@ static void test_adopt_and_close(void)
           VSR_OK);
     world_settle();
     /* The CLOSE chained to the failed FILES_UPDATE is cancelled; the
-     * teardown's closes the raw descriptor (decision E9). */
+     * teardown's closes the raw descriptor (decision 135). */
     CHECK(log_count(a, VSR_IO_SQE_CLOSE) == 2);
     CHECK(peer_eof(peer));
     check_quiet(a);

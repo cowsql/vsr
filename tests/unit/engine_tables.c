@@ -522,7 +522,7 @@ static void test_layout(void)
 
     /* ELIMIT: minimum slabs = the reserve (links + streams * window + 4 *
      * replicas + 1) + the ring's links + streams + 4 + caller_slabs = 2 * 4
-     * + 6 + 8 + 5 + caller (decision E1). */
+     * + 6 + 8 + 5 + caller (decision 127). */
     o = base;
     o.limits.slabs = 29;
     CHECK(layout_of(&o) == VSR_OK);
@@ -711,7 +711,7 @@ static void test_init(void)
     /* Every table is initialized for the limits. */
     CHECK(io->pool.base == payload && io->pool.slabs == SLABS);
     /* The reserve: a send slab per link, the stream windows' chunk reads,
-     * four per replica and one reassembly slab (decision E1). */
+     * four per replica and one reassembly slab (decision 127). */
     CHECK(io->pool.reserve ==
           l->links + l->streams * l->stream_window + 4 * l->replicas + 1);
     CHECK(io->pool.reserve == vsr_io_engine_reserve(l));
@@ -825,7 +825,7 @@ static void test_init(void)
     vsr_io_wake(NULL);
     CHECK(fake.wakes == 1);
     /* The generator was seeded from the executor once, at init; drawing
-     * from it calls nothing (decision E8), and it does not repeat. */
+     * from it calls nothing (decision 134), and it does not repeat. */
     CHECK(fake.randoms == 1);
     memset(random, 0, sizeof(random));
     vsr_io_engine_random(io, random, sizeof(random));
@@ -990,7 +990,7 @@ static void test_slabs(void)
         CHECK(internal[i] != NONE);
     }
     /* Internal users holding the whole reserve leave the share intact
-     * (decision E1): an established link's send slab no longer eats it. */
+     * (decision 127): an established link's send slab no longer eats it. */
     CHECK(io->pool.internal_taken == io->pool.reserve);
     CHECK(vsr_io_pool_floor(&io->pool) == 2);
     CHECK(vsr_io_slab_acquire(io, &first) == VSR_OK);

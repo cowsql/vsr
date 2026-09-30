@@ -2912,6 +2912,9 @@ static void test_idle_superblock(void)
     CHECK(superblock.durable_floor == 3 && superblock.revision == 2);
     harness_poll();
     CHECK(h.store->idle_deadline == VSR_NO_DEADLINE);
+    CHECK(harness_prepare() == 1); /* The flush that puts it on media. */
+    harness_complete(pending_of(VSR_IO_SQE_FSYNC));
+    harness_poll();
     CHECK(harness_prepare() == 0);
     /* Alternating copies: the next rewrite goes to copy B. */
     sync_op = submit_sync(3);
@@ -6737,6 +6740,892 @@ static void test_walk_bounds(void)
     CHECK(!walk.failed && walk.stats.captures >= 60);
 }
 
+/* -------------------------------------------------------------------------
+ * Review: errors during creation and after a CONTINUE error, the idle
+ * floor on media
+ * ---------------------------------------------------------------------- */
+
+/* Starts an open without driving it: the RECOVERY load's op. */
+static uint64_t open_load(uint32_t mode)
+{
+    struct vsr_store_read read;
+    uint64_t op = next_op();
+
+    memset(&read, 0, sizeof(read));
+    read.type = VSR_LOAD_RECOVERY;
+    vsr_io_store_open(h.store, mode, op, &read);
+    CHECK(h.store->state == VSR_IO_STORE_OPENING);
+    return op;
+}
+
+/* Completes pending SQEs, preparing more, until one of `opcode` is
+ * pending, whose index is returned. */
+static uint32_t run_until(uint8_t opcode)
+{
+    for (unsigned rounds = 0; rounds < 1000; ++rounds) {
+        uint32_t at;
+
+        harness_poll();
+        harness_prepare();
+        at = pending_of(opcode);
+        if (at != NONE) {
+            return at;
+        }
+        at = pending_first();
+        CHECK(at != NONE);
+        harness_complete(at);
+    }
+    CHECK(false);
+    return NONE;
+}
+
+/* A write or flush error while the log is created fences the store
+ * under CONTINUE too: there is no log to serve from memory, and the
+ * RECOVERY load (or the STOREs RECOVER's warm-up held) must complete;
+ * the store stayed CREATING forever instead. */
+static void test_review_create_continue(void)
+{
+    struct config c = base_config();
+    uint64_t op;
+    uint64_t store_op;
+    uint32_t at;
+
+    c.durability = VSR_REPLICATED;
+    c.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
+    /* The first segment's header write fails. */
+    harness_open(&c);
+    op = open_load(VSR_START_NEW);
+    run_except(2 * BLOCK);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    CHECK(at != NONE && h.pending[at].sqe.offset == 2 * BLOCK);
+    CHECK(h.store->state == VSR_IO_STORE_CREATING);
+    disk.fail_write = -EIO;
+    harness_complete(at);
+    harness_run();
+    CHECK(h.store->state == VSR_IO_STORE_FAILED && h.store->error == -EIO);
+    expect_completion(op, VSR_IO_FAILED);
+    expect_no_completion();
+    harness_close();
+    /* The flush after it (FDATASYNC) fails, with a STORE held by RECOVER's
+     * warm-up. */
+    harness_open(&c);
+    op = open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_FSYNC);
+    expect_completion(op, VSR_IO_NOT_FOUND);
+    CHECK(h.store->state == VSR_IO_STORE_CREATING);
+    store_op = submit(txn_append(1, 1, 50));
+    CHECK(h.store->stores_count == 1);
+    disk.fail_flush = -EIO;
+    harness_complete(at);
+    harness_run();
+    CHECK(h.store->state == VSR_IO_STORE_FAILED && h.store->error == -EIO);
+    expect_completion(store_op, VSR_IO_FAILED);
+    expect_no_completion();
+    harness_close();
+    /* The superblock write fails (DSYNC). */
+    c.sync_mode = VSR_IO_SYNC_DSYNC;
+    harness_open(&c);
+    op = open_load(VSR_START_NEW);
+    at = run_until(VSR_IO_SQE_WRITE);
+    CHECK(h.pending[at].sqe.offset == 0);
+    disk.fail_write = -EIO;
+    harness_complete(at);
+    harness_run();
+    CHECK(h.store->state == VSR_IO_STORE_FAILED && h.store->error == -EIO);
+    expect_completion(op, VSR_IO_FAILED);
+    expect_no_completion();
+    harness_close();
+}
+
+/* After a write error under CONTINUE nothing reaches the disk, so no
+ * SYNC can ever complete OK: a SYNC queued before the error, and one
+ * submitted after it, complete FAILED rather than never (every op gets
+ * exactly one completion). One already satisfied completes OK. */
+static void test_review_sync_continue(void)
+{
+    static const uint8_t modes[2] = {VSR_IO_SYNC_FDATASYNC, VSR_IO_SYNC_DSYNC};
+    struct config c = base_config();
+
+    c.durability = VSR_REPLICATED;
+    c.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
+    for (uint32_t m = 0; m < 2; ++m) {
+        uint64_t sync_op;
+
+        c.sync_mode = modes[m];
+        harness_open(&c);
+        harness_start(VSR_START_NEW);
+        expect_completion(submit(txn_append(1, 1, 50)), VSR_IO_OK);
+        sync_op = submit_sync(1);
+        harness_run();
+        expect_completion(sync_op, VSR_IO_OK);
+        expect_completion(submit(txn_append(2, 1, 50)), VSR_IO_OK);
+        CHECK(harness_prepare() == 1);
+        expect_completion(submit(txn_append(3, 1, 50)), VSR_IO_OK);
+        CHECK(harness_prepare() == 1); /* Two writes out. */
+        sync_op = submit_sync(3);      /* Queued before the error. */
+        disk.fail_write = -EIO;
+        harness_complete(pending_of(VSR_IO_SQE_WRITE));
+        CHECK(h.store->state == VSR_IO_STORE_READY && h.store->error == -EIO);
+        expect_completion(sync_op, VSR_IO_FAILED);
+        harness_complete(pending_of(VSR_IO_SQE_WRITE)); /* The second. */
+        CHECK(h.store->written == 1); /* Nothing is known written since. */
+        expect_completion(submit(txn_append(4, 1, 50)), VSR_IO_OK);
+        sync_op = submit_sync(4); /* After it. */
+        expect_completion(sync_op, VSR_IO_FAILED);
+        sync_op = submit_sync(1); /* Satisfied before it. */
+        expect_completion(sync_op, VSR_IO_OK);
+        harness_run();
+        expect_no_completion();
+        CHECK(harness_prepare() == 0);
+        harness_close();
+    }
+}
+
+/* The idle superblock write persists the durable floor (decision 50): in
+ * FDATASYNC mode the write alone leaves it in the page cache, so a flush
+ * follows it, and a crash losing every unflushed block keeps the floor.
+ * An O_DSYNC write needs none. */
+static void test_review_idle_flush(void)
+{
+    struct config c = base_config();
+    struct vsr_io_wire_superblock superblock;
+    const struct vsr_loaded *loaded = NULL;
+    uint32_t lease = NONE;
+    uint64_t sync_op;
+    uint32_t at;
+
+    c.flush_interval_ns = 0; /* 100 ms. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_identity(1, VSR_MEMBER_FULL)), VSR_IO_OK);
+    sync_op = submit_sync(1);
+    harness_run();
+    expect_completion(sync_op, VSR_IO_OK);
+    CHECK(h.store->durable == 1 && h.store->superblock_floor == 0);
+    h.now += UINT64_C(100000000);
+    harness_poll();
+    CHECK(h.store->superblock_dirty == 1);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    /* Copy B: the identity's rewrite took copy A. */
+    CHECK(at != NONE && h.pending[at].sqe.offset == BLOCK);
+    harness_complete(at);
+    CHECK(h.store->superblock_floor == 1);
+    harness_poll();
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_FSYNC);
+    CHECK(at != NONE);
+    harness_complete(at);
+    harness_poll();
+    CHECK(harness_prepare() == 0);
+    expect_no_completion();
+    disk_crash(true);
+    read_superblock(1, &superblock);
+    CHECK(superblock.durable_floor == 1 && superblock.revision == 3);
+    harness_open_keep(&c, true);
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == 1 && h.store->superblock_floor == 1);
+    release_lease(lease);
+    harness_close();
+    /* DSYNC: on media at the write's completion. */
+    c.sync_mode = VSR_IO_SYNC_DSYNC;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    expect_completion(submit(txn_append(1, 1, 50)), VSR_IO_OK);
+    sync_op = submit_sync(1);
+    harness_run();
+    expect_completion(sync_op, VSR_IO_OK);
+    h.now += UINT64_C(100000000);
+    harness_poll();
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->superblock_floor == 1);
+    harness_poll();
+    CHECK(harness_prepare() == 0);
+    harness_close();
+}
+
+/* An APPEND at `sequence` whose record is exactly `bytes` long, or NULL
+ * when no shape of up to four entries and 256-byte bodies is. */
+static const struct txn *txn_sized(uint64_t sequence, uint64_t bytes)
+{
+    for (uint32_t count = 1; count <= 4; ++count) {
+        for (size_t body = 0; body <= 256; body += 8) {
+            const struct txn *t = txn_append(sequence, count, body);
+
+            if (t->bytes == bytes) {
+                return t;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* A segment filled to its last byte: the recovered log resumes at the
+ * segment's end (an empty extent there), the next record opens the next
+ * segment, and a second recovery finds both. */
+static void test_review_full_segment(void)
+{
+    struct config c = plain_config();
+    uint64_t sequence = 1;
+    uint64_t op;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    for (;;) {
+        uint64_t used = h.store->segments[h.store->current].used;
+        const struct txn *t;
+
+        CHECK(h.store->head % c.cache_bytes + c.segment_bytes - used <=
+              c.cache_bytes); /* No wrap padding to count. */
+        if (used == c.segment_bytes) {
+            break; /* The fillers filled it exactly. */
+        }
+        t = txn_sized(sequence + 1, c.segment_bytes - used);
+        if (t == NULL) {
+            t = txn_append(sequence + 1, 1, 100);
+        }
+        store_run(t);
+        sequence++;
+        CHECK(sequence < 64);
+    }
+    CHECK(h.store->current == 0 && h.store->head % BLOCK == 0);
+    CHECK(h.store->segments[0].used == c.segment_bytes);
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    expect_recovered(&c, sequence);
+    CHECK(h.store->current == 0 && h.store->slots == 2);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_OPEN &&
+          h.store->segments[0].used == c.segment_bytes);
+    CHECK(h.store->file_head == slot_offset(0) + c.segment_bytes);
+    store_run(txn_append(++sequence, 2, 100));
+    CHECK(h.store->current == 1 && h.store->segments[1].number == 2);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_SEALED);
+    store_run(txn_append(++sequence, 2, 100));
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    expect_recovered(&c, sequence);
+    CHECK(h.store->current == 1 && h.store->segments[0].number == 1);
+    harness_close();
+}
+
+/* Completes pending SQEs, preparing more, until a READ at file offset
+ * `offset` is pending, whose index is returned. */
+static uint32_t run_until_read_at(uint64_t offset)
+{
+    for (unsigned rounds = 0; rounds < 1000; ++rounds) {
+        uint32_t at;
+
+        harness_poll();
+        harness_prepare();
+        for (at = 0; at < PENDING_MAX; ++at) {
+            if (h.pending[at].state == 1 &&
+                h.pending[at].sqe.opcode == VSR_IO_SQE_READ &&
+                h.pending[at].sqe.offset == offset) {
+                return at;
+            }
+        }
+        at = pending_first();
+        CHECK(at != NONE);
+        harness_complete(at);
+    }
+    CHECK(false);
+    return NONE;
+}
+
+/* A segment header that cannot be read (twice: the re-read of decision
+ * 50 fails too): the start slot's makes the log CORRUPT; another slot is
+ * taken for free, so the chain ends before it, and the floor its
+ * records carry (swept as a free slot's) makes that CORRUPT too. */
+static void test_review_header_unreadable(void)
+{
+    struct config c = plain_config();
+    uint64_t sequence;
+    uint64_t op;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    sequence = fill_slot(2); /* Its record opened slot 1. */
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    store_run(txn_append(++sequence, 1, 100)); /* flushed = sequence - 1. */
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        uint32_t at;
+
+        disk_crash(false);
+        harness_open_keep(&c, true);
+        op = open_load(VSR_START_RECOVER);
+        at = run_until_read_at(slot_offset(slot));
+        disk.fail_read = -EIO;
+        harness_complete(at);
+        CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
+        at = run_until_read_at(slot_offset(slot));
+        disk.fail_read = -EIO;
+        harness_complete(at);
+        harness_run();
+        expect_completion(op, VSR_IO_CORRUPT);
+        CHECK(h.store->state == VSR_IO_STORE_FAILED);
+        expect_no_completion();
+    }
+    /* Readable again: recovered whole. */
+    expect_recovered(&c, sequence);
+    harness_close();
+}
+
+/* Crashes during a recovery (FDATASYNC): its superblock write torn away,
+ * or lost with the unflushed blocks before the flush after it, leaves
+ * the older superblock, whose run the next recovery counts from again;
+ * the records it read are on media by then (the flush before the
+ * write). A crash losing unflushed blocks before that first flush loses
+ * the records nothing acknowledged, and the next recovery finds the
+ * flushed prefix. Then DSYNC: the write torn away. */
+static void test_review_recovery_crash(void)
+{
+    struct config c = plain_config();
+    const struct vsr_loaded *loaded = NULL;
+    struct vsr_io_wire_superblock superblock;
+    uint32_t lease = NONE;
+    uint64_t op;
+    uint32_t at;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(6, 4); /* 1..4 flushed, 5 and 6 written. */
+    CHECK(h.store->flushed == 4 && h.store->written == 6);
+    /* A process crash keeps the page cache: the instance is abandoned
+     * with the unflushed blocks still dirty, and the machine goes down
+     * before the recovery's first flush: 5 and 6 are gone. */
+    disk.slot = -1;
+    disk.flags = 0;
+    disk.base_slot = -1;
+    harness_open_keep(&c, true);
+    (void)open_load(VSR_START_RECOVER);
+    (void)run_until(VSR_IO_SQE_FSYNC);
+    CHECK(h.store->recovery.sequence == 6);
+    disk_crash(true);
+    harness_open_keep(&c, true);
+    expect_recovered(&c, 4);
+    CHECK(h.store->run == 2);
+    harness_close();
+    /* The superblock write torn away: run 3 was never on media. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(6, 6);
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    (void)open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_WRITE);
+    CHECK(h.pending[at].sqe.offset < 2 * BLOCK && h.store->run == 2);
+    disk.tear_armed = 1;
+    disk.tear_blocks = 0;
+    harness_complete(at);
+    CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
+    expect_no_completion();
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    expect_recovered(&c, 6);
+    CHECK(h.store->run == 2);
+    read_superblock(h.store->superblock_next == 0 ? 1 : 0, &superblock);
+    CHECK(superblock.run == 2 && superblock.durable_floor == 6);
+    /* Lost with the unflushed blocks before the flush after it. */
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    (void)open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_WRITE);
+    CHECK(h.pending[at].sqe.offset < 2 * BLOCK && h.store->run == 3);
+    harness_complete(at);
+    CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
+    disk_crash(true);
+    harness_open_keep(&c, true);
+    expect_recovered(&c, 6);
+    CHECK(h.store->run == 3);
+    /* Nothing lost: READY with run 3 on media, the next run 4. */
+    expect_completion(submit(txn_append(7, 1, 50)), VSR_IO_OK);
+    op = submit_sync(7);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    disk_crash(true);
+    harness_open_keep(&c, true);
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == 7 && h.store->run == 4);
+    release_lease(lease);
+    harness_close();
+    /* DSYNC: the write torn away. */
+    c.sync_mode = VSR_IO_SYNC_DSYNC;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(6, 6);
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    (void)open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_WRITE);
+    CHECK(h.pending[at].sqe.offset < 2 * BLOCK);
+    disk.tear_armed = 1;
+    disk.tear_blocks = 0;
+    harness_complete(at);
+    expect_no_completion();
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    expect_recovered(&c, 6);
+    CHECK(h.store->run == 2);
+    harness_close();
+}
+
+/* -------------------------------------------------------------------------
+ * Review: tests written for the mutants the suite and the walk missed
+ * ---------------------------------------------------------------------- */
+
+/* The header CRC of `slot` made good again after an edit. */
+static void image_fix_header(uint32_t slot)
+{
+    unsigned char *header = disk_image + slot_offset(slot);
+    uint32_t length = vsr_io_get_u32(header + 24);
+
+    vsr_io_put_u32(header + length - 4, vsr_io_crc32c(0, header, length - 4));
+}
+
+/* Decision 114: a log with an op its scan did not replay is CORRUPT. Slot
+ * 0 held the ops the TRIM in slot 1 removed and was freed once the TRIM
+ * was on media (a flush the store asked for, nothing acknowledged
+ * durable); the TRIM's record damaged, the chain ends before it and the
+ * start header's log names ops nothing holds. */
+static void test_review_unreplayed_op(void)
+{
+    struct config c = script_config(VSR_IO_SYNC_FDATASYNC);
+    struct vsr_id x = {0x51, 1};
+    const struct txn *t;
+    uint64_t sequence;
+    uint64_t trim;
+
+    c.max_segments = 2;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    sequence = fill_slot(2); /* Opened slot 1. */
+    trim = ++sequence;
+    store_run(txn_trim(trim, h.store->log_end - 1));
+    harness_capture(x);
+    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+    expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+    CHECK(h.store->flushed == 0 && h.store->reclaimed == 0);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_SEALED);
+    for (;;) {
+        t = txn_append(++sequence, 4, 250);
+        if (h.store->segments[1].used + t->bytes > c.segment_bytes) {
+            break;
+        }
+        store_run(t);
+    }
+    store_run(t); /* Held for a slot: the store flushes, frees slot 0. */
+    CHECK(h.store->current == 0 && h.store->segments[0].number == 3);
+    CHECK(h.store->durable == 0 && h.store->start_slot == 1);
+    CHECK(txns[trim].file_offset % BLOCK == 0);
+    disk_image[txns[trim].file_offset + 48] ^= 0x10; /* Its descriptor. */
+    expect_corrupt(&c);
+    harness_close();
+}
+
+/* Decision 112: a base change above the media sequence that lowers the
+ * base lowers the floor's base term at once. The foreign PUBLISH y, its
+ * record still unwritten (DSYNC), lowers the base below client A's
+ * record in slot 0, which the file does not cover: the RECLAIM that
+ * follows must not free slot 0. */
+static void test_review_base_lowering(void)
+{
+    struct config c = base_config();
+    struct vsr_id a = {0xA, 1};
+    struct vsr_id x = {0x51, 1};
+    struct vsr_id y = {0x52, 1};
+    struct vsr_io_wire_client_record wire;
+    const struct vsr_loaded *loaded;
+    const struct vsr_client_record *record;
+    uint64_t number = 1;
+    uint64_t op = 1;
+    uint64_t sequence;
+    uint64_t store_op;
+    uint64_t load_op;
+    uint32_t lease = NONE;
+
+    c.sync_mode = VSR_IO_SYNC_DSYNC;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_clients(2, 1, &a, &number, &op, 8));
+    sequence = fill_slot(3); /* Opened slot 1. */
+    store_run(txn_trim(++sequence, h.store->log_end - 1));
+    harness_capture(x);
+    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+    CHECK(h.store->client_base == sequence - 1 &&
+          h.store->client_base_floor == sequence - 1);
+    CHECK(h.store->written == sequence);
+    /* y covers only client B: A's record at 2 stays the log's. */
+    store_op = submit(txn_publish(++sequence, y, h.store->log_end - 1));
+    CHECK(vsr_io_store_base_wanted(h.store, NULL, NULL));
+    vsr_io_store_base_begin(h.store);
+    memset(&wire, 0, sizeof(wire));
+    wire.client_hi = 0xB;
+    wire.client_lo = 1;
+    wire.number = 1;
+    wire.op = 1;
+    CHECK(vsr_io_store_base_record(h.store, &wire, 300) == VSR_OK);
+    vsr_io_store_base_end(h.store, y, sequence);
+    vsr_io_store_base_resume(h.store, VSR_IO_OK);
+    expect_completion(store_op, VSR_IO_OK);
+    CHECK(h.store->client_base == 1 && h.store->written == sequence - 1);
+    CHECK(h.store->client_base_pending == sequence);
+    CHECK(h.store->client_base_floor == 1); /* Lowered at once. */
+    expect_completion(submit_reclaim(sequence - 1), VSR_IO_OK);
+    CHECK(h.store->reclaimed == sequence - 1);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_SEALED);
+    harness_run();
+    CHECK(h.store->written == sequence && h.store->client_base_floor == 1);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_SEALED);
+    load_op = load_client(sequence, a);
+    harness_run();
+    loaded = expect_loaded(load_op, VSR_IO_OK, &lease);
+    record = loaded->items;
+    CHECK(loaded->count == 1 && record->request.number == 1);
+    release_lease(lease);
+    harness_close();
+}
+
+/* Memory-only mode (a write error under CONTINUE): nothing is written
+ * any more, so every floor term applies at once and freed slots are FREE
+ * at once; the slots of the table keep turning over without the disk.
+ * Then the error while a slot waits for its superblock write: the slot
+ * is released and the STORE held for it proceeds. */
+static void test_review_memory_only_free(void)
+{
+    struct config c = base_config();
+    const struct txn *t;
+    uint64_t sequence = 2;
+    uint32_t captures = 0;
+
+    c.durability = VSR_REPLICATED;
+    c.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
+    c.max_segments = 2;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    expect_completion(submit(txn_append(sequence++, 1, 50)), VSR_IO_OK);
+    CHECK(harness_prepare() == 1);
+    disk.fail_write = -EIO;
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->state == VSR_IO_STORE_READY && h.store->error == -EIO);
+    for (uint32_t cycle = 0; cycle < 4; ++cycle) {
+        struct vsr_id id = {0x70 + captures++, 1};
+        uint32_t current = h.store->current;
+
+        while (h.store->current == current) {
+            store_run(txn_append(sequence++, 4, 250));
+        }
+        store_run(txn_trim(sequence++, h.store->log_end - 1));
+        harness_capture(id);
+        store_run(txn_publish(sequence++, id, h.store->log_end - 1));
+        expect_completion(submit_reclaim(h.store->readable), VSR_IO_OK);
+        CHECK(h.store->segments[current].phase == VSR_IO_SEGMENT_FREE);
+        CHECK(harness_prepare() == 0);
+    }
+    harness_close();
+    /* The superblock write of a freeing fails (durable mode: the setup's
+     * SYNC would wait for the interval flush of replicated mode). */
+    c = script_config(VSR_IO_SYNC_FDATASYNC);
+    c.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
+    c.max_segments = 2;
+    t = freeing_setup(&c);
+    CHECK(harness_prepare() == 1);
+    disk.fail_write = -EIO;
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->state == VSR_IO_STORE_READY && h.store->error == -EIO);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FREE);
+    expect_completion(submit(t), VSR_IO_OK);
+    CHECK(h.store->current == 0 && h.store->readable == t->store.sequence);
+    harness_close();
+}
+
+/* A PAD that covers a whole block is skipped, but a record behind it of
+ * a sequence beyond the next ends the chain: the log recovers to the
+ * record before the gap, and the next record written there is found by
+ * the next recovery while the old one behind is rejected by its run. */
+static void test_review_scan_gap(void)
+{
+    struct config c = plain_config();
+    unsigned char *block;
+    uint64_t op;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(4, 4);
+    disk_crash(false);
+    block = disk_image + txns[3].file_offset;
+    CHECK(txns[3].file_offset % BLOCK == 0);
+    memset(block, 0, BLOCK);
+    vsr_io_put_u32(block, VSR_IO_PAD_MAGIC);
+    vsr_io_put_u32(block + 4, BLOCK);
+    expect_recovered(&c, 2);
+    CHECK(h.store->file_head == txns[3].file_offset);
+    store_run(txn_append(3, 1, 50));
+    op = submit_sync(3);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    expect_recovered(&c, 3);
+    harness_close();
+}
+
+/* Decision 48's successor rule: among the headers naming the sequence
+ * the chain ended at, one of a run below the chain's does not qualify,
+ * and of those that do the greatest number wins, whatever records lie
+ * behind the others. Slot 2 is forged from slot 1 (segment 2, run 1):
+ * segment 3 with a differing first record; then segment 3 of run 0. */
+static void test_review_successor_rules(void)
+{
+    struct config c = plain_config();
+    const struct vsr_loaded *loaded = NULL;
+    uint32_t lease = NONE;
+    uint64_t sequence;
+    uint64_t op;
+
+    c.segments = 3;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    sequence = fill_slot(2); /* Opened slot 1 with its record. */
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->segments[2].number == 0);
+    for (uint32_t k = 0; k < 2; ++k) {
+        uint32_t run = 1 - k; /* Then a run below the chain's. */
+        uint64_t at;
+
+        disk_crash(false);
+        memcpy(disk_image + slot_offset(2), disk_image + slot_offset(1),
+               (size_t)c.segment_bytes);
+        vsr_io_put_u64(disk_image + slot_offset(2) + 16, 3);
+        vsr_io_put_u32(disk_image + slot_offset(2) + 32, run);
+        image_fix_header(2);
+        at = slot_offset(2) + (txns[sequence].file_offset - slot_offset(1));
+        disk_image[at + vsr_io_get_u32(disk_image + at + 4) - 9] ^= 0x55;
+        image_fix_record(at);
+        harness_open_keep(&c, true);
+        CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+        CHECK(loaded->sequence == sequence);
+        release_lease(lease);
+        if (run == 1) {
+            CHECK(h.store->current == 2 && h.store->segments[2].number == 3);
+            CHECK(h.store->segments[1].number == 0);
+            CHECK(op_ref(txns[sequence].entries[0].op)->offset == at);
+        } else {
+            CHECK(h.store->current == 1 && h.store->segments[1].number == 2);
+            CHECK(h.store->segments[2].number == 0);
+            CHECK(op_ref(txns[sequence].entries[0].op)->offset ==
+                  txns[sequence].file_offset);
+        }
+    }
+    harness_close();
+}
+
+/* Every valid header's durable_floor raises F: a segment opened after
+ * a SYNC carries the acknowledged sequence, and when its only record is
+ * lost and the acknowledged record damaged, the header alone makes the
+ * scan that ends below it CORRUPT. */
+static void test_review_header_floor(void)
+{
+    struct config c = plain_config();
+    struct vsr_io_wire_segment fixed;
+    uint64_t sequence = 1;
+    uint64_t op;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    for (;;) {
+        const struct txn *t = txn_append(sequence + 1, 2, 100);
+
+        if (h.store->segments[0].used + t->bytes > c.segment_bytes) {
+            break;
+        }
+        store_run(t);
+        sequence++;
+    }
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    store_run(txn_append(sequence + 1, 2, 100)); /* Opens slot 1. */
+    CHECK(h.store->current == 1);
+    read_header(1, &fixed);
+    CHECK(fixed.durable_floor == sequence && fixed.last_sequence == sequence);
+    CHECK(h.store->durable == sequence && h.store->flushed == sequence);
+    disk_lose_block(txns[sequence + 1].file_offset / BLOCK);
+    disk_image[txns[sequence].file_offset + 48] ^= 0x10;
+    expect_corrupt(&c);
+    harness_close();
+}
+
+/* A file shorter than the slots its superblock names is CORRUPT. */
+static void test_review_short_file(void)
+{
+    struct config c = plain_config();
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(3, 3);
+    CHECK(disk.size == 2 * BLOCK + 2 * c.segment_bytes);
+    disk.size -= c.segment_bytes;
+    expect_corrupt(&c);
+    harness_close();
+}
+
+/* Decision 69's hold simulates the whole packing: a seal whose header
+ * does not fit before the ring's end goes to the next lap, and the
+ * record after it would overwrite the lap's first record, pinned by a
+ * LOAD lease; the STORE is held until the lease is released. */
+static void test_review_seal_wrap_pin(void)
+{
+    struct config c = base_config();
+    uint64_t ring = c.cache_bytes;
+    uint64_t sequence = 1;
+    const struct vsr_loaded *loaded;
+    uint32_t lease = NONE;
+    uint64_t load_op;
+    uint64_t op;
+
+    c.segment_bytes = ring - BLOCK; /* Full one block before the end. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    CHECK(h.store->ring_size == ring && h.store->head == h.header_bytes);
+    expect_completion(submit(txn_append(sequence++, 1, 8)), VSR_IO_OK);
+    harness_run();
+    while (h.store->head < ring - BLOCK) {
+        expect_completion(submit(txn_append(sequence++, 1, 8)), VSR_IO_OK);
+        harness_run();
+        CHECK(h.store->head % BLOCK == 0);
+    }
+    CHECK(h.store->head == ring - BLOCK && h.store->current == 0);
+    CHECK(h.store->segments[0].used == c.segment_bytes);
+    /* Op 1's record, right after the first header, pinned. */
+    load_op = load_log(sequence - 1, 1, 2, 1, limits.message_bytes);
+    loaded = expect_loaded(load_op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1 && h.store->pins[lease].begin == h.header_bytes);
+    op = submit(append_of(sequence, 200));
+    CHECK(h.store->stores_count == 1); /* Held: the seal would reach it. */
+    harness_poll();
+    CHECK(h.store->stores_count == 1 && h.store->current == 0);
+    release_lease(lease);
+    harness_poll();
+    CHECK(h.store->stores_count == 0 && h.store->current == 1);
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->head == ring + h.header_bytes + 200);
+    harness_run();
+    CHECK(h.store->written == sequence);
+    harness_close();
+}
+
+/* Decision 111: a slot freed after the superblock write was issued is
+ * not named absent by that write, so its completion under a dirty
+ * superblock releases nothing; the STORE that needs the slot waits for
+ * the next write. Slot 1 is kept from the first freeing by a cold LOAD
+ * reading from it, then freed by the second RECLAIM while the write of
+ * the first is out. */
+static void test_review_freeing_dirty(void)
+{
+    struct config c = script_config(VSR_IO_SYNC_DSYNC);
+    struct vsr_id x = {0x51, 1};
+    const struct vsr_loaded *loaded;
+    const struct txn *t;
+    uint64_t sequence;
+    uint64_t opened;
+    uint64_t trim;
+    uint64_t load_op;
+    uint64_t store_op;
+    uint32_t lease = NONE;
+    uint32_t at;
+
+    c.segments = 3;
+    c.max_segments = 3;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    opened = fill_slot(2);            /* Opened slot 1. */
+    sequence = fill_slot(opened + 1); /* Opened slot 2. */
+    trim = ++sequence;
+    store_run(txn_trim(trim, h.store->log_end - 1));
+    harness_capture(x);
+    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+    for (;;) {
+        t = txn_append(++sequence, 4, 250);
+        if (h.store->segments[2].used + t->bytes > c.segment_bytes) {
+            break;
+        }
+        store_run(t);
+    }
+    CHECK(h.store->written == sequence - 1);
+    /* A cold read from slot 1 keeps it. */
+    load_op = load_log(trim - 1, txns[opened].entries[0].op,
+                       txns[opened].entries[0].op + 1, 1, limits.message_bytes);
+    CHECK(h.store->loads_count == 1);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_READ);
+    CHECK(at != NONE && h.pending[at].sqe.offset >= slot_offset(1) &&
+          h.pending[at].sqe.offset < slot_offset(2));
+    expect_completion(submit_reclaim(h.store->readable), VSR_IO_OK);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FREEING);
+    CHECK(h.store->segments[1].phase == VSR_IO_SEGMENT_SEALED);
+    CHECK(h.store->start_slot == 1 && h.store->superblock_dirty == 1);
+    CHECK(harness_prepare() == 1);
+    CHECK(pending_of(VSR_IO_SQE_WRITE) != NONE);
+    harness_complete(at); /* The read: slot 1 may free now. */
+    loaded = expect_loaded(load_op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    release_lease(lease);
+    expect_completion(submit_reclaim(h.store->readable + 1), VSR_IO_OK);
+    CHECK(h.store->segments[1].phase == VSR_IO_SEGMENT_FREEING);
+    CHECK(h.store->start_slot == 2 && h.store->superblock_dirty == 1);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE)); /* Names slot 1. */
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FREEING);
+    CHECK(h.store->segments[1].phase == VSR_IO_SEGMENT_FREEING);
+    store_op = submit(t);
+    CHECK(h.store->stores_count == 1); /* Held for the next write. */
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_HEADER);
+    CHECK(h.store->segments[1].phase == VSR_IO_SEGMENT_FREE);
+    expect_completion(store_op, VSR_IO_OK);
+    harness_run();
+    expect_no_completion();
+    harness_close();
+}
+
+/* Decision 77: a change descriptor whose payload lies inside the
+ * descriptor area is CORRUPT even when nothing decodes the payload (a
+ * TRIM), at recovery as at a STORE. */
+static void test_review_descriptor_overlap(void)
+{
+    struct config c = plain_config();
+    unsigned char *record;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_append(2, 2, 100));
+    store_run(txn_trim(3, 2));
+    record = disk_image + txns[3].file_offset;
+    CHECK(vsr_io_get_u32(record + 48) == VSR_STORE_TRIM);
+    CHECK(vsr_io_get_u32(record + 48 + 20) == 0); /* No payload. */
+    vsr_io_put_u32(record + 48 + 16, 56); /* Inside its own descriptor. */
+    image_fix_record(txns[3].file_offset);
+    expect_corrupt(&c);
+    harness_close();
+}
+
 /* Names the test that fails; VSR_STORE_TEST in the environment runs
  * only the test of that name. */
 #define RUN(test)                                                              \
@@ -6818,6 +7707,22 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_client_base_moved);
     RUN(test_walk);
     RUN(test_walk_bounds);
+    RUN(test_review_create_continue);
+    RUN(test_review_sync_continue);
+    RUN(test_review_idle_flush);
+    RUN(test_review_full_segment);
+    RUN(test_review_header_unreadable);
+    RUN(test_review_recovery_crash);
+    RUN(test_review_unreplayed_op);
+    RUN(test_review_base_lowering);
+    RUN(test_review_memory_only_free);
+    RUN(test_review_scan_gap);
+    RUN(test_review_successor_rules);
+    RUN(test_review_header_floor);
+    RUN(test_review_short_file);
+    RUN(test_review_seal_wrap_pin);
+    RUN(test_review_freeing_dirty);
+    RUN(test_review_descriptor_overlap);
     printf("store: ok\n");
     return 0;
 }

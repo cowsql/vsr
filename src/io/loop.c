@@ -20,7 +20,7 @@
  * events, the MESSAGEs, the caller's other events and TIME(now), all in
  * one vsr_step_many, and consumes the accepted prefix. An update's
  * capacity is bounded by the room left in the forwarded ring, so every op
- * of it can be routed at once (decision E3). A head event the core finds
+ * of it can be routed at once (decision 129). A head event the core finds
  * INPUT_BLOCKED keeps its queue (MESSAGEs, or the caller's other events)
  * out of the rest of the poll, so TIME and the queues before it still
  * reach the core; an event the core refuses with EINVAL is dropped (the
@@ -160,7 +160,7 @@ int vsr_io_complete(struct vsr_io *io, const struct vsr_io_cqe *cqes,
  * ---------------------------------------------------------------------- */
 
 /* A completion decided at once is fed to the core the replica's retry_ns
- * later (decision E3): the core re-sends at once on a failed SEND (its
+ * later (decision 129): the core re-sends at once on a failed SEND (its
  * peer is marked for a heartbeat), so feeding a refused SEND's RETRY in
  * the same poll turned an unauthorized destination into a hot loop; the
  * delay makes it one attempt per retry_ns, the cadence the core retries
@@ -693,8 +693,8 @@ static bool replica_step(struct vsr_io *io, struct vsr_io_replica *replica,
 }
 
 /* STATUS once per poll in which STATE_CHANGED was reported, and at
- * STOPPED (7.8); the status is copied into the ring entry (decision E4),
- * valid as long as any rail descriptor (decision E6). */
+ * STOPPED (7.8); the status is copied into the ring entry (decision 130),
+ * valid as long as any rail descriptor (decision 132). */
 static bool emit_status(struct vsr_io *io, struct vsr_io_replica *replica)
 {
     struct vsr_io_forwarded *entry;
@@ -1020,7 +1020,7 @@ int vsr_io_submit(struct vsr_io *io, const struct vsr_io_event *events,
  * vsr_io_prepare (7.4)
  * ---------------------------------------------------------------------- */
 
-/* Pool provision (decision E7): the slabs above the provision floor go to
+/* Pool provision (decision 133): the slabs above the provision floor go to
  * the ring through one PROVIDE record at the end of the batch, which the
  * executor runs before the batch's other records, so a receive armed or
  * re-armed in this batch already sees them. The pool counts them KERNEL

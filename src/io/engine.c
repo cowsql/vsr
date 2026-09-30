@@ -70,7 +70,7 @@
 #define LEASE_FREE VSR_IO_LEASE_STATE_FREE
 #define LEASE_QUEUED VSR_IO_LEASE_STATE_QUEUED
 /* Pool reserve per replica: a cold-load or recovery read slab, and the
- * snapshot module's writer, writer-cold and reader slabs (decision E1). */
+ * snapshot module's writer, writer-cold and reader slabs (decision 127). */
 #define ENGINE_RESERVE_PER_REPLICA 4u
 /* One reassembly slab, and the slabs the ring keeps beyond one per link
  * and one per stream in the minimum-slabs rule. */
@@ -220,7 +220,7 @@ static int check_options(const struct vsr_io_options *options)
      * replicas + 1), the ring's links + streams + 4 (a slab per link
      * receiving, one per stream, four more) and caller_slabs, that is
      * 2 * links + streams * (stream_window + 1) + 4 * replicas + 5 +
-     * caller_slabs (decisions 42, 54 and E1). */
+     * caller_slabs (decisions 42, 54 and 127). */
     if (!vsr_size_add(limits->stream_window, 1, &term) ||
         !vsr_size_mul(limits->streams, term, &term) ||
         !vsr_size_add(limits->links, term, &minimum) ||
@@ -459,7 +459,7 @@ uint32_t vsr_io_engine_reserve(const struct vsr_io_limits *limits)
            ENGINE_RESERVE_REASSEMBLY;
 }
 
-/* The generator (decision E8): xoshiro256**, seeded once from the
+/* The generator (decision 134): xoshiro256**, seeded once from the
  * executor's entropy at init, so that nothing the primitives reach calls
  * the executor; a simulation stays deterministic by its seed. The values
  * are unique, not secret: a keyed handshake needing secret nonces would
@@ -751,7 +751,7 @@ static uint32_t ring_slot(uint32_t head, uint32_t count, uint32_t capacity)
 /* A rail's descriptor lives in the ring entry, so op.data of a rail op
  * points into it; the entry is reused by the first producer after the
  * poll that dequeues it, which vsr-io.h bounds by the caller's next call
- * into the engine (decision E6). */
+ * into the engine (decision 132). */
 struct vsr_io_forwarded *
 vsr_io_forward(struct vsr_io *io, struct vsr_io_replica *replica, uint32_t kind)
 {
@@ -824,7 +824,7 @@ uint32_t vsr_io_lease_alloc(struct vsr_io_replica *replica, uint32_t slab,
         if (slab != NONE) {
             /* The bytes are the lease's now (a cold LOAD result, a
              * reassembled MESSAGE): the reserve is free again for the
-             * internal user that acquired the slab (decision E1). */
+             * internal user that acquired the slab (decision 127). */
             vsr_io_pool_handoff(&replica->io->pool, slab);
         }
         return i;
@@ -936,7 +936,7 @@ bool vsr_io_engine_deliver(struct vsr_io *io, struct vsr_io_replica *replica,
 /* A replica whose STOP was submitted is not resolved: its core refuses
  * MESSAGEs (they are dropped and counted, decision 75) and its files are
  * not served any more (NOT_FOUND), so the served streams that would hold
- * its detach off end (decision E4). */
+ * its detach off end (decision 130). */
 struct vsr_io_replica *vsr_io_engine_replica(struct vsr_io *io,
                                              struct vsr_id cluster)
 {

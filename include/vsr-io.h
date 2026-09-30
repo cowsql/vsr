@@ -211,7 +211,7 @@ enum vsr_io_buffer_ring_flags {
 /*
  * Two record kinds are registration work rather than kernel operations, so
  * that a planner emits it as data like any other record (docs/io-design.md
- * decision E7: the engine's primitives never call the executor).
+ * decision 133: the engine's primitives never call the executor).
  * FILES_UPDATE installs descriptors into registered slots from `offset`
  * (io_uring's FILES_UPDATE): each slot takes its own reference, the
  * descriptors stay open and the caller's, -1 empties a slot; the result is
@@ -584,7 +584,7 @@ int vsr_io_submit(struct vsr_io *io, const struct vsr_io_event *events,
  * is the earliest engine deadline or VSR_NO_DEADLINE, and must reach
  * submit_and_wait. Records left over stay queued. The four calls above
  * never call the executor: registration work goes out as FILES_UPDATE and
- * PROVIDE records (docs/io-design.md decision E7). */
+ * PROVIDE records (docs/io-design.md decision 133). */
 int vsr_io_prepare(struct vsr_io *io, uint64_t now_ns, struct vsr_io_sqe *sqes,
                    uint32_t capacity, uint32_t *count, uint64_t *deadline_ns);
 

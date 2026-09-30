@@ -4,7 +4,7 @@ Worktree build/wt/engine, branch `wt/engine`, from main fb747c3 with
 main bf5a9d4 (the snapshot review) merged in. Not pushed. Every function
 vsr-io.h declared and nothing defined is now implemented: the node API,
 attach, detach, the replica accessors, `vsr_io_submit`, `poll`,
-`prepare`, `complete` and `run`. Placeholder decisions E1 to E9 are in
+`prepare`, `complete` and `run`. Placeholder decisions 127 to 135 are in
 docs/io-design.md section 10 (after main's 117 to 123; the coordinator
 renumbers). docs/io-implementation.md sections 7.1 to 7.8, 8, 9, 10 and
 11 describe the code as it is.
@@ -13,14 +13,14 @@ Commits (first parent):
 
 | Commit | What |
 | --- | --- |
-| 0953251 | Pool shares (E1 first form): `internal_taken`, the slab's `internal` flag, `vsr_io_pool_handoff`, `vsr_io_pool_floor` |
+| 0953251 | Pool shares (127 first form): `internal_taken`, the slab's `internal` flag, `vsr_io_pool_handoff`, `vsr_io_pool_floor` |
 | 041fe43 | The engine proper: `src/io/replica.c`, `src/io/loop.c`, engine.c's node API, close and closing |
 | 7717524 | tests/unit/engine.c, the first seventeen tests |
 | d53ff02 | Tests for the bounds, timers and close that mutants showed unguarded |
 | 927d851 | `VSR_IO_SQE_FILES_UPDATE` and `VSR_IO_SQE_PROVIDE` in the executor contract, uring.c, the sim, the fault wrapper, conformance |
-| 279ba7d | Purity (E7 to E9): the generator, link takeover by record, slot clears by record, PROVIDE from prepare, tests/lib/pure_executor |
-| 9d9523a | E1's final form (reserve `links + streams * window + 4 * replicas + 1`, a ring slab per link), the snapshot test at `caller_slabs = 0` |
-| 75f6b94 | Decisions E2 to E6, the plan's sections brought in line, vsr-io.h comments |
+| 279ba7d | Purity (133 to 135): the generator, link takeover by record, slot clears by record, PROVIDE from prepare, tests/lib/pure_executor |
+| 9d9523a | 127's final form (reserve `links + streams * window + 4 * replicas + 1`, a ring slab per link), the snapshot test at `caller_slabs = 0` |
+| 75f6b94 | Decisions 128 to 132, the plan's sections brought in line, vsr-io.h comments |
 | cbc95a6 | Merge of main bf5a9d4 |
 | 55dffc6 | A check that prepare surfaces a CAPTURE deadline armed at now (decision 122) |
 | 49f2c38 | This file |
@@ -35,8 +35,8 @@ snapshot.o:
 
 - `src/io/engine.c`: the kernel. Layout and init/deinit, close and
   `check_closed`, the forwarded ring (`vsr_io_forward`), leases, MESSAGE
-  delivery, engine file slots and their clears (E9), the generator (E8),
-  the reserve (E1), caller slabs, the node API (thin wrappers over
+  delivery, engine file slots and their clears (135), the generator (134),
+  the reserve (127), caller slabs, the node API (thin wrappers over
   link.c). No reference to the store or the snapshot module.
 - `src/io/replica.c`: `vsr_io_replica_layout`/`size`, attach, detach,
   `replica_status`/`core`/`find`.
@@ -54,8 +54,8 @@ decode regions, the store, the snapshot module):
   LOAD results with engine leases). One per outstanding core op, so it
   never fills (asserted).
 - `deferred` [operations]: completions the routing decided at once, each
-  due `retry_ns` after routing (E3). Due in order; the head is earliest.
-- `priority` [operations + 1]: the caller's COMPLETE and STOP (E2).
+  due `retry_ns` after routing (129). Due in order; the head is earliest.
+- `priority` [operations + 1]: the caller's COMPLETE and STOP (128).
 - `events` [limits.events]: the caller's REQUEST, CLIENT_QUERY, READ,
   CHECKPOINT.
 - `messages` [regions]: MESSAGEs from links under engine leases.
@@ -154,7 +154,7 @@ queued.
 
 ## Invariants
 
-- Purity (E7): complete, poll, submit, prepare, and everything they
+- Purity (133): complete, poll, submit, prepare, and everything they
   reach, call no executor op and no system call. Executor calls only in
   init (registrations, the generator's seed), deinit, attach
   (`update_buffer` of the tail), detach (its unregistration), wake and
@@ -172,7 +172,7 @@ queued.
   and no clear pending (the closing engine waits for the FILES_UPDATEs).
 - Detach requires STOPPED, no forwarded op naming the replica, no packed
   bytes unwritten, no deferred completion, and both modules closed.
-- Pool (E1): provision leaves FREE the reserve's unheld part plus the
+- Pool (127): provision leaves FREE the reserve's unheld part plus the
   caller's untaken share; a caller acquire fails at its share or when
   FREE is down to the reserve's unheld part; internal slabs handed to a
   lease stop counting.
@@ -286,14 +286,14 @@ not OK ends admission also for BUSY; REQUESTs queued before a STOP get no
 REPLY; a refused SEND costs `retry_ns`; `vsr_io_run` drops ELIMIT; a
 failed executor submission leaves slots taken and the engine unable to
 close; M19's path. Also: a keyed handshake needs secret nonces from a
-loop-refilled entropy pool, not the generator (E8); the snapshot module
+loop-refilled entropy pool, not the generator (134); the snapshot module
 still calls `vsr_io_engine_slot_free` on slots that never held a file,
-which stays correct under E9; a clear that fails leaves its file
+which stays correct under 135; a clear that fails leaves its file
 registered (not open to the engine, but not closed) until the slot is
 reused.
 
 Module edits outside the engine: link.c/link.h (takeover by FILES_UPDATE,
 `VSR_IO_STAGE_INSTALL`, the HANDSHAKE stage cleared before the install),
 snapshot.c (`slot_drop` only: `vsr_io_engine_slot_clear`), pool.c/pool.h
-(E1), slots.h (two kinds), uring.c, src/sim (the two records), the fault
+(127), slots.h (two kinds), uring.c, src/sim (the two records), the fault
 wrapper, include/vsr-io.h (two opcodes, the sizing rule, comments).

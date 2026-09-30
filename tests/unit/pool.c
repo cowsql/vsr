@@ -132,7 +132,7 @@ static void check_pool(const struct vsr_io_pool *pool)
     CHECK(lent == pool->caller_taken);
     CHECK(lent <= pool->caller_slabs);
     CHECK(internal == pool->internal_taken);
-    /* The unheld parts of both shares stay FREE (decisions 54 and E1). */
+    /* The unheld parts of both shares stay FREE (decisions 54 and 127). */
     floor = (pool->reserve > internal ? pool->reserve - internal : 0) +
             pool->caller_slabs - lent;
     CHECK(vsr_io_pool_floor(pool) == floor);
@@ -948,7 +948,7 @@ static void test_caller_share(void)
     /* Internal users take the reserve first and are never refused while a
      * slab is FREE, so beyond the reserve they eat into the share; the
      * caller gets a slab whenever the FREE count exceeds the part of the
-     * reserve internal users do not hold (decision E1). */
+     * reserve internal users do not hold (decision 127). */
     for (int i = 0; i < 4; ++i) {
         internal[i] = vsr_io_pool_acquire(&pool, false);
         CHECK(internal[i] != VSR_IO_INDEX_NONE);

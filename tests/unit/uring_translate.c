@@ -113,7 +113,7 @@ static void test_nop(void)
 }
 
 /* FILES_UPDATE is the kernel's own; PROVIDE is the executor's work and
- * never an SQE (decision E7). */
+ * never an SQE (decision 133). */
 static void test_files_update(void)
 {
     struct io_uring_sqe sqe;

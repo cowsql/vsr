@@ -1200,7 +1200,7 @@ static void execute(struct engine *e, const struct vsr_io_sqe *sqe,
     case VSR_IO_SQE_FILES_UPDATE: {
         /* A link's takeover (the raw descriptor stays until the CLOSE
          * chained behind), or a slot the engine empties for the module
-         * (decision E9), as fake_update_file did. */
+         * (decision 135), as fake_update_file did. */
         int32_t fd;
         struct fslot *slot;
 
@@ -1403,7 +1403,7 @@ static struct vsr_io_options engine_options(struct engine *e, uint64_t node)
     l->slabs = SLABS;
     l->slab_bytes = PAGE;
     /* No caller share: the engine's reserve covers the links' send slabs
-     * and this module's staging (decision E1), so a fetch no longer
+     * and this module's staging (decision 127), so a fetch no longer
      * starves its own stream link's send slab on an idle engine. */
     l->caller_slabs = 0;
     l->file_slots = FILE_SLOTS;
@@ -1869,7 +1869,7 @@ static void check_file_slots(const struct engine *e)
             found = found || held[j] == slot;
         }
         /* A slot the module gave back stays open until the engine's
-         * FILES_UPDATE empties it (decision E9). */
+         * FILES_UPDATE empties it (decision 135). */
         found = found || vsr_io_engine_slot_clearing(io, slot);
         if (!found) {
             fprintf(stderr,
@@ -3438,7 +3438,7 @@ static void test_capture(void)
     CHECK(pool_refs(a) == 0);
     CHECK(vsr_io_snapshots_close(a->io, REPLICA) == VSR_OK);
     CHECK(a->store->base_slot == -1);
-    settle(); /* The engine empties the given-back slots (decision E9). */
+    settle(); /* The engine empties the given-back slots (decision 135). */
     for (uint32_t i = 0; i < DFILES; ++i) {
         /* Every clients file closed; the log is the store's. */
         CHECK(a->files[i].refs == 0 ||
@@ -4985,7 +4985,7 @@ static void test_close(void)
     CHECK(vsr_io_snapshots_close(a->io, REPLICA) == VSR_OK);
     CHECK(a->store->base_slot == -1 && a->snapshots->closed);
     CHECK(a->replica->leases_free == REGIONS);
-    settle(); /* The engine empties the given-back slots (decision E9). */
+    settle(); /* The engine empties the given-back slots (decision 135). */
     for (uint32_t i = 0; i < DFILES; ++i) {
         CHECK(!a->files[i].used || a->files[i].refs == 0 ||
               strcmp(a->files[i].name, DIRECTORY "/log") == 0);

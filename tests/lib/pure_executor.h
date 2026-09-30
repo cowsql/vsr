@@ -7,7 +7,7 @@
 #include <stdint.h>
 
 /*
- * Purity guard (docs/io-design.md decision E7): an executor wrapper that
+ * Purity guard (docs/io-design.md decision 133): an executor wrapper that
  * forwards every call to an inner executor and counts the calls made while
  * it is armed. A harness arms it around each call to the engine's four
  * primitives (vsr_io_complete, vsr_io_poll, vsr_io_submit, vsr_io_prepare)

@@ -1923,7 +1923,7 @@ static void scenario_fixed_files(struct fixture *f)
     CHECK(run(f, r) == -EBADF);
 }
 
-/* FILES_UPDATE (decision E7): a record installs descriptors into slots,
+/* FILES_UPDATE (decision 133): a record installs descriptors into slots,
  * each slot taking its own reference while the descriptor stays open and
  * the caller's; -1 empties a slot; the count updated before a bad
  * descriptor; -EBADF, -EINVAL (beyond the table, a fixed file), -EFAULT. */
@@ -2457,7 +2457,7 @@ static struct vsr_io_sqe select_record(int32_t fd, uint16_t group,
     return r;
 }
 
-/* PROVIDE (decision E7): the executor provides the buffers itself before
+/* PROVIDE (decision 133): the executor provides the buffers itself before
  * any other record of the batch reaches the kernel, so a receive armed in
  * the same batch takes them; it completes only when it fails (-ENOENT, a
  * full ring's -ENOSPC, -EINVAL for a flag or a LINK before it). */
