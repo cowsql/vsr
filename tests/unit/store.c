@@ -7075,6 +7075,106 @@ static void test_review_header_unreadable(void)
     harness_close();
 }
 
+/* Crashes during a recovery (FDATASYNC): its superblock write torn away,
+ * or lost with the unflushed blocks before the flush after it, leaves
+ * the older superblock, whose run the next recovery counts from again;
+ * the records it read are on media by then (the flush before the
+ * write). A crash losing unflushed blocks before that first flush loses
+ * the records nothing acknowledged, and the next recovery finds the
+ * flushed prefix. Then DSYNC: the write torn away. */
+static void test_review_recovery_crash(void)
+{
+    struct config c = plain_config();
+    const struct vsr_loaded *loaded = NULL;
+    struct vsr_io_wire_superblock superblock;
+    uint32_t lease = NONE;
+    uint64_t op;
+    uint32_t at;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(6, 4); /* 1..4 flushed, 5 and 6 written. */
+    CHECK(h.store->flushed == 4 && h.store->written == 6);
+    /* A process crash keeps the page cache: the instance is abandoned
+     * with the unflushed blocks still dirty, and the machine goes down
+     * before the recovery's first flush: 5 and 6 are gone. */
+    disk.slot = -1;
+    disk.flags = 0;
+    disk.base_slot = -1;
+    harness_open_keep(&c, true);
+    op = open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_FSYNC);
+    CHECK(h.store->recovery.sequence == 6);
+    disk_crash(true);
+    harness_open_keep(&c, true);
+    expect_recovered(&c, 4);
+    CHECK(h.store->run == 2);
+    harness_close();
+    /* The superblock write torn away: run 3 was never on media. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(6, 6);
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    op = open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_WRITE);
+    CHECK(h.pending[at].sqe.offset < 2 * BLOCK && h.store->run == 2);
+    disk.tear_armed = 1;
+    disk.tear_blocks = 0;
+    harness_complete(at);
+    CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
+    expect_no_completion();
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    expect_recovered(&c, 6);
+    CHECK(h.store->run == 2);
+    read_superblock(h.store->superblock_next == 0 ? 1 : 0, &superblock);
+    CHECK(superblock.run == 2 && superblock.durable_floor == 6);
+    /* Lost with the unflushed blocks before the flush after it. */
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    op = open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_WRITE);
+    CHECK(h.pending[at].sqe.offset < 2 * BLOCK && h.store->run == 3);
+    harness_complete(at);
+    CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
+    disk_crash(true);
+    harness_open_keep(&c, true);
+    expect_recovered(&c, 6);
+    CHECK(h.store->run == 3);
+    /* Nothing lost: READY with run 3 on media, the next run 4. */
+    expect_completion(submit(txn_append(7, 1, 50)), VSR_IO_OK);
+    op = submit_sync(7);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    disk_crash(true);
+    harness_open_keep(&c, true);
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == 7 && h.store->run == 4);
+    release_lease(lease);
+    harness_close();
+    /* DSYNC: the write torn away. */
+    c.sync_mode = VSR_IO_SYNC_DSYNC;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(6, 6);
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    op = open_load(VSR_START_RECOVER);
+    at = run_until(VSR_IO_SQE_WRITE);
+    CHECK(h.pending[at].sqe.offset < 2 * BLOCK);
+    disk.tear_armed = 1;
+    disk.tear_blocks = 0;
+    harness_complete(at);
+    expect_no_completion();
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    expect_recovered(&c, 6);
+    CHECK(h.store->run == 2);
+    harness_close();
+    (void)op;
+}
+
 /* Names the test that fails; VSR_STORE_TEST in the environment runs
  * only the test of that name. */
 #define RUN(test)                                                              \
@@ -7161,6 +7261,7 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_review_idle_flush);
     RUN(test_review_full_segment);
     RUN(test_review_header_unreadable);
+    RUN(test_review_recovery_crash);
     printf("store: ok\n");
     return 0;
 }
