@@ -8,7 +8,7 @@ seeded fault simulation share one directory.
 | --- | --- | --- |
 | `unit/` | Small deterministic tests of private modules | Checked arithmetic (`checked`), logical equality (`objects`), PCG (`random`), in-memory store (`memory`, `memory_watch`), graph validation (`validate`), runtime ownership and scheduling against a protocol double (`runtime`), read rounds (`reads`), descriptor copies (`descriptors`), arena planner (`layout`) |
 | `integration/` | Public API and host adapter contracts | Replication, normal-path minima and lagging peers (`normal_contract`), reads, checkpoints, epoch handoff (`epochs`), stop/failure/crash lifecycle (`lifecycle`), transfer and recovery transitions (`transitions`), effect prerequisites (`audit`, `transfer_audit`), failure handling (`failures`), view change edges (`view_change_edges`), log offers (`offers`), capture scheduling (`capture`), client contract (`clients`), the independent driver-facing API conformance suite (`api_contract`), and the compile-only header check (`libheader.a`) |
-| `fuzzy/` | Coverage-guided fuzzing and seeded cluster/fault simulation | libFuzzer harnesses for checked arithmetic (`checked`), graph validation (`validation`), the cluster scenario (`cluster_fuzz`), the codec's decoders (`frame`) and its indexed entry decoder (`entry`); seeded cluster scheduler (`cluster`, `cluster_extended`); `KNOWN_FAILURES.md` for open campaign findings |
+| `fuzzy/` | Coverage-guided fuzzing and seeded cluster/fault simulation | libFuzzer harnesses for checked arithmetic (`checked`), graph validation (`validation`), the cluster scenario (`cluster_fuzz`), the codec's decoders (`frame`), its indexed entry decoder (`entry`) and the store's recovery (`recovery`); seeded cluster scheduler (`cluster`, `cluster_extended`); `KNOWN_FAILURES.md` for open campaign findings |
 | `regression/` | Minimal reproducers for fixed bugs and crashes | Seventeen reproducers, each with its origin in `regression/README.md`: trimmed-prefix resend (`trim_resend`); witness anchor adoption during recovery and transfer (`recovery_coverage`, `transfer_anchor`, `witness_prefix`); boundaries learned in view change or before STEADY (`boundary_from_view_change`, `next_epoch_before_steady`); lost-state members rejoining only through quorum recovery (`review_epoch_recovery_vote`, `epoch_announcement_recovery`, `recovery_into_handoff`); learner restart and continuous warm-up (`learner_restart`, `learner_follows`); input-pressure relief and a view change at minimum budgets (`pressure_reload`, `view_change_minimum`); a lagging peer's loaded entry sent before another peer's load can evict it (`lagging_reload`); checkpoint adoption behind the applied position and replies across a restoration (`anchor_behind_applied`, `reply_restore`); `vsr_init` output clearing (`api_init_out`); add with each bug fix |
 | `benchmark/` | Repeatable latency, throughput, allocation and copy measurements | `core`: arena bytes and `vsr_step` timings over a small configuration matrix, run by `make benchmark` outside `TESTS`; copying and cache behavior are not measured |
 | `lib/` | Shared test-only assertions and fixtures | In-memory immutable storage validating each transaction's shape at issuance; cluster host with always-active oracles for fence exclusion, read-fence bounds, a cluster-wide client execution/reply table, offer-versus-store equality, LOAD/RECLAIM/DROP retention rules, lease release, and STOPPED accounting; seeded RNG |
@@ -46,6 +46,18 @@ useful minimized inputs in source control and list them in `EXTRA_DIST`.
 The `frame` and `entry` corpora are seeded by `tests/unit/codec`, which writes
 encodings it builds when `VSR_CODEC_CORPUS` and `VSR_CODEC_ENTRY_CORPUS` name
 directories.
+
+`tests/fuzzy/recovery` drives the random walk of `tests/unit/store` from its
+input: STOREs, SYNCs, RECLAIMs, LOADs, captures and crashes with torn writes,
+lost unflushed blocks and flipped bytes, each recovery compared with an
+independent reading of the raw image and with a model of the log. The unit
+test runs twelve seeded walks; `./tests/unit/store SEED [BYTES]` runs the walk
+of one seed instead of the tests (its input is SEED's splitmix64 stream, so
+seeds replay under every compiler), `VSR_WALK_TRACE=1` prints every step, I/O
+and the image at each crash, `VSR_STORE_TEST=NAME` runs one test, and
+`VSR_RECOVERY_CORPUS=DIR` writes the default walks' inputs there (`make fuzz`
+seeds `corpus/recovery` so). Replay a recovery artifact with
+`./tests/fuzzy/recovery PATH_TO_ARTIFACT`.
 
 ## Seeded cluster scheduler
 

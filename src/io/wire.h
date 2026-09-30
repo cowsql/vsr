@@ -375,8 +375,10 @@ struct vsr_io_wire_hard_state {
  * are dead once writing resumed at the block after it, and the chain
  * continues with a record of the next sequence found there (decision S14).
  * The run rule is what rejects a persisted block of a torn write once the
- * block before it has been rewritten by a later run
- * (docs/io-implementation.md, "Recovery").
+ * block before it has been rewritten by a later run; where the run goes
+ * up, the record's flushed must reach its predecessor's sequence, which
+ * rejects the reverse splice (decision S20; docs/io-implementation.md,
+ * "Recovery").
  *
  * Change payloads, located by descriptor offset (from the record start) and
  * length:
