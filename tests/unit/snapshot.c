@@ -144,19 +144,28 @@ struct record_log {
 
 /* A file of the directory model. */
 struct dfile {
-    bool used;
-    char name[DNAME_BYTES];         /* Empty once unlinked. */
-    char durable_name[DNAME_BYTES]; /* As of the last directory fsync. */
-    uint32_t refs;                  /* Open slots. */
-    uint32_t flags;                 /* Flags of the last open. */
     uint64_t size;
     uint64_t flushed_size;
+    unsigned char *data;    /* [DFILE_BYTES] */
+    unsigned char *flushed; /* [DFILE_BYTES] */
+    uint32_t refs;          /* Open slots. */
+    uint32_t flags;         /* Flags of the last open. */
     uint32_t writes;
     uint32_t reads;
     uint32_t fsyncs;
-    unsigned char *data;    /* [DFILE_BYTES] */
-    unsigned char *flushed; /* [DFILE_BYTES] */
+    bool used;
+    char name[DNAME_BYTES];         /* Empty once unlinked. */
+    char durable_name[DNAME_BYTES]; /* As of the last directory fsync. */
 };
+
+/* Copies a file name of the model (bounded by DNAME_BYTES). */
+static void name_copy(char *out, const char *in)
+{
+    size_t length = strlen(in);
+
+    CHECK(length < DNAME_BYTES);
+    memcpy(out, in, length + 1);
+}
 
 struct fslot {
     int file; /* dfile index, -1 free, -2 the directory. */
@@ -381,8 +390,7 @@ static int dfile_create(struct engine *e, const char *name)
         if (!f->used) {
             memset(f, 0, sizeof(*f));
             f->used = true;
-            CHECK(strlen(name) < DNAME_BYTES);
-            strcpy(f->name, name);
+            name_copy(f->name, name);
             f->data = file_data[e->index][i];
             f->flushed = file_flushed[e->index][i];
             memset(f->data, 0, DFILE_BYTES);
@@ -464,7 +472,7 @@ static void dir_crash(struct engine *e)
             f->used = false;
             continue;
         }
-        strcpy(f->name, f->durable_name);
+        name_copy(f->name, f->durable_name);
         memcpy(f->data, f->flushed, DFILE_BYTES);
         f->size = f->flushed_size;
     }
@@ -660,7 +668,7 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
             }
             for (uint32_t i = 0; i < DFILES; ++i) {
                 if (e->files[i].used) {
-                    strcpy(e->files[i].durable_name, e->files[i].name);
+                    name_copy(e->files[i].durable_name, e->files[i].name);
                 }
             }
             e->dir_fsyncs++;
@@ -723,8 +731,7 @@ static bool dir_apply(struct engine *e, const struct vsr_io_sqe *sqe,
             e->files[to].name[0] = 0;
             dfile_reap(&e->files[to]);
         }
-        CHECK(strlen(sqe->addr2) < DNAME_BYTES);
-        strcpy(e->files[from].name, sqe->addr2);
+        name_copy(e->files[from].name, sqe->addr2);
         *result = 0;
         return true;
     }
@@ -2665,8 +2672,8 @@ static uint64_t store_clients(struct engine *e, uint64_t sequence,
 {
     for (uint32_t done = 0; done < count;) {
         struct vsr_id ids[4];
-        uint64_t numbers[4];
-        uint64_t ops[4];
+        uint64_t numbers[4] = {0};
+        uint64_t ops[4] = {0};
         uint32_t n = count - done < 4 ? count - done : 4;
 
         for (uint32_t i = 0; i < n; ++i) {
@@ -2815,7 +2822,7 @@ static void craft_file(struct craft *c, struct vsr_id id, uint32_t count,
         struct vsr_span span;
 
         for (size_t b = 0; b < result; ++b) {
-            data[b] = (unsigned char)(i * 17u + b);
+            data[b] = (unsigned char)((size_t)i * 17u + b);
         }
         span.data = data;
         span.size = result;
@@ -2881,7 +2888,7 @@ static struct dfile *file_install(struct engine *e, struct vsr_id id, bool tmp,
     f->size = size;
     memcpy(f->flushed, f->data, DFILE_BYTES);
     f->flushed_size = size;
-    strcpy(f->durable_name, f->name);
+    name_copy(f->durable_name, f->name);
     return f;
 }
 
@@ -3633,7 +3640,6 @@ static void test_sync(void)
         struct task_holder hc;
         uint64_t capture_op;
         struct vsr_id next;
-        uint32_t steps = 0;
 
         CHECK(entry != NULL && entry->file_slot >= 0 &&
               entry->job == VSR_IO_SNAPSHOT_JOB_NONE);
@@ -3650,9 +3656,9 @@ static void test_sync(void)
             CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_SYNC &&
                   entry->file_slot >= 0);
         } else {
-            while (entry->fileop == NONE) {
+            for (uint32_t steps = 0; entry->fileop == NONE; ++steps) {
+                CHECK(steps < 10);
                 step_checked(a);
-                CHECK(++steps < 10);
             }
             CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE);
             CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &h, prev, &op) ==
