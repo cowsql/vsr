@@ -2221,6 +2221,19 @@ static void syncs_settle(struct vsr_io_store *store)
     }
 }
 
+/* Completes every queued SYNC FAILED: nothing reaches the disk any more
+ * (a write error under CONTINUE), so none can complete OK, and every op
+ * gets exactly one completion (vsr.h). */
+static void syncs_fail(struct vsr_io_store *store)
+{
+    while (store->syncs_count > 0) {
+        complete(store, syncs_at(store, 0)->op, VSR_IO_FAILED, NONE, NULL);
+        syncs_pop(store);
+    }
+    store->flush_pending = FLUSH_NONE;
+    store->flush_deadline = VSR_NO_DEADLINE;
+}
+
 int vsr_io_store_sync(struct vsr_io_store *store, uint64_t op,
                       uint64_t sequence)
 {
@@ -2252,6 +2265,9 @@ int vsr_io_store_sync(struct vsr_io_store *store, uint64_t op,
         store->flush_pending = FLUSH_WANTED; /* Else the flush out decides. */
     }
     syncs_settle(store);
+    if (memory_only(store)) {
+        syncs_fail(store); /* Not satisfied already: never. */
+    }
     return VSR_OK;
 }
 
@@ -2355,14 +2371,19 @@ static struct vsr_io_write *write_plan(struct vsr_io_store *store)
 static void write_error(struct vsr_io_store *store, int32_t error)
 {
     store->error = error;
-    if (store->options.on_write_error == VSR_IO_WRITE_ERROR_FENCE) {
+    if (store->options.on_write_error == VSR_IO_WRITE_ERROR_FENCE ||
+        store->state == VSR_IO_STORE_CREATING) {
+        /* A log that failed to be created cannot be served from memory
+         * either: the RECOVERY load, or the STOREs a warm-up held,
+         * complete FAILED rather than never. */
         store_fail(store, VSR_IO_FAILED);
         return;
     }
-    /* CONTINUE: the store stops writing and serves from memory; no SYNC
-     * is ever issued in replicated mode, so nothing else waits. A freed
-     * slot no superblock or flush will release is free in the table, and
-     * the floor terms waiting for the media apply (memory_only). */
+    /* CONTINUE: the store stops writing and serves from memory; a SYNC
+     * (never issued in replicated mode) can no longer complete OK. A
+     * freed slot no superblock or flush will release is free in the
+     * table, and the floor terms waiting for the media apply
+     * (memory_only). */
     for (uint32_t i = 0; i < store->slots; ++i) {
         if (store->segments[i].phase == VSR_IO_SEGMENT_FREEING ||
             store->segments[i].phase == VSR_IO_SEGMENT_FLUSHING) {
@@ -2371,6 +2392,7 @@ static void write_error(struct vsr_io_store *store, int32_t error)
     }
     store->freeing_flush = FREEING_FLUSH_NONE;
     store->flush_own = 0;
+    syncs_fail(store);
     reclaim_apply(store);
 }
 
@@ -2489,6 +2511,16 @@ static void superblock_done(struct vsr_io_store *store, uint64_t floor,
     }
     if (floor > store->superblock_floor) {
         store->superblock_floor = floor;
+        if (store->options.sync_mode == VSR_IO_SYNC_FDATASYNC &&
+            store->state == VSR_IO_STORE_READY) {
+            /* The floor (the idle write of decision 50, or one a growth
+             * or freeing write carried) is on media only once a flush
+             * issued from now on completed, which the store asks for
+             * itself, like a freed slot's superblock (decision 111);
+             * recovery's own write is flushed by its FLUSH_AGAIN step. */
+            store->freeing_flush = FREEING_FLUSH_WANTED;
+            flush_request(store);
+        }
     }
     if (store->growth == GROWTH_SUPERBLOCK) {
         store->slots = file_slots(store);
