@@ -6941,6 +6941,140 @@ static void test_review_idle_flush(void)
     harness_close();
 }
 
+/* An APPEND at `sequence` whose record is exactly `bytes` long, or NULL
+ * when no shape of up to four entries and 256-byte bodies is. */
+static const struct txn *txn_sized(uint64_t sequence, uint64_t bytes)
+{
+    for (uint32_t count = 1; count <= 4; ++count) {
+        for (size_t body = 0; body <= 256; body += 8) {
+            const struct txn *t = txn_append(sequence, count, body);
+
+            if (t->bytes == bytes) {
+                return t;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* A segment filled to its last byte: the recovered log resumes at the
+ * segment's end (an empty extent there), the next record opens the next
+ * segment, and a second recovery finds both. */
+static void test_review_full_segment(void)
+{
+    struct config c = plain_config();
+    const struct txn *t;
+    uint64_t sequence = 1;
+    uint64_t op;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    for (;;) {
+        uint64_t used = h.store->segments[h.store->current].used;
+
+        CHECK(h.store->head % c.cache_bytes + c.segment_bytes - used <=
+              c.cache_bytes); /* No wrap padding to count. */
+        if (used == c.segment_bytes) {
+            break; /* The fillers filled it exactly. */
+        }
+        t = txn_sized(sequence + 1, c.segment_bytes - used);
+        if (t == NULL) {
+            t = txn_append(sequence + 1, 1, 100);
+        }
+        store_run(t);
+        sequence++;
+        CHECK(sequence < 64);
+    }
+    CHECK(h.store->current == 0 && h.store->head % BLOCK == 0);
+    CHECK(h.store->segments[0].used == c.segment_bytes);
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    expect_recovered(&c, sequence);
+    CHECK(h.store->current == 0 && h.store->slots == 2);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_OPEN &&
+          h.store->segments[0].used == c.segment_bytes);
+    CHECK(h.store->file_head == slot_offset(0) + c.segment_bytes);
+    store_run(txn_append(++sequence, 2, 100));
+    CHECK(h.store->current == 1 && h.store->segments[1].number == 2);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_SEALED);
+    store_run(txn_append(++sequence, 2, 100));
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    expect_recovered(&c, sequence);
+    CHECK(h.store->current == 1 && h.store->segments[0].number == 1);
+    harness_close();
+}
+
+/* Completes pending SQEs, preparing more, until a READ at file offset
+ * `offset` is pending, whose index is returned. */
+static uint32_t run_until_read_at(uint64_t offset)
+{
+    for (unsigned rounds = 0; rounds < 1000; ++rounds) {
+        uint32_t at;
+
+        harness_poll();
+        harness_prepare();
+        for (at = 0; at < PENDING_MAX; ++at) {
+            if (h.pending[at].state == 1 &&
+                h.pending[at].sqe.opcode == VSR_IO_SQE_READ &&
+                h.pending[at].sqe.offset == offset) {
+                return at;
+            }
+        }
+        at = pending_first();
+        CHECK(at != NONE);
+        harness_complete(at);
+    }
+    CHECK(false);
+    return NONE;
+}
+
+/* A segment header that cannot be read (twice: the re-read of decision
+ * 50 fails too): the start slot's makes the log CORRUPT; another slot is
+ * taken for free, so the chain ends before it, and the floor its
+ * records carry (swept as a free slot's) makes that CORRUPT too. */
+static void test_review_header_unreadable(void)
+{
+    struct config c = plain_config();
+    uint64_t sequence;
+    uint64_t op;
+    uint32_t at;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    sequence = fill_slot(2); /* Its record opened slot 1. */
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    store_run(txn_append(++sequence, 1, 100)); /* flushed = sequence - 1. */
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        disk_crash(false);
+        harness_open_keep(&c, true);
+        op = open_load(VSR_START_RECOVER);
+        at = run_until_read_at(slot_offset(slot));
+        disk.fail_read = -EIO;
+        harness_complete(at);
+        CHECK(h.store->state == VSR_IO_STORE_RECOVERING);
+        at = run_until_read_at(slot_offset(slot));
+        disk.fail_read = -EIO;
+        harness_complete(at);
+        harness_run();
+        expect_completion(op, VSR_IO_CORRUPT);
+        CHECK(h.store->state == VSR_IO_STORE_FAILED);
+        expect_no_completion();
+    }
+    /* Readable again: recovered whole. */
+    expect_recovered(&c, sequence);
+    harness_close();
+}
+
 /* Names the test that fails; VSR_STORE_TEST in the environment runs
  * only the test of that name. */
 #define RUN(test)                                                              \
@@ -7025,6 +7159,8 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_review_create_continue);
     RUN(test_review_sync_continue);
     RUN(test_review_idle_flush);
+    RUN(test_review_full_segment);
+    RUN(test_review_header_unreadable);
     printf("store: ok\n");
     return 0;
 }
