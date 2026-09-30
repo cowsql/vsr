@@ -316,6 +316,7 @@ void vsr_epochs_normal(struct vsr *v)
         e->epoch = p->current.epoch;
         e->installed = p->self != VSR_INDEX_NONE;
         e->stage = EPOCH_IDLE;
+        e->retry_at = VSR_NO_DEADLINE;
         return;
     }
     if (e->epoch != p->current.epoch)
@@ -649,7 +650,10 @@ void vsr_epochs_complete(struct vsr *v, struct vsr_operation *operation,
 
 uint64_t vsr_epochs_deadline(const struct vsr *v)
 {
-    return epochs_const(v)->retry_at;
+    /* Only a handoff in progress retransmits; the timer is re-armed at
+     * every TIME event that finds it expired. */
+    const struct vsr_epochs *e = epochs_const(v);
+    return e->stage == EPOCH_IDLE ? VSR_NO_DEADLINE : e->retry_at;
 }
 
 void vsr_epochs_stop(struct vsr *v)

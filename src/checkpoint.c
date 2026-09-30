@@ -886,8 +886,11 @@ static bool advertisement_poll(struct vsr *v)
     }
     if (!checkpoint->advertise && v->time_set &&
         checkpoint->advertise_at <= v->now) {
+        /* The round is due: its sends go at every poll until they are all
+         * issued, and the timer is re-armed at its end. */
         checkpoint->advertise = true;
         checkpoint->advertise_cursor = 0;
+        checkpoint->advertise_at = VSR_NO_DEADLINE;
     }
     if (!checkpoint->advertise)
         return false;
@@ -911,7 +914,9 @@ static bool advertisement_poll(struct vsr *v)
         return true;
     }
     checkpoint->advertise = false;
-    checkpoint->advertise_at = vsr_after(v, v->options.heartbeat_ns);
+    /* A send of this round that failed already asked for an earlier retry. */
+    if (checkpoint->advertise_at == VSR_NO_DEADLINE)
+        checkpoint->advertise_at = vsr_after(v, v->options.heartbeat_ns);
     return true;
 }
 
@@ -992,9 +997,13 @@ bool vsr_checkpoint_poll(struct vsr *v)
         if (checkpoint->published != VSR_INDEX_NONE &&
             v->status.applied <= v->status.checkpoint_op) {
             protocol->checkpoint_requested = false;
+        } else if (!maintenance_capacity(v, true, 0, 0)) {
+            /* Deferred under input pressure. The advertisement below needs
+             * no capacity and its timer must still be acted on: returning
+             * here left it expired and reported at every idle return. */
+            if (maintenance_evict(v))
+                return true;
         } else {
-            if (!maintenance_capacity(v, true, 0, 0))
-                return maintenance_evict(v);
             const uint32_t index = free_slot(checkpoint);
             if (index != VSR_INDEX_NONE) {
                 checkpoint->slots[index].used = true;
@@ -1129,7 +1138,8 @@ uint64_t vsr_checkpoint_deadline(const struct vsr *v)
     if (checkpoint == NULL || checkpoint->stopped)
         return VSR_NO_DEADLINE;
     uint64_t result = checkpoint->retry_at;
-    if (checkpoint->stage == CHECKPOINT_IDLE &&
+    /* An advertisement round in progress is driven by polls, not time. */
+    if (checkpoint->stage == CHECKPOINT_IDLE && !checkpoint->advertise &&
         v->status.state == VSR_STATE_NORMAL &&
         v->status.role == VSR_MEMBER_FULL && checkpoint->advertise_at < result)
         result = checkpoint->advertise_at;

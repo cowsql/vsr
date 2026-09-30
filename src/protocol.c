@@ -490,9 +490,15 @@ static bool store_poll(struct vsr *v)
     bool results = p->results_pending && p->results_sequence == 0;
     if (!p->identity_pending && !p->hard_dirty && !append && !results)
         return false;
+    /* Once the batching delay has elapsed the append is due and needs no
+     * deadline: a transaction slot or operation it lacks now is freed by a
+     * completion, whose step polls again. A deadline kept at or before the
+     * clock would wake the host into a poll that changes nothing. */
+    if (p->append_at != VSR_NO_DEADLINE && v->now >= p->append_at)
+        p->append_at = VSR_NO_DEADLINE;
     if (append && !p->identity_pending && !p->hard_dirty && !results &&
         p->log_end - p->written_end < v->options.limits.batch_entries &&
-        p->append_at != VSR_NO_DEADLINE && v->now < p->append_at)
+        p->append_at != VSR_NO_DEADLINE)
         return false;
     if (p->next_sequence == UINT64_MAX) {
         vsr_fail(v, VSR_FAILURE_EXHAUSTED, NULL, VSR_IO_OK);

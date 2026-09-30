@@ -65,6 +65,27 @@ scenario function inside it; "scheduler flag" refers to the profile flags of
   `integration/view_change_edges` (`learner_rotates_donor`),
   `regression/review_epoch_recovery_vote`.
 
+## Replication
+
+- Application waits on no send. A primary notifies, and applies, a committed
+  entry as soon as it is committed and present; only the RECONFIGURE that
+  ends an epoch waits, for its COMMIT to be issued in the old envelope to
+  every peer up to date with the boundary (its PREPARE went out and was not
+  rewound since; the acknowledging quorum among them), one send each, so
+  the wait is bounded by sends in flight and never by a peer. Peers behind
+  or unreachable learn the boundary from the handoff announcement and
+  transfer the history they hold. Why: the poll
+  advanced its commit notification, which gates application, only once a
+  COMMIT at least that high had been issued to every peer; a peer more than
+  a batch behind only ever received PREPAREs whose `committed` was capped at
+  the batch's end, and a failed SEND or the retry timer rewound its cursor to
+  its last acknowledgment, so with one backup of three unreachable (its
+  SENDs completing `RETRY`, as the I/O layer answers a SEND to a node it has
+  no link to) request `batch_entries + 1` committed and was never applied.
+  Where: `docs/protocol.md` "Epoch handoff and witnesses". Tests:
+  `regression/dead_backup_apply`; scheduler flag `128` (the memory cluster's
+  link model, `mem_cluster_model_links`).
+
 ## Recovery
 
 - Learning a later epoch never substitutes for quorum recovery. A replica
@@ -232,6 +253,25 @@ each states what `src/core.c` and `src/validate.c` already did.
   arena, which returns `VSR_EINVAL` without writing through `out`. Where:
   `include/vsr.h` `vsr_init`; `docs/vsr-api.md` "Initialization". Tests:
   `regression/api_init_out`, `api_contract` (`test_init_validation`).
+- A deadline is a promise that time alone will wake the core into work: a
+  return without `MORE` never reports a deadline at or before the last
+  accepted time. Every expired timer has been acted on, and a timer whose
+  action also waits for a completion is withheld until that completion's
+  step polls again. Why: a replica RECOVERING from a lost store reported its
+  recovery round's `retry_at`, set when the round began, while its hard-state
+  STORE was outstanding, so a host waking at the deadline polled in a loop
+  for the whole log creation; the same held for a view change's round and
+  election timer, for discovery rounds, for the warm-up timer, for the
+  election timer during a learner's transfer, for retries (a fetch, a
+  served load, a batched append, a checkpoint advertisement) that stayed
+  expired for want of an operation slot or budget, and for the
+  advertisement timer while a capture hint deferred under input pressure
+  ended the checkpoint poll before it (every fourth seed of the profiles
+  with flag `2`). `include/vsr.h` is unchanged: this states what a deadline
+  meant. Where: `docs/vsr-api.md`
+  "Driving the core". Tests: `regression/held_store_deadline`; the memory
+  cluster checks it at every idle return of every node, so every integration
+  test and scheduler run does.
 
 ## Fixed without a contract change
 

@@ -135,7 +135,14 @@ nanoseconds in one local clock domain; values may repeat but never decrease.
 Other events use the last accepted time. The first TIME establishes the origin;
 protocol timers and read deadlines do not fire beforehand. A returned deadline
 at or before the current time requires another current TIME event. Early timer
-wakeups are harmless. `batch_delay_ns = 0` disables intentional delay; positive
+wakeups are harmless. A deadline is a promise that time alone will wake the
+core into work: a return without `MORE` never reports a deadline at or before
+the last accepted time, because every timer that expired has been acted on,
+and a timer whose action also waits for a completion (the hard-state STORE
+that must precede a round's messages, the answer to a request already out, a
+free operation slot for a retry) is withheld until that completion's step
+polls again. A host that arms its timer from each return therefore never
+wakes into a step that changes nothing. `batch_delay_ns = 0` disables intentional delay; positive
 values bound it from the first queued entry. Heartbeats and retries cannot wait
 for application batching. Counter or time arithmetic must fail before wrapping.
 

@@ -283,6 +283,54 @@ static bool hard_safe(const struct vsr *v)
            p->safe_sequence >= p->hard_sequence;
 }
 
+/* A deadline is reported only while the poll that owns the timer would act
+ * on its expiry. A timer whose action also waits for a completion, the
+ * hard-state STORE that must precede a round's messages or the answer to
+ * the request already out, is withheld until then: the completion's step
+ * polls again and acts on the expired timer. Reported, such a timer would
+ * wake the host into a poll that changes nothing, at every TIME event until
+ * the completion arrived (regression held_store_deadline). */
+static bool round_timer_live(const struct vsr *v)
+{
+    const struct vsr_transition *t = transition_const(v);
+    if (t->target.active)
+        return false;
+    switch (t->round) {
+    case ROUND_VIEW:
+    case ROUND_RECOVERY:
+        return hard_safe(v);
+    case ROUND_CATCHUP:
+    case ROUND_WARM:
+    case ROUND_EPOCH:
+        /* A discovery that could not be sent is retried at every poll. */
+        return t->discovery_waiting && (hard_safe(v) || t->uninitialized_hint);
+    default:
+        return false;
+    }
+}
+
+/* The election timer is acted on at every poll during a catch-up and during
+ * the transfer a view change selected, and by the view round otherwise. */
+static bool election_timer_live(const struct vsr *v)
+{
+    const struct vsr_transition *t = transition_const(v);
+    if (t->round == ROUND_CATCHUP)
+        return true;
+    if (t->target.active)
+        return t->target.goal == TARGET_PRIMARY ||
+               t->target.goal == TARGET_BACKUP;
+    return t->round == ROUND_VIEW && hard_safe(v);
+}
+
+/* An idle learner between warm-ups: the only state in which the warm-up
+ * timer is armed and acted on. */
+static bool warm_idle(const struct vsr *v)
+{
+    const struct vsr_transition *t = transition_const(v);
+    return v->status.state == VSR_STATE_WARMING && t->round == ROUND_NONE &&
+           !t->target.active && !t->boot_restore && v->time_set && hard_safe(v);
+}
+
 /* The committed position a full replica must have applied before a transfer
  * or restart completes. Application beyond the boundary belongs to the new
  * epoch's full members: a removed or demoted member stops there (the epoch
@@ -824,9 +872,13 @@ static bool server_poll(struct vsr *v)
             continue;
         struct retained_offer *offer = &t->offers[server->offer];
         if (server->phase == SERVER_LOAD) {
-            if (server->retry_at != VSR_NO_DEADLINE &&
-                !expired(v, server->retry_at))
-                continue;
+            if (server->retry_at != VSR_NO_DEADLINE) {
+                if (!expired(v, server->retry_at))
+                    continue;
+                /* Due: the load is attempted at every poll from here on,
+                 * and a budget it lacks is freed by a completion. */
+                server->retry_at = VSR_NO_DEADLINE;
+            }
             uint64_t manifest = offer->state.checkpoint == NULL
                                     ? 0
                                     : offer->checkpoint.manifest.size;
@@ -1271,15 +1323,20 @@ static bool fetch_phase(struct vsr *v)
     }
     if (target->load_id != 0)
         return false;
-    if (target->waiting && !expired(v, target->retry_at))
-        return false;
-    if (target->waiting && target->source != v->options.replica &&
-        (target->goal == TARGET_EPOCH || target->goal == TARGET_WARM)) {
-        if (target->unanswered < TARGET_PATIENCE)
-            target->unanswered++;
-        if (target->unanswered >= TARGET_PATIENCE) {
-            restart_selection(v);
-            return true;
+    if (target->waiting) {
+        if (!expired(v, target->retry_at))
+            return false;
+        /* Unanswered: the next fetch is issued at every poll until it can
+         * be, with no deadline to wait for meanwhile. */
+        target->waiting = false;
+        if (target->source != v->options.replica &&
+            (target->goal == TARGET_EPOCH || target->goal == TARGET_WARM)) {
+            if (target->unanswered < TARGET_PATIENCE)
+                target->unanswered++;
+            if (target->unanswered >= TARGET_PATIENCE) {
+                restart_selection(v);
+                return true;
+            }
         }
     }
     uint32_t entries;
@@ -1595,12 +1652,17 @@ static bool discovery_poll(struct vsr *v)
          t->round != ROUND_EPOCH) ||
         (!hard_safe(v) && !t->uninitialized_hint))
         return false;
-    if (t->discovery_waiting && !expired(v, t->retry_at))
-        return false;
-    if (t->discovery_waiting && t->round == ROUND_WARM)
-        t->discovery_peer = warm_peer(v);
-    if (t->discovery_waiting && t->round == ROUND_EPOCH)
-        t->discovery_peer = epoch_peer(v);
+    if (t->discovery_waiting) {
+        if (!expired(v, t->retry_at))
+            return false;
+        /* Unanswered: a round that may choose its donor moves on, and the
+         * next request is issued at every poll until it can be. */
+        t->discovery_waiting = false;
+        if (t->round == ROUND_WARM)
+            t->discovery_peer = warm_peer(v);
+        if (t->round == ROUND_EPOCH)
+            t->discovery_peer = epoch_peer(v);
+    }
     struct vsr_fetch request = {
         .max_bytes =
             v->options.limits.command_bytes + v->options.limits.manifest_bytes,
@@ -1625,14 +1687,13 @@ static bool discovery_poll(struct vsr *v)
 static bool warm_poll(struct vsr *v)
 {
     struct vsr_transition *t = transition(v);
-    if (v->status.state != VSR_STATE_WARMING || t->round != ROUND_NONE ||
-        t->target.active || t->boot_restore || !v->time_set)
+    if (!warm_idle(v))
         return false;
     if (t->warm_at == VSR_NO_DEADLINE) {
         t->warm_at = vsr_after(v, v->options.heartbeat_ns);
         return false;
     }
-    if (!expired(v, t->warm_at) || !hard_safe(v))
+    if (!expired(v, t->warm_at))
         return false;
     begin_discovery(v, v->status.primary, true);
     return true;
@@ -2180,15 +2241,13 @@ uint64_t vsr_transition_deadline(const struct vsr *v)
     uint64_t result = VSR_NO_DEADLINE;
     if (!t->enabled)
         return result;
-    if (t->round != ROUND_NONE)
+    if (round_timer_live(v))
         result = t->retry_at;
-    if ((t->round == ROUND_VIEW || t->round == ROUND_CATCHUP ||
-         t->target.active) &&
-        t->election_at < result)
+    if (election_timer_live(v) && t->election_at < result)
         result = t->election_at;
     if (t->target.active && t->target.waiting && t->target.retry_at < result)
         result = t->target.retry_at;
-    if (t->warm_at < result)
+    if (warm_idle(v) && t->warm_at < result)
         result = t->warm_at;
     for (uint32_t i = 0; i < v->options.limits.transfers; i++) {
         if (t->offers[i].used && t->offers[i].references == 0 &&
