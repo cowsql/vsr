@@ -1840,8 +1840,12 @@ static void fetch_settle(struct vsr_io *io, uint32_t replica,
     struct vsr_io_replica *rep = replica_of(io, replica);
     struct vsr_io_snapshots *s = &rep->snapshots;
 
+    /* Only the op's own jobs are waited for: a FETCH of a held file may
+     * find housekeeping (the RELEASE of its kept slot) under way, which
+     * calls no settle when it ends. */
     if (entry->caller_status == -1 || entry->library_status == -1 ||
-        entry->job != VSR_IO_SNAPSHOT_JOB_NONE) {
+        entry->job == VSR_IO_SNAPSHOT_JOB_FETCH ||
+        entry->job == VSR_IO_SNAPSHOT_JOB_DISCARD) {
         return;
     }
     if (entry->caller_status == VSR_IO_OK) {
@@ -1851,7 +1855,7 @@ static void fetch_settle(struct vsr_io *io, uint32_t replica,
     /* A fetched file the caller failed on is a private partial object
      * (vsr.h), unless the store adopted it meanwhile. */
     if (entry->on_disk && entry->sequence == 0) {
-        if (entry->readers == 0) {
+        if (entry->readers == 0 && entry->job == VSR_IO_SNAPSHOT_JOB_NONE) {
             discard_start(entry);
             return;
         }

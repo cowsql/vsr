@@ -3998,6 +3998,37 @@ static void test_fetch_failures(void)
         settle();
         expect_checkpoint(b, op, x, &h);
         CHECK(links_in_state(b, VSR_IO_LINK_ESTABLISHED) == links);
+        /* A FETCH of a held id while base_track releases its kept slot:
+         * the caller answers before the CLOSE completes; the completion
+         * must not wait for a job it did not start. */
+        {
+            struct task_holder hc;
+            uint64_t capture_op;
+            struct vsr_id prev;
+            struct vsr_id next;
+            const struct vsr_io_snapshot *entry;
+
+            (void)capture(b);
+            prev = b->store->last_capture;
+            entry = entry_of(b, prev);
+            next = capture_stepped(b, &hc, &capture_op);
+            vsr_io_snapshots_poll(b->io, REPLICA, world.now);
+            CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE);
+            CHECK(fetch_start(b, &h, prev, 1, &op) == VSR_OK);
+            step_checked(b); /* Forwarded; the CLOSE issued. */
+            CHECK(entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE &&
+                  entry->fileop != NONE);
+            CHECK(forwarded_core(b, VSR_OP_SNAPSHOT_FETCH, op) != NULL);
+            task_result(&h, prev);
+            caller_done(b, op, VSR_IO_OK, &h.checkpoint);
+            settle();
+            expect_checkpoint(b, op, prev, &h);
+            task_result(&hc, next);
+            caller_done(b, capture_op, VSR_IO_OK, &hc.checkpoint);
+            settle();
+            expect_checkpoint(b, capture_op, next, &hc);
+            CHECK(entry->file_slot < 0);
+        }
         /* The held file is kept when that caller fails. */
         CHECK(fetch_start(b, &h, x, 1, &op) == VSR_OK);
         settle();
