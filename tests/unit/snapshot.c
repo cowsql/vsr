@@ -3879,7 +3879,7 @@ static void test_drop(void)
 /* The requester side's failures. A file the source serves wrongly (a bad
  * record CRC, a record longer than result_bytes, a header naming another
  * snapshot, a file cut before its trailer) is FAILED, like a source that
- * ends short or fails to read (W7: the damage is not the fetching
+ * ends short or fails to read (123: the damage is not the fetching
  * replica's, and CORRUPT would latch its snapshot failure); a lost link
  * RETRY; the requester's own
  * open, write, short write and rename errors FAILED. In every case the
@@ -5202,7 +5202,7 @@ static void craft_tampered(struct craft *c, struct vsr_id id, uint32_t variant)
  * replaced (its last reply forgotten: a retried request would run again),
  * and a fetch accepted and renamed the file. The trailer's crc over the
  * whole file catches each variant of craft_tampered: a load answers
- * CORRUPT, a fetch FAILED (W7). */
+ * CORRUPT, a fetch FAILED (123). */
 static void test_review_record_integrity(void)
 {
     for (uint32_t variant = 0; variant < 3; ++variant) {

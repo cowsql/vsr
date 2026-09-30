@@ -6,19 +6,19 @@ test first, observed failing before the fix (section "Review" at the end
 of tests/unit/snapshot.c, `test_review_*`). store.c, stream.c, link.c,
 engine.c and pool.c untouched; the clients-file format change touches
 wire.h, codec.c/.h, tests/unit/codec.c and tests/fuzzy/frame.c.
-Placeholder decisions W1..W7 in docs/io-design.md section 10 (the
+Placeholder decisions 117..123 in docs/io-design.md section 10 (the
 coordinator renumbers); docs/io-implementation.md "Snapshots", 5.4, 7.4,
 section 10 (two rows) and section 11 updated.
 
-Commits: 1166607 (W1), 9cf3e6a (W2), e23f2e3 (W3), 72abe58 (W4),
-0f14160 (W5), 090da53 (W6), dbc726c and ec6bd46 (tests closing mutation
+Commits: 1166607 (117), 9cf3e6a (118), e23f2e3 (119), 72abe58 (120),
+0f14160 (121), 090da53 (122), dbc726c and ec6bd46 (tests closing mutation
 survivors, slot accounting), 2d4710f and 46f77b6 (lint in the new tests),
 f23abc0 (decisions and docs), cad7411 (wake_now moved away from
-`slot_drop`), this file, then 766053d (W7, the coordinator's decision on
+`slot_drop`), this file, then 766053d (123, the coordinator's decision on
 the first open item) and its docs. No `vsr_io_engine_install` or other executor
 call was added or moved: `slot_drop` and its surroundings are as on main
 (the engine agent converts that call into a submission record); the fixes
-issue only records (the directory's OPENAT for W3) and arm deadlines.
+issue only records (the directory's OPENAT for 119) and arm deadlines.
 
 Checks (kernel 7.2, clang 21 ASan+UBSan and gcc 16 `--disable-sanitize`,
 both `--enable-werror`): `make check` 68/68 on both (the first gcc run was
@@ -31,7 +31,7 @@ tests/fuzzy/frame.c is not built outside `--enable-fuzzing`: built by hand
 against the ASan library and run 30 s on the corpus tests/unit/codec seeds
 (5.2M runs, no failure), clang-tidy clean. The experiment behind the
 pool-reserve item below was a scratch change to the harness, not committed.
-After W7: tests/unit/snapshot passes under both compilers; format-check,
+After 123: tests/unit/snapshot passes under both compilers; format-check,
 clang-tidy and cppcheck are clean on snapshot.c and its test.
 
 ## CONFIRMED (7, all fixed)
@@ -50,7 +50,7 @@ clang-tidy and cppcheck are clean on snapshot.c and its test.
    (no later CAPTURE). The same for a SYNC whose file stopped being the
    latest capture (a capture completing during a SYNC, which today's core
    stages never produce). Fix 1166607: no RELEASE while `entry->op != 0`.
-   Tests `test_review_capture_release`, `test_review_sync_release`. W1.
+   Tests `test_review_capture_release`, `test_review_sync_release`. 117.
 
 2. **A repeated FETCH failing at its caller unlinked the core's held file**
    (lease/hold rules). A FETCH of an id the module holds transfers nothing;
@@ -63,7 +63,7 @@ clang-tidy and cppcheck are clean on snapshot.c and its test.
    not reach yet. The author's test asserted the unlink under a comment
    saying the opposite. Fix 9cf3e6a: `transferred` (the former
    `reserved`) marks a file this op's stream wrote; only that one is
-   discarded. Test `test_review_refetch_kept`. W2.
+   discarded. Test `test_review_refetch_kept`. 118.
 
 3. **A failed directory open was final: every SNAPSHOT_SYNC fenced the
    replica** (transient condition). The directory is opened once, at the
@@ -72,7 +72,7 @@ clang-tidy and cppcheck are clean on snapshot.c and its test.
    SYNC reaching the directory fsync with the directory FAILED has the
    poll re-arm the open once for it (`dir_retried`); only that attempt's
    failure fails it, so nothing loops. Test `test_review_dir_retry`
-   (harness fault `fail_dir_opens`). W3.
+   (harness fault `fail_dir_opens`). 119.
 
 4. **Records were not bound to their file or place** (format). Each record
    CRC covers its own bytes; a record written over another of the same
@@ -90,7 +90,7 @@ clang-tidy and cppcheck are clean on snapshot.c and its test.
    bytes followed by their own CRC ends in a constant (the residue), so
    that digest depended only on the record lengths. Test
    `test_review_record_integrity` (duplicate, resealed foreign record,
-   swap; each through a load and a fetch). W4.
+   swap; each through a load and a fetch). 120.
 
 5. **A witness promoted to FULL by a RESTORE whose file had gone came up
    with an empty client table** (base handling). `load_done` read ENOENT
@@ -99,7 +99,7 @@ clang-tidy and cppcheck are clean on snapshot.c and its test.
    (`base_hold` reads the transaction's role) or a FULL replica's recovery,
    so the branch never served a witness and fired only on promotion. Fix
    0f14160: a missing base file is CORRUPT. Test
-   `test_review_witness_promotion`. W5.
+   `test_review_witness_promotion`. 121.
 
 6. **Outcomes decided in the module's prepare slept until an unrelated
    wake** (liveness). `vsr_io_snapshots_prepare` runs after the core's poll
@@ -112,7 +112,7 @@ clang-tidy and cppcheck are clean on snapshot.c and its test.
    a truncated file, CORRUPT at the requester). Fix 090da53: such paths
    arm the replica's CAPTURE deadline at `io->now` (`wake_now`). Tests
    `test_review_serve_no_slot`, the prepare-time failure in
-   `test_review_dir_retry`. W6.
+   `test_review_dir_retry`. 122.
 
 7. **A remote file's corruption latched the fetching replica** (status;
    reported open, decided by the coordinator). A FETCH whose received
@@ -127,14 +127,14 @@ clang-tidy and cppcheck are clean on snapshot.c and its test.
    `test_review_fetch_corrupt_failed` (corrupt chunk, bad trailer, a swap
    only the file's crc catches; the .tmp unlinked each time);
    test_fetch_failures and the fetches of test_review_record_integrity now
-   expect FAILED. W7.
+   expect FAILED. 123.
 
 ## OPEN, not fixed
 
 8. **The pool reserve** (docs section 11, recommendation below).
 9. **A damaged source keeps failing its fetchers.** A source serves its
    own file raw (the FILE write is not read through the reader), so every
-   fetch from a source whose file is damaged ends FAILED (W7) until
+   fetch from a source whose file is damaged ends FAILED (123) until
    discovery picks another source; the source learns of it only at its own
    next load. Verifying on serve is left open (section 11).
 10. **A base change during a capture** would point the writer's cold read
@@ -212,7 +212,7 @@ when a slab is missing at an op's start; the unit harness keeps
   file being written or fetched only under a core that breaks its own
   schedule.
 - A `vsr_io_store_base_record` duplicate in one load merges silently;
-  the trailer crc (W4) now rejects such a file first.
+  the trailer crc (120) now rejects such a file first.
 - A queued base CLIENT load across a base change (store phase 4):
   `base_track` runs in every poll, which the loop runs before every
   prepare; a pack inside `vsr_io_complete` (a held STORE drained at a write
@@ -226,16 +226,16 @@ The runner applies each mutant to the file, rebuilds tests/unit/snapshot
 
 | # | Mutation | Result |
 | --- | --- | --- |
-| R1 | base_track releases a slot under a core op (W1 reverted) | test_review_capture_release, test_review_sync_release |
-| R2 | fetch_settle discards without `transferred` (W2 reverted) | test_review_refetch_kept |
+| R1 | base_track releases a slot under a core op (117 reverted) | test_review_capture_release, test_review_sync_release |
+| R2 | fetch_settle discards without `transferred` (118 reverted) | test_review_refetch_kept |
 | R3 | fetch_finish does not mark the file `transferred` | test_fetch_failures (the failed caller's private file stays) |
 | R4 | op_complete keeps `transferred` | test_fetch_failures, test_review_refetch_kept |
-| R5 | the poll does not re-arm a failed directory open (W3) | test_review_dir_retry |
+| R5 | the poll does not re-arm a failed directory open (119) | test_review_dir_retry |
 | R6 | prepare fails a SYNC at a failed directory before its retry | equivalent: FSYNC_DIR is reached only at a completion, so the poll re-arms before prepare sees it, except after a prepare_dir failure in the same prepare, whose retry fails the same way |
 | R7 | `dir_retried` not reset by a new SYNC | test_review_dir_retry |
 | R8 | the file digest over the record CRCs too (the residue) | test_capture (file_parse), test_review_record_integrity |
 | R9 | trailer count not compared | test_load_failures (count edited, crc resealed) |
-| R10 | a missing base file is an empty base (W5 reverted, any role) | test_load_failures, test_review_witness_promotion |
+| R10 | a missing base file is an empty base (121 reverted, any role) | test_load_failures, test_review_witness_promotion |
 | R11 | a load overwrites a known entry's `sequence` | equivalent: `sequence` is only ever compared with 0, and both leave a loaded entry nonzero |
 | R12 | serve accepts an entry whose file is not on disk | test_review_serve_refusals |
 | R13 | serve accepts an entry being discarded | test_review_serve_refusals |
@@ -259,7 +259,7 @@ The runner applies each mutant to the file, rebuilds tests/unit/snapshot
 | R37 | a source end frees the serve while its open is out | check_snapshots (test_serve) |
 | R38 | fetch chunk writes without `reads == 0` | equivalent: an open in flight holds `fileop`, an unissued one leaves the step at OPEN |
 | R40 | a caller failure does not abort the writer | test_capture_failures |
-| R41 | wake_now does nothing (W6 reverted) | test_review_dir_retry, test_review_serve_no_slot |
+| R41 | wake_now does nothing (122 reverted) | test_review_dir_retry, test_review_serve_no_slot |
 | R43 | no wake after the serve refusal | test_review_serve_no_slot |
 | R44 | no wake after a SYNC failed in prepare | test_review_dir_retry |
 | R46 | END OK short of the trailer not CORRUPT | test_fetch_failures |
@@ -278,8 +278,8 @@ The runner applies each mutant to the file, rebuilds tests/unit/snapshot
 | R76 | RENAMEAT to the .tmp name | test_fetch |
 | R78 | fetch_settle does not wait for a DISCARD | equivalent: a DISCARD starts only once the caller answered, and no settle runs again before it ends |
 | T1 | codec: the trailer's crc not compared (codec.c) | test_load_failures, test_review_record_integrity |
-| R79 | a failed fetch completes CORRUPT again (W7 reverted) | test_review_fetch_corrupt_failed (observed failing before the fix) |
-| A4 | record CRC not verified (the author's M4, rechecked under W4) | test_fetch_failures (the CRC byte flipped: the file digest leaves record CRCs out) |
+| R79 | a failed fetch completes CORRUPT again (123 reverted) | test_review_fetch_corrupt_failed (observed failing before the fix) |
+| A4 | record CRC not verified (the author's M4, rechecked under 120) | test_fetch_failures (the CRC byte flipped: the file digest leaves record CRCs out) |
 | A16 | bytes after the trailer accepted (M16 rechecked) | test_load_failures |
 | A20 | header count not bounded (M20 rechecked) | test_fetch_failures |
 

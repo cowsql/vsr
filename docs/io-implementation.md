@@ -708,7 +708,7 @@ states the four op sequences; the details:
   like any file record); each record plus its CRC is staged in the slab,
   written (`WRITE | FIXED_FILE | FIXED_BUFFER`) when full and at the end;
   trailer, whose crc the writer extends over the header and each record
-  (without its CRC) as it stages them (W4).
+  (without its CRC) as it stages them (120).
   `vsr_io_store_capture_offset` records each entry's offset;
   `capture_end` sets `last_capture` (a zero id when the library half
   fails: the floor only). The file stays open (the latest capture's kept
@@ -726,7 +726,7 @@ states the four op sequences; the details:
   SYNC of an entry whose kept slot is being released cancels or follows
   that RELEASE (107). A SYNC that reaches the directory fsync while the
   directory's open has failed has the poll retry that open once for it,
-  and fails only if that attempt fails (W3).
+  and fails only if that attempt fails (119).
 - FETCH: an id already held is forwarded at once. Otherwise `task->peer`
   is resolved to a node through the authorization table (no node:
   `RETRY`), an engine lease, the reader's slab, a file slot and an entry
@@ -745,12 +745,12 @@ states the four op sequences; the details:
   with the stream's status (`RETRY` on loss, `FAILED` for a source read
   error, a local I/O error or bytes that fail verification, `NOT_FOUND`
   from the source; a fetch never reports `CORRUPT`, which would latch the
-  fetching replica's snapshot failure for the source's damage, W7) without
+  fetching replica's snapshot failure for the source's damage, 123) without
   involving the caller. A caller
   failure on a file this FETCH's stream wrote, not yet adopted by a
   RESTORE, unlinks it (vsr.h's private partial object); a FETCH of an id
   already held transferred nothing and keeps the file whatever its caller
-  answers (the core's hold of the earlier FETCH, W2). `basis` is passed
+  answers (the core's hold of the earlier FETCH, 118). `basis` is passed
   through; the library half does not use it.
 - DROP: forwards; on the caller's OK, the kept slot is closed and the
   file unlinked once `readers == 0`, then the entry freed; a served library
@@ -767,10 +767,10 @@ states the four op sequences; the details:
   `vsr_io_store_base_resume(status)`. A missing file is `CORRUPT`: the
   store wants one only for a FULL role (the held transaction's, or a FULL
   replica's recovery), so a witness's RESTORE loads nothing and a witness
-  promoted to FULL needs its file like any full replica (W5). The file
+  promoted to FULL needs its file like any full replica (121). The file
   stays open; `store.base_slot` follows the store's client base (106). A
   kept slot is released (a RELEASE job: CLOSE) only while no core op is in
-  progress on its entry (W1): the settles wait for the entry's job to end,
+  progress on its entry (117): the settles wait for the entry's job to end,
   and a RELEASE settles nothing.
 - Serving: `vsr_io_snapshots_serve` finds the replica by cluster and
   replica id, requires the registry entry complete, not discarded or
@@ -788,7 +788,7 @@ lease or a file operation arms the replica's CAPTURE deadline at
 `io->now + 1 ms`; its pop needs no dispatch, the poll that follows retries.
 An outcome decided in the module's prepare (a serve refused for want of a
 slot, a SYNC failed there, a name that does not fit) arms it at `io->now`,
-since the core's poll and the links' prepare already ran (W6).
+since the core's poll and the links' prepare already ran (122).
 `vsr_io_snapshots_close` (detach) is EBUSY while a record is in flight,
 the writer or reader is busy or a served stream is open; otherwise it
 drops every kept slot, clears `store.base_slot` and releases the leases of
@@ -812,9 +812,9 @@ After every step the harness checks the module's invariants: engine file
 slots held exactly once and covering every open handle, CLIENTS records
 equal to the file operations and at most four, reserved leases distinct.
 The review's tests (`test_review_*`) cover an op answered while a RELEASE
-of its file is out (W1), a repeated FETCH failing at its caller (W2), a
-failed directory open (W3) and tampered files, each through a load and a
-fetch (W4).
+of its file is out (117), a repeated FETCH failing at its caller (118), a
+failed directory open (119) and tampered files, each through a load and a
+fetch (120).
 `tests/integration/snapshots` over the simulation (capture on one engine,
 fetch by another, restore, recovery from the file after a crash, a corrupt
 file detected) is still to be written.
@@ -1136,13 +1136,13 @@ op, sequence (the writer's), count, crc (over the preceding bytes). Records:
 `vsr_io_wire_client_record`, result bytes padded to 8, then `u32 crc` of
 the record and bytes. Trailer (16 bytes): magic, count, crc, reserved (0);
 the trailer's crc is the CRC32C of the header, of every record without its
-own CRC, in file order, and of the trailer's magic and count (W4), so a
+own CRC, in file order, and of the trailer's magic and count (120), so a
 record is bound to its file and its place (a record CRC alone accepts a
 record written over another of the same length, or two swapped). The
 record CRCs are left out because a CRC run over bytes followed by their
 own CRC ends in a constant, whatever the bytes. A reader verifies every
 CRC and both counts; anything else is `CORRUPT` (a fetch reports it
-`FAILED`, W7: the damage is the source's). The snapshot
+`FAILED`, 123: the damage is the source's). The snapshot
 module's reader bounds a record's `length` by `result_bytes` and, when the
 file's size is known (loads, not fetches), the record's whole extent by the
 bytes left before the trailer; it waits for the record's bytes, checks the
@@ -1675,7 +1675,7 @@ returns immediately and prepares again):
    `vsr_io_snapshots_prepare` (the directory open, clients file opens,
    reads, writes, STATX, fsyncs, closes, renames, unlinks, at most
    `VSR_IO_SNAPSHOT_FILEOPS` in flight; the same `count` continues; an
-   outcome it decides arms the replica's CAPTURE deadline at `now`, W6).
+   outcome it decides arms the replica's CAPTURE deadline at `now`, 122).
 5. `*deadline_ns = vsr_io_deadlines_earliest()`.
 
 ### 7.5 vsr_io_complete
@@ -1916,9 +1916,9 @@ of `docs/io-design.md`:
 | `vsr-io.h` | `vsr_io_uring_init` names its refusals: `-ENOSYS` (no io_uring, or a kernel older than the baseline, including one whose setup refuses a flag with `EINVAL`), `-EPERM`, `-EINVAL` | 104 |
 | `snapshot.h` (internal) | The module's structures as implemented: `vsr_io_snapshots_size`/`init` take the engine limits (`stream_window`, `streams`) and `max_clients`; `vsr_io_snapshots_region_bytes`; a registry entry carries the file size, the job and its step, the record in flight, the kept and transient slots, `on_disk`, `sync_failed`, `job_next`, the reserved `lease` and the copied `result`; the writer, the reader, the chunk ring, the serves, the file-operation table, the directory slot and `pending_base`; the ops are `RETRY` without an engine lease; an OK CAPTURE or FETCH completion carries the lease; a DROP of an id the registry lacks is taken; a file with a CAPTURE outstanding is not served; the weak hook stubs left stream.c | 105, 106, 107, 108, 109 |
 | `store.h` | `vsr_io_recovery.chain_resume` (the boundary at which the chain resumes past a block's dead tail); `VSR_IO_SEGMENT_FLUSHING`, `freeing_flush` and `flush_own` (a freed slot waits for the flush after its superblock write, which the store issues without waiting for a SYNC's target); `reclaimed`, `client_base_floor` and `client_base_pending` (the floor terms bounded by the sequence on media); `snapshot_clients` reports a record freed under the base as the base file's (sequence 0, the base offset); `vsr_io_store.replica`, the embedding replica, set by init; `vsr_io_recovery.record_run` (was `reserved`), the run of the last replayed record | 110, 111, 112, 113, 116 |
-| `wire.h`, `codec.h` (internal) | Clients file format 2: `vsr_io_wire_clients_trailer` is 16 bytes (`crc`, `reserved`); `vsr_io_codec_put_clients_trailer` and `get_clients_trailer` take the running CRC32C of the header and the records (each without its CRC), which the trailer's crc extends over its magic and count | W4 |
-| `snapshot.h` (internal) | `vsr_io_snapshot.transferred` (was `reserved`: a FETCH's own stream wrote the file) and `dir_retried` (a SYNC retried the directory's open); the writer's and reader's `digest`; `base_track` releases no slot of an entry with an op in progress; a missing base file is `CORRUPT` on any role; outcomes decided in `vsr_io_snapshots_prepare` wake the loop at once | W1, W2, W3, W4, W5, W6 |
-| `snapshot.h` (internal) | A FETCH whose received bytes fail verification, or whose source ends it `CORRUPT`, completes `FAILED` (restarting discovery); `CORRUPT` stays for the replica's own files (base loads, captures, recovery) | W7 |
+| `wire.h`, `codec.h` (internal) | Clients file format 2: `vsr_io_wire_clients_trailer` is 16 bytes (`crc`, `reserved`); `vsr_io_codec_put_clients_trailer` and `get_clients_trailer` take the running CRC32C of the header and the records (each without its CRC), which the trailer's crc extends over its magic and count | 120 |
+| `snapshot.h` (internal) | `vsr_io_snapshot.transferred` (was `reserved`: a FETCH's own stream wrote the file) and `dir_retried` (a SYNC retried the directory's open); the writer's and reader's `digest`; `base_track` releases no slot of an entry with an op in progress; a missing base file is `CORRUPT` on any role; outcomes decided in `vsr_io_snapshots_prepare` wake the loop at once | 117, 118, 119, 120, 121, 122 |
+| `snapshot.h` (internal) | A FETCH whose received bytes fail verification, or whose source ends it `CORRUPT`, completes `FAILED` (restarting discovery); `CORRUPT` stays for the replica's own files (base loads, captures, recovery) | 123 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -2036,7 +2036,7 @@ of `docs/io-design.md`:
   reads for large tables.
 - A source whose own clients file is damaged serves it raw (the served
   FILE write is not read through the reader), so every fetch from it ends
-  `FAILED` (W7) until discovery picks another source; the source learns of
+  `FAILED` (123) until discovery picks another source; the source learns of
   the damage only at its own next load of the file. Verifying on serve
   (the reader over the served bytes, `NOT_FOUND` or a local `CORRUPT` on
   failure) is left open.

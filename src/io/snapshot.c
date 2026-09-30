@@ -1392,7 +1392,7 @@ static void fetch_finish(struct vsr_io *io, uint32_t replica, int32_t status)
     /* The caller never saw the op: the core hears the library's status.
      * Bytes that failed verification are the source's damage (or the
      * transfer's), not this replica's: FAILED restarts discovery, where
-     * CORRUPT would latch VSR_FAILURE_SNAPSHOT here (W7). */
+     * CORRUPT would latch VSR_FAILURE_SNAPSHOT here (123). */
     op_complete(rep, entry, status == VSR_IO_CORRUPT ? VSR_IO_FAILED : status);
     entry_free(s, entry);
 }
