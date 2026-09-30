@@ -2727,23 +2727,35 @@ int vsr_io_codec_get_clients_record(struct vsr_io_cursor *cursor,
     return VSR_OK;
 }
 
-void vsr_io_codec_put_clients_trailer(uint32_t count, unsigned char *out)
+void vsr_io_codec_put_clients_trailer(uint32_t count, uint32_t before,
+                                      unsigned char *out)
 {
     struct put put = {out};
 
     put_u32(&put, VSR_IO_CLIENTS_MAGIC);
     put_u32(&put, count);
+    put_u32(&put,
+            vsr_io_crc32c(before, out,
+                          offsetof(struct vsr_io_wire_clients_trailer, crc)));
+    put_u32(&put, 0);
 }
 
 int vsr_io_codec_get_clients_trailer(struct vsr_io_cursor *cursor,
-                                     uint32_t *count)
+                                     uint32_t before, uint32_t *count)
 {
     struct vsr_io_cursor copy = *cursor;
+    uint32_t crc = before;
     uint32_t magic;
     uint32_t in;
+    uint32_t stored;
+    uint32_t reserved;
 
-    if (!vsr_io_cursor_u32(&copy, &magic) || !vsr_io_cursor_u32(&copy, &in) ||
-        magic != VSR_IO_CLIENTS_MAGIC) {
+    if (!vsr_io_cursor_crc(
+            cursor, offsetof(struct vsr_io_wire_clients_trailer, crc), &crc) ||
+        !vsr_io_cursor_u32(&copy, &magic) || !vsr_io_cursor_u32(&copy, &in) ||
+        !vsr_io_cursor_u32(&copy, &stored) ||
+        !vsr_io_cursor_u32(&copy, &reserved) || magic != VSR_IO_CLIENTS_MAGIC ||
+        stored != crc || reserved != 0) {
         return VSR_EINVAL;
     }
     *count = in;

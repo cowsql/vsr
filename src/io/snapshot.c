@@ -41,9 +41,16 @@
 #define SNAPSHOT_RETRY_NS UINT64_C(1000000)
 #define SNAPSHOT_TMP_SUFFIX ".tmp"
 #define SNAPSHOT_HEADER_BYTES 64u
-#define SNAPSHOT_TRAILER_BYTES 8u
+#define SNAPSHOT_TRAILER_BYTES 16u
 #define SNAPSHOT_RECORD_HEADER 40u
 #define SNAPSHOT_RECORD_LENGTH_AT 36u
+
+_Static_assert(SNAPSHOT_HEADER_BYTES ==
+                   sizeof(struct vsr_io_wire_clients_header),
+               "the clients header's size");
+_Static_assert(SNAPSHOT_TRAILER_BYTES ==
+                   sizeof(struct vsr_io_wire_clients_trailer),
+               "the clients trailer's size");
 
 /* Invariant checks in debug builds; a violation traps (see pool.c). */
 #ifdef NDEBUG
@@ -441,6 +448,7 @@ static void op_complete(struct vsr_io_replica *rep,
     entry->op = 0;
     entry->op_type = 0;
     entry->task = NULL;
+    entry->transferred = 0;
     vsr_io_engine_complete_core(rep, &completion);
 }
 
@@ -767,6 +775,9 @@ static bool writer_put(struct vsr_io *io, struct vsr_io_store *store,
     }
     memcpy(slab + w->staged, raw, raw_bytes);
     put_u32(slab + w->staged + raw_bytes, vsr_io_crc32c(0, raw, raw_bytes));
+    /* Not over its CRC: a CRC run over bytes and then their own CRC ends
+     * in a constant (the residue), whatever the bytes. */
+    w->digest = vsr_io_crc32c(w->digest, raw, raw_bytes);
     vsr_io_store_capture_offset(store, w->table[w->next].id,
                                 w->file_offset + w->staged);
     w->staged += total;
@@ -863,6 +874,7 @@ static void writer_stage(struct vsr_io *io, uint32_t replica)
         header.count = w->count;
         vsr_io_codec_put_clients_header(&header, slab);
         w->staged = SNAPSHOT_HEADER_BYTES;
+        w->digest = vsr_io_crc32c(0, slab, SNAPSHOT_HEADER_BYTES);
     }
     while (w->next < w->count) {
         const unsigned char *raw = NULL;
@@ -886,7 +898,7 @@ static void writer_stage(struct vsr_io *io, uint32_t replica)
             entry->step = STEP_WRITE;
             return;
         }
-        vsr_io_codec_put_clients_trailer(w->count, slab + w->staged);
+        vsr_io_codec_put_clients_trailer(w->count, w->digest, slab + w->staged);
         w->staged += SNAPSHOT_TRAILER_BYTES;
         w->trailer_staged = 1;
     }
@@ -1003,6 +1015,7 @@ static void reader_parse(struct vsr_io *io, struct vsr_io_replica *rep,
                 return;
             }
             r->expected = header.count;
+            r->digest = vsr_io_crc32c(0, at, SNAPSHOT_HEADER_BYTES);
             r->consumed += SNAPSHOT_HEADER_BYTES;
             r->stage = STAGE_RECORDS;
         } else if (r->stage == STAGE_RECORDS) {
@@ -1040,6 +1053,8 @@ static void reader_parse(struct vsr_io *io, struct vsr_io_replica *rep,
                 }
             }
             r->seen++;
+            r->digest =
+                vsr_io_crc32c(r->digest, at, (size_t)total - sizeof(uint32_t));
             r->consumed += (uint32_t)total;
         } else if (r->stage == STAGE_TRAILER) {
             struct vsr_io_cursor cursor;
@@ -1048,8 +1063,11 @@ static void reader_parse(struct vsr_io *io, struct vsr_io_replica *rep,
             if (avail < SNAPSHOT_TRAILER_BYTES) {
                 return;
             }
+            /* Its crc covers every byte before it: a record in another
+             * place, or another file's, fails here. */
             vsr_io_cursor_init_one(&cursor, at, SNAPSHOT_TRAILER_BYTES);
-            if (vsr_io_codec_get_clients_trailer(&cursor, &count) != VSR_OK ||
+            if (vsr_io_codec_get_clients_trailer(&cursor, r->digest, &count) !=
+                    VSR_OK ||
                 count != r->expected) {
                 reader_fail(r, VSR_IO_CORRUPT);
                 return;
@@ -1122,6 +1140,7 @@ static void reader_start(struct vsr_io_clients_reader *r, uint32_t snapshot,
     r->file_size = UINT64_MAX;
     r->expected = 0;
     r->seen = 0;
+    r->digest = 0;
     r->sequence = sequence;
     r->status = VSR_IO_OK;
     r->stream = NONE;
@@ -1256,10 +1275,10 @@ static void load_done(struct vsr_io *io, uint32_t replica, uint32_t step,
             int32_t status = VSR_IO_FAILED;
 
             if (result == -ENOENT) {
-                /* A witness keeps no table: an empty base. */
-                status = rep->store.hard.role == VSR_MEMBER_WITNESS
-                             ? VSR_IO_OK
-                             : VSR_IO_CORRUPT;
+                /* The store wants a file only for a FULL role (the held
+                 * transaction's, or a FULL replica's recovery): a missing
+                 * one is corruption, also on a witness being promoted. */
+                status = VSR_IO_CORRUPT;
             } else {
                 s->error = result;
             }
@@ -1366,11 +1385,15 @@ static void fetch_finish(struct vsr_io *io, uint32_t replica, int32_t status)
     if (status == VSR_IO_OK) {
         entry->state = VSR_IO_SNAPSHOT_WRITTEN;
         entry->on_disk = 1;
+        entry->transferred = 1;
         entry->forward_due = 1;
         return;
     }
-    /* The caller never saw the op: the core hears the library's status. */
-    op_complete(rep, entry, status);
+    /* The caller never saw the op: the core hears the library's status.
+     * Bytes that failed verification are the source's damage (or the
+     * transfer's), not this replica's: FAILED restarts discovery, where
+     * CORRUPT would latch VSR_FAILURE_SNAPSHOT here (123). */
+    op_complete(rep, entry, status == VSR_IO_CORRUPT ? VSR_IO_FAILED : status);
     entry_free(s, entry);
 }
 
@@ -1854,9 +1877,11 @@ static void fetch_settle(struct vsr_io *io, uint32_t replica,
         op_complete(rep, entry, VSR_IO_OK);
         return;
     }
-    /* A fetched file the caller failed on is a private partial object
-     * (vsr.h), unless the store adopted it meanwhile. */
-    if (entry->on_disk && entry->sequence == 0) {
+    /* A file this op fetched is a private partial object when its caller
+     * fails (vsr.h), unless the store adopted it meanwhile; a held file the
+     * FETCH found is the core's (a repeated FETCH shares the hold of the
+     * one that fetched it, docs/vsr-api.md) and stays. */
+    if (entry->on_disk && entry->transferred && entry->sequence == 0) {
         if (entry->readers == 0 && entry->job == VSR_IO_SNAPSHOT_JOB_NONE) {
             discard_start(entry);
             return;
@@ -1998,6 +2023,7 @@ int vsr_io_snapshots_capture(struct vsr_io *io, uint32_t replica, uint64_t op,
     w->cold_bytes = 0;
     w->cold_offset = 0;
     w->file_offset = 0;
+    w->digest = 0;
     w->header_op = task->op;
     w->header_sequence = task->sequence;
     w->trailer_staged = 0;
@@ -2044,6 +2070,7 @@ int vsr_io_snapshots_sync(struct vsr_io *io, uint32_t replica, uint64_t op,
     entry->caller_status = -1;
     entry->library_status = -1;
     entry->forward_due = 1;
+    entry->dir_retried = 0;
     entry->state = VSR_IO_SNAPSHOT_SYNCING;
     if (entry->job == VSR_IO_SNAPSHOT_JOB_RELEASE && entry->fileop != NONE) {
         entry->job_next = VSR_IO_SNAPSHOT_JOB_SYNC;
@@ -2316,7 +2343,10 @@ static void release_done(struct vsr_io *io, uint32_t replica,
 /* Keeps store.base_slot on the base's open file (the module owns that
  * field: the store only reads through it) and closes the slots of files
  * that are neither the base, nor the latest capture, nor a file loaded for
- * a held RESTORE or PUBLISH the store has yet to pack. */
+ * a held RESTORE or PUBLISH the store has yet to pack. A file with a core
+ * op in progress keeps its slot until the op is over: the settles of
+ * CAPTURE and SYNC wait for their entry's job to end, and a RELEASE's
+ * completion settles nothing. */
 static void base_track(struct vsr_io *io, uint32_t replica)
 {
     struct vsr_io_replica *rep = replica_of(io, replica);
@@ -2340,8 +2370,9 @@ static void base_track(struct vsr_io *io, uint32_t replica)
         struct vsr_io_snapshot *entry = &s->entries[i];
 
         if (entry->state == VSR_IO_SNAPSHOT_FREE || entry->file_slot < 0 ||
-            entry->job != VSR_IO_SNAPSHOT_JOB_NONE || entry == base ||
-            i == s->pending_base || id_equal(entry->id, store->last_capture) ||
+            entry->job != VSR_IO_SNAPSHOT_JOB_NONE || entry->op != 0 ||
+            entry == base || i == s->pending_base ||
+            id_equal(entry->id, store->last_capture) ||
             store->cold_active != 0) {
             continue;
         }
@@ -2398,6 +2429,21 @@ void vsr_io_snapshots_poll(struct vsr_io *io, uint32_t replica, uint64_t now)
     if (s->dir_state == DIR_CLOSED) {
         s->dir_state = DIR_OPENING;
     }
+    if (s->dir_state == DIR_FAILED) {
+        /* The open failed (EMFILE, ENOMEM...): a SYNC waiting for the
+         * directory has it tried again once, rather than fencing the
+         * replica for good. */
+        for (uint32_t i = 0; i < s->count; ++i) {
+            struct vsr_io_snapshot *entry = &s->entries[i];
+
+            if (entry->state != VSR_IO_SNAPSHOT_FREE &&
+                entry->job == VSR_IO_SNAPSHOT_JOB_SYNC &&
+                entry->step == STEP_FSYNC_DIR && !entry->dir_retried) {
+                entry->dir_retried = 1;
+                s->dir_state = DIR_OPENING;
+            }
+        }
+    }
     base_track(io, replica);
     if (s->reader.snapshot == NONE &&
         vsr_io_store_base_wanted(&rep->store, &wanted, &sequence)) {
@@ -2422,6 +2468,15 @@ void vsr_io_snapshots_poll(struct vsr_io *io, uint32_t replica, uint64_t now)
 /* -------------------------------------------------------------------------
  * Prepare
  * ---------------------------------------------------------------------- */
+
+/* The module's prepare decided an outcome (a completion to the core, a
+ * stream's close, a failed directory) after the core's poll and the links'
+ * prepare ran: the loop must poll and prepare again at once, or the
+ * outcome waits for an unrelated event to wake it. */
+static void wake_now(struct vsr_io *io, struct vsr_io_replica *rep)
+{
+    vsr_io_deadlines_arm(&io->deadlines, rep->deadline_capture, io->now);
+}
 
 static uint32_t fileop_take(struct vsr_io_snapshots *s)
 {
@@ -2504,11 +2559,15 @@ static bool prepare_entry(struct vsr_io *io, uint32_t replica, uint32_t index,
         return false;
     }
     if (step == STEP_FSYNC_DIR) {
-        if (s->dir_state == DIR_OPENING) {
+        /* A failed open is retried once for this SYNC (the poll re-arms
+         * it); only that attempt's failure fails the SYNC. */
+        if (s->dir_state == DIR_OPENING ||
+            (s->dir_state == DIR_FAILED && !entry->dir_retried)) {
             return false;
         }
         if (s->dir_state != DIR_OPEN) {
             sync_done(io, replica, entry, STEP_FSYNC_DIR, -EIO);
+            wake_now(io, rep);
             return false;
         }
     }
@@ -2542,6 +2601,7 @@ static bool prepare_entry(struct vsr_io *io, uint32_t replica, uint32_t index,
         fileop_free(s, op);
         entry->step = STEP_IDLE;
         entry_done(io, replica, entry, step, -ENAMETOOLONG);
+        wake_now(io, rep);
         return false;
     }
     switch (step) {
@@ -2599,6 +2659,7 @@ static bool prepare_entry(struct vsr_io *io, uint32_t replica, uint32_t index,
                 fileop_free(s, op);
                 entry->step = STEP_IDLE;
                 writer_finish(io, replica, VSR_IO_FAILED);
+                wake_now(io, rep);
                 return false;
             }
             sqe_transfer(io, sqe, VSR_IO_SQE_READ, (uint32_t)fd,
@@ -2690,6 +2751,7 @@ static bool prepare_serve(struct vsr_io *io, uint32_t replica, uint32_t stream,
             serve->state = SERVE_OPEN;
             (void)vsr_io_streams_close(
                 io, vsr_io_streams_handle(&io->streams, stream), VSR_IO_RETRY);
+            wake_now(io, rep);
             return false;
         }
     }
@@ -2713,6 +2775,7 @@ static bool prepare_serve(struct vsr_io *io, uint32_t replica, uint32_t stream,
             vsr_io_slots_free(&io->slots, slot);
             fileop_free(s, op);
             serve_done(io, replica, stream, STEP_OPEN, -ENAMETOOLONG);
+            wake_now(io, rep);
             return false;
         }
         sqe_path(sqe, VSR_IO_SQE_OPENAT, rep->store.dir_fd, fileop->path,
@@ -2768,6 +2831,7 @@ static bool prepare_dir(struct vsr_io *io, uint32_t replica,
         s->dir_slot = NONE;
         s->dir_state = DIR_FAILED;
         s->error = -ENAMETOOLONG;
+        wake_now(io, rep);
         return false;
     }
     sqe_path(sqe, VSR_IO_SQE_OPENAT, rep->store.dir_fd, fileop->path,
