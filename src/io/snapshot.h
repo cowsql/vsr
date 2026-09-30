@@ -157,6 +157,10 @@ struct vsr_io_clients_writer {
     uint32_t cold_bytes;  /* Bytes the cold read returned. */
     uint64_t cold_offset; /* File offset the cold read started at. */
     uint64_t file_offset; /* Bytes written to the file so far. */
+    uint32_t digest;      /* The trailer's crc so far: CRC32C of the
+                             header and of each record staged, without
+                             its own CRC. */
+    uint32_t reserved;
     uint64_t header_op;
     uint64_t header_sequence;
     uint32_t trailer_staged;
@@ -176,6 +180,9 @@ struct vsr_io_clients_reader {
     uint64_t file_size;   /* UINT64_MAX until known. */
     uint32_t expected;    /* Records announced by the header. */
     uint32_t seen;
+    uint32_t digest; /* CRC32C of the header and of each record
+                             parsed, without its own CRC: the trailer's. */
+    uint32_t reserved;
     uint64_t sequence; /* Base sequence to install at the end. */
     int32_t status;    /* Parse failure status, or OK. */
     uint32_t stream;   /* Library stream index for FETCH, or NONE. */

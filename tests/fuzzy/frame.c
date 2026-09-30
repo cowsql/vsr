@@ -508,6 +508,7 @@ static void clients_bytes(const unsigned char *bytes, size_t size,
     uint32_t count = make_pieces(bytes, size, cuts, pieces);
     uint32_t seen = 0;
     uint32_t trailer;
+    uint32_t before;
 
     vsr_io_cursor_init(&cursor, pieces, count);
     if (vsr_io_codec_get_clients_header(&cursor, &header) != VSR_OK) {
@@ -515,6 +516,7 @@ static void clients_bytes(const unsigned char *bytes, size_t size,
     }
     vsr_io_codec_put_clients_header(&header, encode_memory);
     require(memcmp(encode_memory, bytes, sizeof(header)) == 0);
+    before = vsr_io_crc32c(0, bytes, sizeof(header));
     while (seen < header.count) {
         struct vsr_io_cursor skip = cursor;
         size_t start = cursor.position;
@@ -533,11 +535,12 @@ static void clients_bytes(const unsigned char *bytes, size_t size,
         require(fixed.length == record.result.data.size);
         vsr_io_codec_put_clients_record(&record, encode_memory);
         require(memcmp(encode_memory, bytes + start, bytes_of) == 0);
+        before = vsr_io_crc32c(before, bytes + start, bytes_of - 4);
         seen++;
     }
-    if (vsr_io_codec_get_clients_trailer(&cursor, &trailer) == VSR_OK) {
-        vsr_io_codec_put_clients_trailer(trailer, encode_memory);
-        require(memcmp(encode_memory, bytes + cursor.position - 8, 8) == 0);
+    if (vsr_io_codec_get_clients_trailer(&cursor, before, &trailer) == VSR_OK) {
+        vsr_io_codec_put_clients_trailer(trailer, before, encode_memory);
+        require(memcmp(encode_memory, bytes + cursor.position - 16, 16) == 0);
     }
 }
 
@@ -546,6 +549,7 @@ static void fuzz_clients(const unsigned char *bytes, size_t size,
 {
     size_t at = sizeof(struct vsr_io_wire_clients_header);
     uint32_t count;
+    uint32_t before;
 
     clients_bytes(bytes, size, cuts);
     if (size < at) {
@@ -560,6 +564,7 @@ static void fuzz_clients(const unsigned char *bytes, size_t size,
                       offsetof(struct vsr_io_wire_clients_header, crc)));
     count = vsr_io_get_u32(copy_memory +
                            offsetof(struct vsr_io_wire_clients_header, count));
+    before = vsr_io_crc32c(0, copy_memory, at);
     for (uint32_t i = 0; i < count; ++i) {
         size_t length;
         size_t total;
@@ -577,7 +582,13 @@ static void fuzz_clients(const unsigned char *bytes, size_t size,
         }
         vsr_io_put_u32(copy_memory + at + total,
                        vsr_io_crc32c(0, copy_memory + at, total));
+        before = vsr_io_crc32c(before, copy_memory + at, total);
         at += total + sizeof(uint32_t);
+    }
+    /* The trailer after them, with the file's crc (the count as found). */
+    if (size - at >= sizeof(struct vsr_io_wire_clients_trailer)) {
+        vsr_io_codec_put_clients_trailer(vsr_io_get_u32(copy_memory + at + 4),
+                                         before, copy_memory + at);
     }
     clients_bytes(copy_memory, size, cuts);
 }

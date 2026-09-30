@@ -87,6 +87,7 @@
 #define DEADLINE_SYNC 12u
 #define DEADLINE_CAPTURE 14u
 #define OPERATIONS 16u
+#define TRAILER 16u /* The clients file's trailer. */
 
 /* members, operations, input_leases, pending_requests, pending_reads,
  * transfers, log_cache_entries, client_cache_entries, batch_entries,
@@ -2626,6 +2627,33 @@ static struct vsr_id capture(struct engine *e)
     return id;
 }
 
+/* The trailer's crc of a clients file image up to its trailer: the header
+ * and the header's count of records, each without its own CRC (docs 5.4). */
+static uint32_t clients_digest(const unsigned char *bytes, uint64_t size)
+{
+    uint32_t count;
+    uint64_t at = 64;
+    uint32_t crc;
+
+    CHECK(size >= 64);
+    crc = vsr_io_crc32c(0, bytes, 64);
+    count = (uint32_t)bytes[56] | (uint32_t)bytes[57] << 8 |
+            (uint32_t)bytes[58] << 16 | (uint32_t)bytes[59] << 24;
+    for (uint32_t i = 0; i < count && at + 40 <= size; ++i) {
+        const unsigned char *r = bytes + at;
+        uint64_t length = (uint64_t)r[36] | (uint64_t)r[37] << 8 |
+                          (uint64_t)r[38] << 16 | (uint64_t)r[39] << 24;
+        uint64_t body = 40 + length + (8 - length % 8) % 8;
+
+        if (at + body + 4 > size) {
+            break;
+        }
+        crc = vsr_io_crc32c(crc, r, (size_t)body);
+        at += body + 4;
+    }
+    return crc;
+}
+
 /* Parses a clients file image: count records, each checked against the
  * store's client table (id, number, op). */
 struct parsed_record {
@@ -2665,7 +2693,9 @@ static uint32_t file_parse(const unsigned char *bytes, uint64_t size,
         CHECK(vsr_io_cursor_skip(&cursor, 4));
         count++;
     }
-    CHECK(vsr_io_codec_get_clients_trailer(&cursor, &trailer) == VSR_OK);
+    CHECK(vsr_io_codec_get_clients_trailer(
+              &cursor, clients_digest(bytes, cursor.position), &trailer) ==
+          VSR_OK);
     CHECK(trailer == header.count && cursor.position == size);
     return count;
 }
@@ -2842,14 +2872,15 @@ static void craft_file(struct craft *c, struct vsr_id id, uint32_t count,
         record.result.data.size = result;
         record.result.data.count = result > 0 ? 1 : 0;
         c->record_at[i] = c->size;
-        CHECK(c->size + vsr_io_codec_clients_record_bytes(result) + 8 <=
+        CHECK(c->size + vsr_io_codec_clients_record_bytes(result) + TRAILER <=
               sizeof(c->bytes));
         vsr_io_codec_put_clients_record(&record, c->bytes + c->size);
         c->size += vsr_io_codec_clients_record_bytes(result);
     }
     c->record_at[count] = c->size;
-    vsr_io_codec_put_clients_trailer(count, c->bytes + c->size);
-    c->size += 8;
+    vsr_io_codec_put_clients_trailer(count, clients_digest(c->bytes, c->size),
+                                     c->bytes + c->size);
+    c->size += TRAILER;
 }
 
 static void put_le32(unsigned char *at, uint32_t value)
@@ -2859,7 +2890,15 @@ static void put_le32(unsigned char *at, uint32_t value)
     }
 }
 
-/* Recomputes the CRC of record `i` of a crafted file after an edit. */
+static uint32_t get_le32(const unsigned char *at)
+{
+    return (uint32_t)at[0] | (uint32_t)at[1] << 8 | (uint32_t)at[2] << 16 |
+           (uint32_t)at[3] << 24;
+}
+
+/* Recomputes the CRC of record `i` of a crafted file after an edit (the
+ * trailer's crc, over the whole file, still names the old bytes: see
+ * craft_digest). */
 static void craft_seal(struct craft *c, uint32_t i)
 {
     uint64_t at = c->record_at[i];
@@ -2871,6 +2910,17 @@ static void craft_seal(struct craft *c, uint32_t i)
     CHECK(at + 40 + padded + 4 <= sizeof(c->bytes));
     put_le32(c->bytes + at + 40 + padded,
              vsr_io_crc32c(0, c->bytes + at, (size_t)(40 + padded)));
+}
+
+/* Recomputes the trailer's crc of a crafted file (its count as it stands)
+ * after an edit, so that the edit alone is what a reader sees. */
+static void craft_digest(struct craft *c, uint32_t count)
+{
+    uint64_t at = c->record_at[count];
+
+    vsr_io_codec_put_clients_trailer(get_le32(c->bytes + at + 4),
+                                     clients_digest(c->bytes, at),
+                                     c->bytes + at);
 }
 
 /* Writes `bytes` as clients-<id> (tmp: .tmp) into the engine's directory,
@@ -3126,10 +3176,11 @@ static void test_capture(void)
     CHECK(a->dir_opens == 1); /* The directory, once. */
     id = capture(a);
     file = clients_file(a, id, false);
-    CHECK(file != NULL && file->size == 72 && file->refs == 1);
+    CHECK(file != NULL && file->size == 64 + TRAILER && file->refs == 1);
     CHECK(file_parse(file->data, file->size, id, records, 8) == 0);
     CHECK(clients_file(a, id, true) == NULL);
-    CHECK(entry_of(a, id)->file_slot >= 0 && entry_of(a, id)->bytes == 72);
+    CHECK(entry_of(a, id)->file_slot >= 0 &&
+          entry_of(a, id)->bytes == 64 + TRAILER);
     CHECK(entry_of(a, id)->sequence == 1);
     CHECK(a->snapshots->writer.snapshot == NONE && pool_refs(a) == 0);
     CHECK(a->store->capture_floor == UINT64_MAX);
@@ -3147,7 +3198,7 @@ static void test_capture(void)
         file = clients_file(a, second, false);
         CHECK(file != NULL);
         n = file_parse(file->data, file->size, second, records, 8);
-        CHECK(n == 2 && file->size == 64 + 2 * (40 + 8 + 4) + 8);
+        CHECK(n == 2 && file->size == 64 + 2 * (40 + 8 + 4) + TRAILER);
         for (uint32_t i = 0; i < n; ++i) {
             struct vsr_id c = {records[i].wire.client_hi,
                                records[i].wire.client_lo};
@@ -3317,7 +3368,7 @@ static void test_fetch(void)
     refs_b = pool_refs(b);
     id = capture(a);
     source = clients_file(a, id, false);
-    CHECK(source != NULL && source->size == 64 + 8 * (40 + 64 + 4) + 8);
+    CHECK(source != NULL && source->size == 64 + 8 * (40 + 64 + 4) + TRAILER);
     CHECK(source->size > 3 * CHUNK);
     fetch(b, id, 1);
     copy = clients_file(b, id, false);
@@ -3806,7 +3857,7 @@ static void test_fetch_failures(void)
             break;
         }
         case 4: /* Cut before the trailer, consistently: END OK. */
-            source->size -= 8;
+            source->size -= TRAILER;
             entry_mutable(a, x)->bytes = source->size;
             break;
         case 5: /* A record length beyond every byte that follows. */
@@ -3848,7 +3899,7 @@ static void test_fetch_failures(void)
         struct task_holder h;
         uint64_t op;
 
-        craft_file(&craft, x, 3, 32);
+        craft_file(&craft, x, 5, 0);
         CHECK(craft.size == CHUNK);
         (void)file_install(a, x, false, craft.bytes, craft.size);
         entry_mutable(a, x)->bytes = craft.size + 100;
@@ -4594,8 +4645,9 @@ static void test_load_failures(void)
             e->fail_read = -EIO;
             expected = VSR_IO_FAILED;
             break;
-        case 2: /* Bad record CRC. */
+        case 2: /* Bad record CRC (the trailer's crc resealed). */
             craft.bytes[craft.record_at[1] + 41] ^= 0x04;
+            craft_digest(&craft, 3);
             break;
         case 3: /* Longer than result_bytes, sealed. */
             craft_file(&craft, id, 3, 128);
@@ -4604,8 +4656,9 @@ static void test_load_failures(void)
             put_le32(craft.bytes + craft.record_at[2] + 36, 64);
             craft_seal(&craft, 2);
             break;
-        case 5: /* Trailer count. */
-            put_le32(craft.bytes + craft.size - 4, 2);
+        case 5: /* Trailer count (its crc resealed over it). */
+            put_le32(craft.bytes + craft.record_at[3] + 4, 2);
+            craft_digest(&craft, 3);
             break;
         case 6: /* Bytes after the trailer. */
             craft.size += 8;
@@ -5030,6 +5083,93 @@ static void test_review_dir_retry(void)
     engine_crash(a);
 }
 
+/* A crafted file of three records (clients 0x60..0x62, 16-byte results)
+ * with record 1 replaced so that every record CRC, the count and the
+ * trailer's magic still hold: 0 a copy of record 0, 1 another client's
+ * record resealed in place, 2 records 0 and 1 swapped. */
+static void craft_tampered(struct craft *c, struct vsr_id id, uint32_t variant)
+{
+    unsigned char copy[256];
+    uint64_t length;
+
+    craft_file(c, id, 3, 16);
+    length = c->record_at[1] - c->record_at[0];
+    CHECK(c->record_at[2] - c->record_at[1] == length &&
+          length <= sizeof(copy));
+    if (variant == 0) {
+        memcpy(c->bytes + c->record_at[1], c->bytes + c->record_at[0],
+               (size_t)length);
+    } else if (variant == 1) {
+        c->bytes[c->record_at[1]] = 0x99; /* client_hi */
+        craft_seal(c, 1);
+    } else {
+        memcpy(copy, c->bytes + c->record_at[0], (size_t)length);
+        memcpy(c->bytes + c->record_at[0], c->bytes + c->record_at[1],
+               (size_t)length);
+        memcpy(c->bytes + c->record_at[1], copy, (size_t)length);
+    }
+}
+
+/* The file's records are bound to it and to their places: each record's
+ * CRC covers only its own bytes, so a record written over another of the
+ * same length (a misdirected or lost write returning another file's or
+ * another place's valid bytes) was accepted with the count, the trailer
+ * and every CRC right. A RESTORE then dropped the client whose record was
+ * replaced (its last reply forgotten: a retried request would run again),
+ * and a fetch accepted and renamed the file. The trailer's crc over the
+ * whole file catches each variant of craft_tampered: loads and fetches
+ * answer CORRUPT. */
+static void test_review_record_integrity(void)
+{
+    for (uint32_t variant = 0; variant < 3; ++variant) {
+        struct craft craft;
+
+        /* A RESTORE's base load. */
+        {
+            struct engine *e;
+            struct vsr_id id = {0xD00D, 0x10 + variant};
+            uint64_t sequence = fresh_store(&e, 124 + variant, 0);
+            uint64_t op;
+
+            craft_tampered(&craft, id, variant);
+            (void)file_install(e, id, false, craft.bytes, craft.size);
+            op = submit(e, txn_restore(e, sequence, id, 5, VSR_MEMBER_FULL));
+            settle();
+            expect_store(e, op, VSR_IO_CORRUPT);
+            expect_idle(e);
+            engine_crash(e);
+        }
+        /* A fetch of such a file, served as x's. */
+        {
+            struct engine *a = &world.engines[0];
+            struct engine *b = &world.engines[1];
+            struct vsr_id x = fetch_setup(127 + variant, 2);
+
+            craft_tampered(&craft, x, variant);
+            (void)file_install(a, x, false, craft.bytes, craft.size);
+            entry_mutable(a, x)->bytes = craft.size;
+            fetch_fails(b, x, VSR_IO_CORRUPT);
+        }
+    }
+    /* The untampered file restores its three clients, and fetches. */
+    {
+        struct engine *e;
+        struct vsr_id id = {0xD00D, 0x20};
+        struct craft craft;
+        uint64_t sequence = fresh_store(&e, 130, 0);
+        uint64_t op;
+
+        craft_file(&craft, id, 3, 16);
+        (void)file_install(e, id, false, craft.bytes, craft.size);
+        op = submit(e, txn_restore(e, sequence, id, 5, VSR_MEMBER_FULL));
+        settle();
+        expect_store(e, op, VSR_IO_OK);
+        CHECK(e->store->clients_count == 3);
+        expect_idle(e);
+        engine_crash(e);
+    }
+}
+
 int main(void)
 {
     test_capture();
@@ -5047,5 +5187,6 @@ int main(void)
     test_review_capture_release();
     test_review_refetch_kept();
     test_review_dir_retry();
+    test_review_record_integrity();
     return 0;
 }

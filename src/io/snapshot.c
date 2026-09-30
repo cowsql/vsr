@@ -41,9 +41,16 @@
 #define SNAPSHOT_RETRY_NS UINT64_C(1000000)
 #define SNAPSHOT_TMP_SUFFIX ".tmp"
 #define SNAPSHOT_HEADER_BYTES 64u
-#define SNAPSHOT_TRAILER_BYTES 8u
+#define SNAPSHOT_TRAILER_BYTES 16u
 #define SNAPSHOT_RECORD_HEADER 40u
 #define SNAPSHOT_RECORD_LENGTH_AT 36u
+
+_Static_assert(SNAPSHOT_HEADER_BYTES ==
+                   sizeof(struct vsr_io_wire_clients_header),
+               "the clients header's size");
+_Static_assert(SNAPSHOT_TRAILER_BYTES ==
+                   sizeof(struct vsr_io_wire_clients_trailer),
+               "the clients trailer's size");
 
 /* Invariant checks in debug builds; a violation traps (see pool.c). */
 #ifdef NDEBUG
@@ -768,6 +775,9 @@ static bool writer_put(struct vsr_io *io, struct vsr_io_store *store,
     }
     memcpy(slab + w->staged, raw, raw_bytes);
     put_u32(slab + w->staged + raw_bytes, vsr_io_crc32c(0, raw, raw_bytes));
+    /* Not over its CRC: a CRC run over bytes and then their own CRC ends
+     * in a constant (the residue), whatever the bytes. */
+    w->digest = vsr_io_crc32c(w->digest, raw, raw_bytes);
     vsr_io_store_capture_offset(store, w->table[w->next].id,
                                 w->file_offset + w->staged);
     w->staged += total;
@@ -864,6 +874,7 @@ static void writer_stage(struct vsr_io *io, uint32_t replica)
         header.count = w->count;
         vsr_io_codec_put_clients_header(&header, slab);
         w->staged = SNAPSHOT_HEADER_BYTES;
+        w->digest = vsr_io_crc32c(0, slab, SNAPSHOT_HEADER_BYTES);
     }
     while (w->next < w->count) {
         const unsigned char *raw = NULL;
@@ -887,7 +898,7 @@ static void writer_stage(struct vsr_io *io, uint32_t replica)
             entry->step = STEP_WRITE;
             return;
         }
-        vsr_io_codec_put_clients_trailer(w->count, slab + w->staged);
+        vsr_io_codec_put_clients_trailer(w->count, w->digest, slab + w->staged);
         w->staged += SNAPSHOT_TRAILER_BYTES;
         w->trailer_staged = 1;
     }
@@ -1004,6 +1015,7 @@ static void reader_parse(struct vsr_io *io, struct vsr_io_replica *rep,
                 return;
             }
             r->expected = header.count;
+            r->digest = vsr_io_crc32c(0, at, SNAPSHOT_HEADER_BYTES);
             r->consumed += SNAPSHOT_HEADER_BYTES;
             r->stage = STAGE_RECORDS;
         } else if (r->stage == STAGE_RECORDS) {
@@ -1041,6 +1053,8 @@ static void reader_parse(struct vsr_io *io, struct vsr_io_replica *rep,
                 }
             }
             r->seen++;
+            r->digest =
+                vsr_io_crc32c(r->digest, at, (size_t)total - sizeof(uint32_t));
             r->consumed += (uint32_t)total;
         } else if (r->stage == STAGE_TRAILER) {
             struct vsr_io_cursor cursor;
@@ -1049,8 +1063,11 @@ static void reader_parse(struct vsr_io *io, struct vsr_io_replica *rep,
             if (avail < SNAPSHOT_TRAILER_BYTES) {
                 return;
             }
+            /* Its crc covers every byte before it: a record in another
+             * place, or another file's, fails here. */
             vsr_io_cursor_init_one(&cursor, at, SNAPSHOT_TRAILER_BYTES);
-            if (vsr_io_codec_get_clients_trailer(&cursor, &count) != VSR_OK ||
+            if (vsr_io_codec_get_clients_trailer(&cursor, r->digest, &count) !=
+                    VSR_OK ||
                 count != r->expected) {
                 reader_fail(r, VSR_IO_CORRUPT);
                 return;
@@ -1123,6 +1140,7 @@ static void reader_start(struct vsr_io_clients_reader *r, uint32_t snapshot,
     r->file_size = UINT64_MAX;
     r->expected = 0;
     r->seen = 0;
+    r->digest = 0;
     r->sequence = sequence;
     r->status = VSR_IO_OK;
     r->stream = NONE;
@@ -2002,6 +2020,7 @@ int vsr_io_snapshots_capture(struct vsr_io *io, uint32_t replica, uint64_t op,
     w->cold_bytes = 0;
     w->cold_offset = 0;
     w->file_offset = 0;
+    w->digest = 0;
     w->header_op = task->op;
     w->header_sequence = task->sequence;
     w->trailer_staged = 0;

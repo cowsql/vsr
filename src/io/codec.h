@@ -340,8 +340,16 @@ int vsr_io_codec_get_clients_record(struct vsr_io_cursor *cursor,
                                     const struct vsr_limits *limits,
                                     struct vsr_io_bump *region,
                                     struct vsr_client_record *record);
-void vsr_io_codec_put_clients_trailer(uint32_t count, unsigned char *out);
+/* The trailer (16 bytes) of a file of `count` records; before is the
+ * running CRC32C (vsr_io_crc32c's value) of the header and of every record
+ * without its own CRC (wire.h), which the trailer's crc extends over its
+ * magic and count. */
+void vsr_io_codec_put_clients_trailer(uint32_t count, uint32_t before,
+                                      unsigned char *out);
+/* Decodes a trailer and checks it against `before` (as above): EINVAL for a
+ * short cursor, another magic, a crc that is not the file's, or a nonzero
+ * reserved field. */
 int vsr_io_codec_get_clients_trailer(struct vsr_io_cursor *cursor,
-                                     uint32_t *count);
+                                     uint32_t before, uint32_t *count);
 
 #endif /* VSR_IO_CODEC_H */
