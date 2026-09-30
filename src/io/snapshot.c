@@ -453,22 +453,12 @@ static void op_complete(struct vsr_io_replica *rep,
 }
 
 /* A step waits for a resource (a slab, a slot, a file operation): the
- * replica's CAPTURE deadline makes the loop poll and prepare again in a
- * millisecond (its pop needs no dispatch). */
+ * replica's CAPTURE deadline makes the loop poll and prepare again. */
 static void retry_later(struct vsr_io *io, struct vsr_io_replica *rep)
 {
     rep->snapshots.retry = 1;
     vsr_io_deadlines_arm(&io->deadlines, rep->deadline_capture,
                          io->now + SNAPSHOT_RETRY_NS);
-}
-
-/* The module's prepare decided an outcome (a completion to the core, a
- * stream's close, a failed directory) after the core's poll and the links'
- * prepare ran: the loop must poll and prepare again at once, or the
- * outcome waits for an unrelated event to wake it. */
-static void wake_now(struct vsr_io *io, struct vsr_io_replica *rep)
-{
-    vsr_io_deadlines_arm(&io->deadlines, rep->deadline_capture, io->now);
 }
 
 /* Frees an engine file slot the module holds, clearing its descriptor. */
@@ -2475,6 +2465,15 @@ void vsr_io_snapshots_poll(struct vsr_io *io, uint32_t replica, uint64_t now)
 /* -------------------------------------------------------------------------
  * Prepare
  * ---------------------------------------------------------------------- */
+
+/* The module's prepare decided an outcome (a completion to the core, a
+ * stream's close, a failed directory) after the core's poll and the links'
+ * prepare ran: the loop must poll and prepare again at once, or the
+ * outcome waits for an unrelated event to wake it. */
+static void wake_now(struct vsr_io *io, struct vsr_io_replica *rep)
+{
+    vsr_io_deadlines_arm(&io->deadlines, rep->deadline_capture, io->now);
+}
 
 static uint32_t fileop_take(struct vsr_io_snapshots *s)
 {
