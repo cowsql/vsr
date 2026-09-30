@@ -11,7 +11,8 @@
  * (VSR_SIM_ROOT, or an opened mkdtemp directory), the wake source (the same
  * thread, or another thread) and a few environment facts (addresses, disk
  * capacity, socket buffer sizes). Everything else is one code path over
- * executor records.
+ * executor records. The ring runs as three columns: the default ring,
+ * uring-sqpoll (an SQ thread) and uring-napi (NAPI busy polling).
  *
  * Two more factories run the same bodies through the fault-injecting
  * wrapper (tests/lib/faulty_executor.c) at rate zero over each executor:
@@ -74,6 +75,10 @@ struct factory {
     const char *name;
     bool temp_directory; /* The driver makes and removes fixture.dir_path. */
     bool ring;           /* Skipped entirely when no ring can be created. */
+    /* The ring's variant: an SQPOLL thread idling after this many ms, NAPI
+     * busy polling for this many us (0: the default task-work ring). */
+    uint32_t sqpoll_idle_ms;
+    uint32_t napi_busy_poll_us;
     /* 0, or a negative errno; -ENOSYS/-EPERM mean no such executor here. */
     int (*create)(struct fixture *f);
     void (*destroy)(struct fixture *f);
@@ -804,7 +809,9 @@ static int ring_open(struct fixture *f)
     o.cq_entries = 256;
     o.file_slots = 16;
     o.buffer_regions = 4;
+    o.sqpoll_idle_ms = f->factory->sqpoll_idle_ms;
     o.sqpoll_cpu = UINT32_MAX;
+    o.napi_busy_poll_us = f->factory->napi_busy_poll_us;
     CHECK(vsr_io_uring_layout(&o, &need) == VSR_OK);
     size = (need.size + need.alignment - 1) & ~(need.alignment - 1);
     f->memory = aligned_alloc(need.alignment, size);
@@ -1146,6 +1153,59 @@ static const struct factory ring_factory = {
     .peer_close = ring_peer_close,
 };
 
+/* The same ring with a kernel thread polling the SQ (idling after 10 ms,
+ * so both the awake thread and the NEED_WAKEUP path are taken) in place of
+ * the task-work flags, and with NAPI busy polling registered. Loopback
+ * sockets carry no NAPI id, so the second exercises the registration and
+ * the wait path with NAPI enabled, not a busy poll of a device queue. */
+static const struct factory ring_sqpoll_factory = {
+    .name = "uring-sqpoll",
+    .temp_directory = true,
+    .ring = true,
+    .sqpoll_idle_ms = 10,
+    .create = ring_create,
+    .destroy = ring_destroy,
+    .wait = ring_wait,
+    .wake_elsewhere = ring_wake_elsewhere,
+    .direct_alignment = ring_direct_alignment,
+    .partition = ring_partition,
+    .bind_address = ring_bind_address,
+    .dial_address = ring_dial_address,
+    .unused_address = ring_unused_address,
+    .shrink_send_buffer = ring_shrink_send_buffer,
+    .peer_listen = ring_peer_listen,
+    .peer_accept = ring_peer_accept,
+    .peer_connect = ring_peer_connect,
+    .peer_send = ring_peer_send,
+    .peer_recv = ring_peer_recv,
+    .peer_shutdown = ring_peer_shutdown,
+    .peer_close = ring_peer_close,
+};
+
+static const struct factory ring_napi_factory = {
+    .name = "uring-napi",
+    .temp_directory = true,
+    .ring = true,
+    .napi_busy_poll_us = 20,
+    .create = ring_create,
+    .destroy = ring_destroy,
+    .wait = ring_wait,
+    .wake_elsewhere = ring_wake_elsewhere,
+    .direct_alignment = ring_direct_alignment,
+    .partition = ring_partition,
+    .bind_address = ring_bind_address,
+    .dial_address = ring_dial_address,
+    .unused_address = ring_unused_address,
+    .shrink_send_buffer = ring_shrink_send_buffer,
+    .peer_listen = ring_peer_listen,
+    .peer_accept = ring_peer_accept,
+    .peer_connect = ring_peer_connect,
+    .peer_send = ring_peer_send,
+    .peer_recv = ring_peer_recv,
+    .peer_shutdown = ring_peer_shutdown,
+    .peer_close = ring_peer_close,
+};
+
 /* ------------------------------------------------------------------------
  * Scenarios: basics and common flags
  * --------------------------------------------------------------------- */
@@ -1191,7 +1251,7 @@ static void scenario_skip_success(struct fixture *f)
     struct vsr_io_cqe cqe;
     unsigned char *ring_memory = page_alloc(4096);
     struct vsr_io_region memory;
-    unsigned char bytes[16];
+    unsigned char bytes[16] = {0};
 
     r = rec(VSR_IO_SQE_NOP, UD(1));
     r.flags = VSR_IO_SQE_SKIP_SUCCESS;
@@ -1233,7 +1293,7 @@ static void scenario_link_chains(struct fixture *f)
     struct vsr_io_sqe chain[3];
     struct vsr_io_cqe cqe;
     struct link l;
-    char buffer[64];
+    char buffer[64] = {0};
     int32_t fd = open_at(f, f->dir, "chain", O_CREAT | O_RDWR, UD(1));
 
     CHECK(fd >= 0);
@@ -3391,7 +3451,8 @@ static const struct scenario scenarios[] = {
 };
 
 static const struct factory *const factories[] = {
-    &sim_factory, &ring_factory, &faulty_sim_factory, &faulty_ring_factory};
+    &sim_factory,       &ring_factory,       &ring_sqpoll_factory,
+    &ring_napi_factory, &faulty_sim_factory, &faulty_ring_factory};
 
 enum outcome { PASS, FAIL, SKIP };
 
@@ -3518,15 +3579,20 @@ int main(void)
             int rc;
 
             CHECK(probe != NULL);
+            probe->factory = factory;
             rc = ring_open(probe);
             if (rc == 0) {
                 ring_close(probe);
             }
             free(probe);
             if (rc == -ENOSYS || rc == -EPERM) {
+                /* A variant the machine refuses (SQPOLL to an unprivileged
+                 * user, say) is reported; only a missing ring skips. */
                 printf("%s: skipped entirely: no ring (%s)\n", factory->name,
                        strerror(-rc));
-                ring_skipped = true;
+                ring_skipped =
+                    ring_skipped || (factory->sqpoll_idle_ms == 0 &&
+                                     factory->napi_busy_poll_us == 0);
                 continue;
             }
         }

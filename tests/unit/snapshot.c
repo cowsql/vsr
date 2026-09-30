@@ -3103,7 +3103,7 @@ static void test_capture(void)
     CHECK(vsr_io_snapshots_size(&limits, &io_limits, 8, &bytes, &alignment) ==
           VSR_EINVAL);
     CHECK(a->snapshots->count == limits.transfers + VSR_IO_SNAPSHOT_EXTRA);
-    /* A checkpoint copy fits an engine lease region (P1). */
+    /* A checkpoint copy fits an engine lease region (105). */
     {
         size_t copy = 0;
         size_t region = 0;

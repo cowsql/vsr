@@ -40,7 +40,10 @@ simulation and `vsr_client_` in the client.
    snapshot.h        snapshot.c   clients files and the joint snapshot ops
    engine.h          engine.c     struct vsr_io, replicas, entry points
    uring.h           uring.c      vsr_io_uring_* over the io_uring syscalls
-   uapi/io_uring.h                the kernel's UAPI header, vendored
+   uapi/io_uring.h                the kernel's UAPI header, vendored: Linux
+   uapi/io_uring/zcrx.h           7.2.6's headers_install output (from
+                                  linux-libc-dev 7.2.6-1), one include
+                                  redirected; uapi/README.md
  src/sim/           the simulated world
    sim.h             world.c net.c disk.c exec.c
  src/client/        the client bookkeeping
@@ -689,7 +692,7 @@ states the four op sequences; the details:
 - CAPTURE: `vsr_io_snapshots_capture` requires
   `store.clients_sequence <= task->sequence` (else `FAILED`, an invariant
   since ops are processed in emission order), takes an engine lease (for
-  the completion, P1), a staging slab, an engine file slot and a registry
+  the completion, 105), a staging slab, an engine file slot and a registry
   entry (`RETRY` when any is missing, or while another CAPTURE runs), draws
   16 random bytes for the id (redrawn while zero or held), copies the task
   and its checkpoint into the template with the id, snapshots the table
@@ -707,7 +710,7 @@ states the four op sequences; the details:
   trailer. `vsr_io_store_capture_offset` records each entry's offset;
   `capture_end` sets `last_capture` (a zero id when the library half
   fails: the floor only). The file stays open (the latest capture's kept
-  slot, P2). Completion to the core: `OK` with the caller's checkpoint
+  slot, 106). Completion to the core: `OK` with the caller's checkpoint
   under the lease when both halves are OK; otherwise the file is closed and
   unlinked first, then the caller's status (or the library's: `FAILED`
   for I/O errors, `CORRUPT` for record bytes that fail their checks) is
@@ -719,7 +722,7 @@ states the four op sequences; the details:
   poll); completion when both halves are over, with the caller's status
   or `FAILED`; any failure is reported as-is (the core fences on it). A
   SYNC of an entry whose kept slot is being released cancels or follows
-  that RELEASE (P3).
+  that RELEASE (107).
 - FETCH: an id already held is forwarded at once. Otherwise `task->peer`
   is resolved to a node through the authorization table (no node:
   `RETRY`), an engine lease, the reader's slab, a file slot and an entry
@@ -730,7 +733,7 @@ states the four op sequences; the details:
   opened (`O_WRONLY | O_CREAT | O_TRUNC`); chunks arrive through
   `vsr_io_snapshots_stream_data` in order, are copied into the reader and
   verified as they arrive, and are written at their offsets one write at a
-  time, each DATA op completed when its write completes (P5). At
+  time, each DATA op completed when its write completes (109). At
   `stream_end`: an OK END with the reader past a matching trailer closes
   the file, renames it to `clients-<id>` (RENAMEAT), keeps the entry with
   `sequence = 0` (set by the RESTORE's load) and forwards FETCH; any other
@@ -745,7 +748,7 @@ states the four op sequences; the details:
   file unlinked once `readers == 0`, then the entry freed; a served library
   stream still reading it delays the unlink, not the completion. An id the
   registry does not hold is forwarded all the same and its file unlinked
-  if present (P3). The caller's failure keeps the file.
+  if present (107). The caller's failure keeps the file.
 - Base loads: the module's poll starts one whenever
   `vsr_io_store_base_wanted` reports a file (a held RESTORE, a PUBLISH of
   a file that is neither the latest capture nor the base, or recovery's
@@ -756,7 +759,7 @@ states the four op sequences; the details:
   `vsr_io_store_base_resume(status)`. A missing file on a replica whose
   hard-state role is `FULL` is `CORRUPT`; on a `WITNESS` it is expected and
   yields an empty table. The file stays open; `store.base_slot` follows the
-  store's client base (P2).
+  store's client base (106).
 - Serving: `vsr_io_snapshots_serve` finds the replica by cluster and
   replica id, requires the registry entry complete, not discarded or
   dropped and with no CAPTURE outstanding (else END `NOT_FOUND`),
@@ -764,7 +767,7 @@ states the four op sequences; the details:
   feeds one FILE write of the whole file to the stream module followed by
   CLOSE OK (FAILED when the write is refused; the open's failure ends the
   stream `NOT_FOUND` for `ENOENT`, else `FAILED`); the slot is closed and
-  `readers` decremented at `stream_end` (P4).
+  `readers` decremented at `stream_end` (108).
 
 At most `VSR_IO_SNAPSHOT_FILEOPS` (4) records of a replica's module are in
 flight (slot kind CLIENTS, owner the replica, `sub` naming the entry, the
@@ -806,9 +809,11 @@ Section 7.
 Section 8 is the contract; `uring.c` realizes it on Linux >= 6.18 (design
 section 2) through the raw `io_uring_setup`, `io_uring_enter` and
 `io_uring_register` syscalls over the vendored UAPI header
-`src/io/uapi/io_uring.h` (decision 52); there is no liburing and no other
-library. Specifics: the executor state and its tables live in the caller's
-page-aligned region; the rings and the SQE array are the kernel's pages,
+`src/io/uapi/io_uring.h`, Linux 7.2.6's (decision 52; `src/io/uapi/README.md`
+says where it comes from and how to refresh it, and `uring.c` asserts the
+layout of every structure it hands the kernel); there is no liburing and no
+other library. Specifics: the executor state and its tables live in the
+caller's page-aligned region; the rings and the SQE array are the kernel's pages,
 mapped from the ring descriptor by init (one mapping for both rings,
 `IORING_FEAT_SINGLE_MMAP`, one for the SQEs) and unmapped by deinit before
 the descriptor is closed, not caller memory through `NO_MMAP`, because the
@@ -830,7 +835,10 @@ completions). Init checks once that the feature bits it relies on
 (`SINGLE_MMAP`, `NODROP`, `EXT_ARG`, `MIN_TIMEOUT`, `REG_REG_RING`,
 `RSRC_TAGS`, `CQE_SKIP`, `LINKED_FILE`) are set and that `IORING_REGISTER_PROBE` reports
 every opcode the translation table emits, and fails with `-ENOSYS`
-otherwise (decision 53); nothing is probed after that and there is no
+otherwise (decision 53); a setup refused with `-EINVAL` is classified by
+the feature bits of a plain one-entry ring, `-ENOSYS` when they lack a
+required one (a kernel before 6.6 refuses `NO_SQARRAY` so), else
+`-EINVAL` (decision 104); nothing is probed after that and there is no
 fallback. `submit_and_wait` translates the records into the SQ (a full SQ
 is drained by an enter, under `SQPOLL` by `SQ_WAIT`), publishes the tail
 and enters once with `GETEVENTS` and no minimum so completions already due
@@ -847,7 +855,8 @@ eventfd wake is a multishot `POLL_ADD` whose completions are consumed in
 `REGISTER_BUFFERS2` sparse and `BUFFERS_UPDATE` with tags,
 `REGISTER_PBUF_RING`/`UNREGISTER_PBUF_RING` with `IOU_PBUF_RING_INC` for
 incremental rings and `PBUF_STATUS` for the kernel's head, `REGISTER_NAPI`
-when requested; `provide` writes `struct io_uring_buf` entries then
+when requested (`IO_URING_NAPI_REGISTER_OP` with dynamic tracking, the ring
+learning the NAPI ids of the sockets it polls); `provide` writes `struct io_uring_buf` entries then
 publishes the ring tail with a release store. A vectored zero-copy send
 from a registered region is `SENDMSG_ZC` with `IORING_RECVSEND_FIXED_BUF`
 and a `struct msghdr` naming the record's vectors, kept in a per-SQE-slot
@@ -874,10 +883,18 @@ worker) still completes then, so the caller sees such records complete
 before deinit.
 
 Tests: `tests/integration/executor_conformance` (section 8) run over this
-executor; `tests/unit/uring_translate` for the record-to-SQE table with a
-fake SQE buffer (every opcode and flag combination, rejection of
-out-of-region fixed buffers); `tests/integration/uring_smoke` for the ring
-against the kernel.
+executor, as the default ring and as the `uring-sqpoll` (SQ thread idling
+after 10 ms) and `uring-napi` (20 us busy poll) columns;
+`tests/unit/uring_translate` for the record-to-SQE table with a fake SQE
+buffer (every opcode and flag combination, rejection of out-of-region
+fixed buffers); `tests/integration/uring_refusals` for init's refusals on
+emulated older kernels (section 9); `tests/integration/uring_smoke` for
+the ring against the kernel, the whole suite over the default, SQPOLL,
+NAPI and SQPOLL+NAPI rings (a variant refused with `EPERM` is reported
+and skipped). Loopback
+sockets carry no NAPI id, so the NAPI runs cover the registration (read
+back from the kernel) and every path with busy polling enabled, not the
+polling of a device queue.
 
 ### Simulation (`src/sim/sim.h`)
 
@@ -1721,7 +1738,8 @@ with node 0 talking to node 1.
 | --- | --- | --- | --- |
 | `cursor`, `codec`, `pool`, `slots`, `deadline`, `link`, `stream`, `store`, `snapshot`, `sim_world`, `client`, `uring_translate` | unit | `UNIT_TESTS`, each `tests_unit_NAME_SOURCES = tests/unit/NAME.c`, `_LDADD = $(LIBVSR)` | Section 3 |
 | `frame`, `recovery` | fuzzy (libFuzzer) | `if FUZZING` programs and the `fuzz` target, with corpora under `tests/fuzzy/corpus/frame` and `corpus/recovery` | Decoder and recovery never crash; recovered prefixes satisfy the invariants |
-| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise), then over both again through the fault-injecting wrapper | Section 8 |
+| `uring_refusals` | integration | `INTEGRATION_TESTS` (skips without a ring or seccomp) | `vsr_io_uring_init` on emulated kernels, each in a forked child under a seccomp filter: no io_uring (`ENOSYS`) and io_uring disabled (`EPERM`) pass through; Linux 6.1 (setup refuses `NO_SQARRAY`, old features), 6.11 (no `MIN_TIMEOUT`), 6.14 (no `READV_FIXED`) and a kernel without networking are `-ENOSYS`, answered by a supervisor thread through `SECCOMP_RET_USER_NOTIF`; no descriptor stays open; a nonexistent SQPOLL CPU stays `-EINVAL` (decision 104) |
+| `executor_conformance` | integration | `INTEGRATION_TESTS`; runs over the sim and, when `/dev/null` is writable and a ring can be created, over io_uring (skipped with exit 77 otherwise) as the default, SQPOLL and NAPI rings, then over the sim and the default ring again through the fault-injecting wrapper | Section 8 |
 | `engine` | integration | `INTEGRATION_TESTS` | Over the sim: attach NEW, RECOVER, JOIN; empty-store checks; a three-replica group commits, replies, checkpoints, fetches, restarts; STATUS emission; close and detach sequencing; max_clients admission at the primary |
 | `streams`, `snapshots` | integration | `INTEGRATION_TESTS` | Section 3 |
 | `iocluster`, `iocluster_extended` | fuzzy (seeded) | `FUZZY_TESTS`; `SEED COUNT STEPS [trace\|quiet] [PROFILE] [SEEDS]` as `tests/fuzzy/cluster`; the extended program sets a wider default profile | Below |
@@ -1806,7 +1824,8 @@ of `docs/io-design.md`:
 | `stream.h` (internal) | `vsr_io_stream_unit.sequence` (was `reserved`) and `vsr_io_stream.chunks`: a DATA op id's unit field is the chunk's sequence, not its slot | 100 |
 | `stream.h` (internal) | `vsr_io_streams_link_lost` ends a stream CANCELLED while the link module shuts down; `vsr_io_stream.closed`: `vsr_io_streams_close` is OK once per accepted stream until its END op (also after an end under the caller, a read failure included), EINVAL for a status outside enum vsr_io_status; `vsr_io_streams_write` is EINVAL for a caller stream's FILE range on an engine file slot; `vsr_io_streams_data_done` re-arms the requester's clock | 101, 102, 103, 97 |
 | `vsr-io.h` | Bulk streams: CANCELLED on the closing engine whichever shutdown runs first; STREAM_CLOSE once, OK until STREAM_END also after an end under the caller, its status an enum vsr_io_status; STREAM_WRITE EINVAL once the stream ended; a FILE range on one of the engine's slots EINVAL | 101, 102, 103 |
-| `snapshot.h` (internal) | The module's structures as implemented: `vsr_io_snapshots_size`/`init` take the engine limits (`stream_window`, `streams`) and `max_clients`; `vsr_io_snapshots_region_bytes`; a registry entry carries the file size, the job and its step, the record in flight, the kept and transient slots, `on_disk`, `sync_failed`, `job_next`, the reserved `lease` and the copied `result`; the writer, the reader, the chunk ring, the serves, the file-operation table, the directory slot and `pending_base`; the ops are `RETRY` without an engine lease; an OK CAPTURE or FETCH completion carries the lease; a DROP of an id the registry lacks is taken; a file with a CAPTURE outstanding is not served; the weak hook stubs left stream.c | P1, P2, P3, P4, P5 |
+| `vsr-io.h` | `vsr_io_uring_init` names its refusals: `-ENOSYS` (no io_uring, or a kernel older than the baseline, including one whose setup refuses a flag with `EINVAL`), `-EPERM`, `-EINVAL` | 104 |
+| `snapshot.h` (internal) | The module's structures as implemented: `vsr_io_snapshots_size`/`init` take the engine limits (`stream_window`, `streams`) and `max_clients`; `vsr_io_snapshots_region_bytes`; a registry entry carries the file size, the job and its step, the record in flight, the kept and transient slots, `on_disk`, `sync_failed`, `job_next`, the reserved `lease` and the copied `result`; the writer, the reader, the chunk ring, the serves, the file-operation table, the directory slot and `pending_base`; the ops are `RETRY` without an engine lease; an OK CAPTURE or FETCH completion carries the lease; a DROP of an id the registry lacks is taken; a file with a CAPTURE outstanding is not served; the weak hook stubs left stream.c | 105, 106, 107, 108, 109 |
 
 `vsr-sim.h` and `vsr-client.h` are unchanged.
 
@@ -1854,6 +1873,33 @@ of `docs/io-design.md`:
   unit closes the link `-EPIPE` with the END frame still held, ending
   the transfer RETRY at the requester while the source reported OK. Only
   a requester slower than `handshake_timeout_ns` per window gets there.
+- Where Linux 7.2.6 and the simulation answer differently within the
+  contract (the conformance and smoke logs print these, recorded and not
+  checked), the engine depends on neither answer today, so the
+  simulation is left as it is:
+  - A CANCEL of a disk record: the simulation never cancels disk work
+    (`-EALREADY`, and the record completes); the kernel cancels a write it
+    queued for a worker and had not started (a 1 MiB buffered write on
+    btrfs: the CANCEL 0, the write `-ECANCELED`). The engine cancels only
+    socket records (receives, accepts, connects, by `user_data`); code
+    that ever cancels a disk record must take `-ECANCELED` as well, which
+    the simulation would not exercise.
+  - CANCEL `BY_FD` without `ALL`: the simulation cancels the earliest
+    match, the kernel cancelled the later of two receives (its hash
+    order); the contract leaves it unspecified and the engine never
+    cancels by descriptor.
+  - `update_buffer` of a region a pending record uses: `-EBUSY` in the
+    simulation, 0 on the ring, the kernel keeping the old registration
+    until the record completes (decision 65); the engine registers its
+    pool region once, at init.
+  - Direct I/O alignment is the filesystem's: btrfs and tmpfs serve a
+    misaligned `O_DIRECT` read buffered, the simulation refuses it with
+    `-EINVAL` like ext4 and XFS; the engine aligns everything, and the
+    `odirect_*` conformance rows skip on such a filesystem (they need a
+    build tree on ext4 or XFS to run over the ring).
+  - Short-send lengths depend on socket buffers (6144 of 8 MiB with a
+    4096-byte `SO_SNDBUF` on the ring, 262144 in the simulation); only
+    shortness is contract.
 - The pool's reserve (`replicas + 1` free slabs, decision 54's floor) does
   not count the snapshot module's staging slabs (the writer's and its cold
   slab, the reader's: up to three per replica) nor the link send slab a new

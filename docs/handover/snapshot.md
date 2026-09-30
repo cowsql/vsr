@@ -4,7 +4,7 @@ Branch `wt/snapshot`: 2c0c11d implemented `src/io/snapshot.c` (the first
 author); this session reviewed it against the engine's contracts, fixed
 nine gaps (below), wrote `tests/unit/snapshot.c` (eleven tests over two
 engines with real stores, links and streams) and ran two mutation
-campaigns. Decisions P1..P5 in docs/io-design.md section 10 are
+campaigns. Decisions 105..109 in docs/io-design.md section 10 are
 placeholders (the coordinator renumbers); docs/io-implementation.md
 "Snapshots", 5.4, 7.1, 7.4, 7.5, section 10 and section 11 are updated.
 `store.c`/`store.h` are untouched. `main` (e3385c0, the stream review,
@@ -37,7 +37,7 @@ on uring.c (style), tests/unit/stream.c and executor_conformance.c.
   streams), `sequence` (the capture's, or the RESTORE's that loaded a
   fetched file; 0 until known), `bytes`, the op in progress (`op`,
   `op_type`, `task`, `forwarded`, `forward_due`, `caller_status`,
-  `library_status`), `lease` + `result` (P1), `file_slot` (kept) and
+  `library_status`), `lease` + `result` (105), `file_slot` (kept) and
   `tmp_slot` (transient), `job` (NONE, WRITE, DISCARD, LOAD, FETCH, SYNC,
   DROP, RELEASE) with its `step` (the record to issue next: OPEN, STAT,
   READ, WRITE, FSYNC, CLOSE, FSYNC_DIR, RENAME, UNLINK) and `fileop`,
@@ -77,7 +77,7 @@ on uring.c (style), tests/unit/stream.c and executor_conformance.c.
   `fetch_finish` forwards (OK) or completes the core op.
 - DROP: forward; on the caller's OK the poll starts the DROP job (CLOSE,
   UNLINK) once no reader and no job remain; with readers the core hears OK
-  at once. An unknown id gets a transient entry (P3).
+  at once. An unknown id gets a transient entry (107).
 - Base loads: the poll calls `vsr_io_snapshots_load_base` whenever
   `vsr_io_store_base_wanted`; OPEN, STAT, READs through the reader
   (`base_record` per record); `load_finish` keeps the slot, sets
@@ -202,20 +202,20 @@ real store (`replica_setup`), node = index + 1, replica id = index + 1;
 ## Gaps found and fixed in this session
 
 1. OK CAPTURE/FETCH completions carried a module-wide copy and no lease
-   (vsr.h violation; the core's retained checkpoint was overwritten) -> P1.
+   (vsr.h violation; the core's retained checkpoint was overwritten) -> 105.
 2. A fetch chunk write's completion completed every queued chunk: holes in
-   a file renamed into place -> P5.
+   a file renamed into place -> 109.
 3. A serve whose open found no file operation was never retried; an end
    before the open left it OPENING; a failed open after the end closed the
-   index's next stream -> P4.
-4. A wait found in prepare armed no deadline -> P5 (retry_later).
+   index's next stream -> 108.
+4. A wait found in prepare armed no deadline -> 109 (retry_later).
 5. A file loaded for a held RESTORE/PUBLISH the store could not pack at
-   once was closed by base_track -> P2 (pending base).
+   once was closed by base_track -> 106 (pending base).
 6. SYNC (and DROP) during a RELEASE of the kept slot answered RETRY,
-   which fences the replica for SYNC -> P3.
-7. DROP of an id the registry lacks was FAILED (retried forever) -> P3.
+   which fences the replica for SYNC -> 107.
+7. DROP of an id the registry lacks was FAILED (retried forever) -> 107.
 8. A file was servable while its CAPTURE was outstanding, and its discard
-   could free the entry under a reader -> P4.
+   could free the entry under a reader -> 108.
 9. A FETCH of a held file whose kept slot was being released never
    completed when the caller answered before the CLOSE did.
 Also: reads longer than asked are I/O errors; close releases abandoned
