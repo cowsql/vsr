@@ -3483,6 +3483,7 @@ static int32_t recovery_install(struct vsr_io_store *store,
     store->client_base_id = store->anchor.id;
     r->sequence = fixed->last_sequence;
     r->run = fixed->run;
+    r->record_run = fixed->run;
     r->last_slot = store->start_slot;
     r->resume = slot_offset(store, store->start_slot) + store->header_bytes;
     return VSR_IO_OK;
@@ -3837,9 +3838,16 @@ static void recovery_chunk(struct vsr_io_store *store, int32_t result)
             header.flushed > r->durable_floor) {
             r->durable_floor = header.flushed; /* Decision 50. */
         }
+        /* Not the next record (stale or torn), or the first record of a
+         * later run behind a record that run's recovery did not recover:
+         * a run begins at a recovery, which made what it recovered
+         * durable, so its records carry flushed >= that sequence; an
+         * older run's record the torn rewrite of a block left before it
+         * is not its predecessor (decision S20). */
         if (valid && kind == VSR_IO_SCAN_RECORD && r->mode == SCAN_CHAIN &&
-            (header.sequence != r->sequence + 1 || header.run < r->run)) {
-            valid = false; /* Not the next record: stale or torn. */
+            (header.sequence != r->sequence + 1 || header.run < r->run ||
+             (header.run > r->record_run && header.flushed < r->sequence))) {
+            valid = false;
         }
         if (!valid) {
             if (recovery_judge(store, at)) {
@@ -3861,6 +3869,7 @@ static void recovery_chunk(struct vsr_io_store *store, int32_t result)
             }
             r->sequence = header.sequence;
             r->run = header.run;
+            r->record_run = header.run;
             r->last_slot = r->slot;
             r->resume = round_up(at + header.length, block);
             store->segments[r->slot].last_sequence = header.sequence;

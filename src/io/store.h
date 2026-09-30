@@ -243,17 +243,20 @@ struct vsr_io_trim_event {
  * complete; the reads go into a pool slab, the superblocks into their
  * tail blocks, and the ring is scratch until the scan is over. */
 struct vsr_io_recovery {
-    uint32_t stage;     /* Private stage enumeration. */
-    uint32_t slot;      /* Segment slot whose header is read, then
+    uint32_t stage;         /* Private stage enumeration. */
+    uint32_t slot;          /* Segment slot whose header is read, then
                                the one being scanned. */
-    uint32_t slab;      /* Pool slab of the reads, or NONE. */
-    uint32_t io_slot;   /* Executor slot of the read in flight, NONE. */
-    uint32_t copy;      /* Superblock copy recovered from. */
-    uint32_t last_slot; /* Slot holding the last valid record, else
+    uint32_t slab;          /* Pool slab of the reads, or NONE. */
+    uint32_t io_slot;       /* Executor slot of the read in flight, NONE. */
+    uint32_t copy;          /* Superblock copy recovered from. */
+    uint32_t last_slot;     /* Slot holding the last valid record, else
                                the start slot. */
-    uint32_t mode;      /* Private: replaying the chain, or sweeping
+    uint32_t mode;          /* Private: replaying the chain, or sweeping
                                for floors only (decision 50). */
-    uint32_t reserved;
+    uint32_t record_run;    /* Run of the last valid record (the start
+                            header's before one): a record of a later run
+                            carries flushed >= its predecessor's sequence
+                            (decision S20). */
     uint64_t offset;        /* File offset of the chunk in the slab. */
     uint64_t position;      /* File offset of the next record to judge. */
     uint64_t sequence;      /* Last valid record replayed. */

@@ -949,9 +949,17 @@ static struct txn txns[TXN_MAX];
 
 static void feeds_reset(void);
 
+/* Mixed into the bytes of every transaction built after it is set: the
+ * random walk sets one value per run, so that a run's transaction at a
+ * sequence differs from the one an older run packed there and no torn
+ * rewrite splices the two into one CRC-valid record the model cannot
+ * know (a splice with the next record is decision S20's). 0 otherwise. */
+static uint32_t txn_salt;
+
 static void txns_reset(void)
 {
     memset(txns, 0, sizeof(txns));
+    txn_salt = 0;
     feeds_reset();
 }
 
@@ -1024,7 +1032,8 @@ static void txn_entries(struct txn *t, uint64_t first, uint32_t count,
 
         for (size_t b = 0; b < body; ++b) {
             t->bodies[i][b] =
-                (unsigned char)(sequence * 31u + (uint64_t)i * 7u + b);
+                (unsigned char)(sequence * 31u + (uint64_t)i * 7u + b +
+                                txn_salt * 101u);
         }
         t->spans[i].data = t->bodies[i];
         t->spans[i].size = body;
@@ -1033,7 +1042,7 @@ static void txn_entries(struct txn *t, uint64_t first, uint32_t count,
         t->blobs[i].count = body > 0 ? 1 : 0;
         entry->op = first + i;
         entry->epoch = 0;
-        entry->view = 1;
+        entry->view = 1 + txn_salt;
         if (client.hi == 0 && client.lo == 0) {
             entry->request.client.hi = 0x1000 + (i % 2);
             entry->request.client.lo = 1;
@@ -1108,7 +1117,8 @@ static const struct txn *txn_clients(uint64_t sequence, uint32_t count,
         struct vsr_client_record *record = &t->records[i];
 
         for (size_t b = 0; b < result; ++b) {
-            t->results[i][b] = (unsigned char)(numbers[i] * 13u + b);
+            t->results[i][b] =
+                (unsigned char)(numbers[i] * 13u + b + txn_salt * 101u);
         }
         t->result_spans[i].data = t->results[i];
         t->result_spans[i].size = result;
@@ -4805,6 +4815,70 @@ static void test_wrap_exact(void)
     harness_close();
 }
 
+/* A record of a later run behind an older run's record it does not
+ * follow (decision S20). Run 1 packs A at k + 1, two blocks from a block
+ * boundary, and a crash tears its write after the first block, which
+ * recovery's flush persists; run 2 packs A' at k + 1, of A's length and
+ * bytes past the first block (only its entries' clients differ), then B'
+ * at k + 2 in the second block, and a crash keeps that block but loses
+ * the first: A's first block and A''s tail read as A, CRC-valid, and B'
+ * (run 2, flushed k) followed it. The chain now ends at A: run 2's
+ * recovery made k durable and recovered nothing after it, so a run-2
+ * record behind k + 1 is not its successor. */
+static void test_recover_splice(void)
+{
+    struct config c = plain_config();
+    const struct vsr_loaded *loaded = NULL;
+    const struct vsr_entry *entry;
+    struct vsr_id x = {0x77, 1};
+    const struct txn *t;
+    uint32_t lease = NONE;
+    uint64_t offset;
+    uint64_t k = 4;
+    uint64_t op;
+    uint32_t at;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(k, k);
+    t = txn_append(k + 1, 2, 256); /* Clients 0x1000 and 0x1001. */
+    CHECK(t->bytes > BLOCK && t->bytes <= 2 * BLOCK);
+    disk.tear_armed = 1;
+    disk.tear_blocks = 1;
+    expect_completion(submit(t), VSR_IO_OK);
+    offset = txns[k + 1].file_offset;
+    CHECK(offset % BLOCK == 0);
+    harness_run(); /* The write is torn: its completion never comes. */
+    expect_recovered(&c, k);
+    CHECK(h.store->file_head == offset && h.store->run == 2);
+    /* Run 2: A' and B' in one write over A's blocks. */
+    t = txn_append_client(k + 1, 2, 256, x, 1);
+    CHECK(t->bytes == txns[k + 1].bytes);
+    expect_completion(submit(t), VSR_IO_OK);
+    expect_completion(submit(txn_append(k + 2, 1, 8)), VSR_IO_OK);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    CHECK(at != NONE && h.pending[at].sqe.offset == offset &&
+          h.pending[at].sqe.length == 2 * BLOCK);
+    harness_complete(at);
+    disk_lose_block(offset / BLOCK);
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == k + 1); /* A, not A' and B'. */
+    release_lease(lease);
+    op = load_log(k + 1, h.store->log_end - 2, h.store->log_end, 2,
+                  limits.message_bytes);
+    harness_run();
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 2);
+    entry = loaded->items;
+    CHECK(entry[0].request.client.hi == 0x1000 &&
+          entry[1].request.client.hi == 0x1001);
+    release_lease(lease);
+    harness_close();
+}
+
 /* Records of four entries until the current slot changes: the sequence
  * that opened the new slot. */
 static uint64_t fill_slot(uint64_t sequence)
@@ -5256,6 +5330,7 @@ struct checked {
     uint64_t floor;
     uint64_t resume;         /* File offset where writing resumes. */
     uint32_t run;            /* Of the chain so far. */
+    uint32_t record_run;     /* Of its last record (the start header's). */
     uint32_t superblock_run; /* The superblock's. */
     uint32_t last_slot;      /* Slot of the last valid record, else the
                                 start's. */
@@ -5463,7 +5538,11 @@ static void checked_scan(struct checked *c, uint32_t slot, uint64_t generation)
         length = checked_record(data + at, end - at, generation);
         sequence = length != 0 ? vsr_io_get_u64(data + at + 8) : 0;
         run = length != 0 ? vsr_io_get_u32(data + at + 36) : 0;
-        next = length != 0 && sequence == c->sequence + 1 && run >= c->run;
+        flushed = length != 0 ? vsr_io_get_u64(data + at + 24) : 0;
+        /* The next sequence, a run not below the chain's, and a later
+         * run's record carrying its predecessor as flushed (S20). */
+        next = length != 0 && sequence == c->sequence + 1 && run >= c->run &&
+               (run <= c->record_run || flushed >= c->sequence);
         if (!next) {
             if (block_left == BLOCK) {
                 break;
@@ -5473,13 +5552,13 @@ static void checked_scan(struct checked *c, uint32_t slot, uint64_t generation)
             at += block_left;
             continue;
         }
-        flushed = vsr_io_get_u64(data + at + 24);
         count = vsr_io_get_u32(data + at + 32);
         if (flushed > c->floor) {
             c->floor = flushed;
         }
         c->sequence = sequence;
         c->run = run;
+        c->record_run = run;
         c->last_slot = slot;
         c->resume = slot_offset(slot) + round_up(at + length, BLOCK);
         for (uint32_t i = 0; i < count; ++i) {
@@ -5589,6 +5668,7 @@ static void checked_image(struct checked *c)
     headers[slot].visited = true;
     c->sequence = headers[slot].last_sequence;
     c->run = headers[slot].run;
+    c->record_run = headers[slot].run;
     c->identity = (headers[slot].flags & VSR_IO_SEGMENT_STATE) != 0;
     c->hard = c->identity;
     c->log_begin = vsr_io_get_u64(disk_image + slot_offset(slot) + 64);
@@ -6274,6 +6354,7 @@ static void walk_crash(uint8_t arg)
     }
     disk_crash(false);
     walk.stats.crashes++;
+    txn_salt = (uint32_t)walk.stats.crashes; /* The next run's bytes. */
     walk.expected_count = 0;
     harness_open_keep(&walk.c, true);
     checked_image(&checked); /* Before the recovery's superblock write. */
@@ -6586,6 +6667,7 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_recover_superblocks);
     RUN(test_recover_reread);
     RUN(test_recover_modes);
+    RUN(test_recover_splice);
     RUN(test_wrap_seal);
     RUN(test_wrap_exact);
     RUN(test_freeing_flush);
