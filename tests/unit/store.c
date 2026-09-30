@@ -6843,8 +6843,7 @@ static void test_review_create_continue(void)
  * exactly one completion). One already satisfied completes OK. */
 static void test_review_sync_continue(void)
 {
-    static const uint8_t modes[2] = {VSR_IO_SYNC_FDATASYNC,
-                                     VSR_IO_SYNC_DSYNC};
+    static const uint8_t modes[2] = {VSR_IO_SYNC_FDATASYNC, VSR_IO_SYNC_DSYNC};
     struct config c = base_config();
     uint64_t sync_op;
 
@@ -6862,7 +6861,7 @@ static void test_review_sync_continue(void)
         CHECK(harness_prepare() == 1);
         expect_completion(submit(txn_append(3, 1, 50)), VSR_IO_OK);
         CHECK(harness_prepare() == 1); /* Two writes out. */
-        sync_op = submit_sync(3); /* Queued before the error. */
+        sync_op = submit_sync(3);      /* Queued before the error. */
         disk.fail_write = -EIO;
         harness_complete(pending_of(VSR_IO_SQE_WRITE));
         CHECK(h.store->state == VSR_IO_STORE_READY && h.store->error == -EIO);
@@ -7414,8 +7413,7 @@ static void test_review_successor_rules(void)
         disk_image[at + vsr_io_get_u32(disk_image + at + 4) - 9] ^= 0x55;
         image_fix_record(at);
         harness_open_keep(&c, true);
-        CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) ==
-              VSR_IO_OK);
+        CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
         CHECK(loaded->sequence == sequence);
         release_lease(lease);
         if (run == 1) {
@@ -7556,7 +7554,7 @@ static void test_review_freeing_dirty(void)
     harness_open(&c);
     harness_start(VSR_START_NEW);
     store_run(txn_identity(1, VSR_MEMBER_FULL));
-    opened = fill_slot(2);     /* Opened slot 1. */
+    opened = fill_slot(2);            /* Opened slot 1. */
     sequence = fill_slot(opened + 1); /* Opened slot 2. */
     trim = ++sequence;
     store_run(txn_trim(trim, h.store->log_end - 1));
@@ -7572,8 +7570,7 @@ static void test_review_freeing_dirty(void)
     CHECK(h.store->written == sequence - 1);
     /* A cold read from slot 1 keeps it. */
     load_op = load_log(trim - 1, txns[opened].entries[0].op,
-                       txns[opened].entries[0].op + 1, 1,
-                       limits.message_bytes);
+                       txns[opened].entries[0].op + 1, 1, limits.message_bytes);
     CHECK(h.store->loads_count == 1);
     CHECK(harness_prepare() == 1);
     at = pending_of(VSR_IO_SQE_READ);
