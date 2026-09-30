@@ -6845,11 +6845,12 @@ static void test_review_sync_continue(void)
 {
     static const uint8_t modes[2] = {VSR_IO_SYNC_FDATASYNC, VSR_IO_SYNC_DSYNC};
     struct config c = base_config();
-    uint64_t sync_op;
 
     c.durability = VSR_REPLICATED;
     c.on_write_error = VSR_IO_WRITE_ERROR_CONTINUE;
     for (uint32_t m = 0; m < 2; ++m) {
+        uint64_t sync_op;
+
         c.sync_mode = modes[m];
         harness_open(&c);
         harness_start(VSR_START_NEW);
@@ -6966,7 +6967,6 @@ static const struct txn *txn_sized(uint64_t sequence, uint64_t bytes)
 static void test_review_full_segment(void)
 {
     struct config c = plain_config();
-    const struct txn *t;
     uint64_t sequence = 1;
     uint64_t op;
 
@@ -6975,6 +6975,7 @@ static void test_review_full_segment(void)
     store_run(txn_identity(1, VSR_MEMBER_FULL));
     for (;;) {
         uint64_t used = h.store->segments[h.store->current].used;
+        const struct txn *t;
 
         CHECK(h.store->head % c.cache_bytes + c.segment_bytes - used <=
               c.cache_bytes); /* No wrap padding to count. */
@@ -7044,7 +7045,6 @@ static void test_review_header_unreadable(void)
     struct config c = plain_config();
     uint64_t sequence;
     uint64_t op;
-    uint32_t at;
 
     harness_open(&c);
     harness_start(VSR_START_NEW);
@@ -7058,6 +7058,8 @@ static void test_review_header_unreadable(void)
     harness_run();
     expect_completion(op, VSR_IO_OK);
     for (uint32_t slot = 0; slot < 2; ++slot) {
+        uint32_t at;
+
         disk_crash(false);
         harness_open_keep(&c, true);
         op = open_load(VSR_START_RECOVER);
@@ -7163,7 +7165,7 @@ static void test_review_recovery_crash(void)
     plain_run(6, 6);
     disk_crash(false);
     harness_open_keep(&c, true);
-    op = open_load(VSR_START_RECOVER);
+    (void)open_load(VSR_START_RECOVER);
     at = run_until(VSR_IO_SQE_WRITE);
     CHECK(h.pending[at].sqe.offset < 2 * BLOCK);
     disk.tear_armed = 1;
@@ -7389,7 +7391,6 @@ static void test_review_successor_rules(void)
     const struct vsr_loaded *loaded = NULL;
     uint32_t lease = NONE;
     uint64_t sequence;
-    uint64_t at;
     uint64_t op;
 
     c.segments = 3;
@@ -7401,7 +7402,10 @@ static void test_review_successor_rules(void)
     harness_run();
     expect_completion(op, VSR_IO_OK);
     CHECK(h.store->segments[2].number == 0);
-    for (uint32_t run = 1; run + 1 >= 1; --run) {
+    for (uint32_t k = 0; k < 2; ++k) {
+        uint32_t run = 1 - k; /* Then a run below the chain's. */
+        uint64_t at;
+
         disk_crash(false);
         memcpy(disk_image + slot_offset(2), disk_image + slot_offset(1),
                (size_t)c.segment_bytes);
@@ -7424,9 +7428,6 @@ static void test_review_successor_rules(void)
             CHECK(h.store->segments[2].number == 0);
             CHECK(op_ref(txns[sequence].entries[0].op)->offset ==
                   txns[sequence].file_offset);
-        }
-        if (run == 0) {
-            break;
         }
     }
     harness_close();
