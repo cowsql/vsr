@@ -874,12 +874,20 @@ static void ring_pad(struct vsr_io_store *store)
 
 /* Moves head to the next ring start when n bytes do not fit before the
  * wrap; the current write is closed first and the skipped bytes are not
- * mirrored (the file continues at the padded position). */
+ * mirrored (the file continues at the padded position). A head exactly at
+ * the ring's end needs no gap, but the bytes after it go to the ring's
+ * start: they begin a new extent, since an extent's ring range, and so a
+ * write planned from it, must be contiguous in memory. */
 static void ring_wrap(struct vsr_io_store *store, uint64_t n)
 {
+    const struct vsr_io_extent *newest = extent_newest(store);
     uint64_t next;
 
     if (store->head % store->ring_size + n <= store->ring_size) {
+        if (store->head % store->ring_size == 0 && store->current != NONE &&
+            newest != NULL && newest->ring_offset < store->head) {
+            extent_begin(store, store->current, 0);
+        }
         return;
     }
     ring_pad(store);

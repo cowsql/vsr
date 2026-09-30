@@ -653,6 +653,15 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         CHECK(sqe->buffer_index == TAIL_REGION);
         CHECK(in_tail(sqe->addr, sqe->length));
         CHECK(sqe->length > 0);
+        if (sqe->offset >= 2 * BLOCK) {
+            /* A segment's bytes come from the ring, contiguous in it (the
+             * superblocks follow the ring in the tail region). */
+            const unsigned char *at = sqe->addr;
+
+            CHECK(at >= h.store->ring &&
+                  (uint64_t)(at - h.store->ring) + sqe->length <=
+                      h.store->ring_size);
+        }
         if ((disk.flags & O_DIRECT) != 0) {
             CHECK(sqe->offset % BLOCK == 0 && sqe->length % BLOCK == 0);
         }
@@ -4736,6 +4745,45 @@ static void test_wrap_seal(void)
     harness_close();
 }
 
+/* A record ending exactly at the ring's end needs no wrap gap, but the
+ * next one goes to the ring's start: it begins a new extent, so the bytes
+ * on either side of the end are two writes, each contiguous in the ring
+ * (a single write from before the end read the superblock copies that
+ * follow the ring into the file, or ran past the tail region). Found by a
+ * random walk: a flushed record's block held a superblock image. */
+static void test_wrap_exact(void)
+{
+    struct config c = base_config();
+    uint64_t ring = c.cache_bytes;
+    uint64_t sequence = 1;
+
+    c.segment_bytes = ring + 2 * BLOCK;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(sequence++, VSR_MEMBER_FULL));
+    /* Each small record written alone pads to its block. */
+    while (h.store->head < ring - 2 * BLOCK) {
+        store_run(txn_append(sequence++, 1, 8));
+        CHECK(h.store->head % BLOCK == 0);
+    }
+    CHECK(h.store->head == ring - 2 * BLOCK && h.store->current == 0);
+    /* Unwritten records up to the ring's end exactly, then one more. */
+    while (h.store->head < ring) {
+        uint64_t left = ring - h.store->head;
+
+        expect_completion(
+            submit(append_of(sequence++, left > 384 ? 272 : left)), VSR_IO_OK);
+    }
+    CHECK(h.store->head == ring && h.store->issued == ring - 2 * BLOCK);
+    expect_completion(submit(txn_append(sequence++, 1, 8)), VSR_IO_OK);
+    CHECK(h.store->head > ring && h.store->current == 0);
+    harness_run(); /* The disk model checks each write's ring range. */
+    CHECK(h.store->written == sequence - 1);
+    snapshot_take();
+    expect_recovered(&c, sequence - 1);
+    harness_close();
+}
+
 /* Records of four entries until the current slot changes: the sequence
  * that opened the new slot. */
 static uint64_t fill_slot(uint64_t sequence)
@@ -6375,6 +6423,7 @@ int VSR_STORE_TESTS_MAIN(int argc, char **argv)
     RUN(test_recover_reread);
     RUN(test_recover_modes);
     RUN(test_wrap_seal);
+    RUN(test_wrap_exact);
     RUN(test_freeing_flush);
     RUN(test_reclaim_media);
     RUN(test_client_freed);
