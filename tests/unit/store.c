@@ -112,6 +112,7 @@ struct disk {
 };
 
 static struct disk disk;
+static bool disk_trace; /* The walk's trace: every WRITE and FSYNC. */
 static unsigned char base_image[65536];
 /* The image as of the last flush: what a crash is sure to keep. */
 static unsigned char disk_flushed[DISK_BYTES];
@@ -159,6 +160,9 @@ static void disk_crash(bool lose_dirty)
 /* One block written since the last flush did not persist. */
 static void disk_lose_block(uint64_t at)
 {
+    if (disk_trace) {
+        fprintf(stderr, "disk: lose block %" PRIu64 "\n", at);
+    }
     CHECK(disk.dirty[at] != 0);
     memcpy(disk_image + at * BLOCK, disk_flushed + at * BLOCK, BLOCK);
     disk.dirty[at] = 0;
@@ -335,6 +339,8 @@ struct harness {
 static struct harness h;
 
 static void txns_reset(void);
+static const struct vsr_io_op_ref *op_ref(uint64_t op);
+static uint64_t slot_offset(uint32_t slot);
 
 static uint64_t round_up(uint64_t value, uint64_t multiple)
 {
@@ -527,7 +533,8 @@ static uint64_t next_op(void)
 static void disk_track_freeing(void)
 {
     for (uint32_t slot = 0; slot < h.store->slots; ++slot) {
-        if (h.store->segments[slot].phase == VSR_IO_SEGMENT_FREEING) {
+        if (h.store->segments[slot].phase == VSR_IO_SEGMENT_FREEING ||
+            h.store->segments[slot].phase == VSR_IO_SEGMENT_FLUSHING) {
             disk_forget_slot(slot, h.options.segment_bytes);
         }
     }
@@ -649,6 +656,15 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         CHECK(sqe->buffer_index == TAIL_REGION);
         CHECK(in_tail(sqe->addr, sqe->length));
         CHECK(sqe->length > 0);
+        if (sqe->offset >= 2 * BLOCK) {
+            /* A segment's bytes come from the ring, contiguous in it (the
+             * superblocks follow the ring in the tail region). */
+            const unsigned char *at = sqe->addr;
+
+            CHECK(at >= h.store->ring &&
+                  (uint64_t)(at - h.store->ring) + sqe->length <=
+                      h.store->ring_size);
+        }
         if ((disk.flags & O_DIRECT) != 0) {
             CHECK(sqe->offset % BLOCK == 0 && sqe->length % BLOCK == 0);
         }
@@ -662,6 +678,10 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         first = sqe->offset / BLOCK;
         blocks = (sqe->length + BLOCK - 1) / BLOCK;
         keep = disk.tear_armed != 0 ? disk.tear_blocks : blocks;
+        if (disk_trace) {
+            fprintf(stderr, "disk: write %" PRIu64 "+%u%s\n", sqe->offset,
+                    sqe->length, disk.tear_armed != 0 ? " (torn)" : "");
+        }
         for (uint64_t b = 0; b < blocks && b < keep; ++b) {
             uint64_t at = first + b;
             uint64_t from = at * BLOCK;
@@ -691,6 +711,9 @@ static bool disk_apply(const struct vsr_io_sqe *sqe, int32_t *result)
         CHECK(sqe->flags == VSR_IO_SQE_FIXED_FILE && sqe->fd == disk.slot);
         CHECK(sqe->op_flags == VSR_IO_FSYNC_DATASYNC);
         disk.flushes++;
+        if (disk_trace) {
+            fprintf(stderr, "disk: flush\n");
+        }
         if (disk.fail_flush != 0) {
             *result = disk.fail_flush;
             disk.fail_flush = 0;
@@ -892,6 +915,7 @@ static uint64_t harness_start(uint32_t mode)
     CHECK(h.store->state == VSR_IO_STORE_READY);
     expect_completion(op, VSR_IO_NOT_FOUND);
     expect_no_completion();
+    disk.flushes = 0; /* The tests count the flushes after the creation's. */
     return op;
 }
 
@@ -925,9 +949,17 @@ static struct txn txns[TXN_MAX];
 
 static void feeds_reset(void);
 
+/* Mixed into the bytes of every transaction built after it is set: the
+ * random walk sets one value per run, so that a run's transaction at a
+ * sequence differs from the one an older run packed there and no torn
+ * rewrite splices the two into one CRC-valid record the model cannot
+ * know (a splice with the next record is decision 116's). 0 otherwise. */
+static uint32_t txn_salt;
+
 static void txns_reset(void)
 {
     memset(txns, 0, sizeof(txns));
+    txn_salt = 0;
     feeds_reset();
 }
 
@@ -1000,7 +1032,8 @@ static void txn_entries(struct txn *t, uint64_t first, uint32_t count,
 
         for (size_t b = 0; b < body; ++b) {
             t->bodies[i][b] =
-                (unsigned char)(sequence * 31u + (uint64_t)i * 7u + b);
+                (unsigned char)(sequence * 31u + (uint64_t)i * 7u + b +
+                                (uint64_t)txn_salt * 101u);
         }
         t->spans[i].data = t->bodies[i];
         t->spans[i].size = body;
@@ -1009,7 +1042,7 @@ static void txn_entries(struct txn *t, uint64_t first, uint32_t count,
         t->blobs[i].count = body > 0 ? 1 : 0;
         entry->op = first + i;
         entry->epoch = 0;
-        entry->view = 1;
+        entry->view = 1 + txn_salt;
         if (client.hi == 0 && client.lo == 0) {
             entry->request.client.hi = 0x1000 + (i % 2);
             entry->request.client.lo = 1;
@@ -1084,7 +1117,8 @@ static const struct txn *txn_clients(uint64_t sequence, uint32_t count,
         struct vsr_client_record *record = &t->records[i];
 
         for (size_t b = 0; b < result; ++b) {
-            t->results[i][b] = (unsigned char)(numbers[i] * 13u + b);
+            t->results[i][b] = (unsigned char)(numbers[i] * 13u + b +
+                                               (uint64_t)txn_salt * 101u);
         }
         t->result_spans[i].data = t->results[i];
         t->result_spans[i].size = result;
@@ -1444,7 +1478,7 @@ static void check_ring_record(uint64_t sequence, uint64_t flushed)
  * load: per snapshot id, the records of its capture (or a file the test
  * composed) with their offsets; a wanted id without a file is CORRUPT,
  * as a missing file is. `feed` records the last load. */
-#define FEEDS 4u
+#define FEEDS 256u
 
 struct base_feed {
     struct vsr_id id; /* Zero: free. */
@@ -1631,9 +1665,8 @@ static int32_t harness_recover(uint32_t mode, const struct vsr_loaded **loaded,
 /* An index snapshot, taken after every scripted sequence and compared
  * with the state recovered at that sequence. */
 #define SNAP_OPS 256u
-#define SNAP_VERSIONS 64u
 #define SNAP_CLIENTS 16u
-#define SNAPSHOTS 128u
+#define SNAPSHOTS 512u
 
 struct snap_client {
     struct vsr_id id;
@@ -1653,12 +1686,10 @@ struct snapshot {
     struct vsr_id client_base_id;
     struct vsr_store_identity identity;
     struct snap_client clients[SNAP_CLIENTS];
-    struct vsr_io_version versions[SNAP_VERSIONS];
     struct vsr_io_op_ref ops[SNAP_OPS]; /* [log_begin, log_end) */
     uint32_t hard_role;
     uint32_t manifest_size;
     uint32_t ops_count;
-    uint32_t versions_count;
     uint32_t clients_count;
     bool taken;
     bool identity_set;
@@ -1706,10 +1737,6 @@ static void snapshot_take(void)
         }
         s->ops_count++;
     }
-    CHECK(h.store->versions_count <= SNAP_VERSIONS);
-    s->versions_count = h.store->versions_count;
-    memcpy(s->versions, h.store->versions,
-           s->versions_count * sizeof(s->versions[0]));
     for (uint32_t i = 0; i < h.store->clients_capacity; ++i) {
         const struct vsr_io_client *entry = &h.store->clients[i];
         struct snap_client *c;
@@ -1727,9 +1754,11 @@ static void snapshot_take(void)
 }
 
 /* The recovered indexes must agree with the snapshot of `sequence` on
- * the live log, its versions (a superset when RECLAIM had deleted some
- * before the crash), every client's record and retained entry, and the
- * logical state; the client base must honour its invariant. */
+ * the live log, every client's record and retained entry, and the
+ * logical state; the client base must honour its invariant. Versions are
+ * not compared: every one in the snapshot was truncated at or before
+ * `sequence`, and a recovered store serves no older revision, so a
+ * RECLAIM between the snapshot and the crash may have dropped them. */
 static void snapshot_check(uint64_t sequence)
 {
     const struct snapshot *s = &snapshots[sequence];
@@ -1764,28 +1793,19 @@ static void snapshot_check(uint64_t sequence)
             CHECK(ref->op != s->log_begin + i);
             continue;
         }
+        if (ref->op != expected->op || ref->sequence != expected->sequence) {
+            fprintf(stderr,
+                    "snapshot %" PRIu64 ": op %" PRIu64 " sequence %" PRIu64
+                    " recovered as op %" PRIu64 " sequence %" PRIu64 "\n",
+                    sequence, expected->op, expected->sequence, ref->op,
+                    ref->sequence);
+        }
         CHECK(ref->op == expected->op && ref->sequence == expected->sequence);
         CHECK(ref->offset == expected->offset &&
               ref->length == expected->length);
         CHECK(ref->change == expected->change && ref->index == expected->index);
         CHECK(ref->client.hi == expected->client.hi &&
               ref->client.lo == expected->client.lo);
-    }
-    for (uint32_t i = 0; i < s->versions_count; ++i) {
-        const struct vsr_io_version *expected = &s->versions[i];
-        bool found = false;
-
-        for (uint32_t j = 0; j < h.store->versions_count; ++j) {
-            const struct vsr_io_version *v = &h.store->versions[j];
-
-            if (v->op == expected->op && v->appended == expected->appended &&
-                v->truncated == expected->truncated &&
-                v->offset == expected->offset &&
-                v->length == expected->length) {
-                found = true;
-            }
-        }
-        CHECK(found);
     }
     for (uint32_t i = 0; i < s->clients_count; ++i) {
         const struct snap_client *expected = &s->clients[i];
@@ -1795,6 +1815,17 @@ static void snapshot_check(uint64_t sequence)
             continue; /* An in-flight entry: the crash forgot it. */
         }
         CHECK(entry != NULL);
+        if (entry->current.number != expected->number ||
+            entry->current.op != expected->op) {
+            fprintf(stderr,
+                    "snapshot %" PRIu64 ": client %" PRIx64 " number %" PRIu64
+                    " op %" PRIu64 " recovered as number %" PRIu64
+                    " op %" PRIu64 " (sequence %" PRIu64
+                    ", base offset %" PRIu64 ")\n",
+                    sequence, expected->id.hi, expected->number, expected->op,
+                    entry->current.number, entry->current.op,
+                    entry->current.sequence, entry->base_offset);
+        }
         CHECK(entry->current.number == expected->number &&
               entry->current.op == expected->op);
         CHECK(entry->retained == expected->retained);
@@ -2181,9 +2212,17 @@ static void test_create(void)
     CHECK(h.store->state == VSR_IO_STORE_CREATING);
     expect_no_completion();
     harness_complete(at);
-    CHECK(h.store->state == VSR_IO_STORE_READY);
     CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_OPEN);
     CHECK(h.store->segments[0].header_write == NONE);
+    /* FDATASYNC: the superblocks and the header are flushed before the
+     * store is READY; a crash losing them would leave a CORRUPT log. */
+    CHECK(h.store->state == VSR_IO_STORE_CREATING);
+    expect_no_completion();
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_FSYNC);
+    CHECK(at != NONE && disk.flushes == 0);
+    harness_complete(at);
+    CHECK(h.store->state == VSR_IO_STORE_READY && disk.flushes == 1);
     expect_completion(op, VSR_IO_NOT_FOUND);
     expect_no_completion();
     read_header(0, &header);
@@ -2235,6 +2274,10 @@ static void test_recover_missing(void)
     }
     CHECK(h.store->stores_count == 1);
     harness_complete(at);
+    /* The flush of the creation (FDATASYNC), then READY. */
+    CHECK(h.store->state == VSR_IO_STORE_CREATING);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_FSYNC));
     CHECK(h.store->state == VSR_IO_STORE_READY);
     expect_completion(store_op, VSR_IO_OK);
     expect_no_completion();
@@ -3057,7 +3100,7 @@ static void test_empty_index(void)
     vsr_io_store_replied(h.store, id);
     CHECK(h.store->clients_count == 0);
     CHECK(!vsr_io_store_base_wanted(h.store, &id, NULL));
-    CHECK(vsr_io_store_free_floor(h.store) == 1);
+    CHECK(vsr_io_store_free_floor(h.store) == 0); /* Nothing on media. */
     expect_no_completion();
     harness_close();
 }
@@ -3220,13 +3263,19 @@ static void test_index_ops(void)
     loaded = expect_loaded(op, VSR_IO_OK, &lease);
     check_entry(loaded->items, &txns[1], 1);
     release_lease(lease);
-    /* RECLAIM past the truncation drops the versions; revision 3 can no
-     * longer be named. */
+    /* RECLAIM past the truncation: revision 3 can no longer be named;
+     * the versions go once the media reaches the reclaimed revision
+     * (decision 112), here with the SYNC of 4. */
     expect_completion(submit_reclaim(4), VSR_IO_OK);
-    CHECK(h.store->versions_count == 0 && h.store->reclaim == 4);
+    CHECK(h.store->versions_count == 2 && h.store->reclaim == 4);
+    CHECK(h.store->reclaimed == h.store->flushed);
     read = read_of(VSR_LOAD_LOG, 3, a);
     read.end = 6;
     CHECK(vsr_io_store_load(h.store, 71, &read) == VSR_EINVAL);
+    op = submit_sync(4);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->versions_count == 0 && h.store->reclaimed == 4);
     CHECK(vsr_io_store_reclaim(h.store, 72, 6) == VSR_EINVAL);
     expect_completion(submit_reclaim(2), VSR_IO_OK); /* Never backwards. */
     CHECK(h.store->reclaim == 4);
@@ -3467,18 +3516,24 @@ static void test_floor(void)
     uint64_t numbers[1] = {1};
     uint64_t ops[1] = {1};
 
+    c.sync_mode = VSR_IO_SYNC_DSYNC; /* Every record on media once written:
+                                         the terms apply as they are set
+                                         (decision 112). */
     harness_open(&c);
     harness_start(VSR_START_NEW);
     CHECK(vsr_io_store_free_floor(h.store) == 0); /* No RECLAIM yet. */
     expect_completion(submit(txn_append_client(1, 2, 16, a, 1)), VSR_IO_OK);
     expect_completion(submit(txn_append_client(2, 1, 16, b, 1)), VSR_IO_OK);
+    harness_run();
     expect_completion(submit(txn_append_client(3, 1, 16, a, 3)), VSR_IO_OK);
     expect_completion(submit_reclaim(2), VSR_IO_OK);
+    harness_run();
     CHECK(vsr_io_store_free_floor(h.store) == 1); /* Base 0 + 1. */
     vsr_io_store_base_set(h.store, x, 3); /* No records: nothing lower. */
     CHECK(h.store->client_base == 3);
     CHECK(vsr_io_store_free_floor(h.store) == 1); /* Op 1's record. */
     expect_completion(submit(txn_trim(4, 3)), VSR_IO_OK);
+    harness_run();
     CHECK(h.store->log_begin == 3 && h.store->retained_begin == 1);
     CHECK(client_of(a)->retained == 4 && client_of(b)->retained == 3);
     CHECK(vsr_io_store_free_floor(h.store) == 1);
@@ -3486,14 +3541,17 @@ static void test_floor(void)
     CHECK(h.store->retained_begin == 3 && op_ref(1)->op == 0);
     CHECK(vsr_io_store_free_floor(h.store) == 2); /* Op 3's record. */
     expect_completion(submit(txn_trim(5, 5)), VSR_IO_OK);
+    harness_run();
     CHECK(client_of(a) == NULL && client_of(b) == NULL);
     expect_completion(submit_reclaim(6), VSR_IO_OK);
     CHECK(h.store->log_begin == 5 && h.store->log_end == 5);
     CHECK(vsr_io_store_free_floor(h.store) == 4); /* Client base 3. */
     vsr_io_store_base_set(h.store, x, 5);
-    CHECK(vsr_io_store_free_floor(h.store) == 6); /* Everything. */
+    CHECK(vsr_io_store_free_floor(h.store) == 5); /* RECLAIM 6 as far as
+                                                     the media, 5 (112). */
     expect_completion(submit(txn_append_client(6, 1, 16, a, 9)), VSR_IO_OK);
     expect_completion(submit(txn_trim(7, 6)), VSR_IO_OK);
+    harness_run();
     CHECK(client_of(a) == NULL); /* Its retained entry was trimmed. */
     expect_completion(submit_reclaim(7), VSR_IO_OK);
     vsr_io_store_base_set(h.store, x, 7);
@@ -3501,6 +3559,7 @@ static void test_floor(void)
     /* A capture: its floor is the oldest record it copies. */
     expect_completion(submit(txn_clients(8, 1, &a, numbers, ops, 8)),
                       VSR_IO_OK);
+    harness_run();
     expect_completion(submit_reclaim(9), VSR_IO_OK);
     CHECK(vsr_io_store_snapshot_clients(h.store, out, 8) == 1);
     CHECK(out[0].id.hi == 0xA && out[0].record.sequence == 8);
@@ -3511,18 +3570,20 @@ static void test_floor(void)
     CHECK(h.store->capture_floor == UINT64_MAX);
     vsr_io_store_base_set(h.store, y, 9);
     CHECK(h.store->client_base == 9 && client_of(a)->base_offset == 100);
-    CHECK(vsr_io_store_free_floor(h.store) == 9);
+    CHECK(vsr_io_store_free_floor(h.store) == 8); /* RECLAIM 9 as far as 8. */
     CHECK(vsr_io_store_snapshot_clients(h.store, out, 8) == 1);
     CHECK(vsr_io_store_free_floor(h.store) == 8); /* The capture. */
     vsr_io_store_capture_end(h.store, none, 0);   /* Abandoned. */
-    CHECK(vsr_io_store_free_floor(h.store) == 9);
+    CHECK(vsr_io_store_free_floor(h.store) == 8);
     vsr_io_store_base_set(h.store, x, 9); /* A file not covering a. */
     CHECK(h.store->client_base == 7);
     CHECK(vsr_io_store_free_floor(h.store) == 8);
     /* A kept version binds below everything else. */
     expect_completion(submit(txn_append(9, 1, 16)), VSR_IO_OK);
     expect_completion(submit(txn_append(10, 1, 16)), VSR_IO_OK);
+    harness_run();
     expect_completion(submit(txn_truncate(11, 6, 0, 0)), VSR_IO_OK);
+    harness_run();
     CHECK(h.store->versions_count == 2 && h.store->log_end == 6);
     vsr_io_store_capture_offset(h.store, a, 100);
     vsr_io_store_base_set(h.store, y, 11);
@@ -3556,6 +3617,7 @@ static void test_free_segments(void)
     c.max_segments = 2;
     c.write_behind_bytes = c.segment_bytes;
     c.cache_bytes += c.segment_bytes;
+    c.sync_mode = VSR_IO_SYNC_DSYNC; /* Written is on media (112). */
     harness_open(&c);
     harness_start(VSR_START_NEW);
     while (h.store->current == 0) {
@@ -3570,12 +3632,14 @@ static void test_free_segments(void)
     vsr_io_store_free_segments(h.store);
     CHECK(h.store->segments[0].number == 1);
     expect_completion(submit(txn_trim(sequence, h.store->log_end)), VSR_IO_OK);
+    harness_run();
     sequence++;
     expect_completion(submit_reclaim(sequence), VSR_IO_OK);
     CHECK(h.store->segments[0].number == 1); /* Client base 0. */
     vsr_io_store_base_set(h.store, x, sequence - 1);
-    CHECK(vsr_io_store_free_floor(h.store) == sequence);
-    CHECK(sealed_at < sequence);
+    /* The RECLAIM of readable + 1 applies as far as the media. */
+    CHECK(vsr_io_store_free_floor(h.store) == sequence - 1);
+    CHECK(sealed_at < sequence - 1);
     vsr_io_store_free_segments(h.store);
     CHECK(h.store->segments[0].number == 0 &&
           h.store->segments[0].phase == VSR_IO_SEGMENT_FREEING);
@@ -3941,10 +4005,18 @@ static void expect_recovered(const struct config *c, uint64_t sequence)
 {
     const struct vsr_loaded *loaded = NULL;
     uint32_t lease = NONE;
+    int32_t status;
 
     disk_crash(false);
     harness_open_keep(c, true);
-    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    status = harness_recover(VSR_START_RECOVER, &loaded, &lease);
+    if (status != VSR_IO_OK || loaded->sequence != sequence) {
+        fprintf(stderr,
+                "recovered: status %d sequence %" PRIu64 ", expected %" PRIu64
+                "\n",
+                status, status == VSR_IO_OK ? loaded->sequence : 0, sequence);
+    }
+    CHECK(status == VSR_IO_OK);
     CHECK(loaded->sequence == sequence && loaded->count == 1);
     CHECK(((const struct vsr_recovered *)loaded->items)->sequence == sequence);
     release_lease(lease);
@@ -4105,10 +4177,15 @@ static void test_recover_torn(void)
             resume ==
             round_up(txns[expected].file_offset + txns[expected].bytes, BLOCK));
         /* The next record goes to that block; the model would trap a
-         * rewrite below it. */
+         * rewrite below it. The bytes after the last valid record in its
+         * block (a torn record's head, when one straddles the tear) are
+         * dead: the next recovery skips them to find that record
+         * (decision 110). */
         expect_completion(submit(txn_append(expected + 1, 1, 8)), VSR_IO_OK);
         harness_run();
         CHECK(txns[expected + 1].file_offset == resume);
+        snapshot_take();
+        expect_recovered(&c, expected + 1);
         harness_close();
         if (tear == blocks) {
             CHECK(expected == 8);
@@ -4215,7 +4292,10 @@ static void test_recover_floor(void)
     disk_image[txns[6].file_offset + 60] ^= 0xFF;
     expect_corrupt(&c);
     harness_close();
-    /* A bad PAD after record 8 cuts at 8; after record 4 it is CORRUPT. */
+    /* A bad PAD (its length is not CRC-covered) after record 8, or after
+     * record 4 below F, is the dead tail of its block: the chain resumes
+     * with record 9, or 5, at the next block (decision 110); the
+     * recovered log is whole. */
     harness_open(&c);
     harness_start(VSR_START_NEW);
     plain_run(10, 6);
@@ -4223,7 +4303,8 @@ static void test_recover_floor(void)
     CHECK(pad % BLOCK != 0 &&
           vsr_io_get_u32(disk_image + pad) == VSR_IO_PAD_MAGIC);
     vsr_io_put_u32(disk_image + pad + 4, BLOCK); /* Past the block. */
-    expect_recovered(&c, 8);
+    expect_recovered(&c, 10);
+    CHECK(h.store->recovery.durable_floor == 6);
     harness_close();
     harness_open(&c);
     harness_start(VSR_START_NEW);
@@ -4231,7 +4312,17 @@ static void test_recover_floor(void)
     pad = txns[4].file_offset + txns[4].bytes;
     CHECK(pad % BLOCK != 0);
     vsr_io_put_u32(disk_image + pad + 4, 8); /* Short of the block. */
-    expect_corrupt(&c);
+    expect_recovered(&c, 10);
+    harness_close();
+    /* A bad PAD at a block boundary (the PAD of a write whose last
+     * record filled its block) ends the chain there. */
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(10, 6);
+    vsr_io_put_u32(disk_image + txns[9].file_offset, VSR_IO_PAD_MAGIC);
+    vsr_io_put_u32(disk_image + txns[9].file_offset + 4, 8);
+    CHECK(txns[9].file_offset % BLOCK == 0);
+    expect_recovered(&c, 8);
     harness_close();
     /* CRC-valid bytes whose content contradicts the log (an APPEND not
      * at the log end) are CORRUPT wherever they lie. */
@@ -4619,14 +4710,2054 @@ static void test_recover_modes(void)
     harness_close();
 }
 
-/* Names the test that fails. */
+/* An APPEND at `sequence` of exactly `bytes` record bytes, found over
+ * the entry count and body size. */
+static const struct txn *append_of(uint64_t sequence, uint64_t bytes)
+{
+    for (uint32_t count = 1; count <= 4; ++count) {
+        for (size_t body = 0; body <= 256; body += 8) {
+            const struct txn *t = txn_append(sequence, count, body);
+
+            if (t->bytes == bytes) {
+                return t;
+            }
+        }
+    }
+    CHECK(false);
+    return NULL;
+}
+
+/* The ring's wrap pads the file too: a record that fits the segment by
+ * its own bytes but not with the padding of the block the wrap closes
+ * seals the segment instead of overrunning it (the seal rule counts the
+ * padding). The ring is a block shorter than the segment; writes bring
+ * the head to a block boundary a couple of blocks before the ring's end,
+ * three unwritten records bring it 200 bytes before it, and a 600-byte
+ * record then needs 200 bytes of padding plus itself: 400 over the
+ * segment's end. */
+static void test_wrap_seal(void)
+{
+    struct config c = base_config();
+    uint64_t ring = c.cache_bytes;
+    uint64_t sequence = 1;
+    uint64_t target;
+
+    c.segment_bytes = ring + BLOCK;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    CHECK(h.store->ring_size == ring && h.store->head == h.header_bytes);
+    expect_completion(submit(txn_identity(sequence++, VSR_MEMBER_FULL)),
+                      VSR_IO_OK);
+    harness_run();
+    /* Each small record written alone pads to its block. */
+    while (h.store->head < ring - 2 * BLOCK) {
+        expect_completion(submit(txn_append(sequence++, 1, 8)), VSR_IO_OK);
+        harness_run();
+        CHECK(h.store->head % BLOCK == 0);
+    }
+    CHECK(h.store->head == ring - 2 * BLOCK && h.store->current == 0);
+    CHECK(h.store->segments[0].used == h.store->head);
+    target = ring - 200;
+    while (h.store->head < target) {
+        uint64_t left = target - h.store->head;
+        uint64_t bytes = left > UINT64_C(384) ? 272 : left;
+
+        expect_completion(submit(append_of(sequence++, bytes)), VSR_IO_OK);
+    }
+    CHECK(h.store->head == target && h.store->head % BLOCK == 312);
+    CHECK(h.store->segments[0].used + 600 <= c.segment_bytes);
+    expect_completion(submit(append_of(sequence++, 600)), VSR_IO_OK);
+    CHECK(h.store->current == 1); /* Sealed: 200 of padding and 600. */
+    CHECK(h.store->segments[0].used <= c.segment_bytes);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_SEALED);
+    CHECK(h.store->file_head <= slot_offset(1) + c.segment_bytes);
+    harness_run();
+    CHECK(h.store->written == sequence - 1);
+    harness_close();
+}
+
+/* A record ending exactly at the ring's end needs no wrap gap, but the
+ * next one goes to the ring's start: it begins a new extent, so the bytes
+ * on either side of the end are two writes, each contiguous in the ring
+ * (a single write from before the end read the superblock copies that
+ * follow the ring into the file, or ran past the tail region). Found by a
+ * random walk: a flushed record's block held a superblock image. */
+static void test_wrap_exact(void)
+{
+    struct config c = base_config();
+    uint64_t ring = c.cache_bytes;
+    uint64_t sequence = 1;
+
+    c.segment_bytes = ring + 2 * BLOCK;
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(sequence++, VSR_MEMBER_FULL));
+    /* Each small record written alone pads to its block. */
+    while (h.store->head < ring - 2 * BLOCK) {
+        store_run(txn_append(sequence++, 1, 8));
+        CHECK(h.store->head % BLOCK == 0);
+    }
+    CHECK(h.store->head == ring - 2 * BLOCK && h.store->current == 0);
+    /* Unwritten records up to the ring's end exactly, then one more. */
+    while (h.store->head < ring) {
+        uint64_t left = ring - h.store->head;
+
+        expect_completion(
+            submit(append_of(sequence++, left > 384 ? 272 : left)), VSR_IO_OK);
+    }
+    CHECK(h.store->head == ring && h.store->issued == ring - 2 * BLOCK);
+    expect_completion(submit(txn_append(sequence++, 1, 8)), VSR_IO_OK);
+    CHECK(h.store->head > ring && h.store->current == 0);
+    harness_run(); /* The disk model checks each write's ring range. */
+    CHECK(h.store->written == sequence - 1);
+    snapshot_take();
+    expect_recovered(&c, sequence - 1);
+    harness_close();
+}
+
+/* A record of a later run behind an older run's record it does not
+ * follow (decision 116). Run 1 packs A at k + 1, two blocks from a block
+ * boundary, and a crash tears its write after the first block, which
+ * recovery's flush persists; run 2 packs A' at k + 1, of A's length and
+ * bytes past the first block (only its entries' clients differ), then B'
+ * at k + 2 in the second block, and a crash keeps that block but loses
+ * the first: A's first block and A''s tail read as A, CRC-valid, and B'
+ * (run 2, flushed k) followed it. The chain now ends at A: run 2's
+ * recovery made k durable and recovered nothing after it, so a run-2
+ * record behind k + 1 is not its successor. */
+static void test_recover_splice(void)
+{
+    struct config c = plain_config();
+    const struct vsr_loaded *loaded = NULL;
+    const struct vsr_entry *entry;
+    struct vsr_id x = {0x77, 1};
+    const struct txn *t;
+    uint32_t lease = NONE;
+    uint64_t offset;
+    uint64_t k = 4;
+    uint64_t op;
+    uint32_t at;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    plain_run(k, k);
+    t = txn_append(k + 1, 2, 256); /* Clients 0x1000 and 0x1001. */
+    CHECK(t->bytes > BLOCK && t->bytes <= 2 * BLOCK);
+    disk.tear_armed = 1;
+    disk.tear_blocks = 1;
+    expect_completion(submit(t), VSR_IO_OK);
+    offset = txns[k + 1].file_offset;
+    CHECK(offset % BLOCK == 0);
+    harness_run(); /* The write is torn: its completion never comes. */
+    expect_recovered(&c, k);
+    CHECK(h.store->file_head == offset && h.store->run == 2);
+    /* Run 2: A' and B' in one write over A's blocks. */
+    t = txn_append_client(k + 1, 2, 256, x, 1);
+    CHECK(t->bytes == txns[k + 1].bytes);
+    expect_completion(submit(t), VSR_IO_OK);
+    expect_completion(submit(txn_append(k + 2, 1, 8)), VSR_IO_OK);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    CHECK(at != NONE && h.pending[at].sqe.offset == offset &&
+          h.pending[at].sqe.length == 2 * BLOCK);
+    harness_complete(at);
+    disk_lose_block(offset / BLOCK);
+    disk_crash(false);
+    harness_open_keep(&c, true);
+    CHECK(harness_recover(VSR_START_RECOVER, &loaded, &lease) == VSR_IO_OK);
+    CHECK(loaded->sequence == k + 1); /* A, not A' and B'. */
+    release_lease(lease);
+    op = load_log(k + 1, h.store->log_end - 2, h.store->log_end, 2,
+                  limits.message_bytes);
+    harness_run();
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 2);
+    entry = loaded->items;
+    CHECK(entry[0].request.client.hi == 0x1000 &&
+          entry[1].request.client.hi == 0x1001);
+    release_lease(lease);
+    harness_close();
+}
+
+/* Records of four entries until the current slot changes: the sequence
+ * that opened the new slot. */
+static uint64_t fill_slot(uint64_t sequence)
+{
+    uint32_t current = h.store->current;
+
+    while (h.store->current == current) {
+        store_run(txn_append(sequence++, 4, 250));
+    }
+    return sequence - 1;
+}
+
+/* Slot 0 freed with the superblock write naming slot 1 as the start
+ * dirty, slot 1 full: the transaction returned (at the next sequence)
+ * needs slot 0. Slot 0 holds sequence 1 and the records up to the one
+ * that opened slot 1; a TRIM, a capture and its PUBLISH, a SYNC and a
+ * RECLAIM put every floor term above it; the records that filled slot 1
+ * after the SYNC are written, not flushed. */
+static const struct txn *freeing_setup(const struct config *c)
+{
+    struct vsr_id x = {0x51, 1};
+    const struct txn *t;
+    uint64_t published;
+    uint64_t sequence;
+    uint64_t op;
+
+    harness_open(c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    sequence = fill_slot(2); /* Opened slot 1. */
+    CHECK(h.store->current == 1 && h.store->segments[0].number == 1);
+    store_run(txn_trim(++sequence, h.store->log_end - 1));
+    harness_capture(x);
+    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    published = sequence;
+    for (;;) {
+        t = txn_append(++sequence, 4, 250);
+        CHECK(h.store->head % BLOCK == 0); /* No wrap padding to count. */
+        if (h.store->segments[1].used + t->bytes > c->segment_bytes) {
+            break;
+        }
+        store_run(t);
+    }
+    CHECK(h.store->written > h.store->flushed); /* Unflushed records. */
+    expect_completion(submit_reclaim(published), VSR_IO_OK);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FREEING);
+    CHECK(h.store->start_slot == 1 && h.store->superblock_dirty == 1);
+    return t;
+}
+
+/* Completes every pending WRITE, prepares, and again until none is. */
+static void complete_writes(void)
+{
+    harness_prepare();
+    for (uint32_t at = pending_of(VSR_IO_SQE_WRITE); at != NONE;
+         at = pending_of(VSR_IO_SQE_WRITE)) {
+        harness_complete(at);
+        harness_prepare();
+    }
+}
+
+/* A freed slot is reused only once the superblock naming the new start
+ * segment is on media (decision 111): in FDATASYNC mode the write's
+ * completion makes the slot FLUSHING, the store asks for a flush of its
+ * own, and the completion of a flush issued after that makes it FREE; a
+ * STORE needing the slot waits meanwhile. Variants: a crash that loses
+ * the superblock's unflushed block (the older copy names segment 1 in
+ * slot 0, which must still be there: reusing the slot at the write's
+ * completion made this recovery a false CORRUPT); the flush freeing the
+ * slot for the held STORE; a SYNC naming the held STORE's sequence (the
+ * store's own flush does not wait for it: that would never end); a
+ * flush issued before the write completed, which does not count. */
+static void test_freeing_flush(void)
+{
+    struct config c = script_config(VSR_IO_SYNC_FDATASYNC);
+    struct vsr_io_completion completion;
+    const struct txn *t;
+    uint64_t superblock_at;
+    uint64_t store_op;
+    uint64_t op;
+    uint32_t at;
+
+    c.max_segments = 2;
+    /* The crash. */
+    t = freeing_setup(&c);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_WRITE);
+    CHECK(at != NONE && h.pending[at].sqe.offset < 2 * BLOCK);
+    superblock_at = h.pending[at].sqe.offset;
+    harness_complete(at);
+    (void)submit(t);
+    complete_writes();
+    snapshot_take();
+    disk_lose_block(superblock_at / BLOCK);
+    expect_recovered(&c, t->store.sequence - 1); /* Held, never packed. */
+    CHECK(h.store->start_slot == 0 && h.store->segments[0].number == 1);
+    harness_close();
+    /* The flush frees the slot and the held STORE takes it. */
+    t = freeing_setup(&c);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
+    store_op = submit(t);
+    CHECK(h.store->stores_count == 1);
+    CHECK(harness_prepare() == 1);
+    at = pending_of(VSR_IO_SQE_FSYNC);
+    CHECK(at != NONE);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
+    harness_complete(at);
+    CHECK(h.store->stores_count == 0 && h.store->current == 0);
+    CHECK(h.store->segments[0].number > 2 &&
+          h.store->segments[0].phase == VSR_IO_SEGMENT_HEADER);
+    expect_completion(store_op, VSR_IO_OK);
+    harness_run();
+    expect_no_completion();
+    harness_close();
+    /* A SYNC of the held sequence: the flush the SYNCs wait for needs
+     * that STORE written, the STORE needs the slot. */
+    t = freeing_setup(&c);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    store_op = submit(t);
+    op = submit_sync(t->store.sequence);
+    harness_run();
+    expect_completion(store_op, VSR_IO_OK);
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->flushed == t->store.sequence);
+    harness_close();
+    /* A flush in flight when the write completes was issued before it:
+     * the slot waits for the next one. */
+    t = freeing_setup(&c);
+    op = submit_sync(t->store.sequence - 1);
+    harness_poll(); /* No sync delay: the flush is due. */
+    CHECK(harness_prepare() == 2);
+    harness_complete(pending_of(VSR_IO_SQE_WRITE));
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
+    store_op = submit(t);
+    harness_complete(pending_of(VSR_IO_SQE_FSYNC));
+    expect_completion(op, VSR_IO_OK);
+    CHECK(h.store->segments[0].phase == VSR_IO_SEGMENT_FLUSHING);
+    CHECK(h.store->stores_count == 1);
+    CHECK(harness_prepare() == 1);
+    harness_complete(pending_of(VSR_IO_SQE_FSYNC));
+    CHECK(h.store->stores_count == 0 && h.store->current == 0);
+    expect_completion(store_op, VSR_IO_OK);
+    harness_run();
+    while (next_completion(&completion)) {
+        CHECK(false);
+    }
+    harness_close();
+}
+
+/* Completes pending SQEs, preparing more, until only the WRITE starting
+ * at file offset `lost` is left: the write a crash then loses. */
+static void run_except(uint64_t lost)
+{
+    for (unsigned rounds = 0; rounds < 1000; ++rounds) {
+        uint32_t found = NONE;
+
+        harness_poll();
+        harness_prepare();
+        for (uint32_t i = 0; i < PENDING_MAX && found == NONE; ++i) {
+            if (h.pending[i].state == 1 &&
+                (h.pending[i].sqe.opcode != VSR_IO_SQE_WRITE ||
+                 h.pending[i].sqe.offset != lost)) {
+                found = i;
+            }
+        }
+        if (found == NONE) {
+            return;
+        }
+        harness_complete(found);
+    }
+    CHECK(false);
+}
+
+/* Slot 0 holds sequence 1, a CLIENTS record of client 0xC at 2 and the
+ * records up to the one that opened slot 1, whose sequence is returned;
+ * two slots at most. */
+static uint64_t media_setup(const struct config *c)
+{
+    struct vsr_id client = {0xC, 1};
+    uint64_t number = 1;
+    uint64_t op = 1;
+    uint64_t sequence;
+
+    harness_open(c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_clients(2, 1, &client, &number, &op, 16));
+    sequence = fill_slot(3);
+    CHECK(h.store->current == 1 && h.store->segments[0].number == 1);
+    return sequence;
+}
+
+/* A crash that loses every unflushed block, then the recovery of
+ * `sequence`, whose log and clients read back as before (the snapshot
+ * check). */
+static void crash_recover(const struct config *c, uint64_t sequence)
+{
+    disk_crash(true);
+    expect_recovered(c, sequence);
+    CHECK(h.store->reclaimed == 0 && h.store->client_base_pending == 0);
+}
+
+/* The freeing floor counts the RECLAIM revision and the client base as
+ * of the sequence on media (decision 112): a crash can bring back any
+ * revision from there on, whose row must be served whole. Each part
+ * puts a change above the media with its record's write still out, lets
+ * everything else complete (the superblock naming a new start segment
+ * and the flush after it, when a slot was freed) and crashes, losing
+ * that write: the recovered row needs slot 0, which freeing by the
+ * RECLAIM or the base as they stood in memory gave up. Then the terms
+ * follow a SYNC, and a STORE finding nothing to free while a term waits
+ * holds and gets the flush it needs rather than failing. */
+static void test_reclaim_media(void)
+{
+    struct vsr_id x = {0x51, 1};
+
+    for (uint32_t mode = 0; mode < 2; ++mode) {
+        struct config c = script_config(mode == 0 ? VSR_IO_SYNC_FDATASYNC
+                                                  : VSR_IO_SYNC_DSYNC);
+        const struct txn *t;
+        uint64_t reclaimed;
+        uint64_t retained;
+        uint64_t sequence;
+        uint64_t pending;
+        uint64_t floor;
+        uint64_t op;
+        uint32_t phase;
+
+        c.max_segments = 2;
+        /* The RECLAIM term: the base covers client 0xC's record, the
+         * TRIM and its RECLAIM are above the media. */
+        sequence = media_setup(&c);
+        harness_capture(x);
+        store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+        op = submit_sync(sequence);
+        harness_run();
+        expect_completion(op, VSR_IO_OK);
+        t = txn_trim(++sequence, h.store->log_end - 1);
+        expect_completion(submit(t), VSR_IO_OK); /* Packed, not written. */
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        reclaimed = h.store->reclaimed;
+        retained = h.store->retained_begin;
+        floor = vsr_io_store_free_floor(h.store);
+        phase = h.store->segments[0].phase;
+        run_except(t->file_offset);
+        crash_recover(&c, sequence - 1);
+        harness_close();
+        /* What kept slot 0 (checked after the recovery, the verdict). */
+        CHECK(reclaimed == sequence - 1 && retained == 1);
+        CHECK(floor == 3 && phase == VSR_IO_SEGMENT_SEALED); /* Op 1. */
+        /* The base term: the TRIM and its RECLAIM are on media, the
+         * PUBLISH of a base covering client 0xC's record is not. */
+        sequence = media_setup(&c);
+        store_run(txn_trim(++sequence, h.store->log_end - 1));
+        op = submit_sync(sequence);
+        harness_run();
+        expect_completion(op, VSR_IO_OK);
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        CHECK(vsr_io_store_free_floor(h.store) == 1); /* Base 0 + 1. */
+        harness_capture(x);
+        t = txn_publish(++sequence, x, h.store->log_end - 1);
+        expect_completion(submit(t), VSR_IO_OK);
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        CHECK(h.store->client_base == sequence - 1);
+        pending = h.store->client_base_pending;
+        floor = h.store->client_base_floor;
+        phase = h.store->segments[0].phase;
+        run_except(t->file_offset);
+        crash_recover(&c, sequence - 1);
+        harness_close();
+        CHECK(pending == sequence && floor == 0);
+        CHECK(phase == VSR_IO_SEGMENT_SEALED);
+        /* The SYNC of the PUBLISH lets both terms through. */
+        sequence = media_setup(&c);
+        store_run(txn_trim(++sequence, h.store->log_end - 1));
+        harness_capture(x);
+        store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        CHECK(h.store->segments[0].number == 1 ||
+              mode == 1); /* O_DSYNC: on media once written. */
+        op = submit_sync(sequence);
+        harness_run();
+        expect_completion(op, VSR_IO_OK);
+        CHECK(h.store->reclaimed == sequence);
+        CHECK(h.store->client_base_floor == sequence - 1 &&
+              h.store->client_base_pending == 0);
+        CHECK(h.store->segments[0].number == 0 &&
+              h.store->segments[0].phase == VSR_IO_SEGMENT_FREE);
+        harness_close();
+        if (mode == 1) {
+            continue;
+        }
+        /* A STORE that needs a slot while only a term waiting for the
+         * media keeps slot 0: held, and the store flushes on its own. */
+        sequence = media_setup(&c);
+        store_run(txn_trim(++sequence, h.store->log_end - 1));
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        harness_capture(x);
+        store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+        expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+        CHECK(h.store->segments[0].number == 1);
+        CHECK(disk.flushes == 0 && h.store->syncs_count == 0);
+        while (h.store->current == 1) {
+            op = submit(txn_append(++sequence, 4, 250));
+            harness_run();
+            expect_completion(op, VSR_IO_OK);
+        }
+        CHECK(h.store->current == 0 && disk.flushes >= 2);
+        CHECK(h.store->client_base_floor == h.store->client_base);
+        harness_close();
+    }
+}
+
+/* A client's completed record whose slot was freed under the base (the
+ * base term of the floor lets it go) and reused: the ring's extents of
+ * the new segment cover the old record's file range with other bytes, so
+ * a CLIENT load reads the base file, and a capture copies the record from
+ * it (sequence 0, the base offset). Found by a random walk: the load came
+ * back CORRUPT from the new segment's bytes. */
+static void test_client_freed(void)
+{
+    struct config c = script_config(VSR_IO_SYNC_FDATASYNC);
+    struct vsr_io_client_snapshot out[4];
+    struct vsr_id client = {0xC, 1};
+    struct vsr_id x = {0x51, 1};
+    struct vsr_id none = {0, 0};
+    struct vsr_io_piece piece;
+    const struct vsr_client_record *record;
+    const struct vsr_loaded *loaded;
+    uint32_t lease = NONE;
+    uint64_t base_offset;
+    uint64_t sequence;
+    uint64_t op;
+
+    c.max_segments = 2;
+    sequence = media_setup(&c); /* Client 0xC's record at 2, in slot 0. */
+    store_run(txn_trim(++sequence, h.store->log_end - 1));
+    harness_capture(x);
+    store_run(txn_publish(++sequence, x, h.store->log_end - 1));
+    base_offset = client_of(client)->base_offset;
+    CHECK(base_offset != UINT64_MAX && h.store->client_base == sequence - 1);
+    op = submit_sync(sequence);
+    harness_run();
+    expect_completion(op, VSR_IO_OK);
+    expect_completion(submit_reclaim(sequence), VSR_IO_OK);
+    harness_run();
+    CHECK(h.store->segments[0].number == 0 &&
+          h.store->segments[0].phase == VSR_IO_SEGMENT_FREE);
+    /* Slot 0 reused past the old record's bytes, still in the ring. */
+    while (h.store->current != 0 ||
+           h.store->file_head < txns[2].file_offset + txns[2].bytes) {
+        store_run(txn_append(++sequence, 1, 200));
+    }
+    CHECK(vsr_io_store_hot(h.store, txns[2].file_offset,
+                           (uint32_t)txns[2].bytes, &piece));
+    op = load_client(h.store->readable, client);
+    harness_run();
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    record = loaded->items;
+    CHECK(record->request.number == 1 && record->op == 1);
+    CHECK(record->result.data.size == 16 && record->result.data.count == 1 &&
+          memcmp(record->result.data.spans[0].data, txns[2].results[0], 16) ==
+              0);
+    release_lease(lease);
+    CHECK(vsr_io_store_snapshot_clients(h.store, out, 4) == 1);
+    CHECK(out[0].record.sequence == 0 && out[0].record.number == 1 &&
+          out[0].record.offset == base_offset);
+    CHECK(h.store->capture_floor == UINT64_MAX);
+    vsr_io_store_capture_end(h.store, none, 0);
+    harness_close();
+}
+
+/* A client's record newer than the base, evicted from the ring: the
+ * load reads it from the log, not the base file's older record, which
+ * base_offset still names (it is valid only for a record at or below the
+ * base). Found by a random walk: the load returned the older record. */
+static void test_client_newer(void)
+{
+    struct config c = base_config();
+    struct vsr_id client = {0xC, 1};
+    struct vsr_id x = {0x51, 1};
+    const struct vsr_client_record *record;
+    const struct vsr_loaded *loaded;
+    struct vsr_io_piece piece;
+    uint32_t lease = NONE;
+    uint64_t number = 1;
+    uint64_t sequence = 5;
+    uint64_t op = 1;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_append(2, 1, 16));
+    store_run(txn_clients(3, 1, &client, &number, &op, 16));
+    harness_capture(x);
+    store_run(txn_publish(4, x, 1));
+    CHECK(h.store->client_base == 3 &&
+          client_of(client)->base_offset != UINT64_MAX);
+    number = 2;
+    store_run(txn_clients(5, 1, &client, &number, &op, 24));
+    while (vsr_io_store_hot(h.store, txns[5].file_offset,
+                            (uint32_t)txns[5].bytes, &piece)) {
+        store_run(txn_append(++sequence, 4, 200));
+    }
+    op = load_client(h.store->readable, client);
+    harness_run();
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    record = loaded->items;
+    CHECK(record->request.number == 2 && record->result.data.size == 24);
+    CHECK(memcmp(record->result.data.spans[0].data, txns[5].results[0], 24) ==
+          0);
+    release_lease(lease);
+    harness_close();
+}
+
+/* A CLIENT load of a record the base file holds, queued behind a cold
+ * read, and a PUBLISH of a new capture packed meanwhile: the new file has
+ * the record at another offset and base_slot names it when the load is
+ * issued, so the load is resolved again then (it read the new file at
+ * the old offset and completed CORRUPT; the snapshot module's open item). */
+static void test_client_base_moved(void)
+{
+    struct config c = base_config();
+    struct vsr_id ids[3] = {{0xA, 1}, {0xB, 1}, {0xC, 1}};
+    struct vsr_id others[2];
+    struct vsr_id x1 = {0x61, 1};
+    struct vsr_id x2 = {0x62, 1};
+    uint64_t numbers[3] = {1, 1, 1};
+    uint64_t ops[3] = {1, 1, 1};
+    const struct vsr_client_record *record;
+    const struct base_feed *file;
+    const struct vsr_loaded *loaded;
+    struct vsr_io_piece piece;
+    struct vsr_id target;
+    uint32_t lease = NONE;
+    uint64_t sequence = 5;
+    uint64_t old_offset;
+    uint64_t log_op;
+    uint64_t op;
+    uint32_t index = NONE;
+
+    harness_open(&c);
+    harness_start(VSR_START_NEW);
+    store_run(txn_identity(1, VSR_MEMBER_FULL));
+    store_run(txn_append(2, 1, 16));
+    store_run(txn_clients(3, 3, ids, numbers, ops, 16));
+    harness_capture(x1);
+    store_run(txn_publish(4, x1, 1));
+    /* The file's last record is the target; the others grow before it. */
+    file = feed_of(x1, false);
+    CHECK(file != NULL && file->count == 3);
+    target = file->records[2].request.client;
+    old_offset = file->offsets[2];
+    for (uint32_t i = 0, n = 0; i < 3; ++i) {
+        if (ids[i].hi == target.hi) {
+            index = i;
+        } else {
+            others[n++] = ids[i];
+        }
+    }
+    CHECK(index != NONE);
+    numbers[0] = 2;
+    numbers[1] = 2;
+    store_run(txn_clients(sequence, 2, others, numbers, ops, 64));
+    while (vsr_io_store_hot(h.store, txns[3].file_offset,
+                            (uint32_t)txns[3].bytes, &piece)) {
+        store_run(txn_append(++sequence, 4, 200));
+    }
+    /* A cold LOG read in flight; the CLIENT load queues behind it. */
+    log_op = load_log(h.store->readable, 1, 2, 1, limits.message_bytes);
+    CHECK(harness_prepare() == 1 && pending_of(VSR_IO_SQE_READ) != NONE);
+    op = load_client(h.store->readable, target);
+    CHECK(h.store->loads_count == 2);
+    /* The new capture and its PUBLISH move the record in the base file. */
+    harness_capture(x2);
+    file = feed_of(x2, false);
+    CHECK(file->count == 3 && file->offsets[2] != old_offset);
+    expect_completion(submit(txn_publish(++sequence, x2, 1)), VSR_IO_OK);
+    harness_run();
+    (void)expect_loaded(log_op, VSR_IO_OK, &lease);
+    release_lease(lease);
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    CHECK(loaded->count == 1);
+    record = loaded->items;
+    CHECK(record->request.number == 1 && record->result.data.size == 16 &&
+          memcmp(record->result.data.spans[0].data, txns[3].results[index],
+                 16) == 0);
+    release_lease(lease);
+    harness_close();
+}
+
+/* -------------------------------------------------------------------------
+ * An independent reading of the image
+ *
+ * What the format promises recovery finds, computed from the raw bytes by
+ * the rules of docs/io-implementation.md sections 5 and 6.4 (decisions 48,
+ * 50 and 88) and nothing of the store's scanner: the random walk and the
+ * recovery fuzzer compare the store's verdict with it.
+ * ---------------------------------------------------------------------- */
+
+#define CHECKED_SLOTS 8u
+#define CHECKED_OPS 4096u /* Ops the checker tracks: the walk's. */
+
+struct checked_header {
+    bool valid;
+    bool visited;
+    uint32_t run;
+    uint32_t flags;
+    uint64_t number;
+    uint64_t last_sequence;
+    uint64_t floor;
+};
+
+struct checked {
+    int32_t status; /* OK, NOT_FOUND or CORRUPT. */
+    uint64_t sequence;
+    uint64_t floor;
+    uint64_t resume;         /* File offset where writing resumes. */
+    uint32_t run;            /* Of the chain so far. */
+    uint32_t record_run;     /* Of its last record (the start header's). */
+    uint32_t superblock_run; /* The superblock's. */
+    uint32_t last_slot;      /* Slot of the last valid record, else the
+                                start's. */
+    uint32_t start_slot;
+    uint32_t slots;
+    uint64_t start_segment;
+    uint64_t number[CHECKED_SLOTS]; /* Live segment by slot; 0 when free. */
+    uint64_t log_begin; /* The log: the start header's, then as the chain's */
+    uint64_t log_end;   /* APPEND, TRUNCATE and TRIM changes move it. */
+    uint8_t appended[CHECKED_OPS]; /* Op appended by a replayed record. */
+    bool identity;
+    bool hard;
+};
+
+/* Bytes after a superblock's or a header's CRC (a superblock's reserved
+ * field included) are zero, or the block is not valid. */
+static bool checked_zero(const unsigned char *bytes, uint64_t size)
+{
+    for (uint64_t i = 0; i < size; ++i) {
+        if (bytes[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The valid superblock copy with the greater revision, or NULL. */
+static const unsigned char *checked_superblock(void)
+{
+    const unsigned char *best = NULL;
+    uint64_t revision = 0;
+
+    for (uint32_t copy = 0; copy < 2; ++copy) {
+        const unsigned char *b = disk_image + copy * BLOCK;
+
+        if (vsr_io_get_u32(b) != VSR_IO_SUPERBLOCK_MAGIC ||
+            vsr_io_get_u32(b + 4) != VSR_IO_STORE_FORMAT ||
+            vsr_io_get_u32(b + 96) != vsr_io_crc32c(0, b, 96) ||
+            !checked_zero(b + 100, BLOCK - 100)) {
+            continue;
+        }
+        if (best == NULL || vsr_io_get_u64(b + 16) > revision) {
+            best = b;
+            revision = vsr_io_get_u64(b + 16);
+        }
+    }
+    return best;
+}
+
+/* The header of `slot` when valid: magic, format, generation, a length
+ * within the header blocks and the CRC before it (section 5.2). */
+static void checked_header(uint32_t slot, uint64_t generation,
+                           struct checked_header *out)
+{
+    const unsigned char *b = disk_image + slot_offset(slot);
+    uint32_t length = vsr_io_get_u32(b + 24);
+
+    memset(out, 0, sizeof(*out));
+    if (vsr_io_get_u32(b) != VSR_IO_SEGMENT_MAGIC ||
+        vsr_io_get_u32(b + 4) != VSR_IO_STORE_FORMAT ||
+        vsr_io_get_u64(b + 8) != generation || length < 84 ||
+        length > h.header_bytes ||
+        vsr_io_get_u32(b + length - 4) != vsr_io_crc32c(0, b, length - 4) ||
+        !checked_zero(b + length, h.header_bytes - length)) {
+        return;
+    }
+    out->valid = true;
+    out->number = vsr_io_get_u64(b + 16);
+    out->flags = vsr_io_get_u32(b + 28);
+    out->run = vsr_io_get_u32(b + 32);
+    out->last_sequence = vsr_io_get_u64(b + 40);
+    out->floor = vsr_io_get_u64(b + 48);
+}
+
+/* The length of a CRC-valid record of `generation` at `at` with `left`
+ * bytes to the segment's end (section 5.3), or 0. */
+static uint32_t checked_record(const unsigned char *at, uint64_t left,
+                               uint64_t generation)
+{
+    uint32_t length;
+    uint32_t count;
+
+    if (left < 48 || vsr_io_get_u32(at) != VSR_IO_RECORD_MAGIC) {
+        return 0;
+    }
+    length = vsr_io_get_u32(at + 4);
+    if (length < 48 || length % 8 != 0 || length > left ||
+        length > h.max_record ||
+        vsr_io_get_u32(at + 44) != vsr_io_crc32c(0, at, 44) ||
+        vsr_io_get_u64(at + 16) != generation) {
+        return 0;
+    }
+    count = vsr_io_get_u32(at + 32);
+    if (count == 0 || count > VSR_MAX_STORE_CHANGES ||
+        48 + 24 * (uint64_t)count > length ||
+        vsr_io_get_u32(at + 40) != vsr_io_crc32c(0, at + 48, length - 48)) {
+        return 0;
+    }
+    return length;
+}
+
+/* Floors from the records starting in [from, limit) of a slot's data
+ * that ends at `end`: every aligned position is tried, a PAD running to
+ * its block's end is skipped (decision 88). */
+static void checked_sweep(const unsigned char *data, uint64_t from,
+                          uint64_t limit, uint64_t end, uint64_t generation,
+                          uint64_t *floor)
+{
+    uint64_t at = from;
+
+    while (at + 8 <= limit) {
+        uint32_t length;
+        uint64_t flushed;
+
+        if (vsr_io_get_u32(data + at) == VSR_IO_PAD_MAGIC &&
+            vsr_io_get_u32(data + at + 4) == BLOCK - at % BLOCK) {
+            at += BLOCK - at % BLOCK;
+            continue;
+        }
+        length = checked_record(data + at, end - at, generation);
+        if (length == 0) {
+            at += 8;
+            continue;
+        }
+        flushed = vsr_io_get_u64(data + at + 24);
+        if (flushed > *floor) {
+            *floor = flushed;
+        }
+        at += length;
+    }
+}
+
+/* A replayed change as the log sees it (section 6.3): an APPEND at the
+ * log's end, a TRUNCATE dropping the ops from `first`, a TRIM moving the
+ * begin (an empty log starts at the first op either names); IDENTITY and
+ * HARD_STATE are the state a log with records needs. The walk never
+ * RESTOREs, whose begin is in its payload. */
+static void checked_change(struct checked *c, uint32_t type, uint32_t count,
+                           uint64_t first)
+{
+    if ((type == VSR_STORE_APPEND || type == VSR_STORE_TRIM) &&
+        c->log_begin == 0 && c->log_end == 0) {
+        c->log_begin = first;
+        c->log_end = first;
+    }
+    switch (type) {
+    case VSR_STORE_APPEND:
+        for (uint64_t op = first; op < first + count; ++op) {
+            CHECK(op < CHECKED_OPS);
+            c->appended[op] = 1;
+        }
+        c->log_end = first + count;
+        break;
+    case VSR_STORE_TRUNCATE:
+        for (uint64_t op = first; op < c->log_end && op < CHECKED_OPS; ++op) {
+            c->appended[op] = 0;
+        }
+        if (first < c->log_end) {
+            c->log_end = first;
+        }
+        break;
+    case VSR_STORE_TRIM:
+        first = first < c->log_end ? first : c->log_end;
+        if (first > c->log_begin) {
+            c->log_begin = first;
+        }
+        break;
+    case VSR_STORE_IDENTITY:
+        c->identity = true;
+        break;
+    case VSR_STORE_HARD_STATE:
+        c->hard = true;
+        break;
+    default:
+        break;
+    }
+}
+
+/* The chain through the data of `slot` (step 5 of 6.4): a PAD to its
+ * block's end skips, a valid record continues when it is the next
+ * sequence with a run not below the last one; anything else inside a
+ * block is the dead tail of the last valid record's block, swept for
+ * floors and skipped (decision 110), at a block boundary it ends the
+ * chain; the rest of the slot is swept for floors. */
+static void checked_scan(struct checked *c, uint32_t slot, uint64_t generation)
+{
+    const unsigned char *data = disk_image + slot_offset(slot);
+    uint64_t end = h.options.segment_bytes;
+    uint64_t at = h.header_bytes;
+
+    while (at < end) {
+        uint64_t block_left = BLOCK - at % BLOCK;
+        uint64_t sequence;
+        uint64_t flushed;
+        uint32_t length;
+        uint32_t count;
+        uint32_t run;
+        bool next;
+
+        if (vsr_io_get_u32(data + at) == VSR_IO_PAD_MAGIC &&
+            vsr_io_get_u32(data + at + 4) == block_left) {
+            at += block_left;
+            continue;
+        }
+        length = checked_record(data + at, end - at, generation);
+        sequence = length != 0 ? vsr_io_get_u64(data + at + 8) : 0;
+        run = length != 0 ? vsr_io_get_u32(data + at + 36) : 0;
+        flushed = length != 0 ? vsr_io_get_u64(data + at + 24) : 0;
+        /* The next sequence, a run not below the chain's, and a later
+         * run's record carrying its predecessor as flushed (116). */
+        next = length != 0 && sequence == c->sequence + 1 && run >= c->run &&
+               (run <= c->record_run || flushed >= c->sequence);
+        if (!next) {
+            if (block_left == BLOCK) {
+                break;
+            }
+            checked_sweep(data, at, at + block_left, end, generation,
+                          &c->floor);
+            at += block_left;
+            continue;
+        }
+        count = vsr_io_get_u32(data + at + 32);
+        if (flushed > c->floor) {
+            c->floor = flushed;
+        }
+        c->sequence = sequence;
+        c->run = run;
+        c->record_run = run;
+        c->last_slot = slot;
+        c->resume = slot_offset(slot) + round_up(at + length, BLOCK);
+        for (uint32_t i = 0; i < count; ++i) {
+            const unsigned char *change = data + at + 48 + 24 * (uint64_t)i;
+
+            checked_change(c, vsr_io_get_u32(change),
+                           vsr_io_get_u32(change + 4),
+                           vsr_io_get_u64(change + 8));
+        }
+        at += length;
+    }
+    checked_sweep(data, at, end, end, generation, &c->floor);
+}
+
+/* The image as the checker reads it, on stderr (the walk's trace): the
+ * superblocks, each slot's header and every CRC-valid record or PAD at an
+ * aligned position of its data. */
+static void checked_dump(void)
+{
+    const unsigned char *sb = checked_superblock();
+    uint64_t generation = sb != NULL ? vsr_io_get_u64(sb + 8) : 0;
+    uint64_t slots = disk.size > 2 * BLOCK
+                         ? (disk.size - 2 * BLOCK) / h.options.segment_bytes
+                         : 0;
+
+    for (uint32_t copy = 0; copy < 2; ++copy) {
+        const unsigned char *b = disk_image + copy * BLOCK;
+
+        fprintf(stderr,
+                "image: superblock %u: revision %" PRIu64 " start %" PRIu64
+                "/%u run %u floor %" PRIu64 "%s\n",
+                copy, vsr_io_get_u64(b + 16), vsr_io_get_u64(b + 72),
+                vsr_io_get_u32(b + 80), vsr_io_get_u32(b + 84),
+                vsr_io_get_u64(b + 88), b == sb ? " (chosen)" : "");
+    }
+    for (uint32_t slot = 0; slot < slots && slot < CHECKED_SLOTS; ++slot) {
+        const unsigned char *data = disk_image + slot_offset(slot);
+        struct checked_header header;
+
+        checked_header(slot, generation, &header);
+        fprintf(stderr,
+                "image: slot %u: header %s segment %" PRIu64 " last %" PRIu64
+                " run %u floor %" PRIu64 "\n",
+                slot, header.valid ? "valid" : "invalid", header.number,
+                header.last_sequence, header.run, header.floor);
+        for (uint64_t at = h.header_bytes; at + 8 <= h.options.segment_bytes;
+             at += 8) {
+            uint32_t length = checked_record(
+                data + at, h.options.segment_bytes - at, generation);
+
+            if (length != 0) {
+                fprintf(stderr,
+                        "image:   %" PRIu64 ": record %" PRIu64 " run %u "
+                        "flushed %" PRIu64 " length %u\n",
+                        at, vsr_io_get_u64(data + at + 8),
+                        vsr_io_get_u32(data + at + 36),
+                        vsr_io_get_u64(data + at + 24), length);
+            } else if (vsr_io_get_u32(data + at) == VSR_IO_PAD_MAGIC) {
+                fprintf(stderr, "image:   %" PRIu64 ": pad %u\n", at,
+                        vsr_io_get_u32(data + at + 4));
+            }
+        }
+    }
+}
+
+/* The verdict on the image as it is now, under the harness
+ * configuration. */
+static void checked_image(struct checked *c)
+{
+    struct checked_header headers[CHECKED_SLOTS];
+    const unsigned char *sb = checked_superblock();
+    uint64_t generation;
+    uint32_t slot;
+
+    memset(c, 0, sizeof(*c));
+    memset(headers, 0, sizeof(headers));
+    c->status = VSR_IO_CORRUPT;
+    if (sb == NULL) {
+        return;
+    }
+    generation = vsr_io_get_u64(sb + 8);
+    if (vsr_io_get_u32(sb + 52) != BLOCK ||
+        vsr_io_get_u64(sb + 56) != h.options.segment_bytes ||
+        vsr_io_get_u32(sb + 64) != h.header_bytes / BLOCK) {
+        return;
+    }
+    CHECK(disk.size >= 2 * BLOCK);
+    c->slots = (uint32_t)((disk.size - 2 * BLOCK) / h.options.segment_bytes);
+    if (c->slots < vsr_io_get_u32(sb + 68)) {
+        return;
+    }
+    CHECK(c->slots <= CHECKED_SLOTS && c->slots <= h.options.max_segments);
+    c->superblock_run = vsr_io_get_u32(sb + 84);
+    c->floor = vsr_io_get_u64(sb + 88);
+    c->start_segment = vsr_io_get_u64(sb + 72);
+    c->start_slot = vsr_io_get_u32(sb + 80);
+    for (slot = 0; slot < c->slots; ++slot) {
+        checked_header(slot, generation, &headers[slot]);
+        if (headers[slot].valid && headers[slot].floor > c->floor) {
+            c->floor = headers[slot].floor;
+        }
+    }
+    slot = c->start_slot;
+    if (slot >= c->slots || !headers[slot].valid ||
+        headers[slot].number != c->start_segment) {
+        return;
+    }
+    headers[slot].visited = true;
+    c->sequence = headers[slot].last_sequence;
+    c->run = headers[slot].run;
+    c->record_run = headers[slot].run;
+    c->identity = (headers[slot].flags & VSR_IO_SEGMENT_STATE) != 0;
+    c->hard = c->identity;
+    c->log_begin = vsr_io_get_u64(disk_image + slot_offset(slot) + 64);
+    c->log_end = vsr_io_get_u64(disk_image + slot_offset(slot) + 72);
+    c->last_slot = slot;
+    c->resume = slot_offset(slot) + h.header_bytes;
+    for (;;) {
+        uint32_t best = NONE;
+
+        checked_scan(c, slot, generation);
+        for (uint32_t s = 0; s < c->slots; ++s) {
+            const struct checked_header *header = &headers[s];
+
+            if (header->valid && !header->visited &&
+                header->last_sequence == c->sequence && header->run >= c->run &&
+                (best == NONE || header->number > headers[best].number)) {
+                best = s;
+            }
+        }
+        if (best == NONE) {
+            break;
+        }
+        slot = best;
+        headers[slot].visited = true;
+        if (headers[slot].run > c->run) {
+            c->run = headers[slot].run;
+        }
+    }
+    for (uint32_t s = 0; s < c->slots; ++s) {
+        if (!headers[s].visited) {
+            checked_sweep(disk_image + slot_offset(s), h.header_bytes,
+                          h.options.segment_bytes, h.options.segment_bytes,
+                          generation, &c->floor);
+        }
+    }
+    if (c->sequence < c->floor) {
+        return;
+    }
+    if (c->sequence > 0 && !(c->identity && c->hard)) {
+        return;
+    }
+    /* Every op of the recovered log was replayed (decision 114). */
+    for (uint64_t op = c->log_begin; op < c->log_end; ++op) {
+        if (op >= CHECKED_OPS || c->appended[op] == 0) {
+            return;
+        }
+    }
+    for (uint32_t s = 0; s < c->slots; ++s) {
+        /* Visited and not an abandoned successor. */
+        if (headers[s].visited &&
+            (s == c->last_slot || headers[s].last_sequence < c->sequence)) {
+            c->number[s] = headers[s].number;
+        }
+    }
+    c->status = c->sequence == 0 ? VSR_IO_NOT_FOUND : VSR_IO_OK;
+}
+
+/* -------------------------------------------------------------------------
+ * Random walk
+ *
+ * A byte stream drives STOREs of every kind, SYNCs, RECLAIMs, LOADs (hot
+ * and cold), admissions and replies, idle time, and crashes with a torn
+ * write, lost unflushed blocks or flipped bytes, each followed by a
+ * recovery, against a model of the log and the clients' records built
+ * from the transaction table: what was acknowledged durable is recovered
+ * (unless bytes were flipped), the recovered verdict is the checker's,
+ * the recovered indexes are the pre-crash snapshot's and the segment
+ * table the checker's, everything the model holds reads back identically
+ * after every recovery and along the way, and the disk model's
+ * never-rewrite bits hold across crashes. The unit test drives it from a
+ * seeded generator, the recovery fuzzer from its input.
+ * ---------------------------------------------------------------------- */
+
+#define WALK_CLIENTS 3u
+#define WALK_OPS 4096u
+#define WALK_MAX_LOG 200u
+#define WALK_BYTES 4096u
+#define WALK_EXPECTED 64u
+
+enum walk_kind { WALK_STORE, WALK_SYNC, WALK_RECLAIM };
+
+struct walk_entry {
+    uint64_t sequence; /* Transaction that appended the op; 0 none. */
+    uint32_t index;
+};
+
+struct walk_client {
+    uint64_t sequence; /* Latest CLIENTS record: transaction, index. */
+    uint64_t number;
+    uint64_t op;
+    uint32_t index;
+};
+
+struct walk_stats {
+    uint64_t steps;
+    uint64_t stores;
+    uint64_t held;
+    uint64_t syncs;
+    uint64_t reclaims;
+    uint64_t loads;
+    uint64_t cold;
+    uint64_t captures;
+    uint64_t crashes;
+    uint64_t torn;
+    uint64_t lost;
+    uint64_t flips;
+    uint64_t recovered;
+    uint64_t not_found;
+    uint64_t corrupt;
+};
+
+struct walk {
+    struct config c;
+    const uint8_t *bytes;
+    size_t size;
+    size_t at;
+    uint64_t sequence;    /* Last submitted (or recovered) transaction. */
+    uint64_t durable_ack; /* Greatest sequence acknowledged durable. */
+    uint32_t captures;
+    bool trace;      /* VSR_WALK_TRACE set: every step on stderr. */
+    bool corrupting; /* Bytes flipped at the last crash. */
+    bool failed;     /* The store is fenced, or bytes were flipped: the
+                        walk is over. */
+    bool exhausted;  /* Out of snapshot ids: the walk is over. */
+    uint64_t log_begin;
+    uint64_t log_end;
+    struct walk_entry entries[WALK_OPS];
+    struct walk_client clients[WALK_CLIENTS];
+    uint64_t next_number[WALK_CLIENTS];
+    struct {
+        uint64_t op;
+        uint64_t sequence;
+        uint32_t kind;
+    } expected[WALK_EXPECTED];
+    uint32_t expected_count;
+    struct walk_stats stats;
+};
+
+static struct walk walk;
+static const struct vsr_id walk_ids[WALK_CLIENTS] = {
+    {0x21, 1}, {0x22, 1}, {0x23, 1}};
+
+static uint8_t walk_byte(void)
+{
+    if (walk.at >= walk.size) {
+        walk.at = walk.size + 1;
+        return 0;
+    }
+    return walk.bytes[walk.at++];
+}
+
+/* The configuration from the first byte: sync mode, records per segment,
+ * slots, write-behind, writes in flight. */
+static struct config walk_config(uint8_t bits)
+{
+    struct config c = base_config();
+    uint64_t header_bytes;
+    uint64_t max_record;
+    uint64_t records = 4 + ((bits >> 1) & 3);
+
+    derive(&header_bytes, &max_record);
+    c.segment_bytes = round_up(header_bytes + records * max_record, BLOCK);
+    c.segments = 2;
+    c.max_segments = 3 + ((bits >> 3) & 1);
+    c.write_behind_bytes = (bits & 0x20) != 0 ? 4 * BLOCK : 2 * BLOCK;
+    c.cache_bytes =
+        round_up(c.write_behind_bytes + limits.pinned_payload_bytes +
+                     2 * max_record + 2 * header_bytes + BLOCK,
+                 BLOCK);
+    c.inflight_writes = (bits & 0x40) != 0 ? 3 : 2;
+    c.sync_mode = (bits & 1) != 0 ? VSR_IO_SYNC_DSYNC : VSR_IO_SYNC_FDATASYNC;
+    return c;
+}
+
+static uint32_t walk_client_index(struct vsr_id id)
+{
+    for (uint32_t i = 0; i < WALK_CLIENTS; ++i) {
+        if (walk_ids[i].hi == id.hi && walk_ids[i].lo == id.lo) {
+            return i;
+        }
+    }
+    return NONE;
+}
+
+/* The model's step over transaction `sequence`. */
+static void walk_apply(uint64_t sequence)
+{
+    const struct txn *t = &txns[sequence];
+
+    for (uint32_t i = 0; i < t->store.count; ++i) {
+        const struct vsr_change *change = &t->store.changes[i];
+
+        switch (change->type) {
+        case VSR_STORE_APPEND:
+            for (uint32_t k = 0; k < change->count; ++k) {
+                const struct vsr_entry *entry = &t->entries[k];
+                uint32_t ci = walk_client_index(entry->request.client);
+
+                CHECK(entry->op < WALK_OPS);
+                walk.entries[entry->op].sequence = sequence;
+                walk.entries[entry->op].index = k;
+                if (ci != NONE &&
+                    entry->request.number >= walk.next_number[ci]) {
+                    walk.next_number[ci] = entry->request.number + 1;
+                }
+            }
+            walk.log_end = change->first + change->count;
+            break;
+        case VSR_STORE_TRUNCATE:
+            if (change->first < walk.log_end) {
+                walk.log_end = change->first;
+            }
+            break;
+        case VSR_STORE_TRIM:
+            if (change->first > walk.log_begin) {
+                walk.log_begin =
+                    change->first < walk.log_end ? change->first : walk.log_end;
+            }
+            break;
+        case VSR_STORE_CLIENTS:
+            for (uint32_t k = 0; k < change->count; ++k) {
+                const struct vsr_client_record *record = &t->records[k];
+                uint32_t ci = walk_client_index(record->request.client);
+
+                CHECK(ci != NONE);
+                if (record->request.number > walk.clients[ci].number) {
+                    walk.clients[ci].sequence = sequence;
+                    walk.clients[ci].number = record->request.number;
+                    walk.clients[ci].op = record->op;
+                    walk.clients[ci].index = k;
+                }
+                if (record->request.number >= walk.next_number[ci]) {
+                    walk.next_number[ci] = record->request.number + 1;
+                }
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    walk.sequence = sequence;
+}
+
+/* The model as of `sequence`, from the transactions 1..sequence. */
+static void walk_replay(uint64_t sequence)
+{
+    walk.log_begin = 1;
+    walk.log_end = 1;
+    memset(walk.entries, 0, sizeof(walk.entries));
+    memset(walk.clients, 0, sizeof(walk.clients));
+    for (uint32_t i = 0; i < WALK_CLIENTS; ++i) {
+        walk.next_number[i] = 1;
+    }
+    walk.sequence = 0;
+    for (uint64_t q = 1; q <= sequence; ++q) {
+        walk_apply(q);
+    }
+}
+
+static void walk_expect(uint64_t op, uint32_t kind, uint64_t sequence)
+{
+    CHECK(walk.expected_count < WALK_EXPECTED);
+    walk.expected[walk.expected_count].op = op;
+    walk.expected[walk.expected_count].kind = kind;
+    walk.expected[walk.expected_count].sequence = sequence;
+    walk.expected_count++;
+}
+
+/* Every queued completion must be an expected op, OK; a SYNC's sequence
+ * is acknowledged durable. */
+static void walk_drain(void)
+{
+    struct vsr_io_completion completion;
+
+    while (next_completion(&completion)) {
+        uint32_t at = NONE;
+
+        for (uint32_t i = 0; i < walk.expected_count; ++i) {
+            if (walk.expected[i].op == completion.op) {
+                at = i;
+            }
+        }
+        CHECK(at != NONE);
+        if (completion.status != VSR_IO_OK) {
+            fprintf(stderr, "walk: op %" PRIu64 " kind %" PRIu32 " status %d\n",
+                    completion.op, walk.expected[at].kind, completion.status);
+        }
+        CHECK(completion.status == VSR_IO_OK);
+        CHECK(completion.lease == NONE && completion.data == NULL);
+        if (walk.expected[at].kind == WALK_SYNC &&
+            walk.expected[at].sequence > walk.durable_ack) {
+            walk.durable_ack = walk.expected[at].sequence;
+        }
+        walk.expected[at] = walk.expected[walk.expected_count - 1];
+        walk.expected_count--;
+    }
+}
+
+/* Drives everything submitted to completion, a wanted base fed. */
+static void walk_settle(void)
+{
+    harness_run();
+    if (vsr_io_store_base_wanted(h.store, NULL, NULL)) {
+        feed_base();
+        harness_run();
+    }
+    walk_drain();
+}
+
+/* Room for one more op: the core never has more than `operations` ops
+ * outstanding (the store sizes its queues and completion ring by it), so
+ * the walk takes the completions, or waits for them, first. */
+static void walk_room(void)
+{
+    if (walk.expected_count + 1 >= limits.operations) {
+        walk_drain();
+    }
+    if (walk.expected_count + 1 >= limits.operations) {
+        walk_settle();
+    }
+}
+
+/* Submits a transaction: packed at once it is snapshotted now, held it
+ * is driven until it is. */
+static void walk_submit(const struct txn *t)
+{
+    uint64_t op;
+
+    walk_room();
+    op = submit(t);
+    walk_expect(op, WALK_STORE, t->store.sequence);
+    walk_apply(t->store.sequence);
+    walk.stats.stores++;
+    if (h.store->readable != t->store.sequence) {
+        walk.stats.held++;
+        walk_settle();
+        CHECK(h.store->readable == t->store.sequence);
+    }
+    snapshot_take();
+}
+
+static uint64_t walk_checkpoint_op(void)
+{
+    return walk.log_end > 1 ? walk.log_end - 1 : 1;
+}
+
+/* The transaction of a STORE step: its kind from the action, its shape
+ * from `arg`; a log grown long is trimmed instead, a truncation with
+ * many versions kept becomes an append. */
+static const struct txn *walk_txn(uint8_t action, uint8_t arg)
+{
+    uint64_t q = walk.sequence + 1;
+    uint64_t begin = walk.log_begin;
+    uint64_t end = walk.log_end;
+    struct vsr_id ids[2];
+    uint64_t numbers[2];
+    uint64_t ops[2];
+    uint32_t ci = arg % WALK_CLIENTS;
+    uint32_t count = 1 + ((arg >> 2) & 3);
+    size_t body = (size_t)(arg >> 2) * 4;
+    struct txn *t;
+
+    if (q == 1) {
+        return txn_identity(1, VSR_MEMBER_FULL);
+    }
+    if (end - begin > WALK_MAX_LOG) {
+        return txn_trim(q, end - 1);
+    }
+    switch (action) {
+    case 4:
+        t = txn_begin(q);
+        txn_entries(t, end, 1 + ((arg >> 2) % 3), body, walk_ids[ci],
+                    walk.next_number[ci]);
+        return txn_finish(t);
+    case 5:
+        if (end - 1 <= begin || h.store->versions_count > 100) {
+            break;
+        }
+        t = txn_begin(q);
+        txn_add(t, VSR_STORE_TRUNCATE,
+                end - 1 - (arg % 3) < begin + 1 ? begin + 1
+                                                : end - 1 - (arg % 3),
+                0, NULL);
+        if ((arg & 0x80) != 0) {
+            struct vsr_id none = {0, 0};
+
+            txn_entries(t, t->changes[0].first, count, body, none, 0);
+        }
+        return txn_finish(t);
+    case 6:
+        if (end <= begin + 1) {
+            break;
+        }
+        return txn_trim(q, begin + 1 + (arg % 4) < end ? begin + 1 + (arg % 4)
+                                                       : end - 1);
+    case 7:
+        ids[0] = walk_ids[ci];
+        ids[1] = walk_ids[(ci + 1) % WALK_CLIENTS];
+        numbers[0] = walk.next_number[ci];
+        numbers[1] = walk.next_number[(ci + 1) % WALK_CLIENTS];
+        ops[0] = walk_checkpoint_op();
+        ops[1] = ops[0];
+        return txn_clients(q, 1 + ((arg >> 2) & 1), ids, numbers, ops,
+                           (size_t)(arg >> 3) % 65);
+    case 8:
+        return txn_hard(q, VSR_MEMBER_FULL);
+    default:
+        break;
+    }
+    return txn_append(q, count, body);
+}
+
+/* A capture of the table under a fresh id, then its PUBLISH. */
+static void walk_publish(void)
+{
+    struct vsr_id id = {0x60 + walk.captures, 1};
+
+    if (walk.sequence == 0) {
+        walk_submit(walk_txn(0, 8));
+        return;
+    }
+    if (walk.captures + 1 >= FEEDS) {
+        walk.exhausted = true;
+        return;
+    }
+    walk_settle();
+    harness_capture(id);
+    walk.captures++;
+    walk.stats.captures++;
+    walk_submit(txn_publish(walk.sequence + 1, id, walk_checkpoint_op()));
+    walk_settle();
+}
+
+static void walk_reclaim(uint64_t oldest)
+{
+    walk_room();
+    walk_expect(submit_reclaim(oldest), WALK_RECLAIM, oldest);
+    walk.stats.reclaims++;
+}
+
+/* A SYNC of `sequence`. */
+static void walk_sync(uint64_t sequence)
+{
+    walk_room();
+    walk_expect(submit_sync(sequence), WALK_SYNC, sequence);
+    walk.stats.syncs++;
+}
+
+/* What the core does so that slots free: once no slot is free, a fresh
+ * record at the log's end, a TRIM to it, a capture and its PUBLISH, a
+ * RECLAIM after each; then everything but the current slot is below
+ * the floor. */
+static void walk_housekeep(void)
+{
+    if (walk.sequence == 0 || walk.exhausted) {
+        return;
+    }
+    for (uint32_t slot = 0; slot < h.store->slots; ++slot) {
+        uint32_t phase = h.store->segments[slot].phase;
+
+        if (phase == VSR_IO_SEGMENT_FREE || phase == VSR_IO_SEGMENT_FREEING) {
+            return;
+        }
+    }
+    walk_settle();
+    walk_submit(txn_append(walk.sequence + 1, 1, 8));
+    walk_reclaim(h.store->readable);
+    walk_settle();
+    walk_submit(txn_trim(walk.sequence + 1, walk.log_end - 1));
+    walk_reclaim(h.store->readable);
+    walk_settle();
+    walk_publish();
+    walk_reclaim(h.store->readable);
+    walk_settle();
+}
+
+/* The base file of the current base, as the snapshot module keeps it
+ * open: rewritten from its feed after a recovery. */
+static void feed_install(struct vsr_id id)
+{
+    struct base_feed *file = feed_of(id, false);
+
+    CHECK(file != NULL);
+    base_file_write(file->records, file->count, file->offsets);
+}
+
+/* [first, end) of the log reads back as the model's entries. */
+static void walk_check_log(uint64_t first, uint64_t end)
+{
+    const struct vsr_loaded *loaded;
+    const struct vsr_entry *entries;
+    uint32_t reads = disk.reads;
+    uint32_t lease = NONE;
+
+    while (first < end) {
+        uint64_t op =
+            load_log(h.store->readable, first, end, 4, limits.message_bytes);
+
+        harness_run();
+        loaded = expect_loaded(op, VSR_IO_OK, &lease);
+        /* A cold batch is cut to a slab: at least one entry comes. */
+        CHECK(loaded->count >= 1 && loaded->count <= end - first);
+        CHECK(loaded->next == first + loaded->count);
+        CHECK(loaded->sequence == h.store->readable);
+        entries = loaded->items;
+        for (uint32_t i = 0; i < loaded->count; ++i) {
+            const struct walk_entry *e = &walk.entries[first + i];
+
+            CHECK(e->sequence != 0);
+            check_entry(&entries[i], &txns[e->sequence], e->index);
+        }
+        release_lease(lease);
+        walk.stats.loads++;
+        if (disk.reads > reads) {
+            walk.stats.cold++;
+        }
+        first = loaded->next;
+    }
+}
+
+/* The client's latest completed record reads back as the model's. */
+static void walk_check_client(uint32_t ci)
+{
+    const struct walk_client *m = &walk.clients[ci];
+    const struct vsr_loaded *loaded;
+    uint32_t reads = disk.reads;
+    uint32_t lease = NONE;
+    uint64_t op = load_client(h.store->readable, walk_ids[ci]);
+
+    harness_run();
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    if (m->number == 0) {
+        CHECK(loaded->count == 0);
+    } else {
+        const struct txn *t = &txns[m->sequence];
+        const struct vsr_client_record *record = loaded->items;
+        uint64_t size = t->records[m->index].result.data.size;
+
+        CHECK(loaded->count == 1);
+        if (record->request.number != m->number || record->op != m->op) {
+            fprintf(stderr,
+                    "walk: client %u loaded number %" PRIu64 " op %" PRIu64
+                    ", the model's %" PRIu64 " op %" PRIu64
+                    " (sequence %" PRIu64 ")\n",
+                    ci, record->request.number, record->op, m->number, m->op,
+                    m->sequence);
+        }
+        CHECK(record->request.number == m->number && record->op == m->op);
+        CHECK(record->result.data.size == size);
+        if (size > 0) {
+            CHECK(record->result.data.count == 1 &&
+                  memcmp(record->result.data.spans[0].data,
+                         t->results[m->index], (size_t)size) == 0);
+        }
+    }
+    release_lease(lease);
+    walk.stats.loads++;
+    if (disk.reads > reads) {
+        walk.stats.cold++;
+    }
+}
+
+/* The client's retained entry is its latest in the model's log. */
+static void walk_check_request(uint32_t ci)
+{
+    const struct vsr_loaded *loaded;
+    uint32_t reads = disk.reads;
+    uint32_t lease = NONE;
+    uint64_t found = 0;
+    uint64_t op;
+
+    for (uint64_t at = walk.log_end; at > walk.log_begin && found == 0; --at) {
+        const struct walk_entry *e = &walk.entries[at - 1];
+        const struct vsr_entry *entry = &txns[e->sequence].entries[e->index];
+
+        if (e->sequence != 0 &&
+            walk_client_index(entry->request.client) == ci) {
+            found = at - 1;
+        }
+    }
+    op = load_request(h.store->readable, walk_ids[ci]);
+    harness_run();
+    loaded = expect_loaded(op, VSR_IO_OK, &lease);
+    if (found == 0) {
+        CHECK(loaded->count == 0);
+    } else {
+        const struct vsr_entry *entry = loaded->items;
+        const struct walk_entry *e = &walk.entries[found];
+
+        CHECK(loaded->count == 1 && entry->op == found);
+        check_entry(entry, &txns[e->sequence], e->index);
+    }
+    release_lease(lease);
+    walk.stats.loads++;
+    if (disk.reads > reads) {
+        walk.stats.cold++;
+    }
+}
+
+/* Everything the model holds reads back. */
+static void walk_audit(void)
+{
+    for (uint64_t first = walk.log_begin; first < walk.log_end; first += 4) {
+        walk_check_log(first,
+                       first + 4 < walk.log_end ? first + 4 : walk.log_end);
+    }
+    for (uint32_t ci = 0; ci < WALK_CLIENTS; ++ci) {
+        walk_check_client(ci);
+        walk_check_request(ci);
+    }
+}
+
+/* The segment table after a recovery is the checker's. */
+static void walk_check_segments(const struct checked *c)
+{
+    CHECK(h.store->slots == c->slots);
+    for (uint32_t slot = 0; slot < c->slots; ++slot) {
+        const struct vsr_io_segment *segment = &h.store->segments[slot];
+
+        CHECK(segment->number == c->number[slot]);
+        if (segment->number == 0) {
+            CHECK(segment->phase == VSR_IO_SEGMENT_FREE);
+        } else if (slot == c->last_slot) {
+            CHECK(segment->phase == VSR_IO_SEGMENT_OPEN);
+        } else {
+            CHECK(segment->phase == VSR_IO_SEGMENT_SEALED);
+        }
+    }
+    CHECK(h.store->current == c->last_slot);
+    CHECK(h.store->file_head == c->resume);
+    CHECK(h.store->run == c->superblock_run + 1);
+    CHECK(h.store->start_slot == c->start_slot);
+    CHECK(h.store->start_segment == c->start_segment);
+}
+
+/* A crash: perhaps with a STORE and a SYNC just submitted and the next
+ * write torn, perhaps losing unflushed blocks, perhaps flipping bytes;
+ * then the recovery, checked. */
+static void walk_crash(uint8_t arg)
+{
+    const struct vsr_loaded *loaded = NULL;
+    struct checked checked;
+    uint32_t lease = NONE;
+    uint64_t packed;
+    uint64_t media;
+    int32_t status;
+
+    walk.corrupting = false;
+    walk_housekeep();
+    if ((arg & 1) != 0 && !walk.exhausted) {
+        /* Read in order: the order of a call's arguments is the
+         * compiler's, and a walk must replay under both. */
+        uint8_t action = walk_byte();
+        uint8_t shape = walk_byte();
+        const struct txn *t = walk_txn(action % 9, shape);
+        uint64_t op;
+
+        walk_room();
+        op = submit(t);
+
+        walk_expect(op, WALK_STORE, t->store.sequence);
+        walk_apply(t->store.sequence);
+        walk.stats.stores++;
+    }
+    if ((arg & 2) != 0 && h.store->readable > 0) {
+        walk_sync(h.store->readable);
+    }
+    if ((arg & 4) != 0) {
+        disk.tear_armed = 1;
+        disk.tear_blocks = (arg >> 3) & 3;
+        walk.stats.torn++;
+    }
+    harness_run(); /* Until the lost completion stalls it. */
+    disk.tear_armed = 0;
+    packed = h.store->readable;
+    /* The sequence on media, which no crash loses: freeing counted on
+     * every revision from it on (decision 112). */
+    media = walk.c.sync_mode == VSR_IO_SYNC_DSYNC ? h.store->written
+                                                  : h.store->flushed;
+    if (packed > 0) {
+        snapshot_take();
+    }
+    if ((arg & 0x40) != 0 && walk.c.sync_mode == VSR_IO_SYNC_FDATASYNC) {
+        for (uint64_t at = 0; at < disk.size / BLOCK; ++at) {
+            if (disk.dirty[at] != 0 && (walk_byte() & 1) != 0) {
+                disk_lose_block(at);
+                walk.stats.lost++;
+            }
+        }
+    }
+    if ((arg & 0xF0) == 0xF0) {
+        uint32_t flips = 1 + walk_byte() % 2;
+
+        for (uint32_t i = 0; i < flips; ++i) {
+            uint64_t offset = walk_byte();
+            unsigned char bit;
+
+            offset = offset << 8 | walk_byte();
+            offset = (offset << 8 | walk_byte()) % disk.size;
+            bit = (unsigned char)(1u << (walk_byte() & 7));
+            /* On media: a later crash reverting the block to its flushed
+             * content keeps the flip. */
+            disk_image[offset] ^= bit;
+            disk_flushed[offset] ^= bit;
+            walk.stats.flips++;
+        }
+        walk.corrupting = true;
+    }
+    disk_crash(false);
+    walk.stats.crashes++;
+    txn_salt = (uint32_t)walk.stats.crashes; /* The next run's bytes. */
+    walk.expected_count = 0;
+    harness_open_keep(&walk.c, true);
+    checked_image(&checked); /* Before the recovery's superblock write. */
+    if (walk.trace) {
+        checked_dump();
+    }
+    status = harness_recover(VSR_START_RECOVER, &loaded, &lease);
+    if (status != checked.status ||
+        (status == VSR_IO_OK && loaded->sequence != checked.sequence)) {
+        fprintf(stderr,
+                "walk: recovery %d/%" PRIu64 ", the checker %d/%" PRIu64
+                " (floor %" PRIu64 ")\n",
+                status, status == VSR_IO_OK ? loaded->sequence : 0,
+                checked.status, checked.sequence, checked.floor);
+        CHECK(false);
+    }
+    switch (status) {
+    case VSR_IO_OK:
+        CHECK(loaded->count == 1 && loaded->sequence <= packed);
+        CHECK(((const struct vsr_recovered *)loaded->items)->sequence ==
+              loaded->sequence);
+        CHECK(walk.corrupting || loaded->sequence >= walk.durable_ack);
+        CHECK(walk.corrupting || loaded->sequence >= media);
+        if (loaded->sequence < media) {
+            /* Flipped bytes cut records on media no floor covers, which
+             * recovery takes for a torn tail (decision 50's residual):
+             * slots freed for the revisions from `media` on may hold what
+             * this older row needs, so it is not checked against the
+             * model. The walk ends below. */
+            release_lease(lease);
+            walk.stats.recovered++;
+            break;
+        }
+        walk_replay(loaded->sequence);
+        walk.durable_ack = loaded->sequence;
+        release_lease(lease);
+        snapshot_check(walk.sequence);
+        walk_check_segments(&checked);
+        if (feed.fed) {
+            feed_install(feed.id);
+        }
+        walk_audit();
+        walk_reclaim(h.store->readable); /* The core's floor. */
+        walk_settle();
+        walk.stats.recovered++;
+        break;
+    case VSR_IO_NOT_FOUND:
+        CHECK(walk.corrupting || walk.durable_ack == 0);
+        walk_replay(0);
+        walk.durable_ack = 0;
+        walk_check_segments(&checked);
+        walk.stats.not_found++;
+        break;
+    default:
+        CHECK(status == VSR_IO_CORRUPT && walk.corrupting);
+        CHECK(h.store->state == VSR_IO_STORE_FAILED);
+        walk.failed = true;
+        walk.stats.corrupt++;
+        break;
+    }
+    /* After flipped bytes the walk ends once their recovery is checked:
+     * the records a flip cut off stay on media, CRC-valid behind the
+     * damage, and a later crash that loses the block a new run rewrote
+     * over the damage can bring them back (an unacknowledged suffix of an
+     * older run), which the model of the log cannot follow. */
+    if (walk.corrupting) {
+        walk.failed = true;
+    }
+}
+
+static void walk_step(uint8_t action, uint8_t arg)
+{
+    uint32_t ci = arg % WALK_CLIENTS;
+
+    if (walk.trace) {
+        fprintf(stderr,
+                "walk: step %" PRIu64 " action %u arg %u: readable %" PRIu64
+                " written %" PRIu64 " flushed %" PRIu64 " durable ack %" PRIu64
+                " reclaim %" PRIu64 "/%" PRIu64 " base %" PRIu64 "/%" PRIu64
+                " pending %" PRIu64 "\n",
+                walk.stats.steps, action, arg, h.store->readable,
+                h.store->written, h.store->flushed, walk.durable_ack,
+                h.store->reclaim, h.store->reclaimed, h.store->client_base,
+                h.store->client_base_floor, h.store->client_base_pending);
+    }
+    h.now += (uint64_t)(action >> 4) * 10000000; /* Idle writes fire. */
+    switch (action & 15) {
+    case 9:
+        walk_housekeep(); /* A PUBLISH is a record too. */
+        if (!walk.exhausted) {
+            walk_publish();
+        }
+        break;
+    case 10:
+        if (h.store->readable > 0) {
+            /* A little behind the packed sequence, never below 1. */
+            uint64_t sequence =
+                h.store->readable > arg % 3 ? h.store->readable - arg % 3 : 1;
+
+            walk_sync(sequence);
+            if ((arg & 4) != 0) {
+                walk_settle();
+            }
+        }
+        break;
+    case 11:
+        walk_reclaim(h.store->readable > arg % 6 ? h.store->readable - arg % 6
+                                                 : 0);
+        break;
+    case 12:
+        walk_settle();
+        if (walk.log_end > walk.log_begin) {
+            uint64_t span = walk.log_end - walk.log_begin;
+            uint64_t first = walk.log_begin + (uint64_t)arg * 7u % span;
+            uint64_t end = first + 1 + ((arg >> 3) & 3);
+
+            walk_check_log(first, end < walk.log_end ? end : walk.log_end);
+        }
+        walk_check_client(ci);
+        walk_check_request(ci);
+        break;
+    case 13:
+        CHECK(vsr_io_store_admit(h.store, walk_ids[ci]));
+        if ((arg & 4) != 0) {
+            vsr_io_store_replied(h.store, walk_ids[ci]);
+        }
+        break;
+    case 14:
+        walk_crash(arg);
+        break;
+    case 15:
+        walk_settle();
+        break;
+    default:
+        walk_housekeep();
+        if (!walk.exhausted) {
+            walk_submit(walk_txn(action & 15, arg));
+        }
+        break;
+    }
+}
+
+/* One walk over `bytes`: the configuration, then two bytes per step. */
+static void walk_run(const uint8_t *bytes, size_t size)
+{
+    memset(&walk, 0, sizeof(walk));
+    walk.trace = getenv("VSR_WALK_TRACE") != NULL;
+    disk_trace = walk.trace;
+    walk.bytes = bytes;
+    walk.size = size;
+    walk.c = walk_config(walk_byte());
+    walk_replay(0);
+    harness_open(&walk.c);
+    harness_start(VSR_START_NEW);
+    while (walk.at < walk.size && !walk.failed && !walk.exhausted &&
+           walk.sequence + 8 < SNAPSHOTS && walk.log_end + 8 < WALK_OPS) {
+        uint8_t action = walk_byte();
+        uint8_t arg = walk_byte();
+
+        walk.stats.steps++;
+        walk_step(action, arg);
+    }
+    if (!walk.failed) {
+        walk_settle();
+        walk_audit();
+    }
+    harness_close();
+}
+
+/* splitmix64 over the seed. */
+static void walk_bytes(uint64_t seed, uint8_t *bytes, size_t size)
+{
+    uint64_t state = seed;
+
+    for (size_t i = 0; i < size; i += 8) {
+        uint64_t z;
+
+        state += UINT64_C(0x9E3779B97F4A7C15);
+        z = state;
+        z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+        z ^= z >> 31;
+        for (size_t b = 0; b < 8 && i + b < size; ++b) {
+            bytes[i + b] = (uint8_t)(z >> (8 * b));
+        }
+    }
+}
+
+/* A seeded walk, its seed and statistics printed; the bytes go to the
+ * fuzz corpus when VSR_RECOVERY_CORPUS names a directory. */
+static void walk_seeded(uint64_t seed, size_t size)
+{
+    static uint8_t bytes[WALK_BYTES];
+    const char *corpus = getenv("VSR_RECOVERY_CORPUS");
+    const struct walk_stats *s = &walk.stats;
+
+    CHECK(size <= sizeof(bytes));
+    walk_bytes(seed, bytes, size);
+    if (corpus != NULL) {
+        char path[512];
+        FILE *file;
+
+        CHECK(snprintf(path, sizeof(path), "%s/walk-%016" PRIx64, corpus,
+                       seed) < (int)sizeof(path));
+        file = fopen(path, "wb");
+        CHECK(file != NULL && fwrite(bytes, 1, size, file) == size);
+        CHECK(fclose(file) == 0);
+    }
+    /* On stderr, unbuffered: a failing walk names its seed. */
+    fprintf(stderr, "store: walk seed %" PRIu64 " (%s)\n", seed,
+            size > 0 && (bytes[0] & 1) != 0 ? "dsync" : "fdatasync");
+    walk_run(bytes, size);
+    fprintf(stderr,
+            "store: walk seed %" PRIu64 ": %" PRIu64 " steps, %" PRIu64
+            " stores (%" PRIu64 " held), %" PRIu64 " syncs, %" PRIu64
+            " reclaims, %" PRIu64 " loads (%" PRIu64 " cold), %" PRIu64
+            " captures, %" PRIu64 " crashes (%" PRIu64 " torn, %" PRIu64
+            " blocks lost, %" PRIu64 " flips): %" PRIu64 " recovered, %" PRIu64
+            " not found, %" PRIu64 " corrupt\n",
+            seed, s->steps, s->stores, s->held, s->syncs, s->reclaims, s->loads,
+            s->cold, s->captures, s->crashes, s->torn, s->lost, s->flips,
+            s->recovered, s->not_found, s->corrupt);
+}
+
+static void test_walk(void)
+{
+    static const uint64_t seeds[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    struct walk_stats total;
+
+    memset(&total, 0, sizeof(total));
+    for (size_t i = 0; i < sizeof(seeds) / sizeof(seeds[0]); ++i) {
+        walk_seeded(seeds[i], WALK_BYTES);
+        total.cold += walk.stats.cold;
+        total.held += walk.stats.held;
+        total.recovered += walk.stats.recovered;
+        total.torn += walk.stats.torn;
+        total.lost += walk.stats.lost;
+        total.captures += walk.stats.captures;
+    }
+    CHECK(total.cold > 0 && total.held > 0 && total.recovered > 0);
+    CHECK(total.torn > 0 && total.lost > 0 && total.captures > 0);
+}
+
+/* Walks the recovery fuzzer broke: more SYNCs than the core's
+ * `operations` bound before they complete, and more RECLAIMs than the
+ * store's completion ring holds (the walk waits as the core would: the
+ * fuzzer's first crash was the store refusing the seventeenth SYNC). */
+static void test_walk_bounds(void)
+{
+    uint8_t bytes[1 + 2 * (3 + 40 + 70)];
+    size_t n = 0;
+
+    bytes[n++] = 0; /* FDATASYNC, the smallest configuration. */
+    for (uint32_t i = 0; i < 3; ++i) {
+        bytes[n++] = 2; /* Transaction 1 (IDENTITY), then APPENDs. */
+        bytes[n++] = 0;
+    }
+    for (uint32_t i = 0; i < 40; ++i) {
+        bytes[n++] = 10; /* A SYNC of the packed sequence, not waited. */
+        bytes[n++] = 0;
+    }
+    for (uint32_t i = 0; i < 70; ++i) {
+        bytes[n++] = 11; /* A RECLAIM of the packed sequence. */
+        bytes[n++] = 0;
+    }
+    CHECK(n == sizeof(bytes));
+    walk_run(bytes, n);
+    CHECK(!walk.failed && walk.stats.syncs == 40 && walk.stats.reclaims >= 70);
+    /* PUBLISH steps alone: each is a record, so the walk reclaims before
+     * them as before any STORE (the fuzzer's second crash: the slots
+     * filled under a RECLAIM that never moved and a STORE failed). */
+    n = 1;
+    for (uint32_t i = 0; i < 60; ++i) {
+        bytes[n++] = 9;
+        bytes[n++] = 0;
+    }
+    walk_run(bytes, n);
+    CHECK(!walk.failed && walk.stats.captures >= 60);
+}
+
+/* Names the test that fails; VSR_STORE_TEST in the environment runs
+ * only the test of that name. */
 #define RUN(test)                                                              \
     do {                                                                       \
-        fprintf(stderr, "store: %s\n", #test);                                 \
-        test();                                                                \
+        const char *only = getenv("VSR_STORE_TEST");                           \
+                                                                               \
+        if (only == NULL || strcmp(only, #test) == 0) {                        \
+            fprintf(stderr, "store: %s\n", #test);                             \
+            test();                                                            \
+        }                                                                      \
     } while (0)
 
-int main(void)
+/* The recovery fuzzer includes this file and names the entry point
+ * itself; libFuzzer owns main there. */
+#ifndef VSR_STORE_TESTS_MAIN
+#define VSR_STORE_TESTS_MAIN main
+#endif
+
+/* With a seed on the command line, one walk of that seed (and an
+ * optional byte count) instead of the tests. */
+int VSR_STORE_TESTS_MAIN(int argc, char **argv)
 {
     uint64_t header_bytes;
     uint64_t max_record;
@@ -4634,6 +6765,13 @@ int main(void)
     derive(&header_bytes, &max_record);
     printf("store: header %" PRIu64 " bytes, record limit %" PRIu64 "\n",
            header_bytes, max_record);
+    if (argc > 1) {
+        uint64_t seed = strtoull(argv[1], NULL, 0);
+        size_t size = argc > 2 ? (size_t)strtoul(argv[2], NULL, 0) : WALK_BYTES;
+
+        walk_seeded(seed, size);
+        return 0;
+    }
     RUN(test_check);
     RUN(test_create);
     RUN(test_recover_missing);
@@ -4670,6 +6808,16 @@ int main(void)
     RUN(test_recover_superblocks);
     RUN(test_recover_reread);
     RUN(test_recover_modes);
+    RUN(test_recover_splice);
+    RUN(test_wrap_seal);
+    RUN(test_wrap_exact);
+    RUN(test_freeing_flush);
+    RUN(test_reclaim_media);
+    RUN(test_client_freed);
+    RUN(test_client_newer);
+    RUN(test_client_base_moved);
+    RUN(test_walk);
+    RUN(test_walk_bounds);
     printf("store: ok\n");
     return 0;
 }

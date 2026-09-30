@@ -121,6 +121,13 @@ enum flush_state {
     FLUSH_WANTED /* A SYNC asked; poll applies sync_delay_ns. */
 };
 
+enum freeing_flush {
+    FREEING_FLUSH_NONE,
+    FREEING_FLUSH_WANTED,  /* FLUSHING slots wait for a flush issued
+                              after the superblock write completed. */
+    FREEING_FLUSH_INFLIGHT /* One such flush is out. */
+};
+
 enum load_state {
     LOAD_QUEUED,  /* Records resolved; hot ones wait for a lease. */
     LOAD_READING, /* The cold read is in flight. */
@@ -500,6 +507,12 @@ void vsr_io_store_init(struct vsr_io_store *store, void *metadata,
     (void)tail_size;
     memset(store, 0, sizeof(*store));
     memset(base, 0, plan.total);
+    /* The store is only ever a member of a replica (engine attach, and
+     * the unit tests' replicas): the back-pointer is computed once. */
+    store->replica =
+        (struct vsr_io_replica *)(void *)((unsigned char *)store -
+                                          offsetof(struct vsr_io_replica,
+                                                   store));
     store->options = *options;
     store->limits = *limits;
     store->state = VSR_IO_STORE_CLOSED;
@@ -603,13 +616,10 @@ bool vsr_io_store_next_completion(struct vsr_io_store *store,
 }
 
 /* The replica embedding the store: LOAD results need its lease table and
- * its engine's pool, and the store is only ever a member of a replica
- * (engine attach, and the unit test's replica 0). */
+ * its engine's pool. */
 static struct vsr_io_replica *store_replica(struct vsr_io_store *store)
 {
-    return (struct vsr_io_replica *)(void *)((unsigned char *)store -
-                                             offsetof(struct vsr_io_replica,
-                                                      store));
+    return store->replica;
 }
 
 static struct vsr_io_pending_store *stores_at(struct vsr_io_store *store,
@@ -864,12 +874,20 @@ static void ring_pad(struct vsr_io_store *store)
 
 /* Moves head to the next ring start when n bytes do not fit before the
  * wrap; the current write is closed first and the skipped bytes are not
- * mirrored (the file continues at the padded position). */
+ * mirrored (the file continues at the padded position). A head exactly at
+ * the ring's end needs no gap, but the bytes after it go to the ring's
+ * start: they begin a new extent, since an extent's ring range, and so a
+ * write planned from it, must be contiguous in memory. */
 static void ring_wrap(struct vsr_io_store *store, uint64_t n)
 {
+    const struct vsr_io_extent *newest = extent_newest(store);
     uint64_t next;
 
     if (store->head % store->ring_size + n <= store->ring_size) {
+        if (store->head % store->ring_size == 0 && store->current != NONE &&
+            newest != NULL && newest->ring_offset < store->head) {
+            extent_begin(store, store->current, 0);
+        }
         return;
     }
     ring_pad(store);
@@ -1474,8 +1492,12 @@ enum base_source {
  * point at it, and client_base is `sequence` lowered below the record of
  * any entry it does not cover, so that the floor rule client_base + 1
  * never frees a record only the log holds. */
+static void base_mark(struct vsr_io_store *store, uint64_t at);
+
+/* The base file `id` at `sequence`, applied by the transaction (or the
+ * snapshot module's call) at revision `at`. */
 static void base_apply(struct vsr_io_store *store, struct vsr_id id,
-                       uint64_t sequence, enum base_source source)
+                       uint64_t sequence, uint64_t at, enum base_source source)
 {
     uint64_t base = sequence;
 
@@ -1498,6 +1520,7 @@ static void base_apply(struct vsr_io_store *store, struct vsr_id id,
     }
     store->client_base = base;
     store->client_base_id = id;
+    base_mark(store, at);
 }
 
 /* -------------------------------------------------------------------------
@@ -1677,11 +1700,11 @@ static int32_t apply_publish(struct vsr_io_store *store, uint64_t sequence,
     }
     store->anchor = checkpoint;
     if (id_equal(checkpoint.id, store->last_capture)) {
-        base_apply(store, checkpoint.id, store->last_capture_sequence,
+        base_apply(store, checkpoint.id, store->last_capture_sequence, sequence,
                    BASE_FROM_CAPTURE);
     } else if (store->base_state == BASE_LOADED &&
                id_equal(store->base_id, checkpoint.id)) {
-        base_apply(store, checkpoint.id, sequence, BASE_FROM_FILE);
+        base_apply(store, checkpoint.id, sequence, sequence, BASE_FROM_FILE);
         store->base_state = BASE_NONE;
     } else if (!id_equal(checkpoint.id, store->client_base_id)) {
         /* A witness, or recovery replaying: the published snapshot is
@@ -1690,6 +1713,7 @@ static int32_t apply_publish(struct vsr_io_store *store, uint64_t sequence,
          * does not cover; a witness keeps no table). */
         store->client_base = sequence;
         store->client_base_id = checkpoint.id;
+        base_mark(store, sequence);
     }
     return VSR_IO_OK;
 }
@@ -1721,7 +1745,7 @@ static int32_t apply_restore(struct vsr_io_store *store, uint64_t sequence,
     }
     if (store->base_state == BASE_LOADED &&
         id_equal(store->base_id, checkpoint.id)) {
-        base_apply(store, checkpoint.id, sequence, BASE_FROM_RESTORE);
+        base_apply(store, checkpoint.id, sequence, sequence, BASE_FROM_RESTORE);
         store->base_state = BASE_NONE;
     } else {
         /* A witness installs only the anchor and the protocol indexes;
@@ -1729,6 +1753,7 @@ static int32_t apply_restore(struct vsr_io_store *store, uint64_t sequence,
         clients_sweep(store, keep_none);
         store->client_base = sequence;
         store->client_base_id = checkpoint.id;
+        base_mark(store, sequence);
     }
     status = retained_rebuild(store);
     store->reindexed = sequence;
@@ -1928,10 +1953,14 @@ static bool base_hold(struct vsr_io_store *store,
 
 /* True while a freed slot waits for the superblock write that lets it be
  * reused. */
+static void flush_request(struct vsr_io_store *store);
+static bool reclaim_pending(const struct vsr_io_store *store);
+
 static bool segment_freeing(const struct vsr_io_store *store)
 {
     for (uint32_t i = 0; i < store->slots; ++i) {
-        if (store->segments[i].phase == VSR_IO_SEGMENT_FREEING) {
+        if (store->segments[i].phase == VSR_IO_SEGMENT_FREEING ||
+            store->segments[i].phase == VSR_IO_SEGMENT_FLUSHING) {
             return true;
         }
     }
@@ -1957,13 +1986,27 @@ static void store_abort(struct vsr_io_store *store,
  * and write-behind holds (section 6.1 steps 1 to 4), then the copy and
  * the indexes (step 5). False when it must stay held, or when it was
  * failed and the store fenced. */
+/* The bytes n record bytes take in the current segment: n, plus the
+ * padding that closes the ring's last block when they do not fit before
+ * the wrap (ring_wrap pads to the block, in the file too). */
+static uint64_t pack_needs(const struct vsr_io_store *store, uint64_t n)
+{
+    uint64_t block = block_bytes(store);
+
+    if (store->head % store->ring_size + n > store->ring_size &&
+        store->head % block != 0) {
+        return n + block - store->head % block;
+    }
+    return n;
+}
+
 static bool store_pack(struct vsr_io_store *store,
                        struct vsr_io_pending_store *pending)
 {
     uint64_t n = pending->bytes;
-    bool seal =
-        store->current == NONE ||
-        store->segments[store->current].used + n > store->options.segment_bytes;
+    bool seal = store->current == NONE ||
+                store->segments[store->current].used + pack_needs(store, n) >
+                    store->options.segment_bytes;
     uint32_t slot = NONE;
     struct vsr_io_extent *newest;
     unsigned char *at;
@@ -1991,8 +2034,17 @@ static bool store_pack(struct vsr_io_store *store,
                 store->growth = GROWTH_ALLOCATING;
             } else if (store->growth == GROWTH_NONE &&
                        !segment_freeing(store)) {
-                /* Every slot is kept by a floor: nothing can free. */
-                store_abort(store, pending, VSR_IO_FAILED);
+                if (reclaim_pending(store)) {
+                    /* A floor term waits for the media (decision 112):
+                     * the flush that advances it may free a slot (the
+                     * writes' completions come back here otherwise). */
+                    if (store->written > store->flushed) {
+                        flush_request(store);
+                    }
+                } else {
+                    /* Every slot is kept by a floor: nothing can free. */
+                    store_abort(store, pending, VSR_IO_FAILED);
+                }
             }
             return false;
         }
@@ -2088,6 +2140,62 @@ static uint64_t durable_now(const struct vsr_io_store *store)
 {
     return store->options.sync_mode == VSR_IO_SYNC_DSYNC ? store->written
                                                          : store->flushed;
+}
+
+/* The sequence on media as freeing sees it: a crash brings back any
+ * revision from it on (the recovered sequence is at least it, decision
+ * 89). In memory-only mode nothing is written any more, so a slot freed
+ * in the table is never rewritten on disk and every term applies. */
+static uint64_t media_sequence(const struct vsr_io_store *store)
+{
+    return memory_only(store) ? UINT64_MAX : durable_now(store);
+}
+
+/* The RECLAIM revision applies as far as the sequence on media and the
+ * rest as it advances; the floor's client base term is the base as of
+ * that sequence (decision 112). Then whatever the floor allows frees. */
+static void reclaim_apply(struct vsr_io_store *store)
+{
+    uint64_t media = media_sequence(store);
+    uint64_t target = store->reclaim < media ? store->reclaim : media;
+
+    if (store->client_base_pending != 0 &&
+        store->client_base_pending <= media) {
+        store->client_base_floor = store->client_base;
+        store->client_base_pending = 0;
+    }
+    if (target > store->reclaimed) {
+        store->reclaimed = target;
+        trims_reclaim(store, target);
+        versions_reclaim(store, target);
+    }
+    vsr_io_store_free_segments(store);
+}
+
+/* True while a RECLAIM, or a client base change, waits for the media
+ * sequence to reach it: a flush may free a slot then. */
+static bool reclaim_pending(const struct vsr_io_store *store)
+{
+    uint64_t target =
+        store->reclaim < store->readable ? store->reclaim : store->readable;
+
+    return store->reclaimed < target || store->client_base_pending != 0;
+}
+
+/* The client base changed at revision `at`: the floor's base term
+ * follows once that revision is on media, and at once when the base went
+ * down (the floor is then right for the revisions on either side). */
+static void base_mark(struct vsr_io_store *store, uint64_t at)
+{
+    if (at > media_sequence(store)) {
+        store->client_base_pending = at;
+        if (store->client_base < store->client_base_floor) {
+            store->client_base_floor = store->client_base;
+        }
+    } else {
+        store->client_base_floor = store->client_base;
+        store->client_base_pending = 0;
+    }
 }
 
 /* Completes the SYNCs satisfied so far, in emission order. */
@@ -2249,9 +2357,34 @@ static void write_error(struct vsr_io_store *store, int32_t error)
     store->error = error;
     if (store->options.on_write_error == VSR_IO_WRITE_ERROR_FENCE) {
         store_fail(store, VSR_IO_FAILED);
+        return;
     }
     /* CONTINUE: the store stops writing and serves from memory; no SYNC
-     * is ever issued in replicated mode, so nothing else waits. */
+     * is ever issued in replicated mode, so nothing else waits. A freed
+     * slot no superblock or flush will release is free in the table, and
+     * the floor terms waiting for the media apply (memory_only). */
+    for (uint32_t i = 0; i < store->slots; ++i) {
+        if (store->segments[i].phase == VSR_IO_SEGMENT_FREEING ||
+            store->segments[i].phase == VSR_IO_SEGMENT_FLUSHING) {
+            store->segments[i].phase = VSR_IO_SEGMENT_FREE;
+        }
+    }
+    store->freeing_flush = FREEING_FLUSH_NONE;
+    store->flush_own = 0;
+    reclaim_apply(store);
+}
+
+/* The empty store exists, its superblocks and first header on media (in
+ * FDATASYNC mode a flush after the header's write saw to it, since a
+ * crash that lost them would leave a log recovery calls CORRUPT): what
+ * NEW and JOIN expect. */
+static void creation_done(struct vsr_io_store *store)
+{
+    store->state = VSR_IO_STORE_READY;
+    if (store->recovery.load_op != 0) {
+        complete(store, store->recovery.load_op, VSR_IO_NOT_FOUND, NONE, NULL);
+        store->recovery.load_op = 0;
+    }
 }
 
 /* A record or header write completed: the segment opens when its header
@@ -2273,12 +2406,10 @@ static void write_done(struct vsr_io_store *store, uint32_t index,
             segment->phase = VSR_IO_SEGMENT_OPEN;
         }
         if (store->state == VSR_IO_STORE_CREATING) {
-            /* The empty store exists: what NEW and JOIN expect. */
-            store->state = VSR_IO_STORE_READY;
-            if (store->recovery.load_op != 0) {
-                complete(store, store->recovery.load_op, VSR_IO_NOT_FOUND, NONE,
-                         NULL);
-                store->recovery.load_op = 0;
+            if (store->options.sync_mode == VSR_IO_SYNC_FDATASYNC) {
+                store->flush_own = 1; /* READY once it is on media. */
+            } else {
+                creation_done(store);
             }
         }
     }
@@ -2299,7 +2430,23 @@ static void write_done(struct vsr_io_store *store, uint32_t index,
     if (store->writes_count == 0) {
         (void)issue_extent(store); /* Nothing unwritten before a gap. */
     }
+    if (store->options.sync_mode == VSR_IO_SYNC_DSYNC) {
+        reclaim_apply(store); /* written is on media. */
+    }
     syncs_settle(store);
+}
+
+/* A flush the store wants for itself (FLUSHING slots wait for one issued
+ * after their superblock write completed, decision 111; a floor term
+ * waits for the media, decision 112): issued as soon as none is out,
+ * without waiting for flush_target, which a SYNC of a STORE held for a
+ * slot would never let the written sequence reach. */
+static void flush_request(struct vsr_io_store *store)
+{
+    if (store->options.sync_mode == VSR_IO_SYNC_FDATASYNC &&
+        store->error == 0 && store->flush_slot == NONE) {
+        store->flush_own = 1;
+    }
 }
 
 static void flush_done(struct vsr_io_store *store, uint64_t covered,
@@ -2313,6 +2460,22 @@ static void flush_done(struct vsr_io_store *store, uint64_t covered,
     if (covered > store->flushed) {
         store->flushed = covered;
     }
+    if (store->state == VSR_IO_STORE_CREATING) {
+        creation_done(store);
+    }
+    if (store->freeing_flush == FREEING_FLUSH_INFLIGHT) {
+        /* The superblock naming the new start segment is on media: the
+         * slots it no longer names may be reused (decision 111). */
+        for (uint32_t i = 0; i < store->slots; ++i) {
+            if (store->segments[i].phase == VSR_IO_SEGMENT_FLUSHING) {
+                store->segments[i].phase = VSR_IO_SEGMENT_FREE;
+            }
+        }
+        store->freeing_flush = FREEING_FLUSH_NONE;
+    } else if (store->freeing_flush == FREEING_FLUSH_WANTED) {
+        flush_request(store); /* This one was issued before the write. */
+    }
+    reclaim_apply(store);
     syncs_settle(store);
 }
 
@@ -2331,8 +2494,10 @@ static void superblock_done(struct vsr_io_store *store, uint64_t floor,
         store->slots = file_slots(store);
         store->growth = GROWTH_NONE;
     }
-    /* The superblock on disk names a present start segment: the slots
-     * freed before this write may be reused (section 6.5). A slot freed
+    /* The superblock naming a present start segment is written: the
+     * slots freed before this write may be reused once it is on media,
+     * which O_DSYNC made it, and which in FDATASYNC mode a flush issued
+     * from now on makes it (section 6.5, decision 111). A slot freed
      * after it was issued set superblock_dirty again and waits for the
      * next write. */
     if (store->superblock_dirty != 0) {
@@ -2340,8 +2505,16 @@ static void superblock_done(struct vsr_io_store *store, uint64_t floor,
     }
     for (uint32_t i = 0; i < store->slots; ++i) {
         if (store->segments[i].phase == VSR_IO_SEGMENT_FREEING) {
-            store->segments[i].phase = VSR_IO_SEGMENT_FREE;
+            if (store->options.sync_mode == VSR_IO_SYNC_FDATASYNC) {
+                store->segments[i].phase = VSR_IO_SEGMENT_FLUSHING;
+                store->freeing_flush = FREEING_FLUSH_WANTED;
+            } else {
+                store->segments[i].phase = VSR_IO_SEGMENT_FREE;
+            }
         }
+    }
+    if (store->freeing_flush == FREEING_FLUSH_WANTED) {
+        flush_request(store);
     }
 }
 
@@ -2476,6 +2649,21 @@ static uint32_t segment_of(const struct vsr_io_store *store, uint64_t offset)
     return (uint32_t)((offset - fixed) / store->options.segment_bytes);
 }
 
+/* True while the log holds the record of `sequence` at `offset`: its slot
+ * still holds the segment it was packed into. A freed slot may be
+ * rewritten, and a reused one holds later sequences only, whose ring
+ * extents cover the old record's file range with other bytes. Only a
+ * client's completed record outlives its segment: the base term of the
+ * floor frees it once the base file holds it (section 6.5). */
+static bool record_live(const struct vsr_io_store *store, uint64_t offset,
+                        uint64_t sequence)
+{
+    uint32_t slot = segment_of(store, offset);
+
+    return slot < store->slots && store->segments[slot].number != 0 &&
+           sequence >= store->segments[slot].first_sequence;
+}
+
 static void ref_set(struct vsr_io_load_ref *ref, uint64_t offset,
                     uint64_t sequence, uint32_t length, uint32_t change,
                     uint32_t index)
@@ -2524,7 +2712,8 @@ static int32_t resolve_log(const struct vsr_io_store *store,
 
 /* CLIENT: the entry's completed record when the read's sequence covers
  * it (decision 51); from the ring when still there, else from the base
- * file when it holds the record, else from the log. */
+ * file when it holds the record, else from the log. A record whose slot
+ * was freed is no longer in the log (record_live). */
 static int32_t resolve_client(const struct vsr_io_store *store,
                               struct vsr_io_pending_load *load,
                               struct vsr_io_load_ref *refs)
@@ -2532,6 +2721,8 @@ static int32_t resolve_client(const struct vsr_io_store *store,
     const struct vsr_io_client *entry = client_find(store, load->read.client);
     const struct vsr_io_client_version *version;
     uint64_t ring;
+    bool live;
+    bool base;
 
     if (entry == NULL || entry->current.number == 0) {
         return VSR_IO_OK;
@@ -2541,14 +2732,19 @@ static int32_t resolve_client(const struct vsr_io_store *store,
         return VSR_IO_RETRY;
     }
     version = &entry->current;
-    if (version->sequence != 0 &&
-        extent_locate(store, version->offset, version->length, &ring)) {
+    live = version->sequence != 0 &&
+           record_live(store, version->offset, version->sequence);
+    /* The base file holds the current record only up to the base: a later
+     * CLIENTS record leaves base_offset naming the file's older one. */
+    base = entry->base_offset != UINT64_MAX &&
+           version->sequence <= store->client_base;
+    if (live && extent_locate(store, version->offset, version->length, &ring)) {
         ref_set(&refs[0], version->offset, version->sequence, version->length,
                 version->change, version->index);
-    } else if (entry->base_offset != UINT64_MAX) {
+    } else if (base) {
         ref_set(&refs[0], entry->base_offset, 0, 0, 0, 0);
         load->base = 1;
-    } else if (version->sequence != 0) {
+    } else if (live) {
         ref_set(&refs[0], version->offset, version->sequence, version->length,
                 version->change, version->index);
     } else {
@@ -2929,6 +3125,21 @@ static bool prepare_load(struct vsr_io *io, uint32_t replica,
     }
     load = loads_at(store, 0);
     refs = load_refs(store, load);
+    if (load->state == LOAD_QUEUED && load->base != 0) {
+        /* A base file read resolved when accepted: a PUBLISH or RESTORE
+         * packed while it queued may have moved the record, and
+         * base_slot names the file of now, so it is resolved again. */
+        int32_t status;
+
+        load->count = 0;
+        load->base = 0;
+        status = resolve_client(store, load, refs);
+        if (status != VSR_IO_OK) {
+            complete(store, load->op, status, NONE, NULL);
+            loads_pop(store, true);
+            return false;
+        }
+    }
     if (load->state != LOAD_QUEUED || load->count == 0 ||
         load_hot(store, load, refs, &begin, &end)) {
         return false; /* Answered from poll. */
@@ -3287,6 +3498,7 @@ static int32_t recovery_install(struct vsr_io_store *store,
     store->client_base_id = store->anchor.id;
     r->sequence = fixed->last_sequence;
     r->run = fixed->run;
+    r->record_run = fixed->run;
     r->last_slot = store->start_slot;
     r->resume = slot_offset(store, store->start_slot) + store->header_bytes;
     return VSR_IO_OK;
@@ -3353,6 +3565,7 @@ static void recovery_header(struct vsr_io_store *store, int32_t result)
         r->slot = store->start_slot;
         store->segments[r->slot].phase = VSR_IO_SEGMENT_SEALED;
         r->mode = SCAN_CHAIN;
+        r->chain_resume = 0;
         r->offset = slot_offset(store, r->slot) + store->header_bytes;
         r->position = r->offset;
         r->stage = RECOVERY_SCAN;
@@ -3390,6 +3603,18 @@ static void recovery_scan_end(struct vsr_io_store *store)
             return;
         }
     }
+    /* Every op of the recovered log was replayed: the start segment's
+     * header names the log as of its first record, whose earlier ops the
+     * freed segments held, and freeing kept every revision from the
+     * sequence on media on (decision 112). A row older than that (media
+     * corruption of flushed records the floor does not cover) lacks ops
+     * and is CORRUPT rather than served with holes (decision 114). */
+    for (uint64_t op = store->log_begin; op < store->log_end; ++op) {
+        if (op_current(store, op) == NULL) {
+            recovery_fail(store, VSR_IO_CORRUPT);
+            return;
+        }
+    }
     /* Stale headers (never visited) and abandoned successors (visited
      * after the last record, so still naming it) free their slots
      * (decision 48); the rest of the chain is SEALED but for the segment
@@ -3413,6 +3638,10 @@ static void recovery_scan_end(struct vsr_io_store *store)
     store->written = r->sequence;
     store->flushed = r->sequence;
     store->durable = r->sequence;
+    store->reclaim = 0;
+    store->reclaimed = 0;
+    store->client_base_floor = store->client_base;
+    store->client_base_pending = 0;
     store->packed_since_durable = 0;
     store->head = 0;
     store->issued = 0;
@@ -3451,6 +3680,7 @@ static void recovery_rest(struct vsr_io_store *store)
         return;
     }
     r->mode = SCAN_REST;
+    r->chain_resume = 0;
     r->slot = slot;
     r->offset = slot_offset(store, slot) + store->header_bytes;
     r->position = r->offset;
@@ -3483,6 +3713,7 @@ static void recovery_successor(struct vsr_io_store *store)
         r->run = store->segments[best].run;
     }
     r->mode = SCAN_CHAIN;
+    r->chain_resume = 0;
     r->slot = best;
     r->offset = slot_offset(store, best) + store->header_bytes;
     r->position = r->offset;
@@ -3491,10 +3722,15 @@ static void recovery_successor(struct vsr_io_store *store)
 
 /* A range at `at` that reads bad, short or foreign while replaying: read
  * once more before it is judged (true: a re-read is due); the second
- * verdict ends the chain in this slot, which is swept from `at` on. */
+ * verdict ends the chain in this slot, which is swept from `at` on. A
+ * verdict inside a block ends only that block: the bytes after the last
+ * valid record of a block are dead once writing resumed at the block
+ * after it (decision 89), so the chain resumes there once the dead tail
+ * is swept (decision 110). */
 static bool recovery_judge(struct vsr_io_store *store, uint64_t at)
 {
     struct vsr_io_recovery *r = &store->recovery;
+    uint64_t block = block_bytes(store);
 
     if (r->mode != SCAN_CHAIN) {
         return false;
@@ -3502,11 +3738,12 @@ static bool recovery_judge(struct vsr_io_store *store, uint64_t at)
     if (r->retried == 0 || r->retry_offset != at) {
         r->retried = 1;
         r->retry_offset = at;
-        r->offset = at / block_bytes(store) * block_bytes(store);
+        r->offset = at / block * block;
         r->position = at;
         return true;
     }
     r->mode = SCAN_SWEEP;
+    r->chain_resume = at % block != 0 ? round_up(at, block) : 0;
     return false;
 }
 
@@ -3548,18 +3785,31 @@ static void recovery_chunk(struct vsr_io_store *store, int32_t result)
     for (;;) {
         struct vsr_io_cursor cursor;
         struct vsr_io_wire_record header;
-        uint64_t at = r->position;
-        uint64_t p = at - r->offset;
-        uint64_t remaining = p < chunk ? chunk - p : 0;
-        /* A record straddling the chunk's end is read again from its
-         * block, when that makes progress and the segment has the
-         * bytes (SCAN_END covers a short header too). */
-        bool more =
-            r->offset + chunk < data_end && at / block * block > r->offset;
+        uint64_t at;
+        uint64_t p;
+        uint64_t remaining;
+        bool more;
         bool valid = false;
         uint32_t kind = 0;
         int32_t status;
 
+        if (r->mode == SCAN_SWEEP && r->chain_resume != 0 &&
+            r->position >= r->chain_resume) {
+            /* The dead tail is swept (a stale record straddling its end
+             * counted; its remainder is no header): the chain resumes
+             * at the block after it (decision 110). */
+            r->position = r->chain_resume;
+            r->chain_resume = 0;
+            r->mode = SCAN_CHAIN;
+            r->retried = 0;
+        }
+        at = r->position;
+        p = at - r->offset;
+        remaining = p < chunk ? chunk - p : 0;
+        /* A record straddling the chunk's end is read again from its
+         * block, when that makes progress and the segment has the
+         * bytes (SCAN_END covers a short header too). */
+        more = r->offset + chunk < data_end && at / block * block > r->offset;
         if (at >= data_end) {
             recovery_exhausted(store);
             return;
@@ -3603,9 +3853,16 @@ static void recovery_chunk(struct vsr_io_store *store, int32_t result)
             header.flushed > r->durable_floor) {
             r->durable_floor = header.flushed; /* Decision 50. */
         }
+        /* Not the next record (stale or torn), or the first record of a
+         * later run behind a record that run's recovery did not recover:
+         * a run begins at a recovery, which made what it recovered
+         * durable, so its records carry flushed >= that sequence; an
+         * older run's record the torn rewrite of a block left before it
+         * is not its predecessor (decision 116). */
         if (valid && kind == VSR_IO_SCAN_RECORD && r->mode == SCAN_CHAIN &&
-            (header.sequence != r->sequence + 1 || header.run < r->run)) {
-            valid = false; /* Not the next record: stale or torn. */
+            (header.sequence != r->sequence + 1 || header.run < r->run ||
+             (header.run > r->record_run && header.flushed < r->sequence))) {
+            valid = false;
         }
         if (!valid) {
             if (recovery_judge(store, at)) {
@@ -3627,6 +3884,7 @@ static void recovery_chunk(struct vsr_io_store *store, int32_t result)
             }
             r->sequence = header.sequence;
             r->run = header.run;
+            r->record_run = header.run;
             r->last_slot = r->slot;
             r->resume = round_up(at + header.length, block);
             store->segments[r->slot].last_sequence = header.sequence;
@@ -4126,14 +4384,22 @@ static bool prepare_write(struct vsr_io *io, uint32_t replica,
     return true;
 }
 
+/* A SYNC's flush once the written sequence reached flush_target, or the
+ * store's own (flush_request); either covers `written` at issue. An own
+ * flush leaves a SYNC's request pending when it does not satisfy it. */
 static bool prepare_flush(struct vsr_io *io, uint32_t replica,
                           struct vsr_io_store *store, struct vsr_io_sqe *sqe)
 {
     uint32_t slot;
+    bool due;
 
     if (store->options.sync_mode != VSR_IO_SYNC_FDATASYNC ||
-        store->flush_pending != FLUSH_DUE || store->flush_slot != NONE ||
-        store->error != 0 || store->written < store->flush_target) {
+        store->flush_slot != NONE || store->error != 0) {
+        return false;
+    }
+    due = store->flush_pending == FLUSH_DUE &&
+          store->written >= store->flush_target;
+    if (!due && store->flush_own == 0) {
         return false;
     }
     slot = take_slot(io, VSR_IO_SLOT_FLUSH, replica, 0, store->written);
@@ -4144,7 +4410,13 @@ static bool prepare_flush(struct vsr_io *io, uint32_t replica,
             vsr_io_slots_user_data(&io->slots, slot));
     sqe->op_flags = VSR_IO_FSYNC_DATASYNC;
     store->flush_slot = slot;
-    store->flush_pending = FLUSH_NONE;
+    if (due) {
+        store->flush_pending = FLUSH_NONE;
+    }
+    store->flush_own = 0;
+    if (store->freeing_flush == FREEING_FLUSH_WANTED) {
+        store->freeing_flush = FREEING_FLUSH_INFLIGHT;
+    }
     io->stats.flushes++;
     return true;
 }
@@ -4168,6 +4440,9 @@ void vsr_io_store_prepare(struct vsr_io *io, uint32_t replica,
             issued = prepare_create(io, replica, store, sqe);
             if (!issued && store->current != NONE && !wrote) {
                 issued = wrote = prepare_write(io, replica, store, sqe);
+            }
+            if (!issued) {
+                issued = prepare_flush(io, replica, store, sqe);
             }
             break;
         case VSR_IO_STORE_READY:
@@ -4368,9 +4643,7 @@ int vsr_io_store_reclaim(struct vsr_io_store *store, uint64_t op,
     }
     if (oldest > store->reclaim) {
         store->reclaim = oldest;
-        trims_reclaim(store, oldest);
-        versions_reclaim(store, oldest);
-        vsr_io_store_free_segments(store);
+        reclaim_apply(store);
     }
     complete(store, op, VSR_IO_OK, NONE, NULL);
     stores_drain(store); /* A STORE held for a slot may have one now. */
@@ -4403,11 +4676,11 @@ uint64_t vsr_io_store_free_floor(const struct vsr_io_store *store)
             floor = store->versions[i].appended;
         }
     }
-    if (store->reclaim < floor) {
-        floor = store->reclaim;
+    if (store->reclaimed < floor) {
+        floor = store->reclaimed;
     }
-    if (store->client_base + 1 < floor) {
-        floor = store->client_base + 1;
+    if (store->client_base_floor + 1 < floor) {
+        floor = store->client_base_floor + 1;
     }
     if (store->capture_floor < floor) {
         floor = store->capture_floor;
@@ -4565,7 +4838,20 @@ uint32_t vsr_io_store_snapshot_clients(struct vsr_io_store *store,
             out[n].id = entry->id;
             out[n].record = entry->current;
         }
-        if (entry->current.sequence != 0 && entry->current.sequence < floor) {
+        if (entry->current.sequence != 0 &&
+            !record_live(store, entry->current.offset,
+                         entry->current.sequence) &&
+            entry->base_offset != UINT64_MAX) {
+            /* Its slot was freed under the base: the capture copies it
+             * from the base file, like a record only the file has. */
+            if (n < capacity) {
+                memset(&out[n].record, 0, sizeof(out[n].record));
+                out[n].record.number = entry->current.number;
+                out[n].record.op = entry->current.op;
+                out[n].record.offset = entry->base_offset;
+            }
+        } else if (entry->current.sequence != 0 &&
+                   entry->current.sequence < floor) {
             floor = entry->current.sequence;
         }
         n++;
@@ -4608,7 +4894,7 @@ void vsr_io_store_base_set(struct vsr_io_store *store, struct vsr_id id,
     if (store == NULL) {
         return;
     }
-    base_apply(store, id, sequence,
+    base_apply(store, id, sequence, store->readable,
                id_equal(id, store->last_capture) ? BASE_FROM_CAPTURE
                                                  : BASE_FROM_FILE);
     stores_drain(store);
@@ -4680,7 +4966,7 @@ void vsr_io_store_base_end(struct vsr_io_store *store, struct vsr_id id,
     if (store->base_state == BASE_LOADING) {
         store->base_state = BASE_LOADED;
     }
-    base_apply(store, id, sequence, BASE_FROM_FILE);
+    base_apply(store, id, sequence, store->readable, BASE_FROM_FILE);
 }
 
 bool vsr_io_store_base_wanted(const struct vsr_io_store *store,

@@ -78,11 +78,15 @@ enum vsr_io_store_state {
 
 enum vsr_io_segment_phase {
     VSR_IO_SEGMENT_FREE,
-    VSR_IO_SEGMENT_HEADER, /* Header packed; its write not yet complete. */
-    VSR_IO_SEGMENT_OPEN,   /* Records may be packed into it. */
-    VSR_IO_SEGMENT_SEALED, /* Full; records only read. */
-    VSR_IO_SEGMENT_FREEING /* Freed; reused only once the superblock
-                              naming the new start segment is on disk. */
+    VSR_IO_SEGMENT_HEADER,  /* Header packed; its write not yet complete. */
+    VSR_IO_SEGMENT_OPEN,    /* Records may be packed into it. */
+    VSR_IO_SEGMENT_SEALED,  /* Full; records only read. */
+    VSR_IO_SEGMENT_FREEING, /* Freed; reused only once the superblock
+                               naming the new start segment is on disk. */
+    VSR_IO_SEGMENT_FLUSHING /* That superblock write completed; in
+                               FDATASYNC mode a flush issued since must
+                               complete before the slot is reused
+                               (decision 111). */
 };
 
 struct vsr_io_segment {
@@ -239,17 +243,20 @@ struct vsr_io_trim_event {
  * complete; the reads go into a pool slab, the superblocks into their
  * tail blocks, and the ring is scratch until the scan is over. */
 struct vsr_io_recovery {
-    uint32_t stage;     /* Private stage enumeration. */
-    uint32_t slot;      /* Segment slot whose header is read, then
+    uint32_t stage;         /* Private stage enumeration. */
+    uint32_t slot;          /* Segment slot whose header is read, then
                                the one being scanned. */
-    uint32_t slab;      /* Pool slab of the reads, or NONE. */
-    uint32_t io_slot;   /* Executor slot of the read in flight, NONE. */
-    uint32_t copy;      /* Superblock copy recovered from. */
-    uint32_t last_slot; /* Slot holding the last valid record, else
+    uint32_t slab;          /* Pool slab of the reads, or NONE. */
+    uint32_t io_slot;       /* Executor slot of the read in flight, NONE. */
+    uint32_t copy;          /* Superblock copy recovered from. */
+    uint32_t last_slot;     /* Slot holding the last valid record, else
                                the start slot. */
-    uint32_t mode;      /* Private: replaying the chain, or sweeping
+    uint32_t mode;          /* Private: replaying the chain, or sweeping
                                for floors only (decision 50). */
-    uint32_t reserved;
+    uint32_t record_run;    /* Run of the last valid record (the start
+                            header's before one): a record of a later run
+                            carries flushed >= its predecessor's sequence
+                            (decision 116). */
     uint64_t offset;        /* File offset of the chunk in the slab. */
     uint64_t position;      /* File offset of the next record to judge. */
     uint64_t sequence;      /* Last valid record replayed. */
@@ -261,10 +268,18 @@ struct vsr_io_recovery {
                                floors and every valid record's flushed. */
     uint64_t resume;        /* File offset of the block after the last
                                valid record: where writing resumes. */
+    uint64_t chain_resume;  /* While sweeping the dead tail of a block
+                               (decision 110): the block boundary at which
+                               the chain resumes; 0 when not. */
     uint64_t load_op;       /* The RECOVERY load op to complete. */
 };
 
+struct vsr_io_replica;
+
 struct vsr_io_store {
+    struct vsr_io_replica *replica; /* The replica embedding the store (set
+                                       by init): LOAD results take its
+                                       leases and its engine's pool. */
     struct vsr_io_store_options options;
     struct vsr_limits limits;
     uint32_t state;      /* enum vsr_io_store_state */
@@ -293,7 +308,15 @@ struct vsr_io_store {
     uint64_t durable;     /* Last sequence acknowledged by SYNC. */
     uint64_t flushed;     /* Last sequence covered by a completed flush. */
     uint64_t reclaim;     /* RECLAIM floor: oldest revision still needed. */
+    uint64_t reclaimed;   /* The part of it applied: a crash brings back
+                             any revision from the sequence on media on,
+                             so RECLAIM applies as far as that sequence
+                             (decision 112). */
     uint64_t client_base; /* Sequence of the current base file. */
+    uint64_t client_base_floor;   /* The client base as of the sequence
+                                     on media: the floor's base term. */
+    uint64_t client_base_pending; /* Revision that set client_base while
+                                     above the media sequence; 0 none. */
     struct vsr_id client_base_id;
     uint64_t clients_sequence;  /* Last CLIENTS change applied. */
     struct vsr_id last_capture; /* Snapshot whose offsets capture_offset
@@ -351,6 +374,11 @@ struct vsr_io_store {
     uint32_t flush_pending;    /* 1 when a flush must be issued; 2 when a
                                   SYNC asked for one and poll has yet to
                                   apply sync_delay_ns to it. */
+    uint32_t freeing_flush;    /* FLUSHING slots wait for a flush: 1 one
+                                  is wanted, 2 one issued since is out. */
+    uint32_t flush_own;        /* 1 when the store wants a flush of its own
+                                  (decisions 111, 112), issued without
+                                  waiting for flush_target. */
     uint64_t flush_target;     /* Sequence the pending flush must cover. */
     uint64_t flush_deadline;   /* sync_delay / flush_interval expiry. */
     uint64_t superblock_floor; /* durable_floor of the newest superblock. */
@@ -425,6 +453,8 @@ int vsr_io_store_size(const struct vsr_io_store_options *options,
                       const struct vsr_limits *limits, uint32_t regions,
                       size_t *metadata_bytes, size_t *metadata_alignment,
                       size_t *tail_bytes, size_t *tail_alignment);
+/* `store` must be the `store` member of a vsr_io_replica, which init
+ * records in store->replica. */
 void vsr_io_store_init(struct vsr_io_store *store, void *metadata,
                        size_t metadata_size, void *tail, size_t tail_size,
                        const struct vsr_io_store_options *options,
@@ -482,8 +512,10 @@ void vsr_io_store_replied(struct vsr_io_store *store, struct vsr_id client);
 /*
  * Capture support. snapshot copies the completed record of every entry
  * into `out` (id, number, op, record location; `capacity` should hold
- * max_clients, the count is returned regardless), resets every entry's
- * capture_offset and sets capture_floor so their segments stay; the
+ * max_clients, the count is returned regardless; a record only the base
+ * file holds, because it never was in this log or because its slot was
+ * freed under the base, has sequence 0 and the file offset), resets every
+ * entry's capture_offset and sets capture_floor so their segments stay; the
  * snapshot module reads result bytes hot or cold, calls capture_offset
  * with each entry's offset in the file it writes and, at the end,
  * capture_end with the snapshot id and the sequence captured (a zero id
