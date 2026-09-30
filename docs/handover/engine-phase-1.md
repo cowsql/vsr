@@ -23,7 +23,9 @@ Commits (first parent):
 | 75f6b94 | Decisions E2 to E6, the plan's sections brought in line, vsr-io.h comments |
 | cbc95a6 | Merge of main bf5a9d4 |
 | 55dffc6 | A check that prepare surfaces a CAPTURE deadline armed at now (decision 122) |
-| this file | |
+| 49f2c38 | This file |
+| 77397bc | Lint findings (clang-tidy, cppcheck, gcc 16's format truncation) |
+| 6aa5d2f | The store review's engine items: detach asserts the store's queues are empty, `test_replicated_flush` |
 
 ## Source layout
 
@@ -177,7 +179,7 @@ queued.
 
 ## Tests
 
-tests/unit/engine.c: 22 tests over one simulated world (3 nodes, up to 2
+tests/unit/engine.c: 23 tests over one simulated world (3 nodes, up to 2
 replicas per engine, real cores and stores), listed in
 docs/io-implementation.md section 9. Each test's header comment says what
 it pins. Run one with `VSR_ENGINE_TEST=name`; `VSR_ENGINE_TRACE=1` prints
