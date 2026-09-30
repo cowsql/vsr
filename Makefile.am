@@ -86,11 +86,13 @@ REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/anchor_behind_applied tests/regression/reply_restore \
   tests/regression/next_epoch_before_steady \
   tests/regression/recovery_into_handoff tests/regression/view_change_minimum \
-  tests/regression/lagging_reload tests/regression/dead_backup_apply
+  tests/regression/lagging_reload tests/regression/dead_backup_apply \
+  tests/regression/held_store_deadline
 FUZZY_TESTS = tests/fuzzy/cluster tests/fuzzy/cluster_extended
 # Reproductions of open safety bugs found in review go here; they turn into
 # XPASS once the core is fixed and then move to the ordinary regressions.
-XFAIL_TESTS = tests/regression/dead_backup_apply
+XFAIL_TESTS = tests/regression/dead_backup_apply \
+  tests/regression/held_store_deadline
 check_PROGRAMS = $(UNIT_TESTS) $(INTEGRATION_TESTS) $(REGRESSION_TESTS) $(FUZZY_TESTS)
 tests_unit_checked_SOURCES = tests/unit/checked.c
 tests_unit_checked_LDADD = $(LIBVSR)
@@ -305,6 +307,11 @@ tests_regression_dead_backup_apply_SOURCES = \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
 tests_regression_dead_backup_apply_LDADD = $(LIBVSR)
+tests_regression_held_store_deadline_SOURCES = \
+  tests/regression/held_store_deadline.c \
+  tests/lib/memory.c tests/lib/memory.h \
+  tests/lib/memory_cluster.c tests/lib/memory_cluster.h
+tests_regression_held_store_deadline_LDADD = $(LIBVSR)
 tests_regression_api_init_out_SOURCES = tests/regression/api_init_out.c
 tests_regression_api_init_out_LDADD = $(LIBVSR)
 CLUSTER_SCENARIO = tests/fuzzy/scenario.c tests/fuzzy/scenario.h \
