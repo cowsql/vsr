@@ -75,7 +75,7 @@ INTEGRATION_TESTS += tests/integration/failures tests/integration/view_change_ed
   tests/integration/offers tests/integration/capture tests/integration/clients
 INTEGRATION_TESTS += tests/integration/uring_smoke \
   tests/integration/uring_refusals tests/integration/executor_conformance
-INTEGRATION_TESTS += tests/integration/engine
+INTEGRATION_TESTS += tests/integration/engine tests/integration/streams
 REGRESSION_TESTS = tests/regression/trim_resend \
   tests/regression/recovery_coverage tests/regression/transfer_anchor \
   tests/regression/witness_prefix tests/regression/boundary_from_view_change \
@@ -166,6 +166,8 @@ IO_WORLD = tests/lib/io_world.c tests/lib/io_world.h \
   tests/lib/random.c tests/lib/random.h
 tests_integration_engine_SOURCES = tests/integration/engine.c $(IO_WORLD)
 tests_integration_engine_LDADD = $(LIBVSR)
+tests_integration_streams_SOURCES = tests/integration/streams.c $(IO_WORLD)
+tests_integration_streams_LDADD = $(LIBVSR)
 tests_integration_replication_SOURCES = tests/integration/replication.c \
   tests/lib/memory.c tests/lib/memory.h \
   tests/lib/memory_cluster.c tests/lib/memory_cluster.h
