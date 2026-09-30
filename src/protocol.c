@@ -1196,22 +1196,24 @@ static bool network_poll(struct vsr *v)
  * SENDs fail and its cursor rewinds to its last acknowledgment; both learn
  * the boundary from the announcement. No other entry waits: a COMMIT can
  * follow ordinary commitment at any time, and application must not depend
- * on any send to any peer (regression dead_backup_apply). */
-static bool boundary_commit_pending(const struct vsr *v,
-                                    const struct vsr_entry *entry)
+ * on any send to any peer (regression dead_backup_apply).
+ *
+ * The boundary is recognised by the proposal fence, not by loading the
+ * entry: the fence names the RECONFIGURE of this epoch and survives its
+ * eviction, and with a small cache the entry and those the peers still
+ * need would otherwise evict each other for as long as the gate holds
+ * (tests/fuzzy/cluster 135 1 600 quiet 44, a one-entry cache). */
+static bool boundary_commit_pending(const struct vsr *v, uint64_t op)
 {
     const struct vsr_protocol *p = vsr_protocol_const(v);
-    if (entry->type != VSR_REQUEST_RECONFIGURE ||
-        entry->epoch != p->current.epoch ||
-        v->status.state != VSR_STATE_NORMAL ||
+    if (op != p->proposed_boundary || v->status.state != VSR_STATE_NORMAL ||
         v->status.primary != v->options.replica)
         return false;
     for (uint32_t i = 0; i < p->current.count; ++i) {
         const struct vsr_peer *peer = &p->peers[i];
         uint64_t reached =
             peer->sent > peer->prepared ? peer->sent : peer->prepared;
-        if (i != p->self && reached >= entry->op &&
-            peer->commit_sent < entry->op)
+        if (i != p->self && reached >= op && peer->commit_sent < op)
             return true;
     }
     return false;
@@ -1732,20 +1734,22 @@ bool vsr_protocol_poll(struct vsr *v)
             p->notified_commit = p->readable_begin - 1;
             return true;
         }
-        struct vsr_log_slot *s = vsr_protocol_log_find(v, next);
-        if (s == NULL) {
-            if (vsr_protocol_load_log(v, next, p->stable_commit + 1))
-                return true;
-        } else if (boundary_commit_pending(v, &s->entry)) {
+        if (boundary_commit_pending(v, next)) {
             /* The boundary changes the membership the moment it is
              * notified: issue the final old-group commit first, while its
-             * envelope is still valid. */
+             * envelope is still valid, and before loading the boundary. */
             if (network_poll(v))
                 return true;
         } else {
-            p->notified_commit = next;
-            vsr_extension_committed(v, &s->entry);
-            return true;
+            struct vsr_log_slot *s = vsr_protocol_log_find(v, next);
+            if (s == NULL) {
+                if (vsr_protocol_load_log(v, next, p->stable_commit + 1))
+                    return true;
+            } else {
+                p->notified_commit = next;
+                vsr_extension_committed(v, &s->entry);
+                return true;
+            }
         }
     }
     if (routes_poll(v))
