@@ -41,10 +41,15 @@ static struct vsr_status status(struct mem_node *node)
     return result;
 }
 
+/* Member whose incoming epoch announcements (START_EPOCH, NEW_EPOCH) are
+ * dropped, or zero: the primary must enter the epoch it committed by its
+ * own notification, not by following a backup that learned it first. */
+static uint64_t unannounced;
+
 /* Steps every live node, completes its effects (a SEND to the dead member
  * completes RETRY once the sender's clock allows it, as the engine defers
  * it), delivers messages except those queued for the dead member before it
- * crashed. */
+ * crashed and the announcements withheld above. */
 static void drive(struct mem_cluster *cluster, struct mem_node **nodes)
 {
     for (size_t turn = 0; turn < 100000; turn++) {
@@ -66,9 +71,12 @@ static void drive(struct mem_cluster *cluster, struct mem_node **nodes)
         }
         for (size_t i = 0; i < mem_cluster_messages(cluster); i++) {
             uint64_t to;
+            const struct vsr_message *message =
+                mem_cluster_message(cluster, i, &to);
 
-            (void)mem_cluster_message(cluster, i, &to);
-            if (to == DEAD) {
+            if (to == DEAD ||
+                (to == unannounced && (message->type == VSR_MSG_START_EPOCH ||
+                                       message->type == VSR_MSG_NEW_EPOCH))) {
                 mem_cluster_drop(cluster, i);
                 progress = true;
                 break;
@@ -181,8 +189,10 @@ int main(int argc, char **argv)
     }
     /* The boundary of a reconfiguration is the one entry whose commitment
      * waits for its COMMIT to be issued to the old group: to the peers up
-     * to date with it, which the dead one is not. The handoff must complete
-     * with the live backup's promise alone. */
+     * to date with it, which the dead one is not. The primary must enter
+     * the epoch by its own notification (a rule waiting on every peer was
+     * rescued only by the live backup's START_EPOCH, withheld here), and
+     * the handoff must complete with that backup's promise alone. */
     {
         const struct vsr_membership next = {1, members, MEMBERS, 1};
         const struct vsr_request request = {
@@ -192,6 +202,7 @@ int main(int argc, char **argv)
         bool done = false;
 
         CHECK(primary != NULL);
+        unannounced = mem_node_id(primary);
         CHECK(mem_node_event(primary, &event).consumed == 1);
         for (unsigned round = 0; round < 64 && !done; round++) {
             drive(cluster, nodes);
@@ -200,6 +211,16 @@ int main(int argc, char **argv)
                 done = true;
             now += 1;
             tick(nodes, now);
+        }
+        if (!done) {
+            struct vsr_status st = status(primary);
+
+            fprintf(stderr,
+                    "reconfiguration not done: replied %d epoch %" PRIu64
+                    " phase %u state %u committed %" PRIu64 " applied %" PRIu64
+                    "\n",
+                    replied(primary, 100), st.epoch, st.configuration->phase,
+                    st.state, st.committed, st.applied);
         }
         CHECK(done);
     }
