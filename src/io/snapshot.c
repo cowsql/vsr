@@ -2316,7 +2316,10 @@ static void release_done(struct vsr_io *io, uint32_t replica,
 /* Keeps store.base_slot on the base's open file (the module owns that
  * field: the store only reads through it) and closes the slots of files
  * that are neither the base, nor the latest capture, nor a file loaded for
- * a held RESTORE or PUBLISH the store has yet to pack. */
+ * a held RESTORE or PUBLISH the store has yet to pack. A file with a core
+ * op in progress keeps its slot until the op is over: the settles of
+ * CAPTURE and SYNC wait for their entry's job to end, and a RELEASE's
+ * completion settles nothing. */
 static void base_track(struct vsr_io *io, uint32_t replica)
 {
     struct vsr_io_replica *rep = replica_of(io, replica);
@@ -2340,8 +2343,9 @@ static void base_track(struct vsr_io *io, uint32_t replica)
         struct vsr_io_snapshot *entry = &s->entries[i];
 
         if (entry->state == VSR_IO_SNAPSHOT_FREE || entry->file_slot < 0 ||
-            entry->job != VSR_IO_SNAPSHOT_JOB_NONE || entry == base ||
-            i == s->pending_base || id_equal(entry->id, store->last_capture) ||
+            entry->job != VSR_IO_SNAPSHOT_JOB_NONE || entry->op != 0 ||
+            entry == base || i == s->pending_base ||
+            id_equal(entry->id, store->last_capture) ||
             store->cold_active != 0) {
             continue;
         }

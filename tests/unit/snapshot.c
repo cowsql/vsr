@@ -4859,6 +4859,96 @@ static void test_close(void)
     }
 }
 
+/* -------------------------------------------------------------------------
+ * Review: settles, holds, retries and the file's integrity
+ * ---------------------------------------------------------------------- */
+
+/* base_track starts no RELEASE of a kept slot under an op: the settles of
+ * CAPTURE and SYNC wait for `job == NONE` and a RELEASE's completion
+ * settles nothing, so an op whose caller answered while the RELEASE's CLOSE
+ * was out never reached the core (for a CAPTURE, the application fence
+ * held forever). Here a CAPTURE whose file failed after its creation: the
+ * failed file is neither the latest capture nor the base. */
+static void test_review_capture_release(void)
+{
+    struct engine *a;
+    struct task_holder h;
+    struct vsr_id id;
+    uint64_t op;
+    uint64_t sequence = fresh_store(&a, 120, 2);
+    const struct vsr_io_snapshot *entry;
+    uint32_t steps = 0;
+
+    (void)sequence;
+    /* CAPTURE: the first write fails (ENOSPC) with the file created; the
+     * caller has not answered yet. */
+    {
+        struct vsr_id zero = {0, 0};
+
+        task_init(&h, zero, 5, a->store->readable, 0);
+        op = next_op(a);
+        CHECK(vsr_io_snapshots_capture(a->io, REPLICA, op, &h.task) == VSR_OK);
+        entry = &a->snapshots->entries[a->snapshots->capture];
+        id = entry->id;
+    }
+    a->fail_write = -ENOSPC;
+    while (entry->library_status == -1) {
+        step_checked(a);
+        CHECK(++steps < 20);
+    }
+    CHECK(entry->library_status == VSR_IO_FAILED && entry->on_disk);
+    CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_CAPTURE, op) != NULL);
+    task_result(&h, id);
+    caller_done(a, op, VSR_IO_OK, &h.checkpoint);
+    settle();
+    expect_core(a, op, VSR_IO_FAILED);
+    CHECK(clients_file(a, id, false) == NULL && entry_of(a, id) == NULL);
+    expect_idle(a);
+    engine_crash(a);
+}
+
+/* SYNC of the latest capture: its library half is over when another
+ * capture's file completes, which makes the synced file neither the latest
+ * nor the base; the caller answers while the RELEASE's CLOSE is out. */
+static void test_review_sync_release(void)
+{
+    struct engine *a;
+    const struct vsr_io_snapshot *entry;
+    uint64_t sequence = fresh_store(&a, 121, 2);
+
+    (void)sequence;
+    {
+        struct task_holder hs;
+        struct task_holder hc;
+        uint64_t sync_op;
+        uint64_t capture_op;
+        struct vsr_id prev = capture(a);
+        struct vsr_id next;
+
+        entry = entry_of(a, prev);
+        CHECK(entry->file_slot >= 0);
+        CHECK(joint_start(a, VSR_OP_SNAPSHOT_SYNC, &hs, prev, &sync_op) ==
+              VSR_OK);
+        settle();
+        CHECK(forwarded_core(a, VSR_OP_SNAPSHOT_SYNC, sync_op) != NULL);
+        CHECK(entry->library_status == VSR_IO_OK &&
+              entry->job == VSR_IO_SNAPSHOT_JOB_NONE);
+        next = capture_stepped(a, &hc, &capture_op);
+        step_checked(a); /* base_track runs */
+        caller_done(a, sync_op, VSR_IO_OK, NULL);
+        settle();
+        expect_core(a, sync_op, VSR_IO_OK);
+        CHECK(entry->state == VSR_IO_SNAPSHOT_DURABLE);
+        task_result(&hc, next);
+        caller_done(a, capture_op, VSR_IO_OK, &hc.checkpoint);
+        settle();
+        expect_checkpoint(a, capture_op, next, &hc);
+        CHECK(entry->file_slot < 0); /* Released once the op is over. */
+    }
+    expect_idle(a);
+    engine_crash(a);
+}
+
 int main(void)
 {
     test_capture();
@@ -4872,5 +4962,7 @@ int main(void)
     test_load_failures();
     test_recovery();
     test_close();
+    test_review_sync_release();
+    test_review_capture_release();
     return 0;
 }
